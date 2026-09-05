@@ -91,11 +91,11 @@ both as “retry the command” risks duplicate effects.
 
 Before retrying work, collect safe runtime facts:
 
-1. Use `runtime_status` / `list_agents` to establish the current Server build,
+1. Use `runtime_status` / `list_runners` to establish the current Server build,
    Runner connection state, `client_id`, process-scoped `agent_instance_id`,
    reconciliation capability, and Job concurrency state. If reconciliation logs
    are available, cross-check `process_started_at` there; it is not part of the
-   current `runtime_status` / `list_agents` projection.
+   current `runtime_status` / `list_runners` projection.
 2. Determine whether the Runner process changed. If it changed, do not claim the
    same-process Server-restart recovery contract was violated.
 3. If the Runner process is unchanged, inspect the registration/reconciliation
@@ -116,9 +116,9 @@ credentials, and private paths are not required.
 
 ## 4. Runner Job capacity is shared across windows and projects
 
-`max_concurrent_jobs` is a Runner-process execution limit (default 4, effective
-range 1..64). It is not allocated per ChatGPT window, Workflow Session, or
-Project.
+`max_concurrent_jobs` is a Runner-process execution limit (default 4, valid
+range 1..64; out-of-range configuration is rejected). It is not allocated per
+ChatGPT window, Workflow Session, or Project.
 
 Opening multiple model windows consumes no Job slot by itself. A slot is consumed
 while a Job-backed execution owns Runner execution capacity. Therefore several
@@ -150,7 +150,7 @@ Do not conflate the Job execution pool with other limits. In particular:
 - polling request dispatch has its own in-flight bound;
 - persistent shells have their own bounded population/lifecycle.
 
-Changing one does not redefine the others. `runtime_status` / `list_agents`
+Changing one does not redefine the others. `runtime_status` / `list_runners`
 should be used for current `job_concurrency { limit, running, queued }` facts
 instead of inferring capacity from the number of browser/model windows. These
 are bounded lifecycle-status counts, not an exact free-slot calculation:
@@ -171,13 +171,16 @@ choices, and any lifecycle fact that changes retry safety. Put detailed numeric
 bounds, wire rules, and field-specific behavior on the relevant input/output
 schema instead of repeating them in every top-level description.
 
-For ordinary tools, aim for roughly 80–220 characters of high-signal text. This
-is a review target rather than a wire limit; longer descriptions need a concrete
-selection reason. Avoid naming sibling tools merely to restate implementation or
-fallback details, because exact-name discovery may otherwise retrieve unrelated
-tools whose descriptions happen to mention the queried name. Prefer capability
-phrasing such as “shell command tool”, “structured validation”, or “asynchronous
-execution” unless the sibling tool name is itself needed to choose correctly.
+For ordinary tools, keep the top-level description as short as its selection and
+lifecycle semantics allow. There is no secondary numeric density limit below the
+repository hard ceiling (`MODEL_TOOL_DESCRIPTION_MAX_CHARS`, currently 600);
+using more of that budget is appropriate when it preserves selection, authority,
+retry, continuation, uncertainty, safety, or recovery semantics. Avoid naming
+sibling tools merely to restate implementation or fallback details, because
+exact-name discovery may otherwise retrieve unrelated tools whose descriptions
+happen to mention the queried name. Prefer capability phrasing such as “shell
+command tool”, “structured validation”, or “asynchronous execution” unless the
+sibling tool name is itself needed to choose correctly.
 
 Generic lifecycle words such as `Job` should be concentrated on actual Job
 creation/observation tools. Structured validators and process adapters can say
@@ -225,7 +228,7 @@ description plus observation-field schemas should make clear that:
 
 ### Runtime/operator observation tools
 
-Descriptions for `runtime_status`, `list_agents`, and related operator surfaces
+Descriptions for `runtime_status`, `list_runners`, and related operator surfaces
 should distinguish connection health from execution capacity and expose safe
 facts needed to diagnose recovery:
 

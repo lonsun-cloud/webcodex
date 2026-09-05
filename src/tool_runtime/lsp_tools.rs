@@ -1,16 +1,16 @@
-//! Runtime dispatch for read-only agent-side LSP navigation tools.
+//! Runtime dispatch for read-only Runner-side LSP navigation tools.
 
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::lsp_bridge::{
     clamp_document_diagnostics_limit, clamp_document_symbols_limit, clamp_find_references_limit,
     clamp_goto_definition_limit, clamp_workspace_symbols_limit, error_codes, is_known_error_code,
-    parse_agent_lsp_result_envelope, redact_absolute_paths, validate_call_hierarchy_bounds,
-    AgentLspPayload, AgentLspRequest, CallHierarchyResult, DocumentDiagnosticsResult,
-    DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult, LocationsResult,
-    LspStatusResult, WorkspaceSymbolsResult, MAX_CALL_HIERARCHY_CALL_SITES_PER_EDGE,
+    parse_runner_lsp_result_envelope, redact_absolute_paths, validate_call_hierarchy_bounds,
+    CallHierarchyResult, DocumentDiagnosticsResult, DocumentDiagnosticsStatus,
+    DocumentSymbolsResult, HoverResult, LocationsResult, LspStatusResult, RunnerLspPayload,
+    RunnerLspRequest, WorkspaceSymbolsResult, MAX_CALL_HIERARCHY_CALL_SITES_PER_EDGE,
     MAX_CALL_HIERARCHY_ROOTS,
 };
-use crate::shell_client::{EnqueueLspError, RunnerFeature};
+use crate::runner_http::{EnqueueLspError, RunnerFeature};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -23,7 +23,7 @@ impl ToolRuntime {
             ToolCall::LspStatus {
                 project,
                 session_id: _,
-            } => self.call_agent_lsp(project, AgentLspRequest::Status).await,
+            } => self.call_agent_lsp(project, RunnerLspRequest::Status).await,
             ToolCall::DocumentSymbols {
                 project,
                 path,
@@ -32,7 +32,7 @@ impl ToolRuntime {
             } => {
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::DocumentSymbols {
+                    RunnerLspRequest::DocumentSymbols {
                         path,
                         limit: clamp_document_symbols_limit(limit),
                     },
@@ -47,7 +47,7 @@ impl ToolRuntime {
             } => {
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::DocumentDiagnostics {
+                    RunnerLspRequest::DocumentDiagnostics {
                         path,
                         limit: clamp_document_diagnostics_limit(limit),
                     },
@@ -67,7 +67,7 @@ impl ToolRuntime {
                         error_codes::INVALID_ARGUMENTS
                     ));
                 }
-                self.call_agent_lsp(project, AgentLspRequest::Hover { path, line, column })
+                self.call_agent_lsp(project, RunnerLspRequest::Hover { path, line, column })
                     .await
             }
             ToolCall::WorkspaceSymbols {
@@ -91,7 +91,7 @@ impl ToolRuntime {
                 }
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::WorkspaceSymbols {
+                    RunnerLspRequest::WorkspaceSymbols {
                         query,
                         limit: clamp_workspace_symbols_limit(limit),
                     },
@@ -114,7 +114,7 @@ impl ToolRuntime {
                 }
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::GotoDefinition {
+                    RunnerLspRequest::GotoDefinition {
                         path,
                         line,
                         column,
@@ -140,7 +140,7 @@ impl ToolRuntime {
                 }
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::FindReferences {
+                    RunnerLspRequest::FindReferences {
                         path,
                         line,
                         column,
@@ -174,7 +174,7 @@ impl ToolRuntime {
                 }
                 self.call_agent_lsp(
                     project,
-                    AgentLspRequest::CallHierarchy {
+                    RunnerLspRequest::CallHierarchy {
                         path,
                         line,
                         column,
@@ -189,70 +189,61 @@ impl ToolRuntime {
         }
     }
 
-    async fn call_agent_lsp(&self, project: String, request: AgentLspRequest) -> ToolResult {
+    async fn call_agent_lsp(&self, project: String, request: RunnerLspRequest) -> ToolResult {
         let resolved = match self.resolve_project_input(&project).await {
             Ok(p) => p,
             Err(e) => return e.into_tool_result(),
         };
         let proj = &resolved.config;
-        if !proj.is_agent() {
-            return ToolResult::err(format!(
-                "{}: LSP tools require an agent-backed project",
-                error_codes::AGENT_CAPABILITY_UNAVAILABLE
-            ));
-        }
-        let client_id = match proj.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => return ToolResult::err(e),
-        };
+        let client_id = proj.client_id.clone();
         let Some(client) = self
-            .shell_clients
-            .get_client_semantic_view(&client_id)
+            .runner_registry
+            .get_runner_semantic_view(&client_id)
             .await
         else {
             return ToolResult::err(format!(
-                "{}: agent is not connected",
+                "{}: Runner is not connected",
                 error_codes::AGENT_CAPABILITY_UNAVAILABLE
             ));
         };
         if !client.view.connected {
             return ToolResult::err(format!(
-                "{}: agent is not connected",
+                "{}: Runner is not connected",
                 error_codes::AGENT_CAPABILITY_UNAVAILABLE
             ));
         }
-        let call_hierarchy = matches!(&request, AgentLspRequest::CallHierarchy { .. });
+        let call_hierarchy = matches!(&request, RunnerLspRequest::CallHierarchy { .. });
         if call_hierarchy && !client.supports(RunnerFeature::LspCallHierarchy) {
             return ToolResult::err(format!(
-                "{}: agent does not support lsp_call_hierarchy",
+                "{}: Runner does not support lsp_call_hierarchy",
                 error_codes::AGENT_CAPABILITY_UNAVAILABLE
             ));
         }
         if !call_hierarchy && !client.supports(RunnerFeature::LspReadOnlyNavigation) {
             return ToolResult::err(format!(
-                "{}: agent does not support lsp_read_only_navigation",
+                "{}: Runner does not support lsp_read_only_navigation",
                 error_codes::AGENT_CAPABILITY_UNAVAILABLE
             ));
         }
-        // Server-resolved agent-local project id only — never trust a
-        // model-supplied free-form agent project id for bridge dispatch.
-        let agent_project_id = match agent_local_project_id(&resolved.resolved_id) {
+        // Server-resolved Runner-local project id only — never trust a
+        // model-supplied free-form Runner project id for bridge dispatch.
+        let agent_project_id = match runner_local_project_id(&resolved.resolved_id) {
             Some(id) => id.to_string(),
             None => {
                 return ToolResult::err(format!(
-                    "{}: could not derive agent project id from runtime id",
+                    "{}: could not derive Runner project id from runtime id",
                     error_codes::UNKNOWN_PROJECT
                 ))
             }
         };
         let expected_result = request.clone();
-        let payload = AgentLspPayload {
+        let payload = RunnerLspPayload {
             project_id: agent_project_id,
             request,
         };
         let wait_timeout = 30u64;
         let (request_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_lsp(client_id, payload, "tool_runtime".to_string(), wait_timeout)
             .await
         {
@@ -269,10 +260,10 @@ impl ToolRuntime {
         match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
             Ok(Ok(resp)) => {
                 if let Some(error) = resp.error {
-                    return map_agent_transport_error(error);
+                    return map_runner_transport_error(error);
                 }
                 let stdout = resp.stdout.unwrap_or_default();
-                match parse_agent_lsp_result_envelope(&stdout) {
+                match parse_runner_lsp_result_envelope(&stdout) {
                     Ok(envelope) if envelope.success => {
                         let result = envelope.result.unwrap_or(Value::Null);
                         let mut result = match validate_agent_lsp_result(&expected_result, result) {
@@ -283,7 +274,7 @@ impl ToolRuntime {
                             obj.insert("project".to_string(), json!(resolved.resolved_id));
                         }
                         match expected_result {
-                            AgentLspRequest::DocumentDiagnostics { .. } => {
+                            RunnerLspRequest::DocumentDiagnostics { .. } => {
                                 let status = result
                                     .get("status")
                                     .and_then(Value::as_str)
@@ -311,13 +302,13 @@ impl ToolRuntime {
                         let err =
                             envelope
                                 .error
-                                .unwrap_or_else(|| crate::lsp_bridge::AgentLspError {
+                                .unwrap_or_else(|| crate::lsp_bridge::RunnerLspError {
                                     code: error_codes::LSP_SERVER_FAILED.to_string(),
                                     message: "LSP request failed".to_string(),
                                 });
                         if !is_known_error_code(&err.code) {
                             return ToolResult::err(format!(
-                                "{}: agent result contained an unknown error code",
+                                "{}: Runner result contained an unknown error code",
                                 error_codes::MALFORMED_AGENT_LSP_RESULT
                             ));
                         }
@@ -333,13 +324,13 @@ impl ToolRuntime {
                 }
             }
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
-                ToolResult::err("agent LSP waiter was dropped")
+                self.runner_registry.cancel_request(&request_id).await;
+                ToolResult::err("Runner LSP waiter was dropped")
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 ToolResult::err(format!(
-                    "{}: timed out waiting for agent LSP result",
+                    "{}: timed out waiting for Runner LSP result",
                     error_codes::LSP_REQUEST_TIMEOUT
                 ))
             }
@@ -347,13 +338,13 @@ impl ToolRuntime {
     }
 }
 
-fn validate_agent_lsp_result(request: &AgentLspRequest, result: Value) -> Result<Value, String> {
+fn validate_agent_lsp_result(request: &RunnerLspRequest, result: Value) -> Result<Value, String> {
     let result = match request {
-        AgentLspRequest::Status => roundtrip_typed_result::<LspStatusResult>(result),
-        AgentLspRequest::DocumentSymbols { .. } => {
+        RunnerLspRequest::Status => roundtrip_typed_result::<LspStatusResult>(result),
+        RunnerLspRequest::DocumentSymbols { .. } => {
             roundtrip_typed_result::<DocumentSymbolsResult>(result)
         }
-        AgentLspRequest::DocumentDiagnostics { .. } => {
+        RunnerLspRequest::DocumentDiagnostics { .. } => {
             serde_json::from_value::<DocumentDiagnosticsResult>(result).and_then(|typed| {
                 if validate_document_diagnostics_status(&typed).is_err() {
                     return Err(serde_json::Error::io(std::io::Error::other(
@@ -363,14 +354,14 @@ fn validate_agent_lsp_result(request: &AgentLspRequest, result: Value) -> Result
                 serde_json::to_value(typed)
             })
         }
-        AgentLspRequest::Hover { .. } => roundtrip_typed_result::<HoverResult>(result),
-        AgentLspRequest::WorkspaceSymbols { .. } => {
+        RunnerLspRequest::Hover { .. } => roundtrip_typed_result::<HoverResult>(result),
+        RunnerLspRequest::WorkspaceSymbols { .. } => {
             roundtrip_typed_result::<WorkspaceSymbolsResult>(result)
         }
-        AgentLspRequest::GotoDefinition { .. } | AgentLspRequest::FindReferences { .. } => {
+        RunnerLspRequest::GotoDefinition { .. } | RunnerLspRequest::FindReferences { .. } => {
             roundtrip_typed_result::<LocationsResult>(result)
         }
-        AgentLspRequest::CallHierarchy {
+        RunnerLspRequest::CallHierarchy {
             path,
             direction,
             line,
@@ -389,13 +380,13 @@ fn validate_agent_lsp_result(request: &AgentLspRequest, result: Value) -> Result
     }
     .map_err(|_| {
         format!(
-            "{}: agent result did not match the expected LSP result shape",
+            "{}: Runner result did not match the expected LSP result shape",
             error_codes::MALFORMED_AGENT_LSP_RESULT
         )
     })?;
     if contains_forbidden_path_material(&result) {
         return Err(format!(
-            "{}: agent result contained forbidden path material",
+            "{}: Runner result contained forbidden path material",
             error_codes::MALFORMED_AGENT_LSP_RESULT
         ));
     }
@@ -561,10 +552,10 @@ fn string_contains_forbidden_path_material(value: &str) -> bool {
         && matches!(bytes[2], b'/' | b'\\')
 }
 
-/// Derive the agent-local project id from a server-resolved runtime id.
+/// Derive the Runner-local project id from a server-resolved runtime id.
 /// Shared with the coding-startup semantic-navigation probe; never derived
 /// from model-supplied free-form ids.
-pub(crate) fn agent_local_project_id(resolved_id: &str) -> Option<&str> {
+pub(crate) fn runner_local_project_id(resolved_id: &str) -> Option<&str> {
     let rest = resolved_id.strip_prefix("agent:")?;
     let (_client, project_id) = rest.split_once(':')?;
     if project_id.is_empty() {
@@ -574,10 +565,10 @@ pub(crate) fn agent_local_project_id(resolved_id: &str) -> Option<&str> {
     }
 }
 
-fn map_agent_transport_error(error: String) -> ToolResult {
+fn map_runner_transport_error(error: String) -> ToolResult {
     let lower = error.to_ascii_lowercase();
     if lower.contains("unknown shell client") || lower.contains("not connected") {
-        return ToolResult::err(format!("agent unavailable: {error}"));
+        return ToolResult::err(format!("Runner unavailable: {error}"));
     }
     ToolResult::err(error)
 }

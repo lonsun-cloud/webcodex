@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::continuation_feedback::{
-    continuation_feedback_value, not_applicable_continuation_feedback_value,
-    ContinuationFeedbackInput,
+    continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
+    not_applicable_continuation_feedback_value, ContinuationFeedbackInput,
 };
 use super::handoff::{
     actionable_unexpected_failure_count, apply_compact_workflow_outcomes, closeout_work_projection,
@@ -41,12 +41,10 @@ use super::unknown_session_result;
 use super::validation_events::skipped_validation_summary;
 use super::{ToolCall, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_protocol::{
-    ShellFileOpRequest, SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_GIT,
-    SHELL_CLIENT_CAPABILITY_SHELL,
+use crate::runner_protocol::{
+    ShellFileOpRequest, RUNNER_CAPABILITY_FILE_READ, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_SHELL,
 };
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 
 const RULES_MAX_HEADINGS: usize = 8;
@@ -69,17 +67,8 @@ pub(crate) struct ProjectResolutionMetadata {
 }
 
 enum CodingProjectSource {
-    Existing {
-        project: String,
-    },
-    RunnerPath {
-        client_id: String,
-        path: String,
-    },
-    ManagedTemporary {
-        client_id: String,
-        name: Option<String>,
-    },
+    Existing { project: String },
+    RunnerPath { client_id: String, path: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,10 +81,11 @@ struct CodingStartupOptions {
 }
 
 impl CodingStartupOptions {
-    fn start_coding_task(detail: StartupDetail) -> Self {
+    #[cfg(test)]
+    fn diagnostic(detail: StartupDetail) -> Self {
         Self {
             detail,
-            tool_name: "start_coding_task",
+            tool_name: "work_on_project",
             include_repository_overview: true,
             include_project_instructions: true,
             include_reused_instruction_content: false,
@@ -162,14 +152,10 @@ fn resolve_project_source(
     project: String,
     client_id: Option<String>,
     path: Option<String>,
-    temporary_project_name: Option<String>,
-    managed_temporary_allowed: bool,
 ) -> Result<CodingProjectSource, ToolResult> {
     let project = project.trim().to_string();
     let client_id = non_empty_optional_field("client_id", client_id)?;
     let path = non_empty_optional_field("path", path)?;
-    let temporary_project_name =
-        non_empty_optional_field("temporary_project_name", temporary_project_name)?;
 
     if !project.is_empty() {
         let mut conflicts = Vec::new();
@@ -179,14 +165,11 @@ fn resolve_project_source(
         if path.is_some() {
             conflicts.push("path");
         }
-        if temporary_project_name.is_some() {
-            conflicts.push("temporary_project_name");
-        }
         if !conflicts.is_empty() {
             let mut fields = vec!["project"];
             fields.extend(conflicts);
             return Err(invalid_project_source(
-                "project cannot be combined with client_id, path, or temporary_project_name",
+                "project cannot be combined with client_id or path",
                 json!({"conflicting_fields": fields}),
             ));
         }
@@ -194,12 +177,6 @@ fn resolve_project_source(
     }
 
     if let Some(path) = path {
-        if temporary_project_name.is_some() {
-            return Err(invalid_project_source(
-                "path cannot be combined with temporary_project_name",
-                json!({"conflicting_fields": ["path", "temporary_project_name"]}),
-            ));
-        }
         if let Err(error) = super::projects::validate_project_op_path(&path) {
             return Err(invalid_project_source(
                 error,
@@ -215,35 +192,16 @@ fn resolve_project_source(
         return Ok(CodingProjectSource::RunnerPath { client_id, path });
     }
 
-    if !managed_temporary_allowed {
-        return Err(if client_id.is_some() {
-            invalid_project_source(
-                "client_id requires path",
-                json!({"field": "path", "required_with": "client_id"}),
-            )
-        } else {
-            invalid_project_source(
-                "project or client_id + path is required",
-                json!({"required_any_of": ["project", "client_id + path"]}),
-            )
-        });
-    }
-    let Some(client_id) = client_id else {
-        return Err(if temporary_project_name.is_some() {
-            invalid_project_source(
-                "temporary_project_name requires client_id",
-                json!({"field": "client_id", "required_with": "temporary_project_name"}),
-            )
-        } else {
-            invalid_project_source(
-                "start_coding_task requires project, client_id + path, or client_id for a managed temporary project",
-                json!({"required_any_of": ["project", "client_id + path", "client_id"]}),
-            )
-        });
-    };
-    Ok(CodingProjectSource::ManagedTemporary {
-        client_id,
-        name: temporary_project_name,
+    Err(if client_id.is_some() {
+        invalid_project_source(
+            "client_id requires path",
+            json!({"field": "path", "required_with": "client_id"}),
+        )
+    } else {
+        invalid_project_source(
+            "project or client_id + path is required",
+            json!({"required_any_of": ["project", "client_id + path"]}),
+        )
     })
 }
 
@@ -278,8 +236,8 @@ fn attach_project_resolution(
     resolution: &ProjectResolutionMetadata,
 ) -> ToolResult {
     // Existing-project aliases are not authoritative until runtime resolution
-    // succeeds. Path and managed-temporary sources already carry a Runner-issued
-    // full id, so their metadata remains useful on later Session failures.
+    // succeeds. Path sources already carry a Runner-issued full id, so their
+    // metadata remains useful on later Session failures.
     if !resolution.resolved_project.is_empty() {
         result.output["project_resolution"] =
             serde_json::to_value(resolution).unwrap_or_else(|_| json!({}));
@@ -296,16 +254,17 @@ impl ToolRuntime {
         client_id: &str,
         auth: Option<&AuthContext>,
     ) -> Result<(), ToolResult> {
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let supports_shell = self
-            .shell_clients
-            .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_SHELL, auth)
+            .runner_registry
+            .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_SHELL, access.as_ref())
             .await
             .map_err(ToolResult::err)?;
         let supports_git = if supports_shell {
             false
         } else {
-            self.shell_clients
-                .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_GIT, auth)
+            self.runner_registry
+                .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_GIT, access.as_ref())
                 .await
                 .map_err(ToolResult::err)?
         };
@@ -313,48 +272,9 @@ impl ToolRuntime {
             Ok(())
         } else {
             Err(ToolResult::err(format!(
-                "agent client {client_id} does not support shell or git"
+                "Runner {client_id} does not support shell or git"
             )))
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn start_coding_task(
-        &self,
-        project: String,
-        client_id: Option<String>,
-        path: Option<String>,
-        temporary_project_name: Option<String>,
-        title: Option<String>,
-        mode: SessionMode,
-        deny_write_tools: bool,
-        deny_shell_tools: bool,
-        detail: StartupDetail,
-        resume_session_id: Option<String>,
-        execution_context: Option<sessions::SessionExecutionContext>,
-        auth: Option<&AuthContext>,
-        trusted_recording_session_id: Option<&str>,
-        trusted_recording_session_project: Option<&str>,
-        transport: SessionTransport,
-    ) -> ToolResult {
-        self.start_coding_task_with_options(
-            project,
-            client_id,
-            path,
-            temporary_project_name,
-            title,
-            mode,
-            deny_write_tools,
-            deny_shell_tools,
-            CodingStartupOptions::start_coding_task(detail),
-            resume_session_id,
-            execution_context,
-            auth,
-            trusted_recording_session_id,
-            trusted_recording_session_project,
-            transport,
-        )
-        .await
     }
 
     async fn explicit_coding_session_project(
@@ -414,12 +334,11 @@ impl ToolRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn start_coding_task_with_options(
+    async fn start_coding_workflow(
         &self,
         project: String,
         client_id: Option<String>,
         path: Option<String>,
-        temporary_project_name: Option<String>,
         title: Option<String>,
         mode: SessionMode,
         deny_write_tools: bool,
@@ -433,11 +352,10 @@ impl ToolRuntime {
         transport: SessionTransport,
     ) -> ToolResult {
         let detail = startup.detail;
-        let project_source =
-            match resolve_project_source(project, client_id, path, temporary_project_name, true) {
-                Ok(source) => source,
-                Err(result) => return result,
-            };
+        let project_source = match resolve_project_source(project, client_id, path) {
+            Ok(source) => source,
+            Err(result) => return result,
+        };
         let resume_requested = resume_session_id.is_some();
         let execution_context = match execution_context
             .map(sessions::SessionExecutionContext::validated)
@@ -527,92 +445,6 @@ impl ToolRuntime {
                     resolved_project: String::new(),
                     registered: false,
                     permission: None,
-                };
-                (project, resolution)
-            }
-            CodingProjectSource::ManagedTemporary { client_id, name } => {
-                if let Some(recording_session_id) = trusted_recording_session_id {
-                    return session_project_mismatch_result(
-                        recording_session_id,
-                        startup.tool_name,
-                        &SessionProjectMismatch {
-                            session_project: trusted_recording_session_project
-                                .unwrap_or("<unscoped>")
-                                .to_string(),
-                            request_project: format!(
-                                "managed_temporary:{client_id}:{}",
-                                name.as_deref().unwrap_or("<generated>")
-                            ),
-                        },
-                    );
-                }
-                if resume_session_id.is_some() {
-                    return ToolResult::err_with_output(
-                        "resume_session_id requires an existing project",
-                        json!({
-                            "error_kind": "invalid_arguments",
-                            "failure_kind": "invalid_arguments",
-                            "field": "resume_session_id",
-                            "constraint": "managed_temporary_project_cannot_resume",
-                            "state_changed": false,
-                        }),
-                    );
-                }
-                if let Some(result) =
-                    registration_scope_denied(auth, "managed temporary project creation")
-                {
-                    return result;
-                }
-                let permission = super::permissions::evaluate_permission_for_tool(
-                    &self.permission_evaluator,
-                    "create_project",
-                    None,
-                );
-                if let Some(decision) = permission.as_ref() {
-                    if !decision.allows_execution() {
-                        let mut result =
-                            super::permissions::permission_execution_denied_result(decision);
-                        super::permissions::add_permission_to_result(&mut result, decision);
-                        return result;
-                    }
-                }
-                if let Err(result) = self
-                    .require_runner_coding_capability(&client_id, auth)
-                    .await
-                {
-                    return attach_permission(result, permission.as_ref());
-                }
-                let created = self
-                    .create_managed_temporary_project(client_id, name, auth)
-                    .await;
-                if !created.success {
-                    return attach_permission(created, permission.as_ref());
-                }
-                let Some(project) = created
-                    .output
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_string)
-                else {
-                    return attach_permission(
-                        ToolResult::err_with_output(
-                            "agent returned a managed temporary project without a runtime id",
-                            json!({
-                                "error_kind": "operation_failed",
-                                "failure_kind": "operation_failed",
-                                "state_changed": true,
-                            }),
-                        ),
-                        permission.as_ref(),
-                    );
-                };
-                let resolution = ProjectResolutionMetadata {
-                    source: "managed_temporary".to_string(),
-                    outcome: "managed_temporary_created".to_string(),
-                    resolved_project: project.clone(),
-                    registered: true,
-                    permission,
                 };
                 (project, resolution)
             }
@@ -797,8 +629,8 @@ impl ToolRuntime {
             }
         }
         // Semantic-navigation and fixed project-instruction observation remain
-        // mandatory startup probes. The advanced start_coding_task entry also
-        // runs the independent repository overview concurrently. The ordinary
+        // mandatory startup probes. Diagnostic test projections also run the
+        // independent repository overview concurrently. The ordinary
         // work_on_project entry deliberately omits that optional scan/request.
         let (semantic_navigation, project_instructions, repository_overview) =
             if startup.include_repository_overview {
@@ -867,7 +699,7 @@ impl ToolRuntime {
             runtime_status_call_failed,
         );
         let git = self
-            .start_coding_task_git_summary(
+            .coding_startup_git_summary(
                 &resolved.resolved_id,
                 include_recent_commits,
                 &mut warnings,
@@ -949,7 +781,7 @@ impl ToolRuntime {
                 return attach_project_resolution(
                     ToolResult::err_with_output(
                         format!(
-                            "{error_kind}: start_coding_task cannot resume a {} session",
+                            "{error_kind}: work_on_project cannot resume a {} session",
                             lifecycle.as_str()
                         ),
                         json!({
@@ -1063,7 +895,7 @@ impl ToolRuntime {
         // Continuation feedback for reused/resumed/restored sessions. Pure
         // read-only projection over existing session ledger, validation evidence,
         // bounded job metadata, and the message board. Never executes shell,
-        // reads project files, enqueues Agent requests, mutates the ledger,
+        // reads project files, enqueues Runner requests, mutates the ledger,
         // refreshes activity, or consumes guidance. `created` (fresh empty
         // session) surfaces a compact `not_applicable` verdict.
         let continuation_kind = if resume_requested {
@@ -1078,7 +910,7 @@ impl ToolRuntime {
             .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
             .await;
         let continuation_feedback = self
-            .start_continuation_feedback(
+            .startup_continuation_feedback(
                 &session_outcome.summary,
                 session_outcome.pre_instruction_summary.as_ref(),
                 continuation_kind,
@@ -1156,8 +988,8 @@ impl ToolRuntime {
         // against (fresh session, or a session whose rules were never
         // persisted, e.g. restored after a restart). Otherwise the shared
         // brief compares fingerprints and reports reused/changed. Whether a
-        // reused body is projected is intentionally separate: advanced
-        // start_coding_task stays incremental, while work_on_project follows
+        // reused body is projected is intentionally separate: diagnostic test
+        // projections stay incremental, while work_on_project follows
         // its caller-explicit include_project_instructions preference.
         let force_instruction_load = previous_instructions.is_none();
         let canonical_repository_root_matches = if resume_requested {
@@ -1200,11 +1032,51 @@ impl ToolRuntime {
         attach_permission(result, project_resolution.permission.as_ref())
     }
 
-    /// Thin `start_coding_task` wrapper for the daily model coding loop.
+    /// Test-only diagnostic projection over the same canonical coding workflow
+    /// engine used by `work_on_project`. This is deliberately not a ToolCall or
+    /// a model/API identity.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_coding_workflow_for_test(
+        &self,
+        project: String,
+        client_id: Option<String>,
+        path: Option<String>,
+        title: Option<String>,
+        mode: SessionMode,
+        deny_write_tools: bool,
+        deny_shell_tools: bool,
+        detail: StartupDetail,
+        resume_session_id: Option<String>,
+        execution_context: Option<sessions::SessionExecutionContext>,
+        auth: Option<&AuthContext>,
+        trusted_recording_session_id: Option<&str>,
+        trusted_recording_session_project: Option<&str>,
+        transport: SessionTransport,
+    ) -> ToolResult {
+        self.start_coding_workflow(
+            project,
+            client_id,
+            path,
+            title,
+            mode,
+            deny_write_tools,
+            deny_shell_tools,
+            CodingStartupOptions::diagnostic(detail),
+            resume_session_id,
+            execution_context,
+            auth,
+            trusted_recording_session_id,
+            trusted_recording_session_project,
+            transport,
+        )
+        .await
+    }
+
+    /// Canonical entry for the daily model coding loop.
     ///
-    /// The wrapper validates its simple inputs, maps them onto normal coding-task
-    /// defaults, delegates the business implementation to `start_coding_task`,
-    /// and projects a compact startup result. With `session_id` present, it
+    /// This validates the public inputs, maps them onto the shared coding
+    /// workflow engine, and projects a compact startup result. With `session_id` present, it
     /// exactly resumes that one Workflow Session after project/lifecycle/access/
     /// capability checks; without it, it always creates a fresh Session.
     pub(crate) async fn work_on_project(
@@ -1221,7 +1093,7 @@ impl ToolRuntime {
         trusted_recording_session_project: Option<&str>,
         transport: SessionTransport,
     ) -> ToolResult {
-        let project_source = match resolve_project_source(project, client_id, path, None, false) {
+        let project_source = match resolve_project_source(project, client_id, path) {
             Ok(source) => source,
             Err(result) => return result,
         };
@@ -1229,9 +1101,6 @@ impl ToolRuntime {
             CodingProjectSource::Existing { project } => (project, None, None),
             CodingProjectSource::RunnerPath { client_id, path } => {
                 (String::new(), Some(client_id), Some(path))
-            }
-            CodingProjectSource::ManagedTemporary { .. } => {
-                unreachable!("managed temporary project is disabled for work_on_project")
             }
         };
         let instruction = instruction.trim().to_string();
@@ -1270,17 +1139,16 @@ impl ToolRuntime {
             Some(session_id) => Some(session_id),
             None => None,
         };
-        // Map onto the existing coding-task business implementation. The
-        // internal work-on-project profile keeps the standard shared brief,
+        // Map onto the canonical coding workflow engine. The work-on-project
+        // profile keeps the standard shared brief,
         // including rules, semantic navigation, workspace, and job metadata,
         // while deliberately skipping the optional repository overview. Without
         // an explicit session_id this always creates a fresh Workflow Session.
         let result = self
-            .start_coding_task_with_options(
+            .start_coding_workflow(
                 project.clone(),
                 client_id,
                 path,
-                None,
                 Some(instruction.clone()),
                 SessionMode::Normal,
                 false,
@@ -1382,6 +1250,7 @@ impl ToolRuntime {
             show_changes_call.tool_name(),
             &show_changes_call.session_log_arguments(),
             Some(resolved.resolved_id.clone()),
+            super::sessions::session_tool_contract(show_changes_call.tool_name()),
         );
         let changes_result = self
             .show_changes(
@@ -1427,6 +1296,7 @@ impl ToolRuntime {
                 hygiene_call.tool_name(),
                 &hygiene_call.session_log_arguments(),
                 Some(resolved.resolved_id.clone()),
+                super::sessions::session_tool_contract(hygiene_call.tool_name()),
             );
             let result = self
                 .workspace_hygiene_check(
@@ -1522,6 +1392,11 @@ impl ToolRuntime {
         } else {
             json!({ "available": false, "not_requested": true })
         };
+        let continuation_current_validation =
+            super::validation_events::current_validation_evidence_for_session(
+                &closeout_session_summary,
+                20,
+            );
         let continuation_feedback = if closeout_session_summary.events.is_empty() {
             not_applicable_continuation_feedback_value("empty_session")
         } else {
@@ -1537,6 +1412,10 @@ impl ToolRuntime {
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
                     > 0,
+                hooks: continuation_projection_hooks(),
+                current_validation: continuation_validation_snapshot(
+                    &continuation_current_validation,
+                ),
             })
         };
 
@@ -1604,14 +1483,14 @@ impl ToolRuntime {
         ToolResult::ok(output)
     }
 
-    /// Build the bounded continuation feedback projection for `start_coding_task`.
+    /// Build the bounded continuation feedback projection for coding startup.
     ///
     /// Pure read-only: validation is derived from the session ledger only
     /// (`validation_summary_from_events`, no job-status enrichment), jobs come
     /// from the bounded `active_jobs_summary` metadata, and guidance is read
     /// from the message board without marking anything read or resolved. No
-    /// shell, no file reads, no Agent requests, no ledger mutation.
-    async fn start_continuation_feedback(
+    /// shell, no file reads, no Runner requests, no ledger mutation.
+    async fn startup_continuation_feedback(
         &self,
         summary: &sessions::SessionSummary,
         pre_instruction_summary: Option<&sessions::SessionSummary>,
@@ -1638,6 +1517,10 @@ impl ToolRuntime {
             &projection_summary.events,
             20,
         );
+        let current_validation = super::validation_events::current_validation_evidence_for_session(
+            projection_summary,
+            20,
+        );
         let (discussion, _) = self.discussion_snapshot(&summary.session_id);
         continuation_feedback_value(ContinuationFeedbackInput {
             session_summary: projection_summary,
@@ -1647,6 +1530,8 @@ impl ToolRuntime {
             continuation: continuation_kind,
             suggest_exploration_continuity: true,
             workspace_conflicts,
+            hooks: continuation_projection_hooks(),
+            current_validation: continuation_validation_snapshot(&current_validation),
         })
     }
 
@@ -1686,7 +1571,7 @@ impl ToolRuntime {
         }
     }
 
-    async fn start_coding_task_git_summary(
+    async fn coding_startup_git_summary(
         &self,
         project: &str,
         include_recent_commits: bool,
@@ -1771,7 +1656,7 @@ impl ToolRuntime {
     /// symlink following, no protected/sensitive/build/cache paths, and only
     /// project-relative paths are returned.
     ///
-    /// For agent-backed projects the overview is routed to the owning Runner
+    /// The overview is routed to the owning Runner
     /// via the `file_project_overview` op with a short startup probe timeout.
     /// On timeout the request is cancelled. An optional overview failure never
     /// fails the already-legal coding task: it returns a deterministic
@@ -1783,17 +1668,12 @@ impl ToolRuntime {
         resolved: &ResolvedProject,
         auth: Option<&AuthContext>,
     ) -> Value {
-        if !resolved.config.is_agent() {
-            return repository_overview_local(&resolved.config.path);
-        }
-        let client_id = match resolved.config.agent_client_id() {
-            Ok(client_id) => client_id,
-            Err(_) => return repository_overview_unavailable(),
-        };
+        let client_id = resolved.config.client_id.as_str();
+        let access = crate::runner_http::runner_access_from_auth(auth);
         // The owning runner must support the structured file capability.
         if !self
-            .shell_clients
-            .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_FILE_READ, auth)
+            .runner_registry
+            .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_FILE_READ, access.as_ref())
             .await
             .unwrap_or(false)
         {
@@ -1803,7 +1683,7 @@ impl ToolRuntime {
         // `project_overview` tool's 30s wait.
         let probe_wait_timeout = self.repository_overview_probe_timeout.as_secs().max(1);
         let (request_id, receiver) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_file_op(
                 ShellFileOpRequest {
                     op: "project_overview".to_string(),
@@ -1870,11 +1750,11 @@ impl ToolRuntime {
             }
             Ok(Ok(_)) => repository_overview_unavailable(),
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 repository_overview_unavailable()
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 repository_overview_unavailable()
             }
         }
@@ -1909,8 +1789,7 @@ const STARTUP_OVERVIEW_REQUEST_LIMIT: usize = 120;
 
 /// Validate a startup overview payload against the fixed request bounds using
 /// the shared contract entry. Returns the normalized formal-contract payload
-/// on success. Used for both agent-backed Runner responses and the local
-/// builder so the two paths cannot drift.
+/// on success.
 fn validate_project_overview_for_startup(payload: &Value) -> Result<Value, String> {
     crate::project_overview::validate_project_overview(
         payload,
@@ -1918,31 +1797,6 @@ fn validate_project_overview_for_startup(payload: &Value) -> Result<Value, Strin
         STARTUP_OVERVIEW_REQUEST_MAX_DEPTH,
         STARTUP_OVERVIEW_REQUEST_LIMIT,
     )
-}
-
-/// Build the repository overview locally for a non-agent project. Mirrors the
-/// `project_overview` bounds and safety contract without a shell. The output
-/// is normalized through the same shared contract entry used for Runner
-/// responses, so extra fields can never reach the startup brief.
-fn repository_overview_local(project_root: &str) -> Value {
-    match crate::project_overview::build_project_overview(
-        Path::new(project_root),
-        ".",
-        Some(STARTUP_OVERVIEW_REQUEST_MAX_DEPTH),
-        Some(STARTUP_OVERVIEW_REQUEST_LIMIT),
-    ) {
-        Ok(overview) => match validate_project_overview_for_startup(&overview) {
-            Ok(mut normalized) => {
-                if let Some(object) = normalized.as_object_mut() {
-                    object.insert("status".to_string(), json!("available"));
-                    object.insert("reason_code".to_string(), Value::Null);
-                }
-                normalized
-            }
-            Err(_) => repository_overview_unavailable(),
-        },
-        Err(_) => repository_overview_unavailable(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -1977,7 +1831,7 @@ struct WorkOnProjectProjectProjection {
 struct WorkOnProjectSemanticNavigationProjection {
     #[serde(default)]
     supported: bool,
-    available: bool,
+    available: WorkOnProjectRequiredNullable<bool>,
     status: String,
     capability: WorkOnProjectRequiredNullable<String>,
     reason_code: WorkOnProjectRequiredNullable<String>,
@@ -2156,8 +2010,8 @@ fn is_default_work_on_project_repository(repository: &Value) -> bool {
     })
 }
 
-/// Convert a successful `start_coding_task` result into the compact
-/// `work_on_project` contract. The delegated call may already have changed
+/// Convert a successful canonical coding-startup result into the compact
+/// `work_on_project` contract. The delegated engine may already have changed
 /// Session state, so protocol drift fails closed with `state_changed=true`.
 #[cfg(test)]
 pub(crate) fn project_work_on_project_output(project: String, output: Value) -> ToolResult {
@@ -2357,7 +2211,7 @@ fn work_on_project_projection_failed(
         json!({
             "error_kind": "work_on_project_projection_failed",
             "failure_kind": "work_on_project_projection_failed",
-            "underlying_tool": "start_coding_task",
+            "underlying_tool": "work_on_project",
             "field": field,
             "expected": expected,
             "actual": actual,
@@ -2372,7 +2226,6 @@ fn resolved_project_payload(resolved: &ResolvedProject) -> Value {
         "input": resolved.input.clone(),
         "id": resolved.resolved_id.clone(),
         "path": resolved.config.path.clone(),
-        "executor": if resolved.config.is_agent() { "agent" } else { "local" },
         "client_id": resolved.config.client_id.clone(),
         "allow_patch": resolved.config.allow_patch,
     })
@@ -2676,7 +2529,7 @@ fn startup_verdict(
                 push_unique_action(&mut actions, "inspect active jobs before proceeding")
             }
             Some("agent_offline") => {
-                push_unique_action(&mut actions, "check agent connectivity with list_agents")
+                push_unique_action(&mut actions, "check Runner connectivity with list_runners")
             }
             Some("tool_manifest_not_requested") => push_unique_action(
                 &mut actions,
@@ -2765,18 +2618,13 @@ fn startup_jobs_check(jobs: &Value) -> (&'static str, Option<&'static str>) {
 }
 
 fn startup_agent_check(
-    output: &Value,
+    _output: &Value,
     owning_runner_available: Option<bool>,
 ) -> (&'static str, Option<&'static str>) {
-    let executor = output
-        .pointer("/resolved_project/executor")
-        .and_then(Value::as_str);
-    match (executor, owning_runner_available) {
-        (Some("agent"), Some(false)) => ("fail", Some("agent_offline")),
-        (Some("agent"), Some(true)) => ("pass", None),
-        (Some("agent"), None) => ("warn", Some("agent_health_unknown")),
-        (Some("local"), _) => ("pass", None),
-        _ => ("warn", Some("agent_health_unknown")),
+    match owning_runner_available {
+        Some(false) => ("fail", Some("agent_offline")),
+        Some(true) => ("pass", None),
+        None => ("warn", Some("agent_health_unknown")),
     }
 }
 
@@ -2785,9 +2633,6 @@ fn owning_runner_available(
     runtime_status: &Value,
     runtime_status_call_failed: bool,
 ) -> Option<bool> {
-    if !resolved.config.is_agent() {
-        return Some(true);
-    }
     if runtime_status_call_failed {
         return None;
     }
@@ -2916,13 +2761,13 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
     if expectation_mismatch_count > 0 {
         push(
             &mut actions,
-            "review expected failure mismatches before proceeding",
+            "review result expectation mismatches before proceeding",
         );
     }
     if unexpected_success_count > 0 {
         push(
             &mut actions,
-            "review expected-failure assertions that unexpectedly succeeded",
+            "review failure expectations that unexpectedly succeeded",
         );
     }
     if output
@@ -3048,6 +2893,13 @@ mod startup_runner_tests {
         assert!(actions
             .iter()
             .any(|action| action == "continue the diff review with git_diff_hunks"));
+        assert!(
+            crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
+                output["changes"]["show_changes"]["diff_review_handoff"]["tool"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
         assert!(!actions
             .iter()
             .any(|action| action == "review workspace changes with show_changes"));

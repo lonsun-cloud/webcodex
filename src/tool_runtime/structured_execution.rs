@@ -1,14 +1,17 @@
+use super::helpers::{bounded_tail, COMMAND_STDIO_TAIL_CHARS};
 use crate::auth::AuthContext;
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{
+use crate::runner_http::RunnerRegistry;
+use crate::runner_protocol::{
     ShellJobInfo, STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
     STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 use std::sync::Arc;
 use std::time::Duration;
+use webcodex_runner_registry::RunnerAccess;
 
 pub(crate) const STRUCTURED_EXECUTION_SYNC_WAIT_SECS: u64 = 10;
-pub(crate) const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
+pub(crate) const INITIAL_JOB_HANDOFF_TAIL_LINES: usize = 40;
+pub(crate) use webcodex_core::runtime_contract::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StructuredExecutionBudget {
@@ -64,27 +67,72 @@ pub(crate) enum HiddenStructuredJobWait {
         stderr: String,
     },
     Continued {
-        job: ShellJobInfo,
+        observation: StructuredJobObservation,
         execution_state: &'static str,
         command_started: bool,
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StructuredJobObservation {
+    pub(crate) job: ShellJobInfo,
+    pub(crate) stdout_tail: String,
+    pub(crate) stderr_tail: String,
+    pub(crate) stdout_lines: usize,
+    pub(crate) stderr_lines: usize,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+}
+
+pub(crate) async fn structured_job_observation(
+    clients: &RunnerRegistry,
+    access: Option<&RunnerAccess>,
+    job_id: &str,
+) -> Result<StructuredJobObservation, String> {
+    let (job, stdout, stderr, next_stdout_line, next_stderr_line) = clients
+        .hidden_job_log_for_auth(access, job_id, Some(INITIAL_JOB_HANDOFF_TAIL_LINES))
+        .await?;
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    let stdout_lines = next_stdout_line.saturating_sub(1);
+    let stderr_lines = next_stderr_line.saturating_sub(1);
+    let (stdout_tail, stdout_char_truncated) = bounded_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
+    let (stderr_tail, stderr_char_truncated) = bounded_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
+    let stdout_truncated = job.stdout_log_truncated
+        || job.stdout_retained_from_line.is_some_and(|line| line > 1)
+        || stdout.lines().count() < stdout_lines
+        || stdout_char_truncated;
+    let stderr_truncated = job.stderr_log_truncated
+        || job.stderr_retained_from_line.is_some_and(|line| line > 1)
+        || stderr.lines().count() < stderr_lines
+        || stderr_char_truncated;
+    Ok(StructuredJobObservation {
+        job,
+        stdout_tail,
+        stderr_tail,
+        stdout_lines,
+        stderr_lines,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
 pub(crate) async fn await_hidden_structured_job(
-    clients: Arc<ShellClientRegistry>,
+    clients: Arc<RunnerRegistry>,
     job_id: String,
     sync_wait: Duration,
     auth: Option<AuthContext>,
 ) -> Result<HiddenStructuredJobWait, String> {
-    let mut guard = HiddenJobCleanupGuard::new(clients.clone(), job_id.clone(), auth.clone());
+    let access = crate::runner_http::runner_access_from_auth(auth.as_ref());
+    let mut guard = HiddenJobCleanupGuard::new(clients.clone(), job_id.clone(), access.clone());
     let deadline = std::time::Instant::now() + sync_wait;
     loop {
         if let Ok(job) = clients
-            .get_hidden_job_for_auth(auth.as_ref(), &job_id)
+            .get_hidden_job_for_auth(access.as_ref(), &job_id)
             .await
         {
             if crate::tool_runtime::jobs::is_terminal_job_status(&job.status) {
-                let terminal = hidden_terminal_snapshot(&clients, auth.as_ref(), &job_id).await?;
+                let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
                 guard.disarm();
                 return Ok(terminal);
             }
@@ -97,34 +145,50 @@ pub(crate) async fn await_hidden_structured_job(
 
     let promoted = clients.promote_hidden_job(&job_id).await?;
     if crate::tool_runtime::jobs::is_terminal_job_status(&promoted.status) {
-        let terminal = hidden_terminal_snapshot(&clients, auth.as_ref(), &job_id).await?;
+        let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
         guard.disarm();
         return Ok(terminal);
     }
-    let (execution_state, command_started) = match promoted.status.as_str() {
-        "queued" | "agent_queued" | "started" => ("queued", false),
-        "running" => ("running", true),
-        "stop_requested" if promoted.started_at.is_some() => ("running", true),
-        "stop_requested" => ("queued", false),
-        // Recovery is a real retained Job contract, but it is not proof that
-        // the execution is presently running. Preserve uncertainty explicitly.
-        "recovering" => ("outcome_unknown", true),
-        _ => ("outcome_unknown", true),
-    };
+    let observation = structured_job_observation(&clients, access.as_ref(), &job_id).await?;
+    if crate::tool_runtime::jobs::is_terminal_job_status(&observation.job.status) {
+        let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+        guard.disarm();
+        return Ok(terminal);
+    }
+    let (execution_state, command_started) = continued_execution_state(
+        observation.job.status.as_str(),
+        observation.job.started_at.is_some(),
+    );
     guard.disarm();
     Ok(HiddenStructuredJobWait::Continued {
-        job: promoted,
+        observation,
         execution_state,
         command_started,
     })
 }
 
+fn continued_execution_state(status: &str, started: bool) -> (&'static str, bool) {
+    match status {
+        "queued" | "agent_queued" | "started" if started => ("running", true),
+        "queued" | "agent_queued" | "started" => ("queued", false),
+        "running" => ("running", true),
+        "stop_requested" if started => ("running", true),
+        "stop_requested" => ("queued", false),
+        // Recovery is a real retained Job contract, but it is not proof that
+        // the execution is presently running. Preserve uncertainty explicitly.
+        "recovering" => ("outcome_unknown", true),
+        _ => ("outcome_unknown", true),
+    }
+}
+
 async fn hidden_terminal_snapshot(
-    clients: &ShellClientRegistry,
-    auth: Option<&AuthContext>,
+    clients: &RunnerRegistry,
+    access: Option<&RunnerAccess>,
     job_id: &str,
 ) -> Result<HiddenStructuredJobWait, String> {
-    let (job, stdout, stderr, _, _) = clients.hidden_job_log_for_auth(auth, job_id, None).await?;
+    let (job, stdout, stderr, _, _) = clients
+        .hidden_job_log_for_auth(access, job_id, None)
+        .await?;
     Ok(HiddenStructuredJobWait::Terminal {
         job,
         stdout: stdout.unwrap_or_default(),
@@ -135,18 +199,18 @@ async fn hidden_terminal_snapshot(
 /// Cancels an initially hidden Job if the initiating future is dropped before
 /// it can return either a terminal projection or a public continuation.
 struct HiddenJobCleanupGuard {
-    clients: Arc<ShellClientRegistry>,
+    clients: Arc<RunnerRegistry>,
     job_id: String,
-    auth: Option<AuthContext>,
+    access: Option<RunnerAccess>,
     armed: bool,
 }
 
 impl HiddenJobCleanupGuard {
-    fn new(clients: Arc<ShellClientRegistry>, job_id: String, auth: Option<AuthContext>) -> Self {
+    fn new(clients: Arc<RunnerRegistry>, job_id: String, access: Option<RunnerAccess>) -> Self {
         Self {
             clients,
             job_id,
-            auth,
+            access,
             armed: true,
         }
     }
@@ -162,7 +226,7 @@ impl Drop for HiddenJobCleanupGuard {
             return;
         }
         let clients = self.clients.clone();
-        clients.record_hidden_cleanup_intent(self.job_id.clone(), self.auth.clone());
+        clients.record_hidden_cleanup_intent(self.job_id.clone(), self.access.clone());
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 clients.process_hidden_cleanup_intents().await;
@@ -174,6 +238,38 @@ impl Drop for HiddenJobCleanupGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continued_execution_state_uses_the_fresh_observed_started_state() {
+        assert_eq!(
+            continued_execution_state("stop_requested", false),
+            ("queued", false)
+        );
+        assert_eq!(
+            continued_execution_state("stop_requested", true),
+            ("running", true)
+        );
+        assert_eq!(
+            continued_execution_state("agent_queued", false),
+            ("queued", false)
+        );
+        assert_eq!(
+            continued_execution_state("agent_queued", true),
+            ("running", true)
+        );
+        assert_eq!(
+            continued_execution_state("started", true),
+            ("running", true)
+        );
+        assert_eq!(
+            continued_execution_state("running", true),
+            ("running", true)
+        );
+        assert_eq!(
+            continued_execution_state("recovering", true),
+            ("outcome_unknown", true)
+        );
+    }
 
     #[test]
     fn structured_execution_budget_preserves_default_and_validates_explicit_sync_wait() {

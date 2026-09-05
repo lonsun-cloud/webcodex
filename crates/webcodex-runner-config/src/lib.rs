@@ -13,13 +13,17 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use webcodex_core::shell_protocol::ShellClientCapabilities;
+use webcodex_core::runner_protocol::RunnerCapabilities;
 
 pub mod paths;
 
-/// Default projects directory written into generated Runner configs.
-pub const DEFAULT_INIT_PROJECTS_DIR: &str = "/etc/webcodex/projects.d";
+/// Default Runner project registry selected for a new system-level install.
+pub const DEFAULT_INIT_PROJECT_REGISTRY_DIR: &str = "/etc/webcodex/project-registry";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+/// Largest idle polling floor allowed when polling can be selected. The Server
+/// currently considers a Runner offline after 60 seconds without a keepalive;
+/// 30 seconds leaves one full interval of scheduling/network slack.
+pub const MAX_POLL_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Config value selecting the polling transport (HTTP `/api/shell/agent/poll`).
@@ -43,7 +47,7 @@ pub struct RunnerInitOptions {
     pub display_name: Option<String>,
     pub transport: String,
     pub poll_interval_ms: u64,
-    pub projects_dir: PathBuf,
+    pub project_registry_dir: PathBuf,
     pub output: PathBuf,
     pub allowed_roots: Vec<PathBuf>,
     pub allow_cwd_anywhere: bool,
@@ -111,8 +115,15 @@ pub fn validate_runner_init_options(opts: &RunnerInitOptions) -> Result<(), Stri
     ) {
         return Err("--transport must be websocket, polling, quic, or auto".to_string());
     }
-    if opts.projects_dir.as_os_str().is_empty() {
-        return Err("--projects-dir cannot be empty".to_string());
+    if matches!(opts.transport.as_str(), TRANSPORT_POLLING | TRANSPORT_AUTO)
+        && opts.poll_interval_ms > MAX_POLL_INTERVAL_MS
+    {
+        return Err(format!(
+            "--poll-interval-ms must be <= {MAX_POLL_INTERVAL_MS} when polling may be used"
+        ));
+    }
+    if opts.project_registry_dir.as_os_str().is_empty() {
+        return Err("--project-registry-dir cannot be empty".to_string());
     }
     if opts.output.as_os_str().is_empty() {
         return Err("--output is required".to_string());
@@ -167,8 +178,8 @@ struct GeneratedRunnerConfig {
     owner: String,
     transport: String,
     poll_interval_ms: u64,
-    projects_dir: PathBuf,
-    capabilities: ShellClientCapabilities,
+    project_registry_dir: PathBuf,
+    capabilities: RunnerCapabilities,
     policy: GeneratedRunnerPolicy,
 }
 
@@ -191,8 +202,8 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
         owner: opts.owner.clone(),
         transport: opts.transport.clone(),
         poll_interval_ms: opts.poll_interval_ms,
-        projects_dir: opts.projects_dir.clone(),
-        capabilities: ShellClientCapabilities {
+        project_registry_dir: opts.project_registry_dir.clone(),
+        capabilities: RunnerCapabilities {
             shell: true,
             file_read: true,
             file_write: true,
@@ -302,6 +313,9 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // ACP autonomous coding is a runtime-only capability and must not be
             // silently enabled by generated legacy agent config.
             coding_agent_runs: false,
+            // Native Tool Plugins are likewise advertised only by a Runner
+            // binary that implements the typed local Plugin lifecycle.
+            native_tool_plugins: false,
         },
         policy: GeneratedRunnerPolicy {
             allow_raw_shell: true,
@@ -431,7 +445,7 @@ mod tests {
             display_name: Some("Alice Laptop".to_string()),
             transport: TRANSPORT_WEBSOCKET.to_string(),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
-            projects_dir: PathBuf::from("/etc/webcodex/projects.d"),
+            project_registry_dir: PathBuf::from("/etc/webcodex/project-registry"),
             output,
             allowed_roots: vec![PathBuf::from("/srv/projects")],
             allow_cwd_anywhere: false,
@@ -496,5 +510,22 @@ mod tests {
             assert!(!content.contains("structured_go_test_tool"));
             assert!(!content.contains("job_state_reconciliation"));
         }
+    }
+
+    #[test]
+    fn polling_capable_init_rejects_interval_beyond_online_window_slack() {
+        for transport in [TRANSPORT_POLLING, TRANSPORT_AUTO] {
+            let mut opts = init_opts(PathBuf::from("-"));
+            opts.transport = transport.to_string();
+            opts.poll_interval_ms = MAX_POLL_INTERVAL_MS + 1;
+            let error = validate_runner_init_options(&opts).unwrap_err();
+            assert!(error.contains("must be <= 30000"), "{transport}: {error}");
+            opts.poll_interval_ms = MAX_POLL_INTERVAL_MS;
+            validate_runner_init_options(&opts).unwrap();
+        }
+
+        let mut websocket = init_opts(PathBuf::from("-"));
+        websocket.poll_interval_ms = MAX_POLL_INTERVAL_MS + 1;
+        validate_runner_init_options(&websocket).unwrap();
     }
 }

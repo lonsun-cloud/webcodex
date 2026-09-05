@@ -1,8 +1,8 @@
 use super::config::{
-    default_true, projects_dir, validate_shell_profile_name, RunnerConfig, RunnerPolicy,
+    default_true, project_registry_dir, validate_shell_profile_name, RunnerConfig, RunnerPolicy,
 };
 use super::shell::canonicalize_existing;
-use crate::shell_protocol::{ShellAgentProjectSummary, ShellAgentShellRequest};
+use crate::runner_protocol::{RunnerProjectSummary, RunnerRequest};
 use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
 use serde::{Deserialize, Serialize};
@@ -23,11 +23,9 @@ const PROJECT_SCAN_CACHE_MS: u64 = 5000;
 const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
-const MANAGED_TEMPORARY_PROJECT_KIND: &str = "managed_temporary";
-const AUTO_REGISTERED_PROJECT_KIND: &str = "auto_registered";
-const DEFAULT_MANAGED_TEMPORARY_PROJECT_NAME: &str = "Temporary Project";
-const MANAGED_TEMPORARY_PROJECT_ID_PREFIX: &str = "temporary";
-const MANAGED_TEMPORARY_PROJECT_CREATE_ATTEMPTS: usize = 16;
+const EXPLICIT_REGISTRATION_SOURCE: &str = "explicit";
+const AUTO_REGISTERED_REGISTRATION_SOURCE: &str = "auto_registered";
+const LEGACY_AUTO_REGISTERED_PROJECT_KIND: &str = "auto_registered";
 const AUTO_PROJECT_HASH_PREFIX_LENGTHS: &[usize] = &[8, 12, 16, 24, 32, 48, 64];
 static PROJECT_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -88,6 +86,8 @@ pub(crate) struct RunnerProjectFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) registration_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) disabled: bool,
@@ -97,7 +97,7 @@ pub(crate) struct RunnerProjectFile {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunnerProjectCache {
-    projects: Vec<ShellAgentProjectSummary>,
+    projects: Vec<RunnerProjectSummary>,
     refreshed_at: Option<Instant>,
 }
 
@@ -134,7 +134,7 @@ fn runner_project_server_format_hint(content: &str, err: &str) -> Option<String>
     let normalized = err.replace('`', "");
     if normalized.contains("missing field id") && content.contains("[projects.") {
         Some(
-            "looks like a server projects.toml entry. Runner projects.d files must use top-level fields:\n\
+            "looks like a server projects.toml entry. Runner project registration records must use top-level fields:\n\
              id = \"smoke\"\n\
              path = \"/path/to/repo\""
                 .to_string(),
@@ -161,6 +161,7 @@ pub(crate) fn parse_runner_project_toml(content: &str) -> Result<RunnerProjectFi
     }
     project.name = trim_optional(project.name);
     project.kind = trim_optional(project.kind);
+    project.registration_source = trim_optional(project.registration_source);
     project.description = trim_optional(project.description);
     if let Some(shell_profile) = &project.shell_profile {
         validate_shell_profile_name("project.shell_profile", shell_profile)?;
@@ -212,11 +213,11 @@ fn load_runner_project_shell_contexts_from_dir(dir: &Path) -> Vec<RunnerProjectS
 }
 
 pub(crate) fn find_project_shell_context(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cwd_path: &Path,
 ) -> Option<RunnerProjectShellContext> {
     let cwd = cwd_path.canonicalize().ok()?;
-    load_runner_project_shell_contexts_from_dir(projects_dir)
+    load_runner_project_shell_contexts_from_dir(project_registry_dir)
         .into_iter()
         .filter_map(|project| {
             let project_path = PathBuf::from(&project.path).canonicalize().ok()?;
@@ -237,10 +238,10 @@ pub(crate) fn find_project_shell_context(
 /// the id from the authenticated runtime-project binding rather than choosing
 /// a project solely from a caller-controlled cwd.
 pub(crate) fn find_project_shell_context_by_id(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     project_id: &str,
 ) -> Option<RunnerProjectShellContext> {
-    load_runner_project_shell_contexts_from_dir(projects_dir)
+    load_runner_project_shell_contexts_from_dir(project_registry_dir)
         .into_iter()
         .find(|project| project.id == project_id)
 }
@@ -507,12 +508,56 @@ fn project_revision(project: &RunnerProjectFile) -> String {
     format!("sha256:{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRegistrationSource {
+    Explicit,
+    AutoRegistered,
+}
+
+impl ProjectRegistrationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => EXPLICIT_REGISTRATION_SOURCE,
+            Self::AutoRegistered => AUTO_REGISTERED_REGISTRATION_SOURCE,
+        }
+    }
+}
+
+/// Interpret registration provenance without changing the parsed persisted
+/// representation. Keeping this compatibility projection separate is
+/// important because `project_revision` hashes the raw normalized record.
+fn effective_registration_source(project: &RunnerProjectFile) -> ProjectRegistrationSource {
+    match project.registration_source.as_deref() {
+        Some(AUTO_REGISTERED_REGISTRATION_SOURCE) => ProjectRegistrationSource::AutoRegistered,
+        // A present new field is authoritative. `explicit` and unknown future
+        // values therefore fail closed to ordinary explicit registration rather
+        // than allowing a legacy `kind` value to override newer semantics.
+        Some(_) => ProjectRegistrationSource::Explicit,
+        None if project.kind.as_deref() == Some(LEGACY_AUTO_REGISTERED_PROJECT_KIND) => {
+            ProjectRegistrationSource::AutoRegistered
+        }
+        None => ProjectRegistrationSource::Explicit,
+    }
+}
+
+/// Preserve the historical auto-registration sentinel only at Runner→Server
+/// compatibility boundaries. Persisted `kind` remains genuine project metadata.
+fn project_wire_kind(project: &RunnerProjectFile) -> Option<String> {
+    if project.kind.is_none()
+        && project.registration_source.as_deref() == Some(AUTO_REGISTERED_REGISTRATION_SOURCE)
+    {
+        Some(LEGACY_AUTO_REGISTERED_PROJECT_KIND.to_string())
+    } else {
+        project.kind.clone()
+    }
+}
+
 fn runner_project_summary_with_shutdown(
     project: &RunnerProjectFile,
     updated_at: i64,
     include_git: bool,
     shutdown: Option<&AtomicBool>,
-) -> ShellAgentProjectSummary {
+) -> RunnerProjectSummary {
     let mut hooks = project.hooks.keys().cloned().collect::<Vec<_>>();
     hooks.sort();
     // The server uses the reported path as part of its repository continuity
@@ -541,12 +586,18 @@ fn runner_project_summary_with_shutdown(
     } else {
         (None, None, None)
     };
-    ShellAgentProjectSummary {
+    let registration_source = effective_registration_source(project);
+    // Rolling-upgrade shim: old Servers only know the historical `kind`
+    // sentinel. New auto-registered records keep persisted `kind` empty, but
+    // temporarily project that sentinel on the wire when there is no genuine
+    // project kind. New Servers ignore it in favor of `registration_source`.
+    RunnerProjectSummary {
         id: project.id.clone(),
         name: project.name.clone().or_else(|| Some(project.id.clone())),
         path: resolved_path,
         allow_patch: project.allow_patch,
-        kind: project.kind.clone(),
+        kind: project_wire_kind(project),
+        registration_source: Some(registration_source.as_str().to_string()),
         description: project.description.clone(),
         hooks,
         disabled: project.disabled,
@@ -564,7 +615,7 @@ pub(crate) fn runner_project_summary(
     project: &RunnerProjectFile,
     updated_at: i64,
     include_git: bool,
-) -> ShellAgentProjectSummary {
+) -> RunnerProjectSummary {
     runner_project_summary_with_shutdown(project, updated_at, include_git, None)
 }
 
@@ -586,7 +637,7 @@ fn warn_empty_hook_commands(source: &Path, project: &RunnerProjectFile) {
 fn load_runner_project_summaries_from_dir_with_shutdown(
     dir: &Path,
     shutdown: Option<&AtomicBool>,
-) -> Vec<ShellAgentProjectSummary> {
+) -> Vec<RunnerProjectSummary> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -654,18 +705,18 @@ fn load_runner_project_summaries_from_dir_with_shutdown(
     projects
 }
 
-pub(crate) fn load_runner_project_summaries_from_dir(dir: &Path) -> Vec<ShellAgentProjectSummary> {
+pub(crate) fn load_runner_project_summaries_from_dir(dir: &Path) -> Vec<RunnerProjectSummary> {
     load_runner_project_summaries_from_dir_with_shutdown(dir, None)
 }
 
 fn load_runner_project_summaries(
     cfg: &RunnerConfig,
     shutdown: Option<&AtomicBool>,
-) -> Vec<ShellAgentProjectSummary> {
-    // Loaded configs always carry a materialized projects_dir; a bare
+) -> Vec<RunnerProjectSummary> {
+    // Loaded configs always carry a materialized project_registry_dir; a bare
     // test-built config that cannot derive one reports the error instead of
     // silently scanning a relative path.
-    let dir = match projects_dir(cfg) {
+    let dir = match project_registry_dir(cfg) {
         Ok(dir) => dir,
         Err(error) => {
             eprintln!("webcodex-runner: {error}");
@@ -677,7 +728,7 @@ fn load_runner_project_summaries(
 
 impl RunnerProjectCache {
     #[cfg(test)]
-    pub(crate) fn get(&mut self, cfg: &RunnerConfig) -> Vec<ShellAgentProjectSummary> {
+    pub(crate) fn get(&mut self, cfg: &RunnerConfig) -> Vec<RunnerProjectSummary> {
         self.get_with_shutdown(cfg, None)
     }
 
@@ -685,7 +736,7 @@ impl RunnerProjectCache {
         &mut self,
         cfg: &RunnerConfig,
         shutdown: Option<&AtomicBool>,
-    ) -> Vec<ShellAgentProjectSummary> {
+    ) -> Vec<RunnerProjectSummary> {
         if self.refreshed_at.is_some_and(|refreshed_at| {
             refreshed_at.elapsed() < Duration::from_millis(PROJECT_SCAN_CACHE_MS)
         }) {
@@ -744,14 +795,14 @@ fn build_project_toml(
     description: &Option<String>,
     allow_patch: bool,
 ) -> String {
-    build_project_toml_with_kind(id, name, path, None, description, allow_patch)
+    build_project_toml_with_registration_source(id, name, path, None, description, allow_patch)
 }
 
-fn build_project_toml_with_kind(
+fn build_project_toml_with_registration_source(
     id: &str,
     name: &str,
     path: &str,
-    kind: Option<&str>,
+    registration_source: Option<&str>,
     description: &Option<String>,
     allow_patch: bool,
 ) -> String {
@@ -759,8 +810,11 @@ fn build_project_toml_with_kind(
     toml.push_str(&format!("id = {}\n", toml_basic_string(id)));
     toml.push_str(&format!("name = {}\n", toml_basic_string(name)));
     toml.push_str(&format!("path = {}\n", toml_basic_string(path)));
-    if let Some(kind) = kind {
-        toml.push_str(&format!("kind = {}\n", toml_basic_string(kind)));
+    if let Some(registration_source) = registration_source {
+        toml.push_str(&format!(
+            "registration_source = {}\n",
+            toml_basic_string(registration_source)
+        ));
     }
     if let Some(desc) = description {
         toml.push_str(&format!("description = {}\n", toml_basic_string(desc)));
@@ -797,7 +851,7 @@ fn validate_project_op_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate the project `name`: non-empty after trim, <= 120 chars, no NUL.
+/// Validate the project `name`: non-empty after trim, <= 120 UTF-8 bytes, no NUL.
 fn validate_project_op_name(name: &str) -> Result<(), String> {
     if name.contains('\0') {
         return Err("name must not contain NUL".to_string());
@@ -806,33 +860,18 @@ fn validate_project_op_name(name: &str) -> Result<(), String> {
         return Err("name cannot be empty".to_string());
     }
     if name.len() > 120 {
-        return Err("name must be at most 120 characters".to_string());
+        return Err("name must be at most 120 UTF-8 bytes".to_string());
     }
     Ok(())
 }
 
-/// A managed temporary project name is persisted as display metadata, never
-/// used as a filesystem path. Still reject path-looking input at the Runner
-/// boundary so callers cannot mistake it for a directory selector.
-fn validate_managed_temporary_project_name(name: &str) -> Result<(), String> {
-    validate_project_op_name(name)?;
-    let name = name.trim();
-    if name == "." || name == ".." || name.contains("..") {
-        return Err("name must not contain dot-dot traversal".to_string());
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("name must not contain slash or backslash".to_string());
-    }
-    Ok(())
-}
-
-/// Validate the optional `description`: <= 500 chars, no NUL.
+/// Validate the optional `description`: <= 500 UTF-8 bytes, no NUL.
 fn validate_project_op_description(desc: &str) -> Result<(), String> {
     if desc.contains('\0') {
         return Err("description must not contain NUL".to_string());
     }
     if desc.len() > 500 {
-        return Err("description must be at most 500 characters".to_string());
+        return Err("description must be at most 500 UTF-8 bytes".to_string());
     }
     Ok(())
 }
@@ -900,8 +939,8 @@ fn sync_project_parent_after_rename(path: &Path) -> Result<(), String> {
     sync_parent_dir(path)
 }
 
-/// Write a project TOML file atomically into `projects_dir`. Creates
-/// `projects_dir` if missing. Returns write metadata on success.
+/// Write a project TOML file atomically into `project_registry_dir`. Creates
+/// `project_registry_dir` if missing. Returns write metadata on success.
 /// The temp file is written and fsynced, then atomically published as
 /// `<id>.toml`.
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
@@ -935,14 +974,15 @@ fn unique_registry_temp(dir: &Path, id: &str, suffix: &str) -> PathBuf {
 }
 
 fn write_project_toml_atomic(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     id: &str,
     toml_content: &str,
     overwrite: bool,
 ) -> Result<ProjectTomlWriteResult, ProjectTomlWriteError> {
-    std::fs::create_dir_all(projects_dir).map_err(|_| ProjectTomlWriteError::BeforeRename)?;
-    let canonical_dir =
-        canonicalize_existing(projects_dir).map_err(|_| ProjectTomlWriteError::BeforeRename)?;
+    std::fs::create_dir_all(project_registry_dir)
+        .map_err(|_| ProjectTomlWriteError::BeforeRename)?;
+    let canonical_dir = canonicalize_existing(project_registry_dir)
+        .map_err(|_| ProjectTomlWriteError::BeforeRename)?;
     let config_path = canonical_dir.join(format!("{id}.toml"));
     if !config_path.starts_with(&canonical_dir) {
         return Err(ProjectTomlWriteError::BeforeRename);
@@ -993,9 +1033,9 @@ fn write_project_toml_atomic(
 }
 
 fn load_project_files_for_path_resolution(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
 ) -> Result<Vec<RunnerProjectFile>, &'static str> {
-    let entries = match std::fs::read_dir(projects_dir) {
+    let entries = match std::fs::read_dir(project_registry_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err("project_registry_unavailable"),
@@ -1121,7 +1161,7 @@ fn auto_project_id_candidate(
 }
 
 fn choose_auto_project_id(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     projects: &[RunnerProjectFile],
     canonical_path: &Path,
 ) -> Result<String, &'static str> {
@@ -1132,7 +1172,9 @@ fn choose_auto_project_id(
     for &prefix_length in AUTO_PROJECT_HASH_PREFIX_LENGTHS {
         let candidate = auto_project_id_candidate(canonical_path, prefix_length)?;
         if configured_ids.contains(candidate.as_str())
-            || projects_dir.join(format!("{candidate}.toml")).exists()
+            || project_registry_dir
+                .join(format!("{candidate}.toml"))
+                .exists()
         {
             continue;
         }
@@ -1142,12 +1184,12 @@ fn choose_auto_project_id(
 }
 
 fn path_resolution_success(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     project: &RunnerProjectFile,
     canonical_path: &Path,
     outcome: &'static str,
     registered: bool,
-    projects_config_path: Option<&Path>,
+    project_record_path: Option<&Path>,
 ) -> serde_json::Value {
     serde_json::json!({
         "id": format!("agent:{}:{}", request.client_id, project.id),
@@ -1155,7 +1197,8 @@ fn path_resolution_success(
         "client_id": request.client_id,
         "name": project.name,
         "path": canonical_path.to_string_lossy(),
-        "kind": project.kind,
+        "kind": project_wire_kind(project),
+        "registration_source": effective_registration_source(project).as_str(),
         "description": project.description,
         "allow_patch": project.allow_patch,
         "disabled": project.disabled,
@@ -1166,13 +1209,14 @@ fn path_resolution_success(
         "created_config": registered,
         "changed": registered,
         "recovered": !registered,
-        "projects_config_path": projects_config_path.map(|path| path.to_string_lossy().to_string()),
+        "project_record_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
+        "projects_config_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
     })
 }
 
 fn existing_path_resolution_result(
     start: Instant,
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     canonical_path: &Path,
     matches: Vec<RunnerProjectFile>,
 ) -> Option<CommandResult> {
@@ -1217,8 +1261,8 @@ fn existing_path_resolution_result(
 /// model-visible runtime tool.
 pub(crate) fn handle_resolve_or_register_project(
     policy: &RunnerPolicy,
-    projects_dir: &Path,
-    request: &ShellAgentShellRequest,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
 ) -> CommandResult {
     let start = Instant::now();
     let _registry_guard = match project_registry_write_lock().lock() {
@@ -1327,7 +1371,7 @@ pub(crate) fn handle_resolve_or_register_project(
         );
     }
 
-    let projects = match load_project_files_for_path_resolution(projects_dir) {
+    let projects = match load_project_files_for_path_resolution(project_registry_dir) {
         Ok(projects) => projects,
         Err(error_kind) => {
             return structured_project_error_cmd(start, error_kind, false, serde_json::json!({}))
@@ -1339,7 +1383,8 @@ pub(crate) fn handle_resolve_or_register_project(
         return result;
     }
 
-    let project_id = match choose_auto_project_id(projects_dir, &projects, &canonical_path) {
+    let project_id = match choose_auto_project_id(project_registry_dir, &projects, &canonical_path)
+    {
         Ok(project_id) => project_id,
         Err(error_kind) => {
             return structured_project_error_cmd(start, error_kind, false, serde_json::json!({}))
@@ -1351,22 +1396,22 @@ pub(crate) fn handle_resolve_or_register_project(
         .to_string();
     let name = bounded_project_name(&canonical_path);
     let description = None;
-    let toml_content = build_project_toml_with_kind(
+    let toml_content = build_project_toml_with_registration_source(
         &project_id,
         &name,
         &canonical_path_string,
-        Some(AUTO_REGISTERED_PROJECT_KIND),
+        Some(AUTO_REGISTERED_REGISTRATION_SOURCE),
         &description,
         true,
     );
     let write_result =
-        match write_project_toml_atomic(projects_dir, &project_id, &toml_content, false) {
+        match write_project_toml_atomic(project_registry_dir, &project_id, &toml_content, false) {
             Ok(result) => result,
             Err(ProjectTomlWriteError::BeforeRename) => {
                 // A different process may have won publication. Rescan under
                 // our process-local lock and converge if it registered the
                 // same canonical directory.
-                if let Ok(projects) = load_project_files_for_path_resolution(projects_dir) {
+                if let Ok(projects) = load_project_files_for_path_resolution(project_registry_dir) {
                     let matches = projects_matching_canonical_path(&projects, &canonical_path);
                     if let Some(result) =
                         existing_path_resolution_result(start, request, &canonical_path, matches)
@@ -1414,12 +1459,12 @@ pub(crate) fn handle_resolve_or_register_project(
     )
 }
 
-fn lifecycle_config_path(projects_dir: &Path, id: &str) -> Result<PathBuf, String> {
+fn lifecycle_config_path(project_registry_dir: &Path, id: &str) -> Result<PathBuf, String> {
     validate_project_op_id(id)?;
-    let canonical_dir = canonicalize_existing(projects_dir)?;
+    let canonical_dir = canonicalize_existing(project_registry_dir)?;
     let path = canonical_dir.join(format!("{id}.toml"));
     if !path.starts_with(&canonical_dir) {
-        return Err("project config path would escape projects_dir".to_string());
+        return Err("project config path would escape project_registry_dir".to_string());
     }
     Ok(path)
 }
@@ -1450,11 +1495,11 @@ fn write_existing_project_atomic(path: &Path, content: &str) -> Result<(), Strin
     result
 }
 
-fn cleanup_unregister_tombstones(projects_dir: &Path, id: &str) -> Result<(), String> {
+fn cleanup_unregister_tombstones(project_registry_dir: &Path, id: &str) -> Result<(), String> {
     let prefix = format!(".{id}.");
     let suffix = ".toml.unregistering";
     let mut changed = false;
-    for entry in std::fs::read_dir(projects_dir)
+    for entry in std::fs::read_dir(project_registry_dir)
         .map_err(|e| format!("failed to inspect project registry tombstones: {e}"))?
     {
         let entry = entry.map_err(|e| format!("failed to inspect project registry entry: {e}"))?;
@@ -1467,7 +1512,7 @@ fn cleanup_unregister_tombstones(projects_dir: &Path, id: &str) -> Result<(), St
         }
     }
     if changed {
-        sync_dir(projects_dir)?;
+        sync_dir(project_registry_dir)?;
     }
     Ok(())
 }
@@ -1489,8 +1534,8 @@ fn unregister_project_config(path: &Path) -> Result<(), ProjectUnregisterError> 
 /// the registry TOML and never touches the project path or Git data.
 pub(crate) fn handle_project_lifecycle_op(
     policy: &RunnerPolicy,
-    projects_dir: &Path,
-    request: &ShellAgentShellRequest,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
 ) -> CommandResult {
     let _registry_guard = match project_registry_write_lock().lock() {
         Ok(guard) => guard,
@@ -1520,13 +1565,13 @@ pub(crate) fn handle_project_lifecycle_op(
         Some(v) => v,
         None => return project_error_cmd(start, "invalid_request"),
     };
-    let config_path = match lifecycle_config_path(projects_dir, id) {
+    let config_path = match lifecycle_config_path(project_registry_dir, id) {
         Ok(v) => v,
         Err(e) => return err_cmd(start, e),
     };
     if !config_path.exists() {
         if action == "unregister" {
-            if cleanup_unregister_tombstones(projects_dir, id).is_err() {
+            if cleanup_unregister_tombstones(project_registry_dir, id).is_err() {
                 return project_error_cmd(start, "operation_failed");
             }
             return ok_cmd(
@@ -1558,7 +1603,9 @@ pub(crate) fn handle_project_lifecycle_op(
                 "outcome": if desired_disabled {"already_disabled"} else {"already_enabled"},
                 "changed": false, "revision": current_revision,
                 "disabled": project.disabled, "path": project.path,
-                "name": project.name, "description": project.description,
+                "name": project.name, "kind": project.kind,
+                "registration_source": effective_registration_source(&project).as_str(),
+                "description": project.description,
                 "allow_patch": project.allow_patch
             }),
         );
@@ -1618,21 +1665,23 @@ pub(crate) fn handle_project_lifecycle_op(
             "outcome": if desired_disabled {"disabled"} else {"enabled"},
             "changed": true, "revision": revision,
             "disabled": project.disabled, "path": project.path,
-            "name": project.name, "description": project.description,
+            "name": project.name, "kind": project.kind,
+            "registration_source": effective_registration_source(&project).as_str(),
+            "description": project.description,
             "allow_patch": project.allow_patch
         }),
     )
 }
 
 fn matching_existing_project(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     id: &str,
     name: &str,
     path: &str,
     description: Option<&str>,
     allow_patch: bool,
 ) -> Result<Option<RunnerProjectFile>, &'static str> {
-    let config_path = projects_dir.join(format!("{id}.toml"));
+    let config_path = project_registry_dir.join(format!("{id}.toml"));
     if !config_path.exists() {
         return Ok(None);
     }
@@ -1654,7 +1703,6 @@ fn matching_existing_project(
 fn validate_recovered_create_side_effects(
     path: &Path,
     template: &str,
-    description: Option<&str>,
     git_init: bool,
 ) -> Result<(), &'static str> {
     if !path.is_dir() {
@@ -1666,9 +1714,6 @@ fn validate_recovered_create_side_effects(
     if template == "basic"
         && (!path.join("README.md").is_file() || !path.join(".gitignore").is_file())
     {
-        return Err("project_already_exists");
-    }
-    if template == "empty" && description.is_some() && !path.join("README.md").is_file() {
         return Err("project_already_exists");
     }
     Ok(())
@@ -1684,7 +1729,9 @@ fn recovered_project_result(
 ) -> serde_json::Value {
     serde_json::json!({
         "id": runtime_id, "agent_project_id": project.id, "client_id": client_id,
-        "name": project.name, "path": project.path, "description": project.description,
+        "name": project.name, "path": project.path, "kind": project.kind,
+        "registration_source": effective_registration_source(project).as_str(),
+        "description": project.description,
         "created_directory": false, "created_config": false, "overwritten": false,
         "allow_patch": project.allow_patch, "template": template,
         "git_initialized": git_init, "recovered": true, "changed": false,
@@ -1694,162 +1741,15 @@ fn recovered_project_result(
     })
 }
 
-/// Create and persist one Runner-managed temporary project. The directory name
-/// and project id are generated here, never accepted from the server, and the
-/// canonical result must be exactly one direct child of the configured root.
-///
-/// TODO: add an explicit retention policy plus a safe managed-project deletion
-/// path that re-verifies this kind and root before removing anything.
-fn handle_managed_temporary_project(
-    policy: &RunnerPolicy,
-    projects_dir: &Path,
-    temporary_projects_root: Option<&Path>,
-    request: &ShellAgentShellRequest,
-    json: &serde_json::Value,
-    start: Instant,
-) -> CommandResult {
-    // This internal request accepts no caller-selected directory/id or
-    // create-project behavior. Rejecting those fields makes the generated
-    // direct-child invariant explicit even if a future caller bypasses the
-    // public start_coding_task schema.
-    if [
-        "id",
-        "path",
-        "description",
-        "allow_patch",
-        "template",
-        "git_init",
-        "allow_existing_empty",
-        "overwrite",
-    ]
-    .iter()
-    .any(|field| json.get(*field).is_some())
-    {
-        return project_error_cmd(start, "invalid_request");
-    }
-    let name = match json.get("name") {
-        None | Some(serde_json::Value::Null) => DEFAULT_MANAGED_TEMPORARY_PROJECT_NAME.to_string(),
-        Some(serde_json::Value::String(value)) => {
-            if validate_managed_temporary_project_name(value).is_err() {
-                return project_error_cmd(start, "invalid_request");
-            }
-            value.trim().to_string()
-        }
-        Some(_) => return project_error_cmd(start, "invalid_request"),
-    };
-    let Some(temporary_projects_root) = temporary_projects_root else {
-        return project_error_cmd(start, "temporary_projects_not_configured");
-    };
-    let canonical_root = match canonicalize_existing(temporary_projects_root) {
-        Ok(root) if root.is_dir() => root,
-        _ => return project_error_cmd(start, "temporary_projects_root_unavailable"),
-    };
-    if let Err(error_kind) = validate_windows_project_root(&canonical_root) {
-        return project_error_cmd(start, error_kind);
-    }
-    if validate_project_path_policy(policy, &canonical_root).is_err() {
-        return project_error_cmd(start, "temporary_projects_root_outside_allowed_roots");
-    }
-
-    for _ in 0..MANAGED_TEMPORARY_PROJECT_CREATE_ATTEMPTS {
-        let id = format!(
-            "{MANAGED_TEMPORARY_PROJECT_ID_PREFIX}-{}",
-            uuid::Uuid::new_v4()
-        );
-        if projects_dir.join(format!("{id}.toml")).exists() {
-            continue;
-        }
-        let requested_path = canonical_root.join(&id);
-        match std::fs::create_dir(&requested_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(_) => return project_error_cmd(start, "temporary_project_create_failed"),
-        }
-        let canonical_path = match canonicalize_existing(&requested_path) {
-            Ok(path) if path.is_dir() && path.parent() == Some(canonical_root.as_path()) => path,
-            _ => return project_error_cmd(start, "temporary_project_path_escape"),
-        };
-        let path = canonical_path.to_string_lossy().to_string();
-        match run_git_bounded(&canonical_path, &["init"], Duration::from_secs(5), None) {
-            Ok(output) if output.status.success() => {}
-            Ok(_) | Err(_) => {
-                let _ = std::fs::remove_dir_all(&canonical_path);
-                return project_error_cmd(start, "temporary_project_git_init_failed");
-            }
-        }
-        let description = None;
-        let toml_content = build_project_toml_with_kind(
-            &id,
-            &name,
-            &path,
-            Some(MANAGED_TEMPORARY_PROJECT_KIND),
-            &description,
-            true,
-        );
-        let write_result = match write_project_toml_atomic(projects_dir, &id, &toml_content, false)
-        {
-            Ok(result) => result,
-            Err(ProjectTomlWriteError::BeforeRename) => {
-                // The directory is a newly created direct child of the managed
-                // root and only contains the Git metadata initialized above.
-                let _ = std::fs::remove_dir_all(&canonical_path);
-                return project_error_cmd(start, "operation_failed");
-            }
-            Err(ProjectTomlWriteError::AfterRename) => {
-                return project_error_cmd(start, "operation_indeterminate");
-            }
-        };
-        let project = parse_runner_project_toml(&toml_content)
-            .expect("generated managed temporary project TOML must parse");
-        return ok_cmd(
-            start,
-            serde_json::json!({
-                "id": format!("agent:{}:{}", request.client_id, id),
-                "agent_project_id": id,
-                "client_id": request.client_id,
-                "name": name,
-                "path": path,
-                "description": serde_json::Value::Null,
-                "kind": MANAGED_TEMPORARY_PROJECT_KIND,
-                "source": MANAGED_TEMPORARY_PROJECT_KIND,
-                "managed_temporary": true,
-                "projects_config_path": write_result.config_path.to_string_lossy(),
-                "created_directory": true,
-                "created_config": write_result.created_config,
-                "overwritten": false,
-                "allow_patch": true,
-                "template": "empty",
-                "git_initialized": true,
-                "revision": project_revision(&project),
-                "operation": "create",
-                "outcome": "created",
-                "changed": true,
-                "recovered": false,
-            }),
-        );
-    }
-    project_error_cmd(start, "temporary_project_name_collision")
-}
-
 /// Handle `register_project` / `create_project` agent requests. Parses the
 /// JSON payload from `request.stdin`, validates fields and path against
-/// policy, writes `projects_dir/<id>.toml` atomically (and for
+/// policy, writes `project_registry_dir/<id>.toml` atomically (and for
 /// `create_project` creates the directory / templates / optional git init),
 /// and returns structured JSON in `CommandResult.stdout`.
-#[cfg(test)]
 pub(crate) fn handle_project_op(
     policy: &RunnerPolicy,
-    projects_dir: &Path,
-    request: &ShellAgentShellRequest,
-) -> CommandResult {
-    handle_project_op_with_temporary_projects_root(policy, projects_dir, None, request)
-}
-
-pub(crate) fn handle_project_op_with_temporary_projects_root(
-    policy: &RunnerPolicy,
-    projects_dir: &Path,
-    temporary_projects_root: Option<&Path>,
-    request: &ShellAgentShellRequest,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
 ) -> CommandResult {
     let _registry_guard = match project_registry_write_lock().lock() {
         Ok(guard) => guard,
@@ -1881,20 +1781,8 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             };
         }
     };
-    if kind == "create_project"
-        && json
-            .get("managed_temporary_project")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    {
-        return handle_managed_temporary_project(
-            policy,
-            projects_dir,
-            temporary_projects_root,
-            request,
-            &json,
-            start,
-        );
+    if json.get("managed_temporary_project").is_some() {
+        return project_error_cmd(start, "managed_temporary_projects_retired");
     }
     let get_str = |key: &str| -> Result<String, String> {
         json.get(key)
@@ -1964,8 +1852,8 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         .get("git_init")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let allow_existing_empty = json
-        .get("allow_existing_empty")
+    let adopt_existing_empty = json
+        .get("adopt_existing_empty")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if kind == "create_project" && template != "empty" && template != "basic" {
@@ -1998,7 +1886,7 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         }
         if !overwrite {
             match matching_existing_project(
-                projects_dir,
+                project_registry_dir,
                 &id,
                 &name,
                 &path,
@@ -2023,7 +1911,7 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             }
         }
         let write_result =
-            match write_project_toml_atomic(projects_dir, &id, &toml_content, overwrite) {
+            match write_project_toml_atomic(project_registry_dir, &id, &toml_content, overwrite) {
                 Ok(p) => p,
                 Err(ProjectTomlWriteError::BeforeRename) => {
                     return project_error_cmd(start, "operation_failed")
@@ -2039,10 +1927,12 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             "name": name,
             "path": path,
             "description": description,
+            "project_record_path": write_result.config_path.to_string_lossy(),
             "projects_config_path": write_result.config_path.to_string_lossy(),
             "created_config": write_result.created_config,
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
+            "registration_source": EXPLICIT_REGISTRATION_SOURCE,
             "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
             "operation": "register", "outcome": "registered", "changed": true, "recovered": false,
         });
@@ -2098,7 +1988,7 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
     }
     if !overwrite {
         match matching_existing_project(
-            projects_dir,
+            project_registry_dir,
             &id,
             &name,
             &path,
@@ -2106,12 +1996,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             allow_patch,
         ) {
             Ok(Some(project)) => {
-                if let Err(code) = validate_recovered_create_side_effects(
-                    &path_buf,
-                    &template,
-                    description.as_deref(),
-                    git_init,
-                ) {
+                if let Err(code) =
+                    validate_recovered_create_side_effects(&path_buf, &template, git_init)
+                {
                     return project_error_cmd(start, code);
                 }
                 return ok_cmd(
@@ -2153,8 +2040,8 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         if !is_empty {
             return project_error_cmd(start, "path_not_empty");
         }
-        if !allow_existing_empty {
-            return project_error_cmd(start, "path_not_empty");
+        if !adopt_existing_empty {
+            return project_error_cmd(start, "path_exists");
         }
     } else {
         // Create the directory.
@@ -2185,18 +2072,9 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
             created_paths.cleanup();
             return err_cmd(start, format!("failed to write .gitignore: {}", e));
         }
-    } else if template == "empty" {
-        // For empty template, optionally create README.md if description is provided.
-        if let Some(ref desc) = description {
-            let readme = format!("# {}\n\n{}\n", name, desc);
-            let readme_path = path_buf.join("README.md");
-            if let Err(e) = write_created_file(&readme_path, readme.as_bytes(), &mut created_paths)
-            {
-                created_paths.cleanup();
-                return err_cmd(start, format!("failed to write README.md: {}", e));
-            }
-        }
     }
+    // `empty` itself generates no project files. Description stays registration
+    // metadata; `git_init` remains a separate explicit filesystem side effect.
 
     // git init.
     let mut git_initialized = false;
@@ -2227,17 +2105,17 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
     }
 
     // Write project TOML.
-    let write_result = match write_project_toml_atomic(projects_dir, &id, &toml_content, overwrite)
-    {
-        Ok(p) => p,
-        Err(ProjectTomlWriteError::BeforeRename) => {
-            created_paths.cleanup();
-            return project_error_cmd(start, "operation_failed");
-        }
-        Err(ProjectTomlWriteError::AfterRename) => {
-            return project_error_cmd(start, "operation_indeterminate");
-        }
-    };
+    let write_result =
+        match write_project_toml_atomic(project_registry_dir, &id, &toml_content, overwrite) {
+            Ok(p) => p,
+            Err(ProjectTomlWriteError::BeforeRename) => {
+                created_paths.cleanup();
+                return project_error_cmd(start, "operation_failed");
+            }
+            Err(ProjectTomlWriteError::AfterRename) => {
+                return project_error_cmd(start, "operation_indeterminate");
+            }
+        };
     let result = serde_json::json!({
         "id": runtime_id,
         "agent_project_id": id,
@@ -2245,11 +2123,13 @@ pub(crate) fn handle_project_op_with_temporary_projects_root(
         "name": name,
         "path": path,
         "description": description,
+        "project_record_path": write_result.config_path.to_string_lossy(),
         "projects_config_path": write_result.config_path.to_string_lossy(),
         "created_directory": created_directory,
         "created_config": write_result.created_config,
         "overwritten": write_result.overwritten,
         "allow_patch": allow_patch,
+        "registration_source": EXPLICIT_REGISTRATION_SOURCE,
         "template": template,
         "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
         "git_initialized": git_initialized,
@@ -2278,19 +2158,19 @@ mod durability_tests {
     #[test]
     fn registry_loader_ignores_temp_and_unregister_tombstones() {
         let tmp = tempfile::tempdir().unwrap();
-        let projects_dir = tmp.path().join("projects.d");
+        let project_registry_dir = tmp.path().join("project-registry");
         let source = tmp.path().join("source");
-        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::create_dir_all(&project_registry_dir).unwrap();
         std::fs::create_dir_all(&source).unwrap();
         let content = build_project_toml("demo", "Demo", source.to_str().unwrap(), &None, true);
-        std::fs::write(projects_dir.join("demo.toml"), &content).unwrap();
-        std::fs::write(projects_dir.join(".demo.random.toml.tmp"), &content).unwrap();
+        std::fs::write(project_registry_dir.join("demo.toml"), &content).unwrap();
+        std::fs::write(project_registry_dir.join(".demo.random.toml.tmp"), &content).unwrap();
         std::fs::write(
-            projects_dir.join(".demo.random.toml.unregistering"),
+            project_registry_dir.join(".demo.random.toml.unregistering"),
             &content,
         )
         .unwrap();
-        let projects = load_runner_project_summaries_from_dir(&projects_dir);
+        let projects = load_runner_project_summaries_from_dir(&project_registry_dir);
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, "demo");
     }
@@ -2314,6 +2194,7 @@ mod durability_tests {
             allow_patch: true,
             name: None,
             kind: None,
+            registration_source: None,
             description: None,
             disabled: false,
             hooks: HashMap::new(),

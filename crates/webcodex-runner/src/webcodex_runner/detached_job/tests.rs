@@ -93,7 +93,7 @@ fn test_request(executable: String, args: Vec<String>) -> DetachedStartRequest {
         job_id: format!("job_{}", Uuid::new_v4().simple()),
         request_id: format!("req_{}", Uuid::new_v4().simple()),
         client_id: "test-runner".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
         context: safe_context(),
         launch: DetachedLaunchSpec {
             process: ShellProcessArgv { executable, args },
@@ -418,6 +418,26 @@ fn output_tail_is_bounded_while_total_bytes_and_line_cursors_continue() {
     append_output_tail(&mut output, 5, "tail\n");
     assert_eq!(output.next_line, previous_next + 1);
     validate_output_state("stdout", &output).unwrap();
+}
+
+#[test]
+fn detached_job_persistence_preserves_historical_agent_instance_key() {
+    let request = test_request("/bin/true".to_string(), Vec::new());
+    let request_value = serde_json::to_value(&request).unwrap();
+    assert_eq!(request_value["agent_instance_id"], "test-instance");
+    assert!(request_value.get("runner_instance_id").is_none());
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = DetachedJobStore::new(temp.path().join("state"));
+    let record = match store.prepare(&request).unwrap() {
+        PrepareOutcome::First(record) => record,
+        _ => panic!("first prepare must claim"),
+    };
+    let record_value = serde_json::to_value(&record).unwrap();
+    assert_eq!(record_value["agent_instance_id"], "test-instance");
+    assert!(record_value.get("runner_instance_id").is_none());
+    let decoded: DetachedJobRecord = serde_json::from_value(record_value).unwrap();
+    assert_eq!(decoded.runner_instance_id, "test-instance");
 }
 
 #[test]
@@ -853,16 +873,24 @@ fn durable_update_sequence_advances_and_duplicate_handoff_does_not() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
-    let request = make_payload_request("count_once", Vec::new());
-    let _ = handoff_detached_job(&store, request.clone()).unwrap();
-    let running = store.read(&request.job_id).unwrap();
+    // Keep the payload alive until this test explicitly stops it. The previous
+    // count_once fixture could finish before handoff_detached_job returned on a
+    // loaded runner, making the first observation terminal and turning the
+    // sequence assertion into a scheduler-speed assumption.
+    let request = make_payload_request("linger", Vec::new());
+    let running = handoff_and_wait_running(&store, &request);
     assert!(running.update_seq >= 3);
     let sequence = running.update_seq;
     let replay = handoff_detached_job(&store, request.clone()).unwrap();
     assert!(matches!(replay, DetachedHandoffOutcome::Accepted { .. }));
     assert_eq!(store.read(&request.job_id).unwrap().update_seq, sequence);
+    let stopped = store
+        .request_stop(&request.job_id, &running.execution_id)
+        .unwrap();
+    assert_eq!(stopped.update_seq, sequence + 1);
     let terminal = wait_for_terminal(&store, &request.job_id);
-    assert!(terminal.update_seq > sequence);
+    assert_eq!(terminal.terminal.as_ref().unwrap().status, "stopped");
+    assert!(terminal.update_seq > stopped.update_seq);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

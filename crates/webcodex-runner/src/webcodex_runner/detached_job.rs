@@ -27,8 +27,9 @@ use std::sync::mpsc;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 use uuid::Uuid;
-use webcodex_core::shell_protocol::{
-    validate_process_argv, ShellCommandExecutionState, ShellJobContext, ShellJobSnapshot,
+use webcodex_core::runner_protocol::{
+    validate_process_argv, ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase,
+    ShellJobActivitySource, ShellJobActivityState, ShellJobContext, ShellJobSnapshot,
     ShellJobStreamSnapshot, ShellProcessArgv, JOB_INVENTORY_MAX_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, PROCESS_CWD_MAX_BYTES,
     PROCESS_STDIN_MAX_BYTES, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
@@ -180,7 +181,8 @@ pub(crate) struct DetachedJobRecord {
     pub(crate) execution_id: String,
     pub(crate) request_id: String,
     pub(crate) client_id: String,
-    pub(crate) agent_instance_id: String,
+    #[serde(rename = "agent_instance_id")]
+    pub(crate) runner_instance_id: String,
     pub(crate) context: ShellJobContext,
     pub(crate) phase: DetachedJobPhase,
     pub(crate) update_seq: u64,
@@ -221,7 +223,8 @@ pub(crate) struct DetachedStartRequest {
     pub(crate) job_id: String,
     pub(crate) request_id: String,
     pub(crate) client_id: String,
-    pub(crate) agent_instance_id: String,
+    #[serde(rename = "agent_instance_id")]
+    pub(crate) runner_instance_id: String,
     pub(crate) context: ShellJobContext,
     pub(crate) launch: DetachedLaunchSpec,
 }
@@ -306,12 +309,8 @@ impl DetachedJobStore {
     }
 
     pub(crate) fn read(&self, job_id: &str) -> Result<DetachedJobRecord, String> {
-        let record: DetachedJobRecord = read_json_bounded(
-            &self.state_path_for_job(job_id),
-            DETACHED_STATE_MAX_BYTES,
-            "detached Job state",
-        )?;
-        validate_record(&record)?;
+        let job_dir = self.job_dir(job_id);
+        let record = read_state_record_locked(&job_dir)?;
         if record.job_id != job_id {
             return Err("detached Job state job_id does not match its lookup identity".to_string());
         }
@@ -362,12 +361,7 @@ impl DetachedJobStore {
                     "detached Job state root exceeds {DETACHED_STATE_MAX_RECORDS} records"
                 ));
             }
-            let record: DetachedJobRecord = read_json_bounded(
-                &entry.path().join(STATE_FILE),
-                DETACHED_STATE_MAX_BYTES,
-                "detached Job state",
-            )?;
-            validate_record(&record)?;
+            let record = read_state_record_locked(&entry.path())?;
             if self.job_dir(&record.job_id) != entry.path() {
                 return Err(
                     "detached Job state directory does not match its job identity".to_string(),
@@ -519,12 +513,7 @@ impl DetachedJobStore {
                 );
             }
             let job_dir = entry.path();
-            let initial: DetachedJobRecord = read_json_bounded(
-                &job_dir.join(STATE_FILE),
-                DETACHED_STATE_MAX_BYTES,
-                "detached Job state",
-            )?;
-            validate_record(&initial)?;
+            let initial = read_state_record_locked(&job_dir)?;
             if self.job_dir(&initial.job_id) != job_dir {
                 return Err(
                     "detached Job reclamation state directory does not match durable job identity"
@@ -655,7 +644,7 @@ impl DetachedJobStore {
             execution_id: execution_id_for(request),
             request_id: request.request_id.clone(),
             client_id: request.client_id.clone(),
-            agent_instance_id: request.agent_instance_id.clone(),
+            runner_instance_id: request.runner_instance_id.clone(),
             context: request.context.clone(),
             phase: DetachedJobPhase::Prepared,
             // JobManager has already projected agent_queued at sequence 1 before
@@ -830,7 +819,7 @@ fn validate_start_request(request: &DetachedStartRequest) -> Result<(), String> 
     validate_identity("job_id", &request.job_id, 256)?;
     validate_identity("request_id", &request.request_id, 256)?;
     validate_identity("client_id", &request.client_id, 128)?;
-    validate_identity("agent_instance_id", &request.agent_instance_id, 256)?;
+    validate_identity("agent_instance_id", &request.runner_instance_id, 256)?;
     let context = serde_json::to_vec(&request.context)
         .map_err(|error| format!("failed to encode detached Job context: {error}"))?;
     if context.len() > DETACHED_CONTEXT_MAX_BYTES {
@@ -912,7 +901,7 @@ fn validate_existing_request(
     if record.job_id != request.job_id
         || record.request_id != request.request_id
         || record.client_id != request.client_id
-        || record.agent_instance_id != request.agent_instance_id
+        || record.runner_instance_id != request.runner_instance_id
         || record.context != request.context
         || record.execution_id != execution_id_for(request)
     {
@@ -943,7 +932,7 @@ fn validate_record(record: &DetachedJobRecord) -> Result<(), String> {
     validate_identity("execution_id", &record.execution_id, 96)?;
     validate_identity("request_id", &record.request_id, 256)?;
     validate_identity("client_id", &record.client_id, 128)?;
-    validate_identity("agent_instance_id", &record.agent_instance_id, 256)?;
+    validate_identity("agent_instance_id", &record.runner_instance_id, 256)?;
     let context = serde_json::to_vec(&record.context)
         .map_err(|error| format!("failed to encode detached Job context: {error}"))?;
     if context.len() > DETACHED_CONTEXT_MAX_BYTES {
@@ -1255,7 +1244,7 @@ fn validate_transition(
         || previous.execution_id != next.execution_id
         || previous.request_id != next.request_id
         || previous.client_id != next.client_id
-        || previous.agent_instance_id != next.agent_instance_id
+        || previous.runner_instance_id != next.runner_instance_id
         || previous.context != next.context
         || previous.created_at_unix_ms != next.created_at_unix_ms
     {
@@ -1368,6 +1357,11 @@ pub(crate) fn snapshot_from_detached_record(
         Some(_) => None,
         None => None,
     };
+    let activity = matches!(status, "running" | "stop_requested").then_some(ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::ProcessRunning,
+        source: ShellJobActivitySource::RunnerExecution,
+    });
     let stream = |output: &DetachedOutputState| ShellJobStreamSnapshot {
         tail: output.tail.clone(),
         first_retained_line: output.first_retained_line,
@@ -1393,6 +1387,7 @@ pub(crate) fn snapshot_from_detached_record(
         stdout: stream(&record.stdout),
         stderr: stream(&record.stderr),
         validation_progress: None,
+        activity,
     })
 }
 
@@ -1461,6 +1456,22 @@ fn reject_symlink_or_non_dir(path: &Path, label: &str) -> Result<(), String> {
         return Err(format!("{label} must be a real directory, not a symlink"));
     }
     Ok(())
+}
+
+fn read_state_record_locked(job_dir: &Path) -> Result<DetachedJobRecord, String> {
+    reject_symlink_or_non_dir(job_dir, "detached Job directory")?;
+    // Durable updates replace STATE_FILE atomically, which intentionally changes
+    // its inode. Serialize pathname revalidation with those writers so a trusted
+    // atomic replacement cannot be mistaken for same-user path tampering. The
+    // O_NOFOLLOW + dev/inode checks in read_json_bounded remain authoritative.
+    let _guard = exclusive_lock(&job_dir.join(STATE_LOCK_FILE), true)?;
+    let record: DetachedJobRecord = read_json_bounded(
+        &job_dir.join(STATE_FILE),
+        DETACHED_STATE_MAX_BYTES,
+        "detached Job state",
+    )?;
+    validate_record(&record)?;
+    Ok(record)
 }
 
 fn read_json_bounded<T: for<'de> Deserialize<'de>>(

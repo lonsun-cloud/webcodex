@@ -1,17 +1,17 @@
 use super::*;
 
 async fn wait_for_mcp_agent_request(
-    registry: &crate::shell_client::ShellClientRegistry,
+    registry: &crate::runner_http::RunnerRegistry,
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     label: &str,
-) -> crate::shell_protocol::ShellAgentShellRequest {
+) -> crate::runner_protocol::RunnerRequest {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: agent_instance_id.to_string(),
+                runner_instance_id: runner_instance_id.to_string(),
             })
             .await
             .unwrap()
@@ -44,6 +44,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
         .iter()
         .map(|s| s.name.clone())
         .collect();
+    assert!(runtime_names.iter().any(|name| name == "list_runners"));
+    assert!(!runtime_names.iter().any(|name| name == "list_agents"));
     let legacy_runtime_names: Vec<String> = runtime_names
         .iter()
         .filter(|name| name.as_str() != "export_project_artifact")
@@ -88,6 +90,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             names, legacy_runtime_names,
             "legacy tools/list must equal runtime registry minus stateless-only tools (compact={compact})"
         );
+        assert!(names.iter().any(|name| name == "list_runners"));
+        assert!(!names.iter().any(|name| name == "list_agents"));
 
         let stateless_outcome = handle_mcp_request(
             &runtime,
@@ -113,6 +117,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             stateless_names, stateless_runtime_names,
             "stateless-2026 unauthenticated tools/list must equal the full runtime registry plus fixed Skill runtime tools; Memory tools require explicit authority (compact={compact})"
         );
+        assert!(stateless_names.iter().any(|name| name == "list_runners"));
+        assert!(!stateless_names.iter().any(|name| name == "list_agents"));
         for tool in stateless_value["result"]["tools"].as_array().unwrap() {
             let properties = tool["inputSchema"]["properties"].as_object().unwrap();
             let recorder = properties
@@ -1258,20 +1264,20 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     // surface; select the full operator surface for this call.
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let client_id = "mcp-vision-agent";
-    let agent_instance_id = "inst-mcp-vision";
+    let runner_instance_id = "inst-mcp-vision";
     let project_name = "remote-images";
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: agent_instance_id.to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: runner_instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities {
+                capabilities: RunnerCapabilities {
                     file_read: true,
                     ..Default::default()
                 },
@@ -1287,15 +1293,16 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
-        agent_instance_id,
-        vec![ShellAgentProjectSummary {
+        runner_instance_id,
+        vec![RunnerProjectSummary {
             id: project_name.to_string(),
             name: Some(project_name.to_string()),
             path: "/remote/session-atlas".to_string(),
             allow_patch: true,
             kind: Some("repo".to_string()),
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
@@ -1308,7 +1315,7 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
         }],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id(client_id, project_name);
+    let project = crate::tool_runtime::runner_project_runtime_id(client_id, project_name);
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
 
@@ -1347,9 +1354,9 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     });
 
     let request = wait_for_mcp_agent_request(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
-        agent_instance_id,
+        runner_instance_id,
         "MCP image call",
     )
     .await;
@@ -1383,10 +1390,10 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     .to_string();
     assert!(stdout.len() > 256 * 1024);
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: agent_instance_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(stdout),
@@ -2032,16 +2039,15 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
 
 #[tokio::test]
 async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_id() {
-    use crate::shell_protocol::{
-        ShellAgentProjectSummary, ShellAgentResultRequest, ShellClientCapabilities,
-        ShellClientRegisterRequest,
+    use crate::runner_protocol::{
+        RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest, RunnerResultRequest,
     };
 
     let runtime = test_runtime();
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -2049,13 +2055,13 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: "mcp-client".to_string(),
-                agent_instance_id: "inst".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities {
+                capabilities: RunnerCapabilities {
                     shell: true,
                     git: true,
                     internal_posix_script: true,
@@ -2067,15 +2073,16 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         "mcp-client",
         "inst",
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: "/tmp/mcp-demo".to_string(),
             allow_patch: true,
             kind: None,
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
@@ -2101,6 +2108,7 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         crate::tool_runtime::sessions::SessionTransport::Mcp,
         "write_project_file",
         &write_args,
+        crate::tool_runtime::sessions::session_tool_contract("write_project_file"),
     );
     runtime
         .sessions
@@ -2131,7 +2139,7 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
     );
     let complete = async {
         let req = wait_for_mcp_agent_request(
-            &runtime.shell_clients,
+            &runtime.runner_registry,
             "mcp-client",
             "inst",
             "show_changes",
@@ -2139,10 +2147,10 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         .await;
         let stdout = crate::tool_runtime::framed_clean_show_changes_test_stdout("test head", false);
         runtime
-            .shell_clients
-            .complete(ShellAgentResultRequest {
+            .runner_registry
+            .complete(RunnerResultRequest {
                 client_id: "mcp-client".to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id: req.request_id,
                 exit_code: Some(0),
                 stdout: Some(stdout),

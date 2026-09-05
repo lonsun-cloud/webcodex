@@ -1,11 +1,7 @@
-use crate::shell_protocol::{
-    ShellScriptLanguage, ShellScriptPayload, RAW_SHELL_COMMAND_MAX_BYTES, RAW_SHELL_WIRE_MAX_BYTES,
-};
+use crate::runner_protocol::{RAW_SHELL_COMMAND_MAX_BYTES, RAW_SHELL_WIRE_MAX_BYTES};
 use serde_json::json;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -14,20 +10,24 @@ pub(crate) fn run_command_sync(
     cwd: &Path,
     timeout_secs: u64,
 ) -> (i32, String, String, u64) {
-    run_command_sync_with_shell(cmd, cwd, timeout_secs, "sh")
+    let shell = test_shell();
+    run_command_sync_with_shell(cmd, cwd, timeout_secs, &shell)
 }
 
-pub(crate) fn run_command_sync_with_shell(
+#[cfg(test)]
+fn run_command_sync_with_shell(
     cmd: &str,
     cwd: &Path,
     timeout_secs: u64,
-    shell: &str,
+    shell: &Path,
 ) -> (i32, String, String, u64) {
     let start = Instant::now();
     let mut command = std::process::Command::new(shell);
+    #[cfg(windows)]
+    command.arg("-s").stdin(std::process::Stdio::piped());
+    #[cfg(not(windows))]
+    command.arg("-c").arg(cmd);
     command
-        .arg("-c")
-        .arg(cmd)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -53,6 +53,25 @@ pub(crate) fn run_command_sync_with_shell(
             );
         }
     };
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let write_result = child
+            .stdin
+            .take()
+            .expect("test shell stdin")
+            .write_all(cmd.as_bytes());
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (
+                -1,
+                String::new(),
+                format!("Failed to write command to test shell: {error}"),
+                start.elapsed().as_millis() as u64,
+            );
+        }
+    }
     // Under `process_group(0)` the child's pid is also its process-group id.
     let pgid = child.id();
     let timeout = Duration::from_secs(timeout_secs);
@@ -120,6 +139,33 @@ pub(crate) fn run_command_sync_with_shell(
     }
 }
 
+#[cfg(all(test, not(windows)))]
+pub(crate) fn test_shell() -> PathBuf {
+    PathBuf::from("sh")
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_shell() -> PathBuf {
+    git_for_windows_shell().unwrap_or_else(|| PathBuf::from("sh"))
+}
+
+#[cfg(all(test, windows))]
+fn git_for_windows_shell() -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec_path = String::from_utf8_lossy(&output.stdout);
+    let exec_path = PathBuf::from(exec_path.trim());
+    exec_path.ancestors().find_map(|ancestor| {
+        let candidate = ancestor.join("bin").join("sh.exe");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 /// Best-effort SIGKILL of an entire process group (`kill(-pgid, SIGKILL)`; a
 /// negative target signals every process in the group). Reaps background
 /// grandchildren a synchronous command may have left holding its stdout/stderr
@@ -132,7 +178,7 @@ pub(crate) fn run_command_sync_with_shell(
 /// rejects negative pgid arguments on some coreutils builds. Failure (e.g. the
 /// group already fully exited, ESRCH) is expected and ignored. No-op on
 /// non-Unix targets.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn reap_process_group(pgid: u32) {
     // Guard against ever signalling pid 0 / -1 ("current group" / "all
     // processes") if a caller somehow passed a zero id.
@@ -146,542 +192,26 @@ fn reap_process_group(pgid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn reap_process_group(_pgid: u32) {}
 
-/// Grace added on top of a local command's own `timeout_secs` to form the
-/// outer bound in [`run_command_sync_bounded`]. Covers the post-exit group
-/// reap and output drain, which are normally near-instant.
-pub(crate) const LOCAL_RUN_HARD_GRACE_SECS: u64 = 10;
-
-/// Failure surfaced by [`run_command_sync_bounded`]'s outer backstop rather
-/// than by the command itself (a command's own non-zero exit / timeout is
-/// reported through the `Ok` tuple).
-pub(crate) enum LocalRunFailure {
-    /// The blocking task did not come back within
-    /// `timeout_secs + LOCAL_RUN_HARD_GRACE_SECS`. `run_command_sync` bounds
-    /// the wait on the direct child and reaps its process group, but the
-    /// output drain can still wedge if a descendant escapes the group (e.g.
-    /// via `setsid`) while holding the stdout/stderr pipes. This converts
-    /// that wedge into a prompt timeout error instead of an unbounded await;
-    /// the detached blocking thread is abandoned until the straggler exits,
-    /// since `spawn_blocking` cannot be cancelled.
-    HardTimeout { bound_secs: u64 },
-    /// The blocking task panicked or the runtime is shutting down.
-    Join(String),
-}
-
-/// Run [`run_command_sync`] on the blocking pool, bounded by an outer hard
-/// timeout so a wedged output drain can never park the caller — and with it
-/// the MCP request driving it — indefinitely.
-pub(crate) async fn run_command_sync_bounded(
-    cmd: String,
-    cwd: PathBuf,
-    timeout_secs: u64,
-) -> Result<(i32, String, String, u64), LocalRunFailure> {
-    run_command_sync_bounded_with_shell(cmd, cwd, timeout_secs, "sh".to_string()).await
-}
-
-pub(crate) async fn run_command_sync_bounded_with_shell(
-    cmd: String,
-    cwd: PathBuf,
-    timeout_secs: u64,
-    shell: String,
-) -> Result<(i32, String, String, u64), LocalRunFailure> {
-    let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
-    let task = tokio::task::spawn_blocking(move || {
-        run_command_sync_with_shell(&cmd, &cwd, timeout_secs, &shell)
-    });
-    match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(LocalRunFailure::Join(e.to_string())),
-        Err(_) => Err(LocalRunFailure::HardTimeout { bound_secs }),
-    }
-}
-
-/// Maximum retained bytes per stream for one local synchronous direct process.
-/// Reader threads continuously drain the pipes, retaining only the tail, so a
-/// noisy child cannot deadlock on a full pipe or turn `run_process` into an
-/// unbounded output channel.
-const LOCAL_PROCESS_OUTPUT_MAX_BYTES: usize = 256 * 1024;
-type LocalProcessResult = (i32, String, String, u64);
-
-pub(crate) async fn run_process_sync_bounded(
-    executable: String,
-    args: Vec<String>,
-    stdin: Option<String>,
-    cwd: PathBuf,
-    timeout_secs: u64,
-) -> Result<(i32, String, String, u64), LocalRunFailure> {
-    let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
-    let task = tokio::task::spawn_blocking(move || {
-        run_process_sync(&executable, &args, stdin.as_deref(), &cwd, timeout_secs)
-    });
-    match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => Err(LocalRunFailure::Join(error.to_string())),
-        Err(_) => Err(LocalRunFailure::HardTimeout { bound_secs }),
-    }
-}
-
-pub(crate) async fn run_script_sync_bounded(
-    payload: ShellScriptPayload,
-    stdin: Option<String>,
-    cwd: PathBuf,
-    timeout_secs: u64,
-) -> Result<LocalProcessResult, LocalRunFailure> {
-    let bound_secs = timeout_secs.saturating_add(LOCAL_RUN_HARD_GRACE_SECS);
-    let task = tokio::task::spawn_blocking(move || {
-        run_script_sync(&payload, stdin.as_deref(), &cwd, timeout_secs)
-    });
-    match tokio::time::timeout(Duration::from_secs(bound_secs), task).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => Err(LocalRunFailure::Join(error.to_string())),
-        Err(_) => Err(LocalRunFailure::HardTimeout { bound_secs }),
-    }
-}
-
-fn run_process_sync(
-    executable: &str,
-    args: &[String],
-    stdin: Option<&str>,
-    cwd: &Path,
-    timeout_secs: u64,
-) -> LocalProcessResult {
-    let start = Instant::now();
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    execute_local_process_command(command, stdin, timeout_secs, start)
-}
-
-fn execute_local_process_command(
-    mut command: Command,
-    stdin: Option<&str>,
-    timeout_secs: u64,
-    start: Instant,
-) -> LocalProcessResult {
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return (
-                -1,
-                String::new(),
-                format!("Failed to execute process: {error}"),
-                start.elapsed().as_millis() as u64,
-            )
-        }
-    };
-    let pgid = child.id();
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_local_direct_process(&mut child, pgid);
-            return (
-                -1,
-                String::new(),
-                "Failed to collect process output: stdout pipe missing".to_string(),
-                start.elapsed().as_millis() as u64,
-            );
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_local_direct_process(&mut child, pgid);
-            return (
-                -1,
-                String::new(),
-                "Failed to collect process output: stderr pipe missing".to_string(),
-                start.elapsed().as_millis() as u64,
-            );
-        }
-    };
-    let stdout_reader = spawn_bounded_process_reader(stdout);
-    let stderr_reader = spawn_bounded_process_reader(stderr);
-    let stdin_writer = stdin.map(|input| {
-        let input = input.as_bytes().to_vec();
-        let child_stdin = child.stdin.take();
-        std::thread::spawn(move || match child_stdin {
-            Some(mut child_stdin) => child_stdin.write_all(&input),
-            None => Err(std::io::Error::other("stdin pipe missing")),
-        })
-    });
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if start.elapsed() >= timeout => {
-                timed_out = true;
-                break None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                terminate_local_direct_process(&mut child, pgid);
-                return (
-                    -1,
-                    String::new(),
-                    format!("Failed to wait for process: {error}"),
-                    start.elapsed().as_millis() as u64,
-                );
-            }
-        }
-    };
-    let status = if timed_out {
-        terminate_local_direct_process(&mut child, pgid);
-        None
-    } else {
-        // The direct child is terminal, but descendants may still own output
-        // pipes. Unix process-group ownership lets us close that whole tree.
-        reap_process_group(pgid);
-        status
-    };
-    let stdout = finish_bounded_process_reader(stdout_reader);
-    let stderr = finish_bounded_process_reader(stderr_reader);
-    let elapsed = start.elapsed().as_millis() as u64;
-    let stdin_error = stdin_writer
-        .and_then(|writer| writer.join().ok())
-        .and_then(Result::err)
-        .filter(|error| error.kind() != std::io::ErrorKind::BrokenPipe);
-    match (stdout, stderr, stdin_error) {
-        (_, _, Some(error)) => (
-            -1,
-            String::new(),
-            format!("Failed to write process stdin: {error}"),
-            elapsed,
-        ),
-        (Err(error), _, _) | (_, Err(error), _) => (
-            -1,
-            String::new(),
-            format!("Failed to collect process output: {error}"),
-            elapsed,
-        ),
-        (Ok(stdout), Ok(mut stderr), None) if timed_out => {
-            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                stderr.push('\n');
-            }
-            stderr.push_str(&format!("Command timed out after {timeout_secs} seconds"));
-            (-1, stdout, stderr, elapsed)
-        }
-        (Ok(stdout), Ok(stderr), None) => (
-            status.and_then(|status| status.code()).unwrap_or(-1),
-            stdout,
-            stderr,
-            elapsed,
-        ),
-    }
-}
-
-fn run_script_sync(
-    payload: &ShellScriptPayload,
-    stdin: Option<&str>,
-    cwd: &Path,
-    timeout_secs: u64,
-) -> LocalProcessResult {
-    let start = Instant::now();
-    let interpreter = match find_local_script_interpreter(payload.language) {
-        Some(interpreter) => interpreter,
-        None => {
-            return (
-                -1,
-                String::new(),
-                format!(
-                "interpreter_unavailable: {} interpreter is unavailable; command was not started",
-                payload.language.as_str()
-            ),
-                start.elapsed().as_millis() as u64,
-            )
-        }
-    };
-    let mut builder = tempfile::Builder::new();
-    builder
-        .prefix("webcodex-script-")
-        .suffix(payload.language.file_extension());
-    let mut file = match builder.tempfile() {
-        Ok(file) => file,
-        Err(error) => return local_script_setup_failure("create", &error, start),
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = file
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-        {
-            return local_script_setup_failure("secure", &error, start);
-        }
-    }
-    if payload.language == ShellScriptLanguage::Powershell {
-        if let Err(error) = file.write_all(&[0xEF, 0xBB, 0xBF]) {
-            return local_script_setup_failure("write", &error, start);
-        }
-    }
-    if let Err(error) = file
-        .write_all(payload.script.as_bytes())
-        .and_then(|_| file.flush())
-    {
-        return local_script_setup_failure("write", &error, start);
-    }
-    let original_path = file.path().to_path_buf();
-    // Windows PowerShell 5.1 can reject the extended `\\?\` path prefix that
-    // `canonicalize` commonly returns. Tempfile paths are normally absolute;
-    // make a relative platform temp setting absolute without canonicalizing.
-    let absolute_path = if file.path().is_absolute() {
-        file.path().to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(file.path()),
-            Err(error) => return local_script_setup_failure("resolve", &error, start),
-        }
-    };
-    let temporary_path = file.into_temp_path();
-    let mut command =
-        build_local_script_command(interpreter, payload.language, &absolute_path, &payload.args);
-    command
-        .current_dir(cwd)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut result = execute_local_process_command(command, stdin, timeout_secs, start);
-    redact_local_script_paths(&mut result, &[original_path.as_path(), &absolute_path]);
-    if let Err(error) = temporary_path.close() {
-        tracing::warn!(
-            language = payload.language.as_str(),
-            error_kind = ?error.kind(),
-            "failed to remove Server-owned compatibility temporary script file"
-        );
-    }
-    result
-}
-
-fn local_script_setup_failure(
-    action: &str,
-    error: &std::io::Error,
-    start: Instant,
-) -> LocalProcessResult {
-    (
-        -1,
-        String::new(),
-        format!(
-            "script_setup_failed: failed to {action} Server-owned temporary script file ({:?}); command was not started",
-            error.kind()
-        ),
-        start.elapsed().as_millis() as u64,
-    )
-}
-
-fn build_local_script_command(
-    interpreter: PathBuf,
-    language: ShellScriptLanguage,
-    script_path: &Path,
-    args: &[String],
-) -> Command {
-    let mut command = Command::new(interpreter);
-    match language {
-        ShellScriptLanguage::Sh | ShellScriptLanguage::Bash => {
-            command.arg(script_path);
-        }
-        ShellScriptLanguage::Powershell => {
-            command.arg("-NoProfile").arg("-NonInteractive");
-            if cfg!(windows) {
-                command.arg("-ExecutionPolicy").arg("Bypass");
-            }
-            command.arg("-File").arg(script_path);
-        }
-    }
-    command.args(args);
-    command
-}
-
-fn find_local_script_interpreter(language: ShellScriptLanguage) -> Option<PathBuf> {
-    let candidates: &[&str] = match language {
-        ShellScriptLanguage::Sh => {
-            if cfg!(windows) {
-                &["sh.exe"]
-            } else {
-                &["sh"]
-            }
-        }
-        ShellScriptLanguage::Bash => {
-            if cfg!(windows) {
-                &["bash.exe"]
-            } else {
-                &["bash"]
-            }
-        }
-        ShellScriptLanguage::Powershell => {
-            if cfg!(windows) {
-                &["pwsh.exe", "powershell.exe"]
-            } else {
-                &["pwsh"]
-            }
-        }
-    };
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for directory in std::env::split_paths(&path) {
-        for candidate in candidates {
-            let path = directory.join(candidate);
-            if local_executable_file(&path) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-fn local_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn redact_local_script_paths(result: &mut LocalProcessResult, paths: &[&Path]) {
-    for value in [&mut result.1, &mut result.2] {
-        for path in paths {
-            let rendered = path.to_string_lossy();
-            if !rendered.is_empty() {
-                *value = value.replace(rendered.as_ref(), "<temporary-script>");
-                let alternate = if rendered.contains('\\') {
-                    rendered.replace('\\', "/")
-                } else {
-                    rendered.replace('/', "\\")
-                };
-                if alternate != rendered {
-                    *value = value.replace(&alternate, "<temporary-script>");
-                }
-            }
-        }
-    }
-}
-
-fn terminate_local_direct_process(child: &mut Child, pgid: u32) {
-    reap_process_group(pgid);
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
-fn spawn_bounded_process_reader(
-    mut pipe: impl Read + Send + 'static,
-) -> mpsc::Receiver<Result<String, String>> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut retained = Vec::new();
-        let mut chunk = [0_u8; 8192];
-        let result = loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break Ok(String::from_utf8_lossy(&retained).to_string()),
-                Ok(count) => {
-                    retained.extend_from_slice(&chunk[..count]);
-                    if retained.len() > LOCAL_PROCESS_OUTPUT_MAX_BYTES {
-                        let discard = retained.len() - LOCAL_PROCESS_OUTPUT_MAX_BYTES;
-                        retained.drain(..discard);
-                    }
-                }
-                Err(error) => break Err(error.to_string()),
-            }
-        };
-        let _ = tx.send(result);
-    });
-    rx
-}
-
-fn finish_bounded_process_reader(
-    reader: mpsc::Receiver<Result<String, String>>,
-) -> Result<String, String> {
-    reader
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|_| "process output reader did not finish".to_string())?
-}
-
-pub(crate) fn resolve_local_cwd(
-    proj: &crate::projects::ProjectConfig,
-    cwd: Option<&str>,
-) -> Result<PathBuf, String> {
-    let root = proj.root();
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| format!("Project root does not exist: {}", e))?;
-    let requested = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
-        Some(cwd) => {
-            let path = PathBuf::from(cwd);
-            if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            }
-        }
-        None => root,
-    };
-    let canonical = requested
-        .canonicalize()
-        .map_err(|e| format!("cwd does not exist: {}", e))?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err("cwd is outside project directory".to_string());
-    }
-    Ok(canonical)
-}
-
-pub(crate) fn project_relative_cwd(
-    proj: &crate::projects::ProjectConfig,
-    resolved: &Path,
-) -> Result<String, String> {
-    let root = proj
-        .root()
-        .canonicalize()
-        .map_err(|e| format!("Project root does not exist: {e}"))?;
-    let relative = resolved
-        .strip_prefix(&root)
-        .map_err(|_| "cwd is outside project directory".to_string())?;
-    if relative.as_os_str().is_empty() {
-        Ok(".".to_string())
-    } else {
-        Ok(relative.to_string_lossy().replace('\\', "/"))
-    }
-}
-
-pub(crate) fn project_relative_agent_cwd(
+pub(crate) fn project_relative_runner_cwd(
     proj: &crate::projects::ProjectConfig,
     resolved: &str,
 ) -> Result<String, String> {
+    if let Some(root) = parse_windows_runner_absolute_path(&proj.path)? {
+        let Some(resolved) = parse_windows_runner_absolute_path(resolved)? else {
+            return Err("cwd is outside project directory".to_string());
+        };
+        let relative = windows_runner_descendant_tail(&root, &resolved)
+            .ok_or_else(|| "cwd is outside project directory".to_string())?;
+        return if relative.is_empty() {
+            Ok(".".to_string())
+        } else {
+            Ok(relative.join("/"))
+        };
+    }
+
     let root = proj.root();
     let resolved = Path::new(resolved);
     let relative = resolved
@@ -694,16 +224,20 @@ pub(crate) fn project_relative_agent_cwd(
     }
 }
 
-/// Resolve an Agent command cwd against the registered project root.
+/// Resolve a Runner command cwd against the registered project root.
 ///
-/// The server cannot canonicalize paths on a remote Agent host, so this
+/// The server cannot canonicalize paths on a remote Runner host, so this
 /// performs the project-relative/lexical boundary check before dispatch. The
 /// Agent remains responsible for canonicalizing the existing path against its
 /// configured `allowed_roots`, which rejects symlink escapes.
-pub(crate) fn resolve_agent_cwd(
+pub(crate) fn resolve_runner_cwd(
     proj: &crate::projects::ProjectConfig,
     cwd: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(root) = parse_windows_runner_absolute_path(&proj.path)? {
+        return resolve_windows_runner_cwd(&root, cwd);
+    }
+
     let root = proj.root();
     let requested = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
         Some(cwd) => {
@@ -730,6 +264,122 @@ pub(crate) fn resolve_agent_cwd(
         return Err("cwd is outside project directory".to_string());
     }
     Ok(requested.to_string_lossy().to_string())
+}
+
+/// Pure lexical model of a Runner-owned Windows local-disk path.
+///
+/// The Server may be running on Unix while the owning Runner is on Windows, so
+/// `std::path` on the Server cannot classify or join these paths. This model is
+/// deliberately narrower than Windows filesystem semantics: it recognizes only
+/// rooted local drive paths (plain or `\\?\` verbatim disk form), rejects parent
+/// traversal, and leaves existence/symlink/allowed_roots truth to the Runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRunnerPath {
+    verbatim: bool,
+    drive: char,
+    components: Vec<String>,
+}
+
+fn parse_windows_runner_absolute_path(path: &str) -> Result<Option<WindowsRunnerPath>, String> {
+    let (verbatim, path) = match path.strip_prefix(r"\\?\") {
+        Some(path) => (true, path),
+        None => (false, path),
+    };
+    let bytes = path.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return Ok(None);
+    }
+
+    let components = windows_runner_relative_components(&path[3..])?;
+    Ok(Some(WindowsRunnerPath {
+        verbatim,
+        drive: (bytes[0] as char).to_ascii_uppercase(),
+        components,
+    }))
+}
+
+fn windows_runner_relative_components(path: &str) -> Result<Vec<String>, String> {
+    if path.contains('\0') {
+        return Err("cwd cannot contain NUL bytes".to_string());
+    }
+    let mut components = Vec::new();
+    for component in path.split(|character| matches!(character, '\\' | '/')) {
+        match component {
+            "" | "." => {}
+            ".." => return Err("cwd cannot contain parent traversal".to_string()),
+            component if component.contains(':') => {
+                return Err("cwd contains an invalid Windows path component".to_string())
+            }
+            component => components.push(component.to_string()),
+        }
+    }
+    Ok(components)
+}
+
+fn windows_runner_component_eq(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
+fn windows_runner_descendant_tail<'a>(
+    root: &WindowsRunnerPath,
+    requested: &'a WindowsRunnerPath,
+) -> Option<&'a [String]> {
+    if root.drive != requested.drive
+        || requested.components.len() < root.components.len()
+        || !root
+            .components
+            .iter()
+            .zip(&requested.components)
+            .all(|(left, right)| windows_runner_component_eq(left, right))
+    {
+        return None;
+    }
+    Some(&requested.components[root.components.len()..])
+}
+
+fn render_windows_runner_path(root: &WindowsRunnerPath, tail: &[String]) -> String {
+    let mut output = if root.verbatim {
+        format!("\\\\?\\{}:\\", root.drive)
+    } else {
+        format!("{}:\\", root.drive)
+    };
+    let mut components = root.components.iter().chain(tail.iter()).peekable();
+    while let Some(component) = components.next() {
+        output.push_str(component);
+        if components.peek().is_some() {
+            output.push('\\');
+        }
+    }
+    output
+}
+
+fn resolve_windows_runner_cwd(
+    root: &WindowsRunnerPath,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+        return Ok(render_windows_runner_path(root, &[]));
+    };
+    if cwd == "." {
+        return Ok(render_windows_runner_path(root, &[]));
+    }
+
+    if let Some(absolute) = parse_windows_runner_absolute_path(cwd)? {
+        let tail = windows_runner_descendant_tail(root, &absolute)
+            .ok_or_else(|| "cwd is outside project directory".to_string())?;
+        return Ok(render_windows_runner_path(root, tail));
+    }
+    if cwd.starts_with(['\\', '/']) {
+        return Err(
+            "cwd must be project-relative or an absolute Windows local-drive path".to_string(),
+        );
+    }
+    let relative = windows_runner_relative_components(cwd)?;
+    Ok(render_windows_runner_path(root, &relative))
 }
 
 pub(crate) fn validate_project_relative_path(path: &str) -> Result<(), String> {
@@ -877,18 +527,7 @@ mod raw_shell_bound_tests {
     }
 }
 
-pub(crate) fn shell_escape_simple(s: &str) -> String {
-    let mut out = String::from("'");
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub(crate) use webcodex_core::shell_quote::shell_escape_simple;
 
 pub(crate) fn validate_limited_cleanup_paths(
     paths: &[String],
@@ -935,8 +574,8 @@ pub(crate) fn bounded_tail(text: &str, max_chars: usize) -> (String, bool) {
 
 pub(crate) const COMMAND_STDIO_TAIL_CHARS: usize = 12_000;
 
-/// Synchronous agent-wait tools share this hard upper bound with
-/// `shell_client` validation (`wait_timeout_secs` must be <= 120).
+/// Synchronous Runner-wait tools share this hard upper bound with
+/// `runner_http` validation (`wait_timeout_secs` must be <= 120).
 pub(crate) const MIN_SYNC_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_SYNC_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;
@@ -1060,80 +699,82 @@ pub(crate) fn looks_like_command_timeout(
             .contains(&format!("command timed out after {} seconds", timeout_secs))
 }
 
-pub(crate) fn is_safe_job_id(job_id: &str) -> bool {
-    if job_id.is_empty() || job_id.len() > 80 || job_id.contains("..") {
-        return false;
-    }
-    job_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
+pub(crate) use webcodex_core::workflow_session_contract::is_safe_job_id;
 
-pub(crate) fn normalize_local_status(raw: &str) -> String {
-    match raw.trim() {
-        "queued" | "running" | "started" | "stop_requested" | "completed" | "failed"
-        | "stopped" | "lost" | "timeout" | "timed_out" | "cancelled" => raw.trim().to_string(),
-        "" => "running".to_string(),
-        _ => "lost".to_string(),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn read_trim(path: PathBuf) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-pub(crate) const MAX_LOCAL_LOG_LINES: usize = 500;
 pub(crate) const DEFAULT_JOB_LOG_TAIL_LINES: usize = 200;
 
 #[cfg(test)]
-pub(crate) fn read_lines_from(
-    path: PathBuf,
-    offset: Option<usize>,
-    tail_lines: Option<usize>,
-) -> (String, usize, usize, bool) {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    read_lines_from_text(&content, offset, tail_lines)
-}
-
-#[cfg(test)]
-pub(crate) fn read_lines_from_text(
-    content: &str,
-    offset: Option<usize>,
-    tail_lines: Option<usize>,
-) -> (String, usize, usize, bool) {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    // `offset` is a 1-based line cursor (matching agent `since_stdout_line`).
-    // When provided, read forward from that line, bounded to MAX_LOCAL_LOG_LINES.
-    // Otherwise return the last `tail_lines` (bounded), defaulting to the last
-    // MAX_LOCAL_LOG_LINES lines. Output is always bounded.
-    let (start_idx, limit) = if let Some(off) = offset {
-        let s = off.saturating_sub(1).min(total);
-        (s, MAX_LOCAL_LOG_LINES)
-    } else {
-        let tail = tail_lines
-            .filter(|t| *t > 0)
-            .map(|t| t.min(MAX_LOCAL_LOG_LINES))
-            .unwrap_or(DEFAULT_JOB_LOG_TAIL_LINES);
-        (total.saturating_sub(tail), tail)
-    };
-    let end_idx = (start_idx + limit).min(total);
-    let selected = lines[start_idx..end_idx].join("\n");
-    // 1-based line number to request for the next chunk.
-    let next_line = end_idx + 1;
-    (selected, next_line, total, start_idx > 0 || end_idx < total)
-}
-
-#[cfg(test)]
 mod tests {
-    // Every test in this module is Unix-only, so the glob import is only
-    // needed there.
-    #[cfg(unix)]
     use super::*;
+
+    fn windows_project(path: &str) -> crate::projects::ProjectConfig {
+        crate::projects::ProjectConfig {
+            path: path.to_string(),
+            client_id: "windows-runner".to_string(),
+            allow_patch: true,
+        }
+    }
+
+    #[test]
+    fn runner_cwd_preserves_windows_native_path_syntax_across_server_platforms() {
+        let project = windows_project(r"\\?\E:\git\webcodex");
+        for (cwd, expected, relative) in [
+            (None, r"\\?\E:\git\webcodex", "."),
+            (Some("."), r"\\?\E:\git\webcodex", "."),
+            (
+                Some("apps/desktop"),
+                r"\\?\E:\git\webcodex\apps\desktop",
+                "apps/desktop",
+            ),
+            (
+                Some(r"apps\desktop"),
+                r"\\?\E:\git\webcodex\apps\desktop",
+                "apps/desktop",
+            ),
+            (
+                Some(r"e:/GIT/WEBCODEX/apps/桌面 project"),
+                r"\\?\E:\git\webcodex\apps\桌面 project",
+                "apps/桌面 project",
+            ),
+        ] {
+            let resolved = resolve_runner_cwd(&project, cwd).unwrap();
+            assert_eq!(resolved, expected, "cwd={cwd:?}");
+            assert_eq!(
+                project_relative_runner_cwd(&project, &resolved).unwrap(),
+                relative,
+                "cwd={cwd:?}"
+            );
+        }
+
+        let plain_project = windows_project(r"E:\git\webcodex");
+        let resolved =
+            resolve_runner_cwd(&plain_project, Some(r"\\?\e:\GIT\WEBCODEX\apps/desktop")).unwrap();
+        assert_eq!(resolved, r"E:\git\webcodex\apps\desktop");
+        assert_eq!(
+            project_relative_runner_cwd(&plain_project, &resolved).unwrap(),
+            "apps/desktop"
+        );
+    }
+
+    #[test]
+    fn runner_cwd_windows_lexical_boundary_rejects_escape_and_ambiguous_roots() {
+        let project = windows_project(r"\\?\E:\git\webcodex");
+        for cwd in [
+            r"..\outside",
+            "../outside",
+            r"E:\git\other",
+            r"F:\git\webcodex",
+            r"\Windows",
+            r"\\server\share\repo",
+            r"E:drive-relative",
+            "bad\0cwd",
+        ] {
+            assert!(
+                resolve_runner_cwd(&project, Some(cwd)).is_err(),
+                "unsafe Windows cwd must fail closed: {cwd:?}"
+            );
+        }
+    }
 
     /// Regression guard for the local-command infinite hang: a shell that exits
     /// immediately after backgrounding a long-lived process which inherits the

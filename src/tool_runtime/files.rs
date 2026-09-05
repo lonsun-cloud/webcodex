@@ -11,11 +11,11 @@ use webcodex_workspace::file_read_range::{self, EffectiveRange, FileReadRange, R
 #[cfg(test)]
 use super::helpers::run_command_sync;
 use super::helpers::{
-    looks_like_command_timeout, run_command_sync_bounded, shell_escape_simple,
-    validate_limited_cleanup_paths, validate_project_relative_path, LocalRunFailure,
+    looks_like_command_timeout, shell_escape_simple, validate_limited_cleanup_paths,
+    validate_project_relative_path,
 };
 use super::project_resolution::ResolvedProject;
-use super::shell::{agent_command_lifecycle, dispatch_uncertainty_lifecycle};
+use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::tool_inputs::{
     ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
 };
@@ -32,7 +32,7 @@ use crate::project_overview::{
     normalize_project_overview_path,
 };
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{
+use crate::runner_protocol::{
     ShellCommandExecutionState, ShellFileOpRequest, ShellRunRequest, ShellRunResponse,
     EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
@@ -66,7 +66,7 @@ pub(crate) use search::{
     DEFAULT_SEARCH_TIMEOUT_SECS,
 };
 
-// Edit limits and the sensitive-path guard are shared with the agent binary.
+// Edit limits and the sensitive-path guard are shared with the Runner binary.
 #[cfg(test)]
 pub(crate) use crate::apply_edits_shared::{
     canonicalize_apply_text_line_endings, detect_apply_text_line_ending,
@@ -84,15 +84,15 @@ pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
 }
 
 impl ToolRuntime {
-    // Phase 4: native agent JSON file ops
+    // Phase 4: native Runner JSON file ops
     // -------------------------------------------------------------------------
     //
-    // Structured edits and project artifact tools run through the owning agent.
-    // The server never reads or writes the agent project filesystem directly.
-    // Arguments travel as JSON in a native agent file-op payload; the agent
+    // Structured edits and project artifact tools run through the owning Runner.
+    // The server never reads or writes the Runner project filesystem directly.
+    // Arguments travel as JSON in a native Runner file-op payload; the agent
     // performs validation and returns one JSON object on stdout.
 
-    pub(crate) async fn run_agent_json_file_op(
+    pub(crate) async fn run_runner_json_file_op(
         &self,
         client_id: String,
         cwd: String,
@@ -105,7 +105,7 @@ impl ToolRuntime {
             .map_err(|e| format!("failed to serialize file-op payload: {}", e))?;
         let wait_timeout = 60_u64;
         let (request_id, rx) = self
-            .shell_clients
+            .runner_registry
             .enqueue_file_op(
                 ShellFileOpRequest {
                     op: op.to_string(),
@@ -130,12 +130,12 @@ impl ToolRuntime {
         let resp = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
-                return Err(format!("agent {} request was dropped", tool_name));
+                self.runner_registry.cancel_request(&request_id).await;
+                return Err(format!("Runner {} request was dropped", tool_name));
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
-                return Err(format!("timed out waiting for agent {}", tool_name));
+                self.runner_registry.cancel_request(&request_id).await;
+                return Err(format!("timed out waiting for Runner {}", tool_name));
             }
         };
         if let Some(e) = resp.error {
@@ -143,14 +143,14 @@ impl ToolRuntime {
         }
         if resp.exit_code != Some(0) {
             return Err(resp.stderr.unwrap_or_else(|| {
-                format!("agent {} failed with code {:?}", tool_name, resp.exit_code)
+                format!("Runner {} failed with code {:?}", tool_name, resp.exit_code)
             }));
         }
         let stdout = resp.stdout.unwrap_or_default();
         let stdout = stdout.trim();
         serde_json::from_str(stdout).map_err(|e| {
             format!(
-                "agent {} returned invalid JSON: {} (got: {})",
+                "Runner {} returned invalid JSON: {} (got: {})",
                 tool_name,
                 e,
                 &stdout[..stdout.len().min(200)]

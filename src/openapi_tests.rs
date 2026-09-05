@@ -680,6 +680,20 @@ fn openapi_dedicated_actions_have_expected_routes_and_operation_ids() {
     for (path, operation_id) in expected {
         assert_eq!(spec["paths"][path]["post"]["operationId"], operation_id);
     }
+    let serialized = serde_json::to_string(&spec).unwrap();
+    assert!(serialized.contains("Runner-registered"));
+    assert!(serialized.contains("list_runners"));
+    for retired_runner_term in [
+        "agent-registered",
+        "owning agent",
+        "selected agent",
+        "agent shell capability",
+    ] {
+        assert!(
+            !serialized.contains(retired_runner_term),
+            "OpenAPI must not teach retired Runner term {retired_runner_term:?}"
+        );
+    }
 }
 
 #[test]
@@ -737,7 +751,7 @@ fn openapi_mutation_actions_describe_execution_risk_and_auth() {
             .as_str()
             .unwrap_or("");
         assert!(
-            desc.to_lowercase().contains("agent shell capability"),
+            desc.to_lowercase().contains("runner shell capability"),
             "{path}: {desc}"
         );
     }
@@ -750,7 +764,7 @@ fn openapi_mutation_actions_describe_execution_risk_and_auth() {
             .unwrap_or("");
         assert!(desc.contains("structured_process_argv"), "{path}: {desc}");
         assert!(
-            !desc.to_lowercase().contains("agent shell capability"),
+            !desc.to_lowercase().contains("runner shell capability"),
             "{path}: {desc}"
         );
     }

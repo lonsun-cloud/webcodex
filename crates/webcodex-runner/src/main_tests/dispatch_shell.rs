@@ -3,22 +3,22 @@ use super::*;
 #[test]
 fn dispatch_request_run_shell_sends_result_over_sink() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
         webcodex_runner::SshConnectionPool::default(),
     );
 
-    type SinkFactory = fn(&str) -> (RunnerSink, tokio::sync::mpsc::Receiver<AgentEnvelope>);
+    type SinkFactory = fn(&str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>);
     for (label, make_sink, client_id, expected_stdout) in [
         ("ws", ws_sink as SinkFactory, "ws-client", "wsok"),
         ("quic", quic_sink as SinkFactory, "quic-client", "quic-ok"),
     ] {
         let (sink, mut rx) = make_sink(client_id);
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: format!("req-{label}"),
             client_id: client_id.to_string(),
             kind: "run_shell".to_string(),
@@ -43,6 +43,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: None,
         };
@@ -60,7 +61,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
         assert!(ran, "{label}");
         let env = rx.try_recv().expect("result envelope was sent");
         match env {
-            AgentEnvelope::Result { payload } => {
+            RunnerEnvelope::Result { payload } => {
                 assert_eq!(payload.result.request_id, format!("req-{label}"));
                 assert_eq!(payload.result.exit_code, Some(0));
                 assert_eq!(payload.result.stdout.as_deref(), Some(expected_stdout));
@@ -77,16 +78,16 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
 #[test]
 fn dispatch_request_detached_process_job_enters_job_manager_without_generic_result() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
         webcodex_runner::SshConnectionPool::default(),
     );
     let (sink, mut rx) = ws_sink("ws-client");
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-detached-dispatch".to_string(),
         client_id: "ws-client".to_string(),
         kind: "start_detached_process_job".to_string(),
@@ -101,7 +102,7 @@ fn dispatch_request_detached_process_job_enters_job_manager_without_generic_resu
         end_line: None,
         create_dirs: false,
         command: String::new(),
-        process: Some(shell_protocol::ShellProcessArgv {
+        process: Some(runner_protocol::ShellProcessArgv {
             executable: "never-started".to_string(),
             args: Vec::new(),
         }),
@@ -114,6 +115,7 @@ fn dispatch_request_detached_process_job_enters_job_manager_without_generic_resu
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -130,7 +132,7 @@ fn dispatch_request_detached_process_job_enters_job_manager_without_generic_resu
     )
     .unwrap());
     match rx.try_recv().expect("detached Job rejection update") {
-        AgentEnvelope::JobUpdate { payload } => {
+        RunnerEnvelope::JobUpdate { payload } => {
             assert_eq!(payload.job_id, "job-detached-dispatch");
             assert_eq!(payload.status, "failed");
             assert!(payload
@@ -149,7 +151,7 @@ fn dispatch_request_detached_process_job_enters_job_manager_without_generic_resu
 #[test]
 fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_parser() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     // The generated search program is POSIX shell. It must not inherit an
     // arbitrary configured shell parser (PowerShell is the Windows production
     // case); use a guaranteed-failing program here to prove the bypass.
@@ -159,7 +161,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
         "/bin/false".to_string()
     };
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -167,7 +169,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
     );
     let (sink, mut rx) = ws_sink("ws-client");
     let marker = r#"{"webcodex_search":{"backend":"grep","feature_unavailable":false}}"#;
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-internal-search".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_shell".to_string(),
@@ -183,7 +185,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
         create_dirs: false,
         command: format!(
             "{}\nprintf '%s\\n' '{}'\n",
-            shell_protocol::EXTERNAL_SEARCH_REQUEST_PREFIX,
+            runner_protocol::EXTERNAL_SEARCH_REQUEST_PREFIX,
             marker
         ),
         process: None,
@@ -196,6 +198,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -212,7 +215,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
     )
     .unwrap());
     match rx.try_recv().expect("internal search result") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, Some(0));
             assert!(payload
                 .result
@@ -233,18 +236,18 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
 #[test]
 fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     cfg.shell.program = "/bin/false".to_string();
     cfg.shell.dialect = Some(crate::webcodex_runner::config::ShellDialect::PowerShell);
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
         webcodex_runner::SshConnectionPool::default(),
     );
     let (sink, mut rx) = ws_sink("ws-client");
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-internal-posix".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_internal_posix_script".to_string(),
@@ -260,8 +263,8 @@ fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
         create_dirs: false,
         command: String::new(),
         process: None,
-        script: Some(shell_protocol::ShellScriptPayload {
-            language: shell_protocol::ShellScriptLanguage::Sh,
+        script: Some(runner_protocol::ShellScriptPayload {
+            language: runner_protocol::ShellScriptLanguage::Sh,
             script: "printf 'internal-posix-dispatch-ok\\n'\n".to_string(),
             args: Vec::new(),
         }),
@@ -273,6 +276,7 @@ fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -289,7 +293,7 @@ fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
     )
     .unwrap());
     match rx.try_recv().expect("internal POSIX result") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, Some(0));
             assert_eq!(
                 payload.result.stdout.as_deref(),
@@ -307,16 +311,16 @@ fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
 #[test]
 fn dispatch_request_run_shell_rejects_oversized_wire_command_before_start() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
         webcodex_runner::SshConnectionPool::default(),
     );
     let (sink, mut rx) = ws_sink("ws-client");
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-oversized-shell".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_shell".to_string(),
@@ -330,7 +334,7 @@ fn dispatch_request_run_shell_rejects_oversized_wire_command_before_start() {
         start_line: None,
         end_line: None,
         create_dirs: false,
-        command: "x".repeat(shell_protocol::RAW_SHELL_WIRE_MAX_BYTES + 1),
+        command: "x".repeat(runner_protocol::RAW_SHELL_WIRE_MAX_BYTES + 1),
         process: None,
         script: None,
         stdin: None,
@@ -341,6 +345,7 @@ fn dispatch_request_run_shell_rejects_oversized_wire_command_before_start() {
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -358,7 +363,7 @@ fn dispatch_request_run_shell_rejects_oversized_wire_command_before_start() {
     .unwrap());
     let env = rx.try_recv().expect("rejection envelope was sent");
     match env {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.request_id, "req-oversized-shell");
             assert_eq!(payload.result.exit_code, None);
             assert_eq!(
@@ -400,9 +405,9 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -411,7 +416,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
     let marker = tmp.path().join("marker");
 
     let (sink, mut rx) = ws_sink("ws-client");
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-structured-process".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_process".to_string(),
@@ -426,7 +431,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         end_line: None,
         create_dirs: false,
         command: String::new(),
-        process: Some(shell_protocol::ShellProcessArgv {
+        process: Some(runner_protocol::ShellProcessArgv {
             executable: helper.to_string_lossy().into_owned(),
             args: vec![
                 "argv".to_string(),
@@ -443,6 +448,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -458,7 +464,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
     )
     .unwrap());
     match rx.try_recv().expect("structured process result") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, Some(0));
             assert_eq!(
                 payload.command_execution_state,
@@ -474,7 +480,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
 
     let shell_fallback_marker = tmp.path().join("shell-fallback-marker");
     let (sink, mut rx) = ws_sink("ws-client");
-    let malformed = ShellAgentShellRequest {
+    let malformed = RunnerRequest {
         request_id: "req-structured-process-malformed".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_process".to_string(),
@@ -499,6 +505,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -514,7 +521,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
     )
     .unwrap());
     match rx.try_recv().expect("structured process rejection") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, None);
             assert_eq!(
                 payload.command_execution_state,
@@ -530,9 +537,9 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
 #[test]
 fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
-    let pdir = projects_dir(&cfg).unwrap();
+    let pdir = project_registry_dir(&cfg).unwrap();
     let hot = runtime_config(&cfg);
     let persistent_shells = webcodex_runner::PersistentShellManager::new(
         &cfg.shell,
@@ -542,7 +549,7 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
     let marker = tmp.path().join("marker");
     let shell_fallback_marker = tmp.path().join("shell-fallback-marker");
 
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-structured-script".to_string(),
         client_id: "ws-client".to_string(),
         kind: "run_script".to_string(),
@@ -558,8 +565,8 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
         create_dirs: false,
         command: String::new(),
         process: None,
-        script: Some(shell_protocol::ShellScriptPayload {
-            language: shell_protocol::ShellScriptLanguage::Sh,
+        script: Some(runner_protocol::ShellScriptPayload {
+            language: runner_protocol::ShellScriptLanguage::Sh,
             script: "printf '%s' \"$0\" > \"$1\"\nprintf '%s\\n' \"$2\"\n".to_string(),
             args: vec![
                 observed_path.to_string_lossy().into_owned(),
@@ -574,6 +581,7 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -595,7 +603,7 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
     )
     .unwrap());
     match rx.try_recv().expect("structured script result") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, Some(0));
             assert_eq!(payload.result.stdout.as_deref(), Some("; touch marker\n"));
             assert_eq!(
@@ -624,7 +632,7 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
     )
     .unwrap());
     match rx.try_recv().expect("structured script rejection") {
-        AgentEnvelope::Result { payload } => {
+        RunnerEnvelope::Result { payload } => {
             assert_eq!(payload.result.exit_code, None);
             assert_eq!(
                 payload.command_execution_state,

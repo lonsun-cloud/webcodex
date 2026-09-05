@@ -443,7 +443,7 @@ fn resume_task(location: &TaskLocationOptions, task_id: &str) -> Result<String, 
         .local_connector_task(task_id, &state.logical_project_id)
         .map_err(store_error)?;
     ensure_target(&state, &task.target_root)?;
-    WorkspaceManager::validate_resume(&task, &state.runs, &state.projects)?;
+    WorkspaceManager::validate_resume(&task, &state.runs, &state.project_registry)?;
     let resumed = db
         .resume_connector_task(
             task_id,
@@ -657,6 +657,8 @@ mod tests {
             );
         };
         git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "false"]);
+        git(&["config", "core.longpaths", "true"]);
         std::fs::write(root.join("README.md"), "before\n").unwrap();
         git(&["add", "README.md"]);
         git(&[
@@ -748,7 +750,7 @@ mod tests {
             executor_root: root.to_string_lossy().to_string(),
             runs_root: state.runs.to_string_lossy().to_string(),
             results_root: state_dir.join("results").to_string_lossy().to_string(),
-            projects_dir: state.projects.to_string_lossy().to_string(),
+            project_registry_dir: state.project_registry.to_string_lossy().to_string(),
             profile: "personal".to_string(),
             project_grant_id: "wc_pgrant_1111111111111111".to_string(),
         };
@@ -765,7 +767,10 @@ mod tests {
         .unwrap();
         let task_id = "wc_task_4123456789abcdef0123456789abcdef";
         let run_id = "wc_run_4123456789abcdef0123456789abcdef";
-        let prepared = manager.prepare(&context, task_id, run_id, false).unwrap();
+        let prepared = webcodex_connector_runtime::workspace::root_test_support::prepare(
+            &manager, &context, task_id, run_id, false,
+        )
+        .unwrap();
         let task = db
             .start_connector_task(NewConnectorTask {
                 task_id,
@@ -786,7 +791,10 @@ mod tests {
             })
             .unwrap();
         std::fs::write(Path::new(&task.execution_root).join("README.md"), "after\n").unwrap();
-        let captured = manager.capture_result(&task).unwrap();
+        let captured = webcodex_connector_runtime::workspace::root_test_support::capture_result(
+            &manager, &task,
+        )
+        .unwrap();
         db.finish_connector_task(
             task_id,
             &context.project_id,
@@ -804,7 +812,12 @@ mod tests {
             3,
         )
         .unwrap();
-        assert_eq!(manager.release_task_workspace(&task), None);
+        assert_eq!(
+            webcodex_connector_runtime::workspace::root_test_support::release_task_workspace(
+                &manager, &task,
+            ),
+            None
+        );
         drop(db);
 
         let output = run(TaskCliCommand::Accept {
@@ -830,9 +843,14 @@ mod tests {
 
         let abandoned_task_id = "wc_task_5123456789abcdef0123456789abcdef";
         let abandoned_run_id = "wc_run_5123456789abcdef0123456789abcdef";
-        let prepared = manager
-            .prepare(&context, abandoned_task_id, abandoned_run_id, false)
-            .unwrap();
+        let prepared = webcodex_connector_runtime::workspace::root_test_support::prepare(
+            &manager,
+            &context,
+            abandoned_task_id,
+            abandoned_run_id,
+            false,
+        )
+        .unwrap();
         let interrupted = db
             .start_connector_task(NewConnectorTask {
                 task_id: abandoned_task_id,

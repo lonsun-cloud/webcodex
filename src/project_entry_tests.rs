@@ -1,10 +1,9 @@
 use super::*;
 use crate::connector_runtime::{ConnectorContext, ConnectorRuntime, ConnectorRuntimeSlot};
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentPollRequest, ShellAgentProjectSummary,
-    ShellAgentResultRequest, ShellAgentShellRequest, ShellClientCapabilities,
-    ShellClientRegisterRequest, ShellJobValidationProgress,
+use crate::runner_http::RunnerRegistry;
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerPollRequest, RunnerProjectSummary,
+    RunnerRegisterRequest, RunnerRequest, RunnerResultRequest, ShellJobValidationProgress,
 };
 use crate::tool_runtime::ToolRuntime;
 use salvo::prelude::{affix_state, handler, Depot, Request, Router, Service, StatusCode};
@@ -34,6 +33,8 @@ fn repo(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let state = temp.path().join("state");
     fs::create_dir(&root).unwrap();
     git(&["init", "-q"], &root);
+    git(&["config", "core.autocrlf", "false"], &root);
+    git(&["config", "core.longpaths", "true"], &root);
     fs::write(root.join("README.md"), "fixture\n").unwrap();
     git(&["add", "README.md"], &root);
     git(
@@ -59,6 +60,33 @@ fn options(root: PathBuf, state: PathBuf) -> ProjectCommandOptions {
         json: false,
         console_assets_dir: None,
     }
+}
+
+#[test]
+fn connector_project_registry_environment_clears_legacy_alias() {
+    let mut command = tokio::process::Command::new("unused-test-command");
+    command.env(LEGACY_CONNECTOR_PROJECTS_DIR_ENV, "/legacy/projects.d");
+
+    configure_connector_project_registry_environment(
+        &mut command,
+        Path::new("/current/project-registry"),
+    );
+
+    let env = command
+        .as_std()
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        env.get(CONNECTOR_PROJECT_REGISTRY_DIR_ENV),
+        Some(&Some("/current/project-registry".to_string()))
+    );
+    assert_eq!(env.get(LEGACY_CONNECTOR_PROJECTS_DIR_ENV), Some(&None));
 }
 
 fn write_console_assets(directory: &Path) {
@@ -142,7 +170,7 @@ struct AuthenticatedProjectFixture {
     _temp: tempfile::TempDir,
     service: Service,
     db: Arc<crate::Database>,
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
     connector: Arc<ConnectorRuntime>,
     agent_auth: crate::auth::AuthContext,
     credential: String,
@@ -228,10 +256,10 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
     )
     .unwrap();
     let agent_auth = project_agent_verifier.authenticate(&agent_token).unwrap();
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -239,21 +267,21 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: config.executor_client_id.clone(),
-                agent_instance_id: "project-agent-instance".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "project-agent-instance".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some("configured project Agent".to_string()),
                 owner: Some("local-owner".to_string()),
                 hostname: Some("private-host".to_string()),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         shell: true,
                         ..Default::default()
                     },
                 ),
                 policy: None,
             },
-            Some(&agent_auth),
+            Some(&crate::test_support::runner_access(&agent_auth)),
         )
         .await
         .unwrap();
@@ -261,12 +289,13 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
         &registry,
         &config.executor_client_id,
         "project-agent-instance",
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: config.executor_project_id.clone(),
             name: Some(config.project_name.clone()),
             path: config.root.to_string_lossy().into_owned(),
             allow_patch: true,
             kind: Some("auto".to_string()),
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
@@ -280,7 +309,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
     )
     .await;
     let db = Arc::new(crate::Database::open(&state.join("data/webcodex.db")).unwrap());
-    let tools = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
+    let tools = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
         registry.clone(),
     ));
     let runtime_project_id = config.runtime_project_id();
@@ -296,7 +325,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                 executor_root: config.root.to_string_lossy().into_owned(),
                 runs_root: paths.runs.to_string_lossy().into_owned(),
                 results_root: paths.results.to_string_lossy().into_owned(),
-                projects_dir: paths.projects.to_string_lossy().into_owned(),
+                project_registry_dir: paths.project_registry.to_string_lossy().into_owned(),
                 profile: config.profile.clone(),
                 project_grant_id: grant_id,
             },
@@ -334,19 +363,19 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                 .push(crate::host_console_http::routes())
                 .push(
                     Router::with_path("shell/agent/register")
-                        .post(crate::shell_client::shell_agent_register),
+                        .post(crate::runner_http::runner_register),
                 )
                 .push(
-                    Router::with_path("shell/agent/poll")
-                        .post(crate::shell_client::shell_agent_poll),
+                    Router::with_path("shell/agent/offline")
+                        .post(crate::runner_http::runner_offline),
                 )
+                .push(Router::with_path("shell/agent/poll").post(crate::runner_http::runner_poll))
                 .push(
-                    Router::with_path("shell/agent/result")
-                        .post(crate::shell_client::shell_agent_result),
+                    Router::with_path("shell/agent/result").post(crate::runner_http::runner_result),
                 )
                 .push(
                     Router::with_path("shell/agent/job_update")
-                        .post(crate::shell_client::shell_agent_job_update),
+                        .post(crate::runner_http::runner_job_update),
                 ),
         );
     AuthenticatedProjectFixture {
@@ -389,7 +418,7 @@ async fn post_connector(
     (status, body)
 }
 
-fn agent_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value); 4] {
+fn runner_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value); 5] {
     [
         (
             "/api/shell/agent/register",
@@ -397,8 +426,15 @@ fn agent_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value);
                 "client_id": client_id,
                 "agent_instance_id": PROJECT_AGENT_INSTANCE,
                 "agent_protocol_generation": 2,
-                "capabilities": crate::test_support::current_runner_capabilities(ShellClientCapabilities::default()),
+                "capabilities": crate::test_support::current_runner_capabilities(RunnerCapabilities::default()),
                 "owner": "local-owner"
+            }),
+        ),
+        (
+            "/api/shell/agent/offline",
+            serde_json::json!({
+                "client_id": client_id,
+                "agent_instance_id": PROJECT_AGENT_INSTANCE
             }),
         ),
         (
@@ -431,9 +467,9 @@ fn agent_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value);
 const PROJECT_AGENT_INSTANCE: &str = "project-agent-instance";
 
 #[tokio::test]
-async fn project_credential_is_rejected_from_every_agent_transport_route() {
+async fn project_credential_is_rejected_from_every_runner_transport_route() {
     let fixture = authenticated_project_fixture().await;
-    for (path, body) in agent_transport_cases(&fixture.client_id) {
+    for (path, body) in runner_transport_cases(&fixture.client_id) {
         let (status, response) = post_connector(&fixture, path, &fixture.credential, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {response}");
         assert!(
@@ -454,13 +490,13 @@ async fn project_agent_token_enforces_client_id_and_bootstrap_still_registers() 
         &fixture,
         "/api/shell/agent/register",
         &fixture.agent_token,
-        agent_transport_cases(&fixture.client_id)[0].1.clone(),
+        runner_transport_cases(&fixture.client_id)[0].1.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["success"], true);
 
-    for (path, body) in agent_transport_cases("wrong-project-client") {
+    for (path, body) in runner_transport_cases("wrong-project-client") {
         let (status, response) = post_connector(&fixture, path, &fixture.agent_token, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {response}");
     }
@@ -473,7 +509,7 @@ async fn project_agent_token_enforces_client_id_and_bootstrap_still_registers() 
             "client_id": "bootstrap-client",
             "agent_instance_id": "bootstrap-instance",
             "agent_protocol_generation": 2,
-            "capabilities": crate::test_support::current_runner_capabilities(ShellClientCapabilities::default()),
+            "capabilities": crate::test_support::current_runner_capabilities(RunnerCapabilities::default()),
             "owner": "local-owner"
         }),
     )
@@ -482,16 +518,13 @@ async fn project_agent_token_enforces_client_id_and_bootstrap_still_registers() 
     assert_eq!(response["success"], true);
 }
 
-async fn next_project_agent_request(
-    registry: &ShellClientRegistry,
-    client_id: &str,
-) -> ShellAgentShellRequest {
+async fn next_project_agent_request(registry: &RunnerRegistry, client_id: &str) -> RunnerRequest {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
+                runner_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
             })
             .await
             .unwrap()
@@ -507,17 +540,17 @@ async fn next_project_agent_request(
 }
 
 async fn complete_project_agent_request(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
-    request: ShellAgentShellRequest,
+    request: RunnerRequest,
     exit_code: i32,
     stdout: String,
     stderr: String,
 ) {
     registry
-        .complete(ShellAgentResultRequest {
+        .complete(RunnerResultRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
+            runner_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
             request_id: request.request_id,
             exit_code: Some(exit_code),
             stdout: Some(stdout),
@@ -529,12 +562,12 @@ async fn complete_project_agent_request(
         .unwrap();
 }
 
-fn record_agent_request(recorder: &Arc<Mutex<Vec<String>>>, request: &ShellAgentShellRequest) {
+fn record_agent_request(recorder: &Arc<Mutex<Vec<String>>>, request: &RunnerRequest) {
     recorder.lock().unwrap().push(request.kind.clone());
 }
 
-fn run_agent_shell_request(request: &ShellAgentShellRequest) -> (i32, String, String) {
-    let mut command = Command::new("sh");
+fn run_runner_shell_request(request: &RunnerRequest) -> (i32, String, String) {
+    let mut command = Command::new(crate::tool_runtime::test_shell());
     command.args(["-lc", &request.command]);
     if let Some(cwd) = request.cwd.as_deref() {
         command.current_dir(cwd);
@@ -548,16 +581,16 @@ fn run_agent_shell_request(request: &ShellAgentShellRequest) -> (i32, String, St
 }
 
 async fn complete_project_job(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
-    request: ShellAgentShellRequest,
+    request: RunnerRequest,
     validation: bool,
 ) {
     let job_id = request.job_id.expect("job dispatch must include job_id");
     registry
-        .update_job(ShellAgentJobUpdateRequest {
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
+            runner_instance_id: PROJECT_AGENT_INSTANCE.to_string(),
             update_seq: None,
             job_id,
             request_id: None,
@@ -580,6 +613,7 @@ async fn complete_project_job(
                 current_step: None,
                 failed_step: None,
             }),
+            activity: None,
             finished: true,
         })
         .await
@@ -639,9 +673,9 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         }),
     )
     .await;
-    registration.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{started}");
     assert_eq!(started["ok"], true, "{started}");
+    registration.await.unwrap();
     let task_id = started["task_id"].as_str().unwrap().to_string();
 
     let registry = fixture.registry.clone();
@@ -686,7 +720,7 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         let request = next_project_agent_request(&registry, &client_id).await;
         record_agent_request(&recorder, &request);
         assert_eq!(request.kind, "run_shell");
-        let (exit_code, stdout, stderr) = run_agent_shell_request(&request);
+        let (exit_code, stdout, stderr) = run_runner_shell_request(&request);
         complete_project_agent_request(&registry, &client_id, request, exit_code, stdout, stderr)
             .await;
     });
@@ -771,9 +805,9 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         command,
     )
     .await;
-    commander.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{commanded}");
     assert_eq!(commanded["ok"], true, "{commanded}");
+    commander.await.unwrap();
 
     let registry = fixture.registry.clone();
     let client_id = fixture.client_id.clone();
@@ -790,7 +824,7 @@ async fn run_authenticated_golden_path(recipe: &str) -> GoldenPathEvidence {
         let request = next_project_agent_request(&registry, &client_id).await;
         record_agent_request(&recorder, &request);
         assert_eq!(request.kind, "start_validation_job");
-        let steps: Vec<crate::shell_protocol::ShellJobValidationStep> =
+        let steps: Vec<crate::runner_protocol::ShellJobValidationStep> =
             serde_json::from_str(&request.command).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].program, expected_program);
@@ -953,7 +987,7 @@ async fn authenticated_golden_path_emits_no_discovery_or_session_calls() {
         "tool_manifest",
         "start_session",
         "current_session",
-        "list_agents",
+        "list_runners",
     ] {
         assert!(!evidence
             .request_paths
@@ -1100,7 +1134,7 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
     );
     let agent = fs::read_to_string(state.join("agent/runner.toml")).unwrap();
     let registration = fs::read_to_string(
-        fs::read_dir(state.join("agent/projects.d"))
+        fs::read_dir(state.join("agent/project-registry"))
             .unwrap()
             .next()
             .unwrap()
@@ -1123,10 +1157,10 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
         Some(canonical_root.to_string_lossy().as_ref())
     );
     assert_eq!(
-        agent_toml["projects_dir"].as_str(),
+        agent_toml["project_registry_dir"].as_str(),
         Some(
             canonical_state
-                .join("agent/projects.d")
+                .join("agent/project-registry")
                 .to_string_lossy()
                 .as_ref()
         )
@@ -1140,7 +1174,7 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
         fs::read_to_string(state.join("agent/runner.toml")).unwrap(),
         before.0
     );
-    let project_file = fs::read_dir(state.join("agent/projects.d"))
+    let project_file = fs::read_dir(state.join("agent/project-registry"))
         .unwrap()
         .next()
         .unwrap()
@@ -1168,13 +1202,50 @@ fn fresh_setup_is_minimal_idempotent_and_does_not_expose_internal_ids() {
 }
 
 #[test]
+fn setup_preserves_a_single_legacy_project_registry_layout() {
+    let (_temp, root, state) = repo("legacy-registry");
+    let legacy = state.join("agent/projects.d");
+    fs::create_dir_all(&legacy).unwrap();
+    let options = options(root, state.clone());
+
+    setup(&options).unwrap();
+
+    assert!(legacy.is_dir());
+    assert!(!state.join("agent/project-registry").exists());
+    let runner = fs::read_to_string(state.join("agent/runner.toml")).unwrap();
+    let runner_toml: toml::Value = toml::from_str(&runner).unwrap();
+    assert_eq!(
+        runner_toml["project_registry_dir"].as_str(),
+        Some(legacy.canonicalize().unwrap().to_string_lossy().as_ref())
+    );
+    assert_eq!(fs::read_dir(legacy).unwrap().count(), 1);
+}
+
+#[test]
+fn setup_fails_closed_when_both_project_registry_layouts_exist() {
+    let (_temp, root, state) = repo("ambiguous-registry");
+    fs::create_dir_all(state.join("agent/project-registry")).unwrap();
+    fs::create_dir_all(state.join("agent/projects.d")).unwrap();
+
+    let error = setup(&options(root, state)).unwrap_err();
+    assert_eq!(error.code, "project_registration_invalid");
+    assert!(
+        error
+            .message
+            .contains("both Runner project registry directories exist"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn setup_repairs_only_missing_components_and_preserves_existing_config() {
     let (_temp, root, state) = repo("repair");
     let options = options(root, state.clone());
     setup(&options).unwrap();
     let agent_path = state.join("agent/runner.toml");
     let original_agent = fs::read_to_string(&agent_path).unwrap();
-    let project_path = fs::read_dir(state.join("agent/projects.d"))
+    let project_path = fs::read_dir(state.join("agent/project-registry"))
         .unwrap()
         .next()
         .unwrap()
@@ -1442,7 +1513,10 @@ async fn arbitrary_shared_key_cannot_access_project_connector() {
     };
     let pending = fixture
         .registry
-        .get_client_view_for_auth(&fixture.client_id, Some(&fixture.agent_auth))
+        .get_runner_view_for_auth(
+            &fixture.client_id,
+            Some(&crate::test_support::runner_access(&fixture.agent_auth)),
+        )
         .await
         .unwrap()
         .pending_requests;
@@ -1559,7 +1633,10 @@ async fn connector_credential_cannot_cross_agent_auth_group() {
     };
     let agent = fixture
         .registry
-        .get_client_view_for_auth(&fixture.client_id, Some(&fixture.agent_auth))
+        .get_runner_view_for_auth(
+            &fixture.client_id,
+            Some(&crate::test_support::runner_access(&fixture.agent_auth)),
+        )
         .await
         .unwrap();
     let serialized =
@@ -1641,7 +1718,7 @@ fn doctor_reports_malformed_registration() {
     let (_temp, root, state) = repo("malformed-registration");
     let options = options(root, state.clone());
     setup(&options).unwrap();
-    let project_path = fs::read_dir(state.join("agent/projects.d"))
+    let project_path = fs::read_dir(state.join("agent/project-registry"))
         .unwrap()
         .next()
         .unwrap()
@@ -1664,21 +1741,22 @@ fn doctor_reports_malformed_registration() {
 
 #[test]
 fn doctor_reports_conflicting_registration() {
-    let (_temp, root, state) = repo("conflicting-registration");
+    let (temp, root, state) = repo("conflicting-registration");
     let options = options(root, state.clone());
     setup(&options).unwrap();
-    let project_path = fs::read_dir(state.join("agent/projects.d"))
+    let project_path = fs::read_dir(state.join("agent/project-registry"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .path();
     let before = fs::read_to_string(&project_path).unwrap();
-    let canonical_root = options.root.canonicalize().unwrap();
-    let conflicting = before.replace(
-        &format!("path = \"{}\"", canonical_root.display()),
-        "path = \"/different/project\"",
-    );
+    let different_root = temp.path().join("different-project");
+    fs::create_dir(&different_root).unwrap();
+    let different_root = different_root.canonicalize().unwrap();
+    let mut registration: toml::Value = toml::from_str(&before).unwrap();
+    registration["path"] = toml::Value::String(different_root.to_string_lossy().into_owned());
+    let conflicting = toml::to_string(&registration).unwrap();
     assert_ne!(conflicting, before);
     fs::write(&project_path, &conflicting).unwrap();
 
@@ -1803,7 +1881,10 @@ fn seed_ready_console(
             now,
         })
         .unwrap();
-    let prepared = manager.prepare(&context, task_id, run_id, false).unwrap();
+    let prepared = webcodex_connector_runtime::workspace::root_test_support::prepare(
+        &manager, &context, task_id, run_id, false,
+    )
+    .unwrap();
     let task = fixture
         .db
         .start_connector_task(crate::db::NewConnectorTask {
@@ -1825,7 +1906,9 @@ fn seed_ready_console(
         })
         .unwrap();
     fs::write(Path::new(&task.execution_root).join("README.md"), "after\n").unwrap();
-    let captured = manager.capture_result(&task).unwrap();
+    let captured =
+        webcodex_connector_runtime::workspace::root_test_support::capture_result(&manager, &task)
+            .unwrap();
     let result_id = format!(
         "wc_result_{}",
         &task_id["wc_task_".len().."wc_task_".len() + 16]

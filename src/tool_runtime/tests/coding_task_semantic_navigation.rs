@@ -1,21 +1,20 @@
 use super::support::*;
 use crate::lsp_bridge::{
-    AgentLspRequest, AgentLspResultEnvelope, LspAvailabilityStatus, LspCommandSource,
-    LspServerStatusEntry, LspStatusResult, AGENT_LSP_REQUEST_KIND,
+    LspAvailabilityStatus, LspCommandSource, LspServerStatusEntry, LspStatusResult,
+    RunnerLspRequest, RunnerLspResultEnvelope, AGENT_LSP_REQUEST_KIND,
 };
-use crate::shell_protocol::{
-    ShellAgentResultRequest, ShellClientCapabilities,
-    SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerResultRequest, RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
 };
 use crate::tool_runtime::{
-    known_tool_names, model_hidden_tool_names, registered_tool_specs, SessionMode, ToolCall,
-    ToolResult, ToolRuntime,
+    known_tool_names, model_hidden_tool_names, registered_tool_specs, SessionMode, ToolResult,
+    ToolRuntime,
 };
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-fn semantic_capabilities(enabled: bool) -> ShellClientCapabilities {
-    ShellClientCapabilities {
+fn semantic_capabilities(enabled: bool) -> RunnerCapabilities {
+    RunnerCapabilities {
         shell: true,
         git: true,
         file_read: true,
@@ -40,23 +39,7 @@ async fn register_semantic_agent(
         vec![registered_project(project_id, &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
-}
-
-fn start_call(project: String, mode: SessionMode) -> ToolCall {
-    ToolCall::StartCodingTask {
-        project,
-        client_id: None,
-        path: None,
-        temporary_project_name: None,
-        title: Some("semantic navigation startup".to_string()),
-        mode,
-        detail: Default::default(),
-        deny_write_tools: false,
-        deny_shell_tools: false,
-        resume_session_id: None,
-        execution_context: None,
-    }
+    crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
 }
 
 fn spawn_start(
@@ -67,7 +50,22 @@ fn spawn_start(
     let runtime = runtime.clone();
     tokio::spawn(async move {
         runtime
-            .dispatch_with_auth(start_call(project, mode), Some(&auth_context(None, true)))
+            .start_coding_workflow_for_test(
+                project,
+                None,
+                None,
+                Some("semantic navigation startup".to_string()),
+                mode,
+                false,
+                false,
+                Default::default(),
+                None,
+                None,
+                Some(&auth_context(None, true)),
+                None,
+                None,
+                crate::tool_runtime::sessions::SessionTransport::Api,
+            )
             .await
     })
 }
@@ -75,13 +73,13 @@ fn spawn_start(
 async fn next_semantic_status_request(
     runtime: &ToolRuntime,
     client_id: &str,
-) -> crate::shell_protocol::ShellAgentShellRequest {
+) -> crate::runner_protocol::RunnerRequest {
     let request = wait_for_patch_agent_request(runtime, client_id).await;
     assert_eq!(request.kind, AGENT_LSP_REQUEST_KIND);
     assert!(request.command.is_empty());
     assert!(request.stdin.is_none());
     let payload = request.lsp.as_ref().expect("typed LSP payload");
-    assert_eq!(payload.request, AgentLspRequest::Status);
+    assert_eq!(payload.request, RunnerLspRequest::Status);
     request
 }
 
@@ -89,7 +87,7 @@ async fn complete_status_envelope(
     runtime: &ToolRuntime,
     client_id: &str,
     request_id: &str,
-    envelope: AgentLspResultEnvelope,
+    envelope: RunnerLspResultEnvelope,
 ) {
     complete_patch_agent_request(
         runtime,
@@ -143,7 +141,7 @@ async fn start_with_status(
         &runtime,
         "semantic-agent",
         &request.request_id,
-        AgentLspResultEnvelope::ok(status_result("demo", true, status, position_encoding)),
+        RunnerLspResultEnvelope::ok(status_result("demo", true, status, position_encoding)),
     )
     .await;
     finish_start_servicing_locally(&runtime, "semantic-agent", task).await
@@ -154,8 +152,8 @@ fn seed_clean_repo(root: &std::path::Path) {
     commit_file(root, "README.md", "# demo\n", "chore: seed fixture");
 }
 
-/// Standard-detail startup inspects git through the agent; service those
-/// remaining requests locally until start_coding_task finishes.
+/// Standard-detail startup inspects Git through the Runner; service those
+/// remaining requests locally until the coding workflow finishes.
 async fn finish_start_servicing_locally(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -165,7 +163,7 @@ async fn finish_start_servicing_locally(
     while !task.is_finished() {
         assert!(
             Instant::now() < deadline,
-            "start_coding_task did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the 10-second test deadline"
         );
         if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
             complete_agent_request_by_running_locally(runtime, client_id, request).await;
@@ -272,7 +270,7 @@ async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
         &runtime,
         "non-rust-agent",
         &request.request_id,
-        AgentLspResultEnvelope::ok(status_result(
+        RunnerLspResultEnvelope::ok(status_result(
             "demo",
             false,
             LspAvailabilityStatus::Available,
@@ -295,13 +293,25 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
     let project =
         register_semantic_agent(&runtime, "offline-agent", "demo", temp.path(), true).await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("offline-agent", "inst")
         .await;
     let result = runtime
-        .dispatch_with_auth(
-            start_call(project, SessionMode::Normal),
+        .start_coding_workflow_for_test(
+            project,
+            None,
+            None,
+            Some("semantic navigation startup".to_string()),
+            SessionMode::Normal,
+            false,
+            false,
+            Default::default(),
+            None,
+            None,
             Some(&auth_context(None, true)),
+            None,
+            None,
+            crate::tool_runtime::sessions::SessionTransport::Api,
         )
         .await;
     assert!(result.success, "{result:?}");
@@ -349,18 +359,22 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
     let semantic = &result.output["semantic_navigation"];
     assert_eq!(semantic["status"], "probe_timeout");
     assert_eq!(semantic["reason_code"], "status_probe_timed_out");
-    assert!(result.output["warnings"]
+    assert_eq!(semantic["supported"], true);
+    assert_eq!(semantic["available"], Value::Null);
+    assert_eq!(semantic["provider"], Value::Null);
+    assert_eq!(semantic["capability"], "lsp_read_only_navigation");
+    assert!(!result.output["warnings"]
         .as_array()
         .unwrap()
         .iter()
         .any(|warning| warning == "semantic_navigation_unavailable"));
-    assert_eq!(result.output["startup_verdict"]["status"], "warn");
+    assert_eq!(result.output["startup_verdict"]["status"], "pass");
 
     let expired = runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "timeout-agent".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some("{}".to_string()),
@@ -428,7 +442,7 @@ async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() 
         &runtime,
         "failed-agent",
         &request.request_id,
-        AgentLspResultEnvelope::err("lsp_protocol_error", "private raw failure detail"),
+        RunnerLspResultEnvelope::err("lsp_protocol_error", "private raw failure detail"),
     )
     .await;
     let result = finish_start_servicing_locally(&runtime, "failed-agent", task).await;
@@ -457,7 +471,7 @@ async fn coding_task_semantic_navigation_read_only_keeps_compact_shape() {
         &runtime,
         "compact-agent",
         &request.request_id,
-        AgentLspResultEnvelope::ok(status_result(
+        RunnerLspResultEnvelope::ok(status_result(
             "demo",
             true,
             LspAvailabilityStatus::Available,
@@ -477,7 +491,7 @@ async fn coding_task_semantic_navigation_read_only_keeps_compact_shape() {
 }
 
 #[test]
-fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_are_stable() {
+fn coding_workflow_semantic_navigation_output_schema_is_explicit_and_surface_counts_are_stable() {
     let specs = registered_tool_specs();
     let runtime_tool_count = specs.len();
     assert_eq!(
@@ -485,7 +499,7 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
         known_tool_names().count(),
         "visible runtime tool count + hidden tools must cover every known tool"
     );
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
+    let schema = crate::tool_runtime::registry::coding_workflow_diagnostic_output_schema_for_test();
     let standard = schema["properties"]["output"]["oneOf"]
         .as_array()
         .unwrap()
@@ -524,6 +538,6 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
         .sum();
     assert_eq!(operation_count, 22);
     assert!(!known_tool_names().any(|name| name == "semantic_navigation"));
-    assert!(crate::shell_protocol::SHELL_CLIENT_CAPABILITY_NAMES
-        .contains(&SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION));
+    assert!(crate::runner_protocol::RUNNER_CAPABILITY_NAMES
+        .contains(&RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION));
 }

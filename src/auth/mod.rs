@@ -66,7 +66,7 @@ pub(crate) use project_credential::{
 };
 pub(crate) use project_share::{
     configured_project_share_subject, generate_project_share_session_id,
-    parse_project_share_subject_id, project_share_scopes_are_bounded, validate_project_grant_id,
+    parse_project_share_subject_id, project_share_scopes_are_bounded,
     validate_project_share_grant_subject, PROJECT_SHARE_OAUTH_SCOPES,
     PROJECT_SHARE_OAUTH_SUBJECT_KIND, PROJECT_SHARE_OAUTH_TOKEN_KIND,
 };
@@ -77,8 +77,8 @@ pub use scopes::{
     SCOPE_COMMUNICATION_READ, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
     SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
     SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL,
-    SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE,
-    SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
+    SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PLUGIN_LOCAL, SCOPE_PROJECT_READ,
+    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
 };
 #[cfg(test)]
 pub use scopes::{SCOPE_ACCOUNT_MANAGE, SCOPE_JOB_DETACH};
@@ -92,7 +92,7 @@ pub(crate) use middleware::{
 };
 #[cfg(test)]
 pub(crate) use middleware::{
-    enforce_token_surface, is_account_control_path, is_agent_transport_path,
+    enforce_token_surface, is_account_control_path, is_runner_transport_path,
 };
 
 pub(crate) use pat::{
@@ -106,6 +106,25 @@ pub(crate) use shared_key::{
     allow_anonymous_enabled, is_managed_token_prefix, open_anonymous_context, shared_key_context,
     shared_key_enabled, shared_key_hash_of, DIRECT_SHARED_KEY_MODEL_SCOPES,
 };
+
+/// Root auth policy for OAuth client-secret verification. Persistence returns
+/// the stored hash; hashing and constant-time comparison stay outside the
+/// durable store boundary.
+pub(crate) fn verify_oauth_client_secret(
+    db: &Database,
+    client_id: &str,
+    plaintext_secret: &str,
+) -> anyhow::Result<bool> {
+    let client = db.get_oauth_client_by_client_id(client_id)?;
+    let Some(client) = client else {
+        return Ok(false);
+    };
+    let computed = pat::hash_token(plaintext_secret);
+    Ok(crate::config::constant_time_eq(
+        computed.as_bytes(),
+        client.client_secret_hash.as_bytes(),
+    ))
+}
 
 pub(crate) use tokens::{authenticate, is_oauth2_access_token};
 #[cfg(test)]
@@ -187,7 +206,7 @@ fn restore_test_env(name: &str, value: &Option<std::ffi::OsString>) {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone authentication function (used by QUIC agent transport)
+// Standalone authentication function (used by QUIC Runner transport)
 // ---------------------------------------------------------------------------
 
 /// Authenticate a bearer token *outside* the HTTP request path, reusing the
@@ -203,12 +222,12 @@ fn restore_test_env(name: &str, value: &Option<std::ffi::OsString>) {
 ///   already on an allowed surface.
 /// - **Account credential (`wc_acct_*`)**: **rejected** — returns `None`.
 ///   Account credentials are only valid on HTTP account-control endpoints.
-///   The QUIC/agent transport has no use for them, and accepting them would
+///   The QUIC/Runner transport has no use for them, and accepting them would
 ///   silently update `last_used_at` before the caller rejects the connection.
 /// - **OAuth2 access token (`wc_oat_*`)**: **rejected** — returns `None`
 ///   *before* running the verifier chain, so `last_used_at` is not updated.
 ///   OAuth2 tokens are accepted on regular HTTP surfaces via `AuthMiddleware`,
-///   but not on the QUIC/agent transport surface.
+///   but not on the QUIC/Runner transport surface.
 ///
 /// Returns `None` for unknown/invalid tokens or when the token is recognized
 /// but rejected (disabled user, expired token, account credential). The
@@ -247,7 +266,7 @@ pub(crate) async fn authenticate_bearer(
     // the connection either way.
     match authenticate(config, db, token).await {
         Ok(Some(ctx)) => {
-            // Account credentials are not valid on the agent transport surface.
+            // Account credentials are not valid on the Runner transport surface.
             // Reject them here so they don't silently update last_used_at and then
             // get rejected by the caller anyway.
             if ctx.is_account_credential() {

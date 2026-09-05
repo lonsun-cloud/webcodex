@@ -5,10 +5,10 @@
 use super::support::*;
 use crate::auth::AuthContext;
 use crate::client_window::ClientWindow;
-use crate::shell_client::AgentTransport;
-use crate::shell_protocol::{
-    AgentBuildInfo, AgentHostContext, AgentProtocolGenerationNumber, ShellClientCapabilities,
-    ShellClientRegisterRequest, ShellJobOpRequest, AGENT_PROTOCOL_GENERATION_V2,
+use crate::runner_http::RunnerTransport;
+use crate::runner_protocol::{
+    RunnerBuildInfo, RunnerCapabilities, RunnerHostContext, RunnerProtocolGenerationNumber,
+    RunnerRegisterRequest, ShellJobOpRequest, RUNNER_PROTOCOL_GENERATION_V2,
 };
 use crate::tool_runtime::observations::ToolCallObservation;
 use crate::tool_runtime::tool_inputs::{SessionMode, StartupDetail};
@@ -47,17 +47,17 @@ fn register_request(
     client_id: &str,
     instance: &str,
     process_started_at: Option<i64>,
-    build: Option<AgentBuildInfo>,
-) -> ShellClientRegisterRequest {
-    crate::test_support::current_runner_registration(ShellClientRegisterRequest {
+    build: Option<RunnerBuildInfo>,
+) -> RunnerRegisterRequest {
+    crate::test_support::current_runner_registration(RunnerRegisterRequest {
         client_id: client_id.to_string(),
-        agent_instance_id: instance.to_string(),
-        agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+        runner_instance_id: instance.to_string(),
+        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
         display_name: None,
         owner: None,
         hostname: None,
         host_context: None,
-        capabilities: ShellClientCapabilities {
+        capabilities: RunnerCapabilities {
             shell: true,
             git: true,
             file_read: true,
@@ -82,10 +82,10 @@ async fn register_with_project(
     client_id: &str,
     instance: &str,
     process_started_at: Option<i64>,
-    build: Option<AgentBuildInfo>,
+    build: Option<RunnerBuildInfo>,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register(register_request(
             client_id,
             instance,
@@ -95,7 +95,7 @@ async fn register_with_project(
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         instance,
         vec![registered_project("proj", "/tmp/reconnect-proj")],
@@ -164,7 +164,7 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
 
     // Disconnect: layers change independently; stale registration is not ready.
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("rc-agent", "inst-a")
         .await;
     let disconnected = layers(&runtime).await;
@@ -205,7 +205,7 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
     assert_eq!(reconnected["project_registry"]["status"], "registered");
 
     // Calls recover: a dispatched shell tool reaches the new instance.
-    let project = crate::tool_runtime::agent_project_runtime_id("rc-agent", "proj");
+    let project = crate::tool_runtime::runner_project_runtime_id("rc-agent", "proj");
     let run = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -226,7 +226,7 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "rc-agent", "inst-b").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "rc-agent", "inst-b").await;
     complete_patch_agent_request_for_instance(
         &runtime,
         "rc-agent",
@@ -246,7 +246,7 @@ async fn stale_heartbeat_without_disconnect_is_not_ready() {
     let runtime = test_runtime();
     register_with_project(&runtime, "stale-agent", "inst-a", None, None).await;
     runtime
-        .shell_clients
+        .runner_registry
         .set_last_seen_for_test("stale-agent", chrono::Utc::now().timestamp() - 3600)
         .await;
     let stale = layers(&runtime).await;
@@ -390,7 +390,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
             .unwrap();
 
     let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    let project = register_agent_project_at_path_with_auth(
+    let project = register_runner_project_at_path_with_auth(
         &runtime1,
         "canonical-restart-agent",
         "proj",
@@ -398,19 +398,16 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
         &alice,
     )
     .await;
-    let started = dispatch_start_coding_task_in_window(
+    let started = dispatch_coding_call_in_window(
         &runtime1,
         "canonical-restart-agent",
-        coding_start_call(&project, "canonical root", SessionMode::Normal),
+        coding_start_call(&project, "canonical root"),
         Some(&alice),
         "canonical-restart-window",
     )
     .await;
     assert!(started.success, "{:?}", started.error);
-    let session_id = started.output["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let session_id = started.output["session_id"].as_str().unwrap().to_string();
     runtime1.sessions.flush_persistence();
     assert_eq!(
         persisted_session_authority_fingerprint(&ledger, &session_id).as_deref(),
@@ -419,7 +416,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
     drop(runtime1);
 
     let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    register_agent_project_at_path_with_auth(
+    register_runner_project_at_path_with_auth(
         &runtime2,
         "canonical-restart-agent",
         "proj",
@@ -428,7 +425,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
     )
     .await;
     assert_eq!(runtime2.sessions.status().restored_sessions, 1);
-    let resumed = dispatch_start_coding_task_in_window(
+    let resumed = dispatch_coding_call_in_window(
         &runtime2,
         "canonical-restart-agent",
         coding_resume_call(&project, "explicit canonical resume", &session_id),
@@ -437,7 +434,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
     )
     .await;
     assert!(resumed.success, "{:?}", resumed.error);
-    assert_eq!(resumed.output["session"]["session_id"], session_id);
+    assert_eq!(resumed.output["session_id"], session_id);
     assert_eq!(
         runtime2
             .sessions
@@ -457,7 +454,7 @@ async fn malformed_persisted_authority_is_discarded_fail_closed() {
     let alice = shared_key_auth_context("malformed-authority-alice");
 
     let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    let project = register_agent_project_at_path_with_auth(
+    let project = register_runner_project_at_path_with_auth(
         &runtime1,
         "malformed-authority-agent",
         "proj",
@@ -465,19 +462,16 @@ async fn malformed_persisted_authority_is_discarded_fail_closed() {
         &alice,
     )
     .await;
-    let started = dispatch_start_coding_task_in_window(
+    let started = dispatch_coding_call_in_window(
         &runtime1,
         "malformed-authority-agent",
-        coding_start_call(&project, "canonical root", SessionMode::Normal),
+        coding_start_call(&project, "canonical root"),
         Some(&alice),
         "malformed-authority-window",
     )
     .await;
     assert!(started.success, "{:?}", started.error);
-    let session_id = started.output["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let session_id = started.output["session_id"].as_str().unwrap().to_string();
     runtime1.sessions.flush_persistence();
     drop(runtime1);
     rewrite_persisted_session_with_malformed_authority(&ledger, &session_id);
@@ -497,7 +491,7 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
 
     // Start an async agent job and let the agent pick it up.
     let job = runtime
-        .shell_clients
+        .runner_registry
         .start_job(
             ShellJobOpRequest {
                 op: "start".to_string(),
@@ -516,14 +510,14 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
         )
         .await
         .unwrap();
-    let _req = wait_for_agent_request_for_instance(&runtime, "job-agent", "inst-a").await;
+    let _req = wait_for_runner_request_for_instance(&runtime, "job-agent", "inst-a").await;
 
     // Transport drops mid-job: job authority is not silently completed.
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("job-agent", "inst-a")
         .await;
-    let jobs = runtime.shell_clients.list_jobs(None).await;
+    let jobs = runtime.runner_registry.list_jobs(None).await;
     let lost = jobs
         .iter()
         .find(|info| info.job_id == job.job_id)
@@ -534,7 +528,7 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
     // Reconnect with a new instance: the terminal state must not be
     // resurrected or duplicated.
     register_with_project(&runtime, "job-agent", "inst-b", None, None).await;
-    let jobs = runtime.shell_clients.list_jobs(None).await;
+    let jobs = runtime.runner_registry.list_jobs(None).await;
     let still_lost = jobs
         .iter()
         .find(|info| info.job_id == job.job_id)
@@ -547,20 +541,24 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
 async fn runtime_status_keeps_generation_independent_from_transport() {
     let runtime = test_runtime();
     let cases = [
-        ("polling-gen2", AgentTransport::Polling, "polling"),
-        ("websocket-gen2", AgentTransport::WebSocket, "websocket"),
-        ("quic-gen2", AgentTransport::Quic, "quic"),
+        ("polling-gen2", RunnerTransport::Polling, "polling"),
+        ("websocket-gen2", RunnerTransport::WebSocket, "websocket"),
+        ("quic-gen2", RunnerTransport::Quic, "quic"),
     ];
 
     for (client_id, transport, _) in cases.iter().copied() {
         let registration = register_request(client_id, "inst", None, None);
         match transport {
-            AgentTransport::Polling => {
-                runtime.shell_clients.register(registration).await.unwrap();
-            }
-            AgentTransport::WebSocket | AgentTransport::Quic => {
+            RunnerTransport::Polling => {
                 runtime
-                    .shell_clients
+                    .runner_registry
+                    .register(registration)
+                    .await
+                    .unwrap();
+            }
+            RunnerTransport::WebSocket | RunnerTransport::Quic => {
+                runtime
+                    .runner_registry
                     .register_streaming_session(
                         registration,
                         None,
@@ -587,7 +585,7 @@ async fn runtime_status_keeps_generation_independent_from_transport() {
             .unwrap_or_else(|| panic!("runner {client_id} missing"));
         assert_eq!(
             runner["agent_protocol_generation"],
-            AGENT_PROTOCOL_GENERATION_V2.get()
+            RUNNER_PROTOCOL_GENERATION_V2.get()
         );
         assert_eq!(runner["status"], "compatible");
 
@@ -598,7 +596,7 @@ async fn runtime_status_keeps_generation_independent_from_transport() {
         assert_eq!(client["transport"], transport);
         assert_eq!(
             client["agent_protocol_generation"],
-            AGENT_PROTOCOL_GENERATION_V2.get()
+            RUNNER_PROTOCOL_GENERATION_V2.get()
         );
         assert_eq!(client["project_inventory"]["sync_state"], "pending");
     }
@@ -617,12 +615,12 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
         server_build.git_commit.unwrap_or("server-source")
     );
     runtime
-        .shell_clients
+        .runner_registry
         .register(register_request(
             "same-version-different-source",
             "inst-1",
             None,
-            Some(AgentBuildInfo {
+            Some(RunnerBuildInfo {
                 version: Some(server_version.to_string()),
                 git_commit: Some(different_commit),
                 git_dirty: Some(false),
@@ -632,12 +630,12 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
         .unwrap();
     // Different build version → version_mismatch (connected ≠ compatible).
     runtime
-        .shell_clients
+        .runner_registry
         .register(register_request(
             "old-build",
             "inst-2",
             None,
-            Some(AgentBuildInfo {
+            Some(RunnerBuildInfo {
                 version: Some("0.0.1".to_string()),
                 git_commit: None,
                 git_dirty: None,
@@ -648,9 +646,9 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     // Unsupported protocol generations fail registration and therefore never
     // become a diagnostic-but-operational runtime client.
     let mut unsupported = register_request("future-generation", "inst-3", None, None);
-    unsupported.agent_protocol_generation = AgentProtocolGenerationNumber::new(3);
+    unsupported.runner_protocol_generation = RunnerProtocolGenerationNumber::new(3);
     let unsupported = runtime
-        .shell_clients
+        .runner_registry
         .register(unsupported)
         .await
         .unwrap_err();
@@ -713,14 +711,14 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
 async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
     let runtime = test_runtime();
     let mut request = register_request("sf", "inst-host-context", None, None);
-    request.host_context = Some(AgentHostContext {
+    request.host_context = Some(RunnerHostContext {
         role: Some("server_host".to_string()),
         runtime: Some("Prefer this Runner for operations on its own host.".to_string()),
         service: Some("Use the ordinary host-local service mechanism.".to_string()),
         network: None,
         architecture: Some("Hosts the WebCodex Server/control plane.".to_string()),
     });
-    runtime.shell_clients.register(request).await.unwrap();
+    runtime.runner_registry.register(request).await.unwrap();
 
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
@@ -749,7 +747,7 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
     assert!(compact_sf.get("capabilities").is_none());
     assert!(compact_sf.get("policy").is_none());
 
-    let listed = runtime.list_agents(None).await;
+    let listed = runtime.list_runners(None).await;
     assert!(listed.success);
     let listed_sf = listed.output["agents"]
         .as_array()
@@ -763,12 +761,12 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
     // Same-instance reconnect republishes the current startup context; it does
     // not depend on the previous transport record for this descriptive fact.
     let mut reconnect = register_request("sf", "inst-host-context", None, None);
-    reconnect.host_context = Some(AgentHostContext {
+    reconnect.host_context = Some(RunnerHostContext {
         role: Some("server_host".to_string()),
         network: Some("Internal destinations normally use the direct path.".to_string()),
         ..Default::default()
     });
-    runtime.shell_clients.register(reconnect).await.unwrap();
+    runtime.runner_registry.register(reconnect).await.unwrap();
     let after_reconnect = runtime.runtime_status(None).await;
     let sf = after_reconnect.output["agents"]["clients"]
         .as_array()
@@ -786,27 +784,27 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
 async fn runner_host_context_is_revalidated_at_server_registration() {
     let runtime = test_runtime();
     let mut request = register_request("bad-context", "inst-bad", None, None);
-    request.host_context = Some(AgentHostContext {
+    request.host_context = Some(RunnerHostContext {
         role: Some("Server Host".to_string()),
         ..Default::default()
     });
-    let err = runtime.shell_clients.register(request).await.unwrap_err();
+    let err = runtime.runner_registry.register(request).await.unwrap_err();
     assert!(err.contains("host_context.role"), "{err}");
     assert!(runtime
-        .shell_clients
-        .get_client_view("bad-context")
+        .runner_registry
+        .get_runner_view("bad-context")
         .await
         .is_none());
 }
 
-pub(in crate::tool_runtime::tests) async fn dispatch_start_coding_task_in_window(
+pub(in crate::tool_runtime::tests) async fn dispatch_coding_call_in_window(
     runtime: &ToolRuntime,
     client_id: &str,
     call: ToolCall,
     auth: Option<&AuthContext>,
     window_id: &str,
 ) -> crate::tool_runtime::ToolResult {
-    dispatch_start_coding_task_in_window_with_transport(
+    dispatch_coding_call_in_window_with_transport(
         runtime,
         client_id,
         call,
@@ -817,7 +815,7 @@ pub(in crate::tool_runtime::tests) async fn dispatch_start_coding_task_in_window
     .await
 }
 
-async fn dispatch_start_coding_task_in_window_with_transport(
+async fn dispatch_coding_call_in_window_with_transport(
     runtime: &ToolRuntime,
     client_id: &str,
     call: ToolCall,
@@ -846,18 +844,18 @@ async fn dispatch_start_coding_task_in_window_with_transport(
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "start_coding_task did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the 10-second test deadline"
         );
         if let Some(req) = runtime
-            .shell_clients
-            .poll(crate::shell_protocol::ShellAgentPollRequest {
+            .runner_registry
+            .poll(crate::runner_protocol::RunnerPollRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
             })
             .await
             .unwrap()
         {
-            let (exit_code, stdout, stderr) = run_agent_shell_request_locally(&req);
+            let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&req);
             complete_patch_agent_request(
                 runtime,
                 client_id,
@@ -874,59 +872,51 @@ async fn dispatch_start_coding_task_in_window_with_transport(
     task.await.unwrap()
 }
 
-fn coding_start_call(project: &str, instruction: &str, mode: SessionMode) -> ToolCall {
-    ToolCall::StartCodingTask {
+fn coding_start_call(project: &str, instruction: &str) -> ToolCall {
+    ToolCall::WorkOnProject {
         project: project.to_string(),
         client_id: None,
         path: None,
-        temporary_project_name: None,
-        title: Some(instruction.to_string()),
-        mode,
-        deny_write_tools: false,
-        deny_shell_tools: false,
-        detail: StartupDetail::Standard,
-        resume_session_id: None,
-        execution_context: None,
+        instruction: instruction.to_string(),
+        session_id: None,
+        include_project_instructions: true,
+        include_workflow_guidance: true,
     }
 }
 
 fn coding_resume_call(project: &str, instruction: &str, session_id: &str) -> ToolCall {
-    ToolCall::StartCodingTask {
+    ToolCall::WorkOnProject {
         project: project.to_string(),
         client_id: None,
         path: None,
-        temporary_project_name: None,
-        title: Some(instruction.to_string()),
-        mode: SessionMode::Normal,
-        deny_write_tools: false,
-        deny_shell_tools: false,
-        detail: StartupDetail::Standard,
-        resume_session_id: Some(session_id.to_string()),
-        execution_context: None,
+        instruction: instruction.to_string(),
+        session_id: Some(session_id.to_string()),
+        include_project_instructions: true,
+        include_workflow_guidance: true,
     }
 }
 
 #[tokio::test]
-async fn start_coding_task_without_resume_always_creates_fresh_session() {
+async fn work_on_project_without_resume_always_creates_fresh_session() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "continuity-agent", "demo", dir.path()).await;
+        register_runner_project_at_path(&runtime, "continuity-agent", "demo", dir.path()).await;
     let auth = auth_context(None, true);
 
-    let first = dispatch_start_coding_task_in_window(
+    let first = dispatch_coding_call_in_window(
         &runtime,
         "continuity-agent",
-        coding_start_call(&project, "root objective", SessionMode::Normal),
+        coding_start_call(&project, "root objective"),
         Some(&auth),
         "continuity-window",
     )
     .await;
-    let second = dispatch_start_coding_task_in_window(
+    let second = dispatch_coding_call_in_window(
         &runtime,
         "continuity-agent",
-        coding_start_call(&project, "follow-up objective", SessionMode::Normal),
+        coding_start_call(&project, "follow-up objective"),
         Some(&auth),
         "continuity-window",
     )
@@ -934,11 +924,11 @@ async fn start_coding_task_without_resume_always_creates_fresh_session() {
 
     assert!(first.success, "{:?}", first.error);
     assert!(second.success, "{:?}", second.error);
-    let first_id = first.output["session"]["session_id"].as_str().unwrap();
-    let second_id = second.output["session"]["session_id"].as_str().unwrap();
+    let first_id = first.output["session_id"].as_str().unwrap();
+    let second_id = second.output["session_id"].as_str().unwrap();
     assert_ne!(second_id, first_id);
-    assert_eq!(first.output["session"]["continuation"], "created");
-    assert_eq!(second.output["session"]["continuation"], "created");
+    assert_eq!(first.output["continuation"], "created");
+    assert_eq!(second.output["continuation"], "created");
     assert_eq!(
         runtime
             .sessions
@@ -968,32 +958,32 @@ async fn start_coding_task_without_resume_always_creates_fresh_session() {
 }
 
 #[tokio::test]
-async fn start_coding_task_second_fresh_start_preserves_previous_session() {
+async fn work_on_project_second_fresh_start_preserves_previous_session() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "isolation-agent", "demo", dir.path()).await;
+        register_runner_project_at_path(&runtime, "isolation-agent", "demo", dir.path()).await;
     let auth = auth_context(None, true);
-    let first = dispatch_start_coding_task_in_window(
+    let first = dispatch_coding_call_in_window(
         &runtime,
         "isolation-agent",
-        coding_start_call(&project, "first root", SessionMode::Normal),
+        coding_start_call(&project, "first root"),
         Some(&auth),
         "isolation-window",
     )
     .await;
-    let isolated = dispatch_start_coding_task_in_window(
+    let isolated = dispatch_coding_call_in_window(
         &runtime,
         "isolation-agent",
-        coding_start_call(&project, "second root", SessionMode::Normal),
+        coding_start_call(&project, "second root"),
         Some(&auth),
         "isolation-window",
     )
     .await;
     assert!(first.success && isolated.success);
-    let first_id = first.output["session"]["session_id"].as_str().unwrap();
-    let isolated_id = isolated.output["session"]["session_id"].as_str().unwrap();
+    let first_id = first.output["session_id"].as_str().unwrap();
+    let isolated_id = isolated.output["session_id"].as_str().unwrap();
     assert_ne!(first_id, isolated_id);
     assert_eq!(
         runtime
@@ -1013,22 +1003,22 @@ async fn failed_project_start_does_not_create_or_mutate_workflow_session() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path());
     let runtime = ToolRuntime::new_for_tests();
-    let project = register_agent_project_at_path(&runtime, "stable-agent", "a", dir.path()).await;
+    let project = register_runner_project_at_path(&runtime, "stable-agent", "a", dir.path()).await;
     let auth = auth_context(None, true);
-    let first = dispatch_start_coding_task_in_window(
+    let first = dispatch_coding_call_in_window(
         &runtime,
         "stable-agent",
-        coding_start_call(&project, "stable A", SessionMode::Normal),
+        coding_start_call(&project, "stable A"),
         Some(&auth),
         "failed-switch-window",
     )
     .await;
     assert!(first.success);
 
-    let failed = dispatch_start_coding_task_in_window(
+    let failed = dispatch_coding_call_in_window(
         &runtime,
         "stable-agent",
-        coding_start_call("agent:missing-agent:b", "failed B", SessionMode::Normal),
+        coding_start_call("agent:missing-agent:b", "failed B"),
         Some(&auth),
         "failed-switch-window",
     )
@@ -1042,19 +1032,16 @@ async fn failed_project_start_does_not_create_or_mutate_workflow_session() {
         1
     );
 
-    let again = dispatch_start_coding_task_in_window(
+    let again = dispatch_coding_call_in_window(
         &runtime,
         "stable-agent",
-        coding_start_call(&project, "fresh A", SessionMode::Normal),
+        coding_start_call(&project, "fresh A"),
         Some(&auth),
         "failed-switch-window",
     )
     .await;
     assert!(again.success);
-    assert_ne!(
-        first.output["session"]["session_id"],
-        again.output["session"]["session_id"]
-    );
+    assert_ne!(first.output["session_id"], again.output["session_id"]);
     assert_eq!(
         runtime
             .sessions
@@ -1064,7 +1051,7 @@ async fn failed_project_start_does_not_create_or_mutate_workflow_session() {
 }
 
 #[tokio::test]
-async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() {
+async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path());
     commit_file(
@@ -1096,7 +1083,7 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
             crate::auth::SCOPE_PROJECT_WRITE,
         ],
     );
-    let project = register_agent_project_at_path_with_auth(
+    let project = register_runner_project_at_path_with_auth(
         &runtime,
         "oauth-client",
         "demo",
@@ -1104,20 +1091,62 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
         &read_auth,
     )
     .await;
-    let read_only_started = dispatch_start_coding_task_in_window(
-        &runtime,
-        "oauth-client",
-        coding_start_call(&project, "read only first", SessionMode::ReadOnly),
-        Some(&read_auth),
-        "upgrade-window",
-    )
-    .await;
+    let read_only_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let read_auth = read_auth.clone();
+        async move {
+            runtime
+                .start_coding_workflow_for_test(
+                    project,
+                    None,
+                    None,
+                    Some("read only first".to_string()),
+                    SessionMode::ReadOnly,
+                    false,
+                    false,
+                    StartupDetail::Standard,
+                    None,
+                    None,
+                    Some(&read_auth),
+                    None,
+                    None,
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                )
+                .await
+        }
+    });
+    while !read_only_task.is_finished() {
+        if let Some(req) = runtime
+            .runner_registry
+            .poll(crate::runner_protocol::RunnerPollRequest {
+                client_id: "oauth-client".to_string(),
+                runner_instance_id: "inst".to_string(),
+            })
+            .await
+            .unwrap()
+        {
+            let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&req);
+            complete_patch_agent_request(
+                &runtime,
+                "oauth-client",
+                &req.request_id,
+                exit_code,
+                &stdout,
+                &stderr,
+            )
+            .await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    let read_only_started = read_only_task.await.unwrap();
     assert!(read_only_started.success, "{:?}", read_only_started.error);
     let session_id = read_only_started.output["session"]["session_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let read = dispatch_start_coding_task_in_window(
+    let read = dispatch_coding_call_in_window(
         &runtime,
         "oauth-client",
         ToolCall::ReadFile {
@@ -1134,7 +1163,7 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
     .await;
     assert!(read.success, "{:?}", read.error);
 
-    let denied = dispatch_start_coding_task_in_window(
+    let denied = dispatch_coding_call_in_window(
         &runtime,
         "oauth-client",
         coding_resume_call(&project, "request writes", &session_id),
@@ -1160,7 +1189,7 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
         1
     );
 
-    let upgraded = dispatch_start_coding_task_in_window(
+    let upgraded = dispatch_coding_call_in_window(
         &runtime,
         "oauth-client",
         coding_resume_call(&project, "enable writes", &session_id),
@@ -1169,22 +1198,11 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
     )
     .await;
     assert!(upgraded.success, "{:?}", upgraded.error);
-    assert_eq!(upgraded.output["session"]["session_id"], session_id);
-    assert_eq!(upgraded.output["session"]["mode"], "normal");
+    assert_eq!(upgraded.output["session_id"], session_id);
+    assert_eq!(upgraded.output["continuation"], "resumed_explicitly");
     assert_eq!(upgraded.output["instructions"]["status"], "reused");
-    assert_eq!(upgraded.output["instructions"]["content_included"], false);
-    assert_eq!(
-        upgraded.output["continuation"]["exploration"]["paths"]["items"],
-        serde_json::json!(["src/inspect.rs"])
-    );
-    assert_eq!(
-        upgraded.output["continuation"]["exploration"]["read_count"],
-        1
-    );
-    assert_eq!(
-        upgraded.output["continuation"]["exploration"]["complete"],
-        true
-    );
+    assert_eq!(upgraded.output["instructions"]["content_included"], true);
+    assert!(upgraded.output.get("continuation_feedback").is_none());
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     assert!(!summary.guards.deny_write_tools);
     assert!(!summary.guards.deny_shell_tools);
@@ -1208,6 +1226,6 @@ async fn start_coding_task_read_only_upgrade_is_atomic_and_permission_checked() 
             })
             .count(),
         1,
-        "start_coding_task must not reread ordinary explored source files"
+        "coding workflow must not reread ordinary explored source files"
     );
 }

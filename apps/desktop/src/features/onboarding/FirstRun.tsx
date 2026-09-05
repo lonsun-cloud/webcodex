@@ -1,0 +1,310 @@
+import { useMemo, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
+import { useLocale } from "../../i18n/locale";
+import {
+  desktopErrorPresentation,
+  normalizeDesktopError,
+} from "../../i18n/presentation";
+import type {
+  DesktopError,
+  DesktopState,
+  ProjectSelection,
+} from "../../models/topology";
+
+type SetupMode = "local" | "remote" | "share";
+
+interface FirstRunProps {
+  state: DesktopState;
+  onState: (state: DesktopState) => void;
+}
+
+export function FirstRun({ state, onState }: FirstRunProps) {
+  const { t } = useLocale();
+  const initialMode = useMemo<SetupMode | null>(() => {
+    if (state.topology?.experience === "quick_share") return "share";
+    if (state.topology?.server.kind === "local") return "local";
+    if (state.topology?.server.kind === "remote") return "remote";
+    return null;
+  }, [state.topology]);
+  const [mode, setMode] = useState<SetupMode | null>(initialMode);
+  const [project, setProject] = useState<ProjectSelection | null>(
+    state.project ?? null,
+  );
+  const [serverUrl, setServerUrl] = useState(
+    state.topology?.server.kind === "remote" ? state.topology.server.url : "",
+  );
+  const [pairingCode, setPairingCode] = useState("");
+  const [provider, setProvider] = useState<QuickShareProvider>("cloudflare");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<DesktopError | null>(null);
+  const canReuseRemoteEnrollment = Boolean(
+    mode === "remote" &&
+      project?.runtime_project_id &&
+      state.topology?.experience === "full" &&
+      state.topology.server.kind === "remote" &&
+      sameServerOrigin(serverUrl, state.topology.server.url),
+  );
+
+  const chooseProject = async () => {
+    setError(null);
+    const selection = await open({
+      directory: true,
+      multiple: false,
+      title: t("setup.chooseProject"),
+    });
+    if (typeof selection !== "string") return;
+    try {
+      setProject(await desktopApi.inspectProject(selection));
+    } catch (value) {
+      setError(normalizeDesktopError(value));
+    }
+  };
+
+  const run = async () => {
+    if (!mode || !project) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (mode === "local") {
+        onState(await desktopApi.configureLocal(project.path));
+      } else if (mode === "remote") {
+        const oneTimeCode = pairingCode;
+        setPairingCode("");
+        const next = await desktopApi.configureRemote(
+          serverUrl,
+          oneTimeCode,
+          project.path,
+        );
+        onState(next);
+      } else {
+        onState(await desktopApi.startQuickShare(project.path, provider));
+      }
+    } catch (value) {
+      setError(normalizeDesktopError(value));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!mode) {
+    return (
+      <section className="first-run" aria-labelledby="first-run-title" data-webcodex-page="first-run">
+        <div className="eyebrow">{t("first.welcome")}</div>
+        <h1 id="first-run-title">{t("first.title")}</h1>
+        <p className="lede">{t("first.description")}</p>
+        <div className="entry-grid">
+          <button className="entry-card recommended" onClick={() => setMode("local")} data-webcodex-action="choose-local-setup">
+            <span className="entry-badge">{t("first.recommended")}</span>
+            <strong>{t("first.localTitle")}</strong>
+            <span>{t("first.localDescription")}</span>
+          </button>
+          <button className="entry-card" onClick={() => setMode("remote")} data-webcodex-action="choose-remote-setup">
+            <strong>{t("first.remoteTitle")}</strong>
+            <span>{t("first.remoteDescription")}</span>
+          </button>
+          <button className="entry-card" onClick={() => setMode("share")} data-webcodex-action="choose-quick-share-setup">
+            <strong>{t("first.shareTitle")}</strong>
+            <span>{t("first.shareDescription")}</span>
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  const presentation = error ? desktopErrorPresentation(error, t) : null;
+  const serverInvalid = error?.code === "server_url_invalid" || error?.code === "server_unreachable";
+  const pairingInvalid = error?.code === "pairing_code_invalid";
+
+  return (
+    <form
+      className="setup-shell"
+      aria-labelledby="setup-title"
+      aria-busy={busy}
+      data-webcodex-page="setup"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void run();
+      }}
+    >
+      <button type="button" className="back-button" onClick={() => !busy && setMode(null)} data-webcodex-action="show-setup-options">
+        {t("setup.back")}
+      </button>
+      <div className="eyebrow">{modeLabel(mode, t)}</div>
+      <h1 id="setup-title">{setupTitle(mode, t)}</h1>
+      <p className="lede">{setupDescription(mode, t)}</p>
+
+      {mode === "remote" && (
+        <div className="form-card">
+          <div className="field-group">
+            <label htmlFor="setup-server-url">{t("setup.serverUrl")}</label>
+            <input
+              id="setup-server-url"
+              type="url"
+              value={serverUrl}
+              onChange={(event) => setServerUrl(event.target.value)}
+              placeholder="https://webcodex.example.com"
+              disabled={busy}
+              aria-describedby="setup-server-url-help"
+              aria-invalid={serverInvalid || undefined}
+              aria-errormessage={serverInvalid ? "setup-error" : undefined}
+            />
+            <span className="field-help" id="setup-server-url-help">{t("setup.serverUrlHelp")}</span>
+          </div>
+          {canReuseRemoteEnrollment ? (
+            <div className="enrollment-note">
+              <span className="section-kicker">{t("setup.enrollment")}</span>
+              <strong>{t("setup.reuseEnrollment")}</strong>
+              <span>{t("setup.reuseEnrollmentHelp")}</span>
+            </div>
+          ) : (
+            <div className="field-group">
+              <label htmlFor="setup-pairing-code">{t("setup.pairingCode")}</label>
+              <input
+                id="setup-pairing-code"
+                type="password"
+                value={pairingCode}
+                onChange={(event) => setPairingCode(event.target.value)}
+                placeholder="wc_pair_…"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={busy}
+                aria-describedby="setup-pairing-code-help"
+                aria-invalid={pairingInvalid || undefined}
+                aria-errormessage={pairingInvalid ? "setup-error" : undefined}
+              />
+              <span className="field-help" id="setup-pairing-code-help">{t("setup.pairingCodeHelp")}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mode === "share" && (
+        <fieldset className="provider-row provider-fieldset" role="radiogroup" aria-labelledby="quick-share-provider-legend">
+          <legend id="quick-share-provider-legend">{t("setup.providerLegend")}</legend>
+          {(["cloudflare", "openai", "none"] as QuickShareProvider[]).map((value) => (
+            <div
+              className={`provider-option ${provider === value ? "selected" : ""}`}
+              key={value}
+            >
+              <input
+                id={`quick-share-provider-${value}`}
+                type="radio"
+                name="quick-share-provider"
+                value={value}
+                checked={provider === value}
+                onChange={() => setProvider(value)}
+                disabled={busy}
+                aria-describedby={`quick-share-provider-${value}-description`}
+                data-webcodex-control={`quick-share-provider-${value}`}
+              />
+              <label htmlFor={`quick-share-provider-${value}`}>
+                <strong>{providerLabel(value, t)}</strong>
+                <span id={`quick-share-provider-${value}-description`}>{providerDescription(value, t)}</span>
+              </label>
+            </div>
+          ))}
+        </fieldset>
+      )}
+
+      <div className="project-picker-card">
+        <div>
+          <span className="section-kicker">{t("setup.project")}</span>
+          <strong>{project ? project.path : t("setup.chooseProject")}</strong>
+          {project && (
+            <span className="project-meta">
+              {t("setup.allowedRoot", {
+                root: project.allowed_root,
+                kind: project.is_git_repository ? t("setup.gitRepository") : t("setup.folder"),
+              })}
+            </span>
+          )}
+        </div>
+        <button type="button" className="secondary-button" onClick={chooseProject} disabled={busy} data-webcodex-action="choose-project">
+          {project ? t("setup.changeFolder") : t("setup.chooseFolder")}
+        </button>
+      </div>
+
+      {mode === "remote" && (
+        <details className="advanced-enrollment">
+          <summary>{t("setup.advancedEnrollment")}</summary>
+          <p>{t("setup.advancedEnrollmentHelp")}</p>
+        </details>
+      )}
+
+      {error && (
+        <div className="error-card" role="alert" id="setup-error">
+          <strong>{presentation?.title}</strong>
+          <span>{presentation?.action}</span>
+          <details>
+            <summary>{t("common.details")}</summary>
+            <code>{error.code}</code>
+            <p>{error.message}</p>
+          </details>
+        </div>
+      )}
+
+      <div className="setup-actions">
+        <button
+          type="submit"
+          className="primary-button"
+          disabled={
+            busy ||
+            !project ||
+            (mode === "remote" &&
+              (!serverUrl.trim() || (!canReuseRemoteEnrollment && !pairingCode.trim())))
+          }
+          data-webcodex-action={mode === "local" ? "configure-local" : mode === "remote" ? "configure-remote" : "start-quick-share"}
+        >
+          {busy ? t("common.checking") : actionLabel(mode, canReuseRemoteEnrollment, t)}
+        </button>
+        <span className="action-help">
+          {busy ? t("setup.verifying") : t("setup.noTerminal")}
+        </span>
+      </div>
+    </form>
+  );
+}
+
+type Translate = ReturnType<typeof useLocale>["t"];
+
+function modeLabel(mode: SetupMode, t: Translate) {
+  return mode === "local" ? t("setup.localLabel") : mode === "remote" ? t("setup.remoteLabel") : t("setup.shareLabel");
+}
+
+function setupTitle(mode: SetupMode, t: Translate) {
+  return mode === "local"
+    ? t("setup.localTitle")
+    : mode === "remote"
+      ? t("setup.remoteTitle")
+      : t("setup.shareTitle");
+}
+
+function setupDescription(mode: SetupMode, t: Translate) {
+  if (mode === "local") return t("setup.localDescription");
+  if (mode === "remote") return t("setup.remoteDescription");
+  return t("setup.shareDescription");
+}
+
+function actionLabel(mode: SetupMode, canReuseRemoteEnrollment: boolean, t: Translate) {
+  if (mode === "local") return t("setup.setUp");
+  if (mode === "remote") return canReuseRemoteEnrollment ? t("setup.reconnect") : t("setup.connect");
+  return t("setup.startShare");
+}
+
+function sameServerOrigin(left: string, right: string) {
+  return left.trim().replace(/\/+$/, "").toLowerCase() === right.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function providerLabel(provider: QuickShareProvider, t: Translate) {
+  if (provider === "cloudflare") return "Cloudflare";
+  if (provider === "openai") return "OpenAI Secure Tunnel";
+  return t("common.localOnly");
+}
+
+function providerDescription(provider: QuickShareProvider, t: Translate) {
+  if (provider === "cloudflare") return t("provider.cloudflareDescription");
+  if (provider === "openai") return t("provider.openaiDescription");
+  return t("provider.localDescription");
+}
+

@@ -120,12 +120,13 @@ pub(crate) fn validate_artifact_file_path(path: &str) -> Result<(), String> {
         return Err("path cannot contain NUL bytes".to_string());
     }
     let p = Path::new(path);
-    if p.is_absolute() {
+    let bytes = path.as_bytes();
+    let windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if p.has_root() || path.starts_with('\\') || windows_drive_prefix {
         return Err("path must be project-relative".to_string());
     }
-    if p.components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if path.split(['/', '\\']).any(|component| component == "..") {
         return Err("path cannot contain parent traversal".to_string());
     }
     if is_sensitive_artifact_path(path) {
@@ -267,9 +268,9 @@ pub(crate) fn validate_project_artifact_export_snapshot(
 
 impl ToolRuntime {
     /// Internal-only large-file metadata transport for MCP artifact export.
-    /// The ShellClient registry atomically rechecks the generation-2 streaming
+    /// The Runner registry atomically rechecks the generation-2 streaming
     /// metadata and chunk-read baseline while admitting the request.
-    async fn run_agent_json_artifact_export_metadata_op(
+    async fn run_runner_json_artifact_export_metadata_op(
         &self,
         client_id: String,
         cwd: String,
@@ -299,17 +300,21 @@ impl ToolRuntime {
             wait_timeout_secs: wait_timeout,
         };
         let (request_id, rx) = self
-            .shell_clients
-            .enqueue_artifact_export_metadata(request, "mcp_artifact_export".to_string(), auth)
+            .runner_registry
+            .enqueue_artifact_export_metadata(
+                request,
+                "mcp_artifact_export".to_string(),
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
             .await?;
         let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("agent export_project_artifact request was dropped".to_string());
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("timed out waiting for agent export_project_artifact".to_string());
             }
         };
@@ -370,10 +375,7 @@ impl ToolRuntime {
             .resolve_project_for_auth(project, auth)
             .await
             .map_err(|error| error.to_message())?;
-        if !resolved.is_agent() {
-            return Err("artifact export chunks require an agent-registered project".to_string());
-        }
-        let client_id = resolved.agent_client_id()?.to_string();
+        let client_id = resolved.client_id.clone();
         let payload = json!({
             "path": path,
             "expected_file_bytes": expected_file_bytes,
@@ -402,17 +404,21 @@ impl ToolRuntime {
             wait_timeout_secs: wait_timeout,
         };
         let (request_id, rx) = self
-            .shell_clients
-            .enqueue_artifact_export_chunk(request, "mcp_artifact_export".to_string(), auth)
+            .runner_registry
+            .enqueue_artifact_export_chunk(
+                request,
+                "mcp_artifact_export".to_string(),
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
             .await?;
         let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("agent artifact export chunk request was dropped".to_string());
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("timed out waiting for agent artifact export chunk".to_string());
             }
         };
@@ -473,13 +479,7 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
-        if !proj.is_agent() {
-            return ToolResult::err("save_project_artifact requires an agent-registered project");
-        }
-        let client_id = match proj.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => return ToolResult::err(e),
-        };
+        let client_id = proj.client_id.clone();
 
         let payload = json!({
             "path": path.clone(),
@@ -489,7 +489,7 @@ impl ToolRuntime {
             "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
         });
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -529,22 +529,14 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
-        if !proj.is_agent() {
-            return ToolResult::err(
-                "read_project_artifact_metadata requires an agent-registered project",
-            );
-        }
-        let client_id = match proj.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => return ToolResult::err(e),
-        };
+        let client_id = proj.client_id.clone();
         let payload = json!({
             "path": path.clone(),
             "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
             "allow_missing": allow_missing.unwrap_or(false),
         });
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -580,20 +572,14 @@ impl ToolRuntime {
         if let Err(error) = validate_artifact_file_path(&path) {
             return artifact_policy_rejected_result(&path, error);
         }
-        if !resolved.config.is_agent() {
-            return ToolResult::err("export_project_artifact requires an agent-registered project");
-        }
-        let client_id = match resolved.config.agent_client_id() {
-            Ok(client_id) => client_id.to_string(),
-            Err(error) => return ToolResult::err(error),
-        };
+        let client_id = resolved.config.client_id.clone();
         let streaming_payload = json!({
             "path": path.clone(),
             "max_bytes": MAX_PROJECT_ARTIFACT_EXPORT_BYTES,
             "allow_missing": false,
         });
         let output = match self
-            .run_agent_json_artifact_export_metadata_op(
+            .run_runner_json_artifact_export_metadata_op(
                 client_id,
                 resolved.config.path.clone(),
                 path.clone(),
@@ -697,13 +683,7 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
-        if !proj.is_agent() {
-            return ToolResult::err("read_project_artifact requires an agent-registered project");
-        }
-        let client_id = match proj.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => return ToolResult::err(e),
-        };
+        let client_id = proj.client_id.clone();
         let mut payload = json!({
             "path": path.clone(),
             "offset": offset,
@@ -718,7 +698,7 @@ impl ToolRuntime {
             payload["mcp_image"] = json!(true);
         }
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -768,15 +748,9 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
-        if !proj.is_agent() {
-            return ToolResult::err(format!("{tool_name} requires an agent-registered project"));
-        }
-        let client_id = match proj.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => return ToolResult::err(e),
-        };
+        let client_id = proj.client_id.clone();
         let obj = match self
-            .run_agent_json_file_op(client_id, proj.path.clone(), path, op, payload, tool_name)
+            .run_runner_json_file_op(client_id, proj.path.clone(), path, op, payload, tool_name)
             .await
         {
             Ok(v) => v,

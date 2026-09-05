@@ -265,16 +265,6 @@ pub(crate) fn search_agent_timeout_budget(effective_timeout_secs: u64) -> (u64, 
     (command_timeout, wait_timeout, outer_timeout)
 }
 
-impl SearchResultMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Matches => "matches",
-            Self::FilesWithMatches => "files_with_matches",
-            Self::Count => "count",
-        }
-    }
-}
-
 fn validate_search_globs(
     field: &'static str,
     globs: Vec<String>,
@@ -419,7 +409,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Shell preamble that resolves `head_cmd` at runtime (agent/local sh).
+/// Shell preamble that resolves `head_cmd` at runtime on the Runner POSIX shell.
 /// Absolute fallbacks are embedded as literals for POSIX `sh`.
 pub(super) fn search_head_resolution_shell(absolute_candidates: &[&str]) -> String {
     let mut script = String::from(
@@ -568,14 +558,14 @@ exit "$status""#,
 }
 
 /// Formal cap on search output bytes, applied by a second `head -c` stage in
-/// the command (shared by local and agent paths) so no single over-long match
+/// the Runner command so no single over-long match
 /// line, context line, or path can push the output past the Runner transport
 /// cap (default 256 KiB) before the Rust layer ever sees it. The command emits
 /// at most one probe byte beyond this formal budget; the parser consumes that
 /// byte only as proof of truncation and never exposes it. A record cut mid-line
 /// is dropped and reports `truncation_reason = "output_bytes"`.
 ///
-/// Kept at 32 KiB, not larger: the local path executes the command through
+/// Kept at 32 KiB, not larger: unit tests execute the same command through
 /// [`run_command_sync`](crate::tool_runtime::helpers::run_command_sync), whose
 /// polling loop does not drain stdout while waiting. Output over the ~64 KiB
 /// Linux pipe buffer would block the producer until the hard timeout. 32 KiB
@@ -694,7 +684,7 @@ pub(crate) fn search_project_text_command_with_head_fallbacks(
 }
 
 fn search_request_dropped_tool_result(options: &SearchOptions) -> ToolResult {
-    let message = "search_project_text agent request was dropped";
+    let message = "search_project_text Runner request was dropped";
     search_failure_tool_result(
         options,
         "search_request_dropped",
@@ -799,6 +789,24 @@ struct SearchContextLine {
     text: String,
 }
 
+const SEARCH_READ_HINT_CONTEXT_BEFORE: u64 = 20;
+const SEARCH_READ_HINT_LIMIT: u64 = 80;
+
+#[derive(Debug, Serialize)]
+struct SearchReadHint {
+    path: String,
+    start_line: u64,
+    limit: u64,
+}
+
+fn search_read_hint(path: &str, line: u64) -> SearchReadHint {
+    SearchReadHint {
+        path: path.to_string(),
+        start_line: line.saturating_sub(SEARCH_READ_HINT_CONTEXT_BEFORE).max(1),
+        limit: SEARCH_READ_HINT_LIMIT,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SearchMatch {
     path: String,
@@ -806,6 +814,7 @@ struct SearchMatch {
     preview: String,
     context_before: Vec<SearchContextLine>,
     context_after: Vec<SearchContextLine>,
+    read_hint: SearchReadHint,
 }
 
 #[derive(Debug, Serialize)]
@@ -1011,7 +1020,9 @@ fn is_trusted_search_record_path(path: &str) -> bool {
         return false;
     }
     let p = Path::new(path);
-    if p.is_absolute()
+    if p.has_root()
+        || p.components()
+            .any(|component| matches!(component, std::path::Component::Prefix(_)))
         || p.components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
@@ -1021,6 +1032,10 @@ fn is_trusted_search_record_path(path: &str) -> bool {
 }
 
 fn normalize_search_record_path(path: &str) -> Option<String> {
+    #[cfg(windows)]
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = normalized.as_str();
     let path = path.strip_prefix("./").unwrap_or(path);
     if !is_trusted_search_record_path(path) {
         return None;
@@ -1184,6 +1199,7 @@ fn search_matches_from_records(
             preview: record.text.clone(),
             context_before,
             context_after,
+            read_hint: search_read_hint(&record.path, record.line),
         });
     }
     (matches, truncated)
@@ -1614,183 +1630,135 @@ impl ToolRuntime {
         let effective_timeout_secs = options.timeout_secs;
         let (command_timeout, wait_timeout, outer_timeout) =
             search_agent_timeout_budget(effective_timeout_secs);
-        if proj.is_agent() {
-            let client_id = match proj.agent_client_id() {
-                Ok(id) => id.to_string(),
-                Err(_) => {
-                    return search_failure_tool_result(
-                        &options,
-                        "agent_unavailable",
-                        "agent_request",
-                        "agent_request_failed",
-                        "search_project_text could not resolve the Agent executor",
-                        None,
-                        None,
-                    )
-                }
-            };
-            // External search providers historically interpret `pattern` as regex and
-            // older Runners ignore unknown request fields. Encode literal semantics into
-            // that established pattern contract so mixed Server/Runner versions cannot
-            // silently reinterpret an exact-text request as a regex. The native command
-            // above still uses --fixed-strings/-F when the external provider falls back.
-            let external_pattern = match options.pattern_mode {
-                SearchPatternMode::Regex => options.pattern.clone(),
-                SearchPatternMode::Literal => escape_search_literal_for_regex(&options.pattern),
-            };
-            let payload = json!({
-                "pattern": external_pattern,
-                "path": options.path,
-                "limit": options.limit,
-                "context_before": options.context_before,
-                "context_after": options.context_after,
-                "include_globs": options.include_globs,
-                "exclude_globs": options.exclude_globs,
-                "result_mode": options.result_mode.as_str(),
-                "timeout_secs": command_timeout,
-            });
-            let (req_id, rx) = match self
-                .shell_clients
-                .enqueue_run(
-                    ShellRunRequest {
-                        client_id,
-                        cwd: Some(proj.path.clone()),
-                        command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
-                        stdin: Some(payload.to_string()),
-                        timeout_secs: command_timeout,
-                        wait_timeout_secs: wait_timeout,
-                    },
-                    "tool_runtime".to_string(),
+        let client_id = proj.client_id.clone();
+        // External search providers historically interpret `pattern` as regex and
+        // older Runners ignore unknown request fields. Encode literal semantics into
+        // that established pattern contract so mixed Server/Runner versions cannot
+        // silently reinterpret an exact-text request as a regex. The native command
+        // above still uses --fixed-strings/-F when the external provider falls back.
+        let external_pattern = match options.pattern_mode {
+            SearchPatternMode::Regex => options.pattern.clone(),
+            SearchPatternMode::Literal => escape_search_literal_for_regex(&options.pattern),
+        };
+        let payload = json!({
+            "pattern": external_pattern,
+            "path": options.path,
+            "limit": options.limit,
+            "context_before": options.context_before,
+            "context_after": options.context_after,
+            "include_globs": options.include_globs,
+            "exclude_globs": options.exclude_globs,
+            "result_mode": options.result_mode.as_str(),
+            "timeout_secs": command_timeout,
+        });
+        let (req_id, rx) = match self
+            .runner_registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id,
+                    cwd: Some(proj.path.clone()),
+                    command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
+                    stdin: Some(payload.to_string()),
+                    timeout_secs: command_timeout,
+                    wait_timeout_secs: wait_timeout,
+                },
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return search_failure_tool_result(
+                    &options,
+                    "agent_unavailable",
+                    "agent_request",
+                    "agent_request_failed",
+                    "search_project_text Runner request could not be started",
+                    None,
+                    None,
                 )
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    return search_failure_tool_result(
-                        &options,
-                        "agent_unavailable",
-                        "agent_request",
-                        "agent_request_failed",
-                        "search_project_text Agent request could not be started",
-                        None,
-                        None,
-                    )
+            }
+        };
+        let agent_wait_deadline = Instant::now() + Duration::from_secs(outer_timeout);
+        let batch_deadline_wins =
+            batch_deadline.is_some_and(|deadline| deadline <= agent_wait_deadline);
+        let wait_deadline = batch_deadline.map_or(agent_wait_deadline, |deadline| {
+            std::cmp::min(deadline, agent_wait_deadline)
+        });
+        match tokio::time::timeout_at(wait_deadline, rx).await {
+            Ok(Ok(resp)) => {
+                let raw_stdout = resp.stdout.unwrap_or_default();
+                if let Some(result) = external_provider_error_result(&raw_stdout, &options) {
+                    return result;
                 }
-            };
-            let agent_wait_deadline = Instant::now() + Duration::from_secs(outer_timeout);
-            let batch_deadline_wins =
-                batch_deadline.is_some_and(|deadline| deadline <= agent_wait_deadline);
-            let wait_deadline = batch_deadline.map_or(agent_wait_deadline, |deadline| {
-                std::cmp::min(deadline, agent_wait_deadline)
-            });
-            return match tokio::time::timeout_at(wait_deadline, rx).await {
-                Ok(Ok(resp)) => {
-                    let raw_stdout = resp.stdout.unwrap_or_default();
-                    if let Some(result) = external_provider_error_result(&raw_stdout, &options) {
-                        return result;
-                    }
-                    let stdout = raw_stdout;
-                    let stderr = resp.stderr.unwrap_or_default();
-                    let agent_error = resp.error.as_deref();
-                    if looks_like_search_timeout(
-                        resp.exit_code,
-                        &stderr,
-                        agent_error,
-                        options.timeout_secs,
-                    ) {
-                        let backend_status = parse_search_backend_status(&stdout);
-                        let backend = backend_status
-                            .marker_present
-                            .then_some(backend_status.backend);
-                        return search_timeout_tool_result_with_records(
-                            output_project,
-                            &options,
-                            &stdout,
-                            backend.as_deref(),
-                            resp.exit_code,
-                            if backend.is_some() {
-                                "backend_execution"
-                            } else {
-                                "agent_execution"
-                            },
-                        );
-                    }
-                    if agent_error.is_some() {
-                        let backend_status = parse_search_backend_status(&stdout);
-                        return search_failure_tool_result(
-                            &options,
-                            "search_execution_failed",
-                            "agent_execution",
-                            "agent_execution_failed",
-                            "search_project_text Agent execution failed",
-                            backend_status
-                                .marker_present
-                                .then_some(backend_status.backend.as_str()),
-                            resp.exit_code,
-                        );
-                    }
-                    search_project_text_output(
+                let stdout = raw_stdout;
+                let stderr = resp.stderr.unwrap_or_default();
+                let agent_error = resp.error.as_deref();
+                if looks_like_search_timeout(
+                    resp.exit_code,
+                    &stderr,
+                    agent_error,
+                    options.timeout_secs,
+                ) {
+                    let backend_status = parse_search_backend_status(&stdout);
+                    let backend = backend_status
+                        .marker_present
+                        .then_some(backend_status.backend);
+                    return search_timeout_tool_result_with_records(
                         output_project,
                         &options,
                         &stdout,
+                        backend.as_deref(),
                         resp.exit_code,
-                        &stderr,
-                    )
-                }
-                Ok(Err(_)) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    // Channel closed without a result: agent disconnect / waiter
-                    // drop — not a search timeout.
-                    search_request_dropped_tool_result(&options)
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    // Preserve whether the per-search transport bound or the
-                    // batch's shared absolute deadline ended the wait.
-                    search_timeout_tool_result(
-                        &options,
-                        None,
-                        if batch_deadline_wins {
-                            "batch_deadline"
+                        if backend.is_some() {
+                            "backend_execution"
                         } else {
-                            "agent_transport"
+                            "agent_execution"
                         },
-                    )
+                    );
                 }
-            };
-        }
-        let root = proj.root();
-        let local = run_command_sync_bounded(cmd, root, effective_timeout_secs);
-        let local = match batch_deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, local).await {
-                Ok(result) => result,
-                Err(_) => return search_timeout_tool_result(&options, None, "batch_deadline"),
-            },
-            None => local.await,
-        };
-        match local {
-            Ok((exit_code, stdout, stderr, _)) => search_project_text_output(
-                output_project,
-                &options,
-                &stdout,
-                Some(exit_code),
-                &stderr,
-            ),
-            // Outer hard bound (command timeout + grace) fired: treat as a
-            // search timeout so the MCP request still returns a structured error
-            // instead of parking forever on a wedged output drain.
-            Err(LocalRunFailure::HardTimeout { bound_secs: _ }) => {
-                search_timeout_tool_result(&options, None, "local_execution")
+                if agent_error.is_some() {
+                    let backend_status = parse_search_backend_status(&stdout);
+                    return search_failure_tool_result(
+                        &options,
+                        "search_execution_failed",
+                        "agent_execution",
+                        "agent_execution_failed",
+                        "search_project_text Runner execution failed",
+                        backend_status
+                            .marker_present
+                            .then_some(backend_status.backend.as_str()),
+                        resp.exit_code,
+                    );
+                }
+                search_project_text_output(
+                    output_project,
+                    &options,
+                    &stdout,
+                    resp.exit_code,
+                    &stderr,
+                )
             }
-            Err(LocalRunFailure::Join(_)) => search_failure_tool_result(
-                &options,
-                "search_execution_failed",
-                "local_execution",
-                "local_execution_failed",
-                "search_project_text local execution failed",
-                None,
-                None,
-            ),
+            Ok(Err(_)) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                // Channel closed without a result: agent disconnect / waiter
+                // drop — not a search timeout.
+                search_request_dropped_tool_result(&options)
+            }
+            Err(_) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                // Preserve whether the per-search transport bound or the
+                // batch's shared absolute deadline ended the wait.
+                search_timeout_tool_result(
+                    &options,
+                    None,
+                    if batch_deadline_wins {
+                        "batch_deadline"
+                    } else {
+                        "agent_transport"
+                    },
+                )
+            }
         }
     }
 }
@@ -2476,7 +2444,7 @@ mod tests {
 
     #[test]
     fn search_local_and_agent_parse_same_stdout_identically() {
-        // The agent path parses the runner's stdout with the same function as
+        // The Runner path parses the Runner's stdout with the same function as
         // the local path, so the exact same stdout string must yield identical
         // field semantics in both. This pins that parity for the record fields
         // the task lists: backend, result_mode, matches, count, truncated,

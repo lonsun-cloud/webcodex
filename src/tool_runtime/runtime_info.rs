@@ -1,23 +1,18 @@
 //! Runtime observability metadata injected into `ToolRuntime`.
 
-use super::helpers::normalize_local_status;
-use super::jobs::local_jobs_visible_to_auth;
-use super::local_jobs::ACTIVE_JOB_STATUSES;
 use super::registry::registered_tool_specs;
 use super::{permissions, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_protocol::{ShellClientView, ShellJobInfo};
+use crate::runner_protocol::{RunnerView, ShellJobInfo};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 const RUNNING_JOB_STATUSES: &[&str] = &["running", "started"];
-const AGENT_QUEUED_JOB_STATUSES: &[&str] = &["queued", "agent_queued"];
-const LOCAL_QUEUED_JOB_STATUSES: &[&str] = &["queued"];
-const LIST_AGENTS_MAX_CLIENT_IDS: usize = 8;
+const RUNNER_QUEUED_JOB_STATUSES: &[&str] = &["queued", "agent_queued"];
+const LIST_RUNNERS_MAX_CLIENT_IDS: usize = 8;
 const TARGET_CLIENT_ID_MAX_CHARS: usize = 128;
 
 #[derive(Debug, Default)]
-pub(crate) struct ListAgentsOptions {
+pub(crate) struct ListRunnersOptions {
     pub(crate) client_id: Option<String>,
     pub(crate) client_ids: Option<Vec<String>>,
     pub(crate) include_projects: Option<bool>,
@@ -92,15 +87,15 @@ impl ToolRuntime {
         })
     }
 
-    pub(crate) async fn list_agents(&self, auth: Option<&AuthContext>) -> ToolResult {
-        self.list_agents_with_options(auth, ListAgentsOptions::default())
+    pub(crate) async fn list_runners(&self, auth: Option<&AuthContext>) -> ToolResult {
+        self.list_runners_with_options(auth, ListRunnersOptions::default())
             .await
     }
 
-    pub(crate) async fn list_agents_with_options(
+    pub(crate) async fn list_runners_with_options(
         &self,
         auth: Option<&AuthContext>,
-        options: ListAgentsOptions,
+        options: ListRunnersOptions,
     ) -> ToolResult {
         if options.client_id.is_some() && options.client_ids.is_some() {
             return ToolResult::err_with_output(
@@ -126,10 +121,10 @@ impl ToolRuntime {
                     json!({"error_kind": "invalid_client_ids"}),
                 );
             }
-            if client_ids.len() > LIST_AGENTS_MAX_CLIENT_IDS {
+            if client_ids.len() > LIST_RUNNERS_MAX_CLIENT_IDS {
                 return ToolResult::err_with_output(
                     format!(
-                        "invalid_client_ids: at most {LIST_AGENTS_MAX_CLIENT_IDS} client ids are allowed"
+                        "invalid_client_ids: at most {LIST_RUNNERS_MAX_CLIENT_IDS} client ids are allowed"
                     ),
                     json!({"error_kind": "invalid_client_ids"}),
                 );
@@ -152,7 +147,11 @@ impl ToolRuntime {
             }
         }
 
-        let mut clients = self.shell_clients.list_clients_for_auth(auth).await;
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let mut clients = self
+            .runner_registry
+            .list_runners_for_auth(access.as_ref())
+            .await;
         clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
         clients.retain(|client| {
             if let Some(expected) = options.client_id.as_deref() {
@@ -165,9 +164,12 @@ impl ToolRuntime {
             }
             true
         });
-        let mut agent_jobs = self.shell_clients.list_all_jobs_for_auth(auth).await;
+        let mut runner_jobs = self
+            .runner_registry
+            .list_all_jobs_for_auth(access.as_ref())
+            .await;
         if options.client_id.is_some() || options.client_ids.is_some() {
-            agent_jobs.retain(|job| {
+            runner_jobs.retain(|job| {
                 clients
                     .iter()
                     .any(|client| client.client_id == job.client_id)
@@ -175,24 +177,24 @@ impl ToolRuntime {
         }
         let now = chrono::Utc::now().timestamp();
         let include_projects = options.include_projects.unwrap_or(true);
-        let agents: Vec<Value> = if options.summary_only {
+        let runners: Vec<Value> = if options.summary_only {
             clients
                 .iter()
                 .map(|client| {
                     json!({
                         "client_id": client.client_id,
-                        "agent_instance_id": client.agent_instance_id,
+                        "agent_instance_id": client.runner_instance_id,
                         "display_name": client.display_name,
                         "status": client.status,
                         "connected": client.connected,
-                        "agent_protocol_generation": client.agent_protocol_generation.get(),
+                        "agent_protocol_generation": client.runner_protocol_generation.get(),
                         "transport": client.transport,
                         "last_seen_age_secs": last_seen_age_secs(client, now),
                         "pending_requests": client.pending_requests,
                         "projects_count": enabled_projects_count(client),
                         "project_inventory": client.project_inventory,
-                        "active_jobs": active_jobs_for_client(&agent_jobs, &client.client_id),
-                        "job_concurrency": job_concurrency_for_client(client, &agent_jobs),
+                        "active_jobs": active_jobs_for_client(&runner_jobs, &client.client_id),
+                        "job_concurrency": job_concurrency_for_client(client, &runner_jobs),
                         "build": client.build,
                     })
                 })
@@ -203,22 +205,22 @@ impl ToolRuntime {
                 .map(|client| {
                     let mut value = json!({
                         "client_id": client.client_id,
-                        "agent_instance_id": client.agent_instance_id,
+                        "agent_instance_id": client.runner_instance_id,
                         "display_name": client.display_name,
                         "owner": client.owner,
                         "hostname": client.hostname,
                         "host_context": host_context_projection(client.host_context.as_ref()),
                         "status": client.status,
                         "connected": client.connected,
-                        "agent_protocol_generation": client.agent_protocol_generation.get(),
+                        "agent_protocol_generation": client.runner_protocol_generation.get(),
                         "transport": client.transport,
                         "last_seen": client.last_seen,
                         "last_seen_age_secs": last_seen_age_secs(client, now),
                         "pending_requests": client.pending_requests,
                         "projects_count": enabled_projects_count(client),
                         "project_inventory": client.project_inventory,
-                        "active_jobs": active_jobs_for_client(&agent_jobs, &client.client_id),
-                        "job_concurrency": job_concurrency_for_client(client, &agent_jobs),
+                        "active_jobs": active_jobs_for_client(&runner_jobs, &client.client_id),
+                        "job_concurrency": job_concurrency_for_client(client, &runner_jobs),
                         "capabilities": client.capabilities,
                         "policy": sanitized_policy_summary(client.policy.as_ref()),
                         "shell_profiles": sanitized_shell_profiles_summary(
@@ -240,7 +242,8 @@ impl ToolRuntime {
                 .filter(|client| client.status == "stale")
                 .count();
             return ToolResult::ok(json!({
-                "agents": agents,
+                // `agents` is a stable pre-0.4 serialized compatibility key.
+                "agents": runners,
                 "summary": {
                     "count": clients.len(),
                     "online": online,
@@ -251,9 +254,10 @@ impl ToolRuntime {
             }));
         }
         ToolResult::ok(json!({
-            "agents": agents,
-            "clients": agent_health_clients(&clients, &agent_jobs, now),
-            "summary": agent_health_summary(&clients, &agent_jobs, now),
+            // `agents` is a stable pre-0.4 serialized compatibility key.
+            "agents": runners,
+            "clients": runner_health_clients(&clients, &runner_jobs, now),
+            "summary": runner_health_summary(&clients, &runner_jobs, now),
             "count": clients.len(),
         }))
     }
@@ -261,12 +265,16 @@ impl ToolRuntime {
     /// Build the runtime observability summary. Read-only; never exposes
     /// tokens, api keys, full env, complete project path lists, or
     /// stdout/stderr. Returns a structured JSON object with service metadata,
-    /// agent-registered project status, agent client summaries, and job counts.
+    /// Runner-registered Project status, Runner summaries, and Job counts.
     pub(crate) async fn runtime_status(&self, auth: Option<&AuthContext>) -> ToolResult {
-        let clients = self.shell_clients.list_clients_for_auth(auth).await;
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let clients = self
+            .runner_registry
+            .list_runners_for_auth(access.as_ref())
+            .await;
 
-        // -- projects summary -------------------------------------------------
-        let agent_registered_count: usize = clients
+        // -- Projects summary -------------------------------------------------
+        let runner_registered_count: usize = clients
             .iter()
             .map(|client| {
                 client
@@ -276,7 +284,7 @@ impl ToolRuntime {
                     .count()
             })
             .sum();
-        let agent_registered_online_count: usize = clients
+        let runner_registered_online_count: usize = clients
             .iter()
             .filter(|client| client.connected)
             .map(|client| {
@@ -287,17 +295,18 @@ impl ToolRuntime {
                     .count()
             })
             .sum();
-        let effective_count = agent_registered_count;
+        let effective_count = runner_registered_count;
         let effective_status = if effective_count > 0 {
             "ok"
         } else {
             "no_projects"
         };
         let projects = json!({
+            // Stable pre-0.4 runtime_status compatibility identities.
             "mode": "agent_registered",
             "agent_registered": {
-                "count": agent_registered_count,
-                "online_count": agent_registered_online_count,
+                "count": runner_registered_count,
+                "online_count": runner_registered_online_count,
             },
             "effective": {
                 "count": effective_count,
@@ -307,38 +316,41 @@ impl ToolRuntime {
         });
 
         let now = chrono::Utc::now().timestamp();
-        let agent_jobs = self.shell_clients.list_all_jobs_for_auth(auth).await;
+        let runner_jobs = self
+            .runner_registry
+            .list_all_jobs_for_auth(access.as_ref())
+            .await;
 
-        // -- agents summary ---------------------------------------------------
+        // -- Runners summary --------------------------------------------------
         // Build a trimmed client list so the summary never leaks per-request
         // state. Only carry fields useful for observability. `last_seen` is a
         // unix timestamp (seconds) of the most recent heartbeat/result; the
-        // console uses it to render how stale an agent is and to make a
-        // websocket agent flipping `online` -> `stale` visually obvious.
-        let agent_count = clients.len();
+        // console uses it to render how stale a Runner is and to make a
+        // websocket Runner flipping `online` -> `stale` visually obvious.
+        let runner_count = clients.len();
         let online_count = clients.iter().filter(|c| c.connected).count();
-        // `stale_count` = registered agents whose `last_seen` is older than the
-        // online window (status == "stale"). Truly offline agents are removed
+        // `stale_count` = registered Runners whose `last_seen` is older than the
+        // online window (status == "stale"). Truly offline Runners are removed
         // from the registry on disconnect, so they never appear here.
-        let stale_count = agent_count.saturating_sub(online_count);
+        let stale_count = runner_count.saturating_sub(online_count);
         let clients_summary: Vec<Value> = clients
             .iter()
             .map(|c| {
                 json!({
                     "client_id": c.client_id,
-                    "agent_instance_id": c.agent_instance_id,
+                    "agent_instance_id": c.runner_instance_id,
                     "display_name": c.display_name,
                     "owner": c.owner,
                     "status": c.status,
                     "host_context": host_context_projection(c.host_context.as_ref()),
                     "connected": c.connected,
-                    "agent_protocol_generation": c.agent_protocol_generation.get(),
+                    "agent_protocol_generation": c.runner_protocol_generation.get(),
                     "transport": c.transport,
                     "last_seen": c.last_seen,
                     "last_seen_age_secs": last_seen_age_secs(c, now),
                     "pending_requests": c.pending_requests,
-                    "active_jobs": active_jobs_for_client(&agent_jobs, &c.client_id),
-                    "job_concurrency": job_concurrency_for_client(c, &agent_jobs),
+                    "active_jobs": active_jobs_for_client(&runner_jobs, &c.client_id),
+                    "job_concurrency": job_concurrency_for_client(c, &runner_jobs),
                     "capabilities": c.capabilities,
                     "projects_count": enabled_projects_count(c),
                     "project_inventory": c.project_inventory,
@@ -350,17 +362,17 @@ impl ToolRuntime {
                 })
             })
             .collect();
-        let agents = json!({
-            "count": agent_count,
+        let runners = json!({
+            "count": runner_count,
             "online_count": online_count,
             "stale_count": stale_count,
             "clients": clients_summary,
-            "summary": agent_health_summary(&clients, &agent_jobs, now),
+            "summary": runner_health_summary(&clients, &runner_jobs, now),
         });
         let connection_layers = connection_layers(
             &clients,
-            agent_registered_count,
-            agent_registered_online_count,
+            runner_registered_count,
+            runner_registered_online_count,
             self.observations.as_ref(),
             auth,
             now,
@@ -368,43 +380,30 @@ impl ToolRuntime {
         let version_compatibility = version_compatibility(&clients);
 
         // -- jobs summary -----------------------------------------------------
-        // Agent-known jobs come from the registry; local jobs come from the
-        // in-memory map. Active includes same-runner `recovering` jobs.
-        let agent_known_count = agent_jobs.len();
-        let local_job_dirs: Vec<PathBuf> = if local_jobs_visible_to_auth(auth) {
-            let local_jobs_map = self.local_jobs.lock().await;
-            local_jobs_map
-                .values()
-                .map(|record| record.dir.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let local_known_count = local_job_dirs.len();
-        // Avoid double-counting: agent jobs are tracked separately from local
-        // jobs (local jobs are only in the in-memory map; agent jobs are only
-        // in the registry). Count active across both.
-        let agent_active = agent_jobs
+        // Registered Project jobs are Runner-owned. Active includes same-runner
+        // `recovering` jobs during restart/reconnect reconciliation.
+        let runner_known_count = runner_jobs.len();
+        let active_count = runner_jobs
             .iter()
-            .filter(|j| ACTIVE_JOB_STATUSES.contains(&j.status.as_str()))
+            .filter(|j| webcodex_runner_registry::job_status_is_active(&j.status))
             .count();
-        let recovering_count = agent_jobs
+        let recovering_count = runner_jobs
             .iter()
             .filter(|job| job.status == "recovering")
             .count();
-        let agent_running = agent_jobs
+        let running_count = runner_jobs
             .iter()
             .filter(|job| job_status_is_running(&job.status))
             .count();
-        let agent_queued = agent_jobs
+        let queued_count = runner_jobs
             .iter()
-            .filter(|job| job_status_is_agent_queued(&job.status))
+            .filter(|job| job_status_is_runner_queued(&job.status))
             .count();
-        let reconciled_count = agent_jobs
+        let reconciled_count = runner_jobs
             .iter()
             .filter(|job| job.recovery_state.as_deref() == Some("reconciled"))
             .count();
-        let lost_after_reconcile_count = agent_jobs
+        let lost_after_reconcile_count = runner_jobs
             .iter()
             .filter(|job| {
                 job.status == "lost"
@@ -418,28 +417,9 @@ impl ToolRuntime {
                     )
             })
             .count();
-        let mut local_active = 0usize;
-        let mut local_running = 0usize;
-        let mut local_queued = 0usize;
-        for dir in local_job_dirs {
-            if let Some(status) = std::fs::read_to_string(dir.join("status"))
-                .ok()
-                .map(|s| s.trim().to_string())
-            {
-                let normalized = normalize_local_status(&status);
-                if ACTIVE_JOB_STATUSES.contains(&normalized.as_str()) {
-                    local_active += 1;
-                }
-                local_running += usize::from(job_status_is_running(&normalized));
-                local_queued += usize::from(job_status_is_local_queued(&normalized));
-            }
-        }
-        let active_count = agent_active + local_active;
-        let running_count = agent_running + local_running;
-        let queued_count = agent_queued + local_queued;
         let jobs = json!({
-            "agent_known_count": agent_known_count,
-            "local_known_count": local_known_count,
+            // `agent_known_count` is a stable pre-0.4 runtime_status compatibility key.
+            "agent_known_count": runner_known_count,
             "active_count": active_count,
             "running_count": running_count,
             "queued_count": queued_count,
@@ -480,7 +460,8 @@ impl ToolRuntime {
             "auth_enabled": self.runtime_info.auth_enabled,
             "configured_public_url": self.runtime_info.configured_public_url,
             "projects": projects,
-            "agents": agents,
+            // `agents` remains the stable runtime_status JSON compatibility key.
+            "agents": runners,
             "connection_layers": connection_layers,
             "version_compatibility": version_compatibility,
             "jobs": jobs,
@@ -526,7 +507,11 @@ impl ToolRuntime {
                 json!({"error_kind": "invalid_client_id"}),
             );
         }
-        let visible_clients = self.shell_clients.list_clients_for_auth(auth).await;
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let visible_clients = self
+            .runner_registry
+            .list_runners_for_auth(access.as_ref())
+            .await;
         let Some(client) = visible_clients
             .iter()
             .find(|client| client.client_id == client_id)
@@ -538,7 +523,10 @@ impl ToolRuntime {
                 json!({"error_kind": "unknown_client_id", "client_id": client_id}),
             );
         };
-        let visible_jobs = self.shell_clients.list_all_jobs_for_auth(auth).await;
+        let visible_jobs = self
+            .runner_registry
+            .list_all_jobs_for_auth(access.as_ref())
+            .await;
         let selected_jobs: Vec<ShellJobInfo> = visible_jobs
             .iter()
             .filter(|job| job.client_id == client.client_id)
@@ -576,9 +564,9 @@ impl ToolRuntime {
                     == Some("different")
             })
             .count();
-        let agent_active = selected_jobs
+        let runner_active = selected_jobs
             .iter()
-            .filter(|job| ACTIVE_JOB_STATUSES.contains(&job.status.as_str()))
+            .filter(|job| webcodex_runner_registry::job_status_is_active(&job.status))
             .count();
         let running_count = selected_jobs
             .iter()
@@ -586,7 +574,7 @@ impl ToolRuntime {
             .count();
         let queued_count = selected_jobs
             .iter()
-            .filter(|job| job_status_is_agent_queued(&job.status))
+            .filter(|job| job_status_is_runner_queued(&job.status))
             .count();
         let recovering_count = selected_jobs
             .iter()
@@ -622,17 +610,17 @@ impl ToolRuntime {
             },
             "count": project_count,
         });
-        let agents = json!({
+        let runners = json!({
             "count": 1,
             "online_count": usize::from(client.connected),
             "stale_count": usize::from(!client.connected),
             "clients": [{
                 "client_id": client.client_id,
-                "agent_instance_id": client.agent_instance_id,
+                "agent_instance_id": client.runner_instance_id,
                 "display_name": client.display_name,
                 "status": client.status,
                 "connected": client.connected,
-                "agent_protocol_generation": client.agent_protocol_generation.get(),
+                "agent_protocol_generation": client.runner_protocol_generation.get(),
                 "transport": client.transport,
                 "last_seen": client.last_seen,
                 "last_seen_age_secs": last_seen_age_secs(&client, now),
@@ -641,12 +629,12 @@ impl ToolRuntime {
                 "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
                 "projects_count": project_count,
             }],
-            "summary": agent_health_summary(&clients, &selected_jobs, now),
+            "summary": runner_health_summary(&clients, &selected_jobs, now),
         });
         let jobs = json!({
+            // `agent_known_count` is a stable pre-0.4 runtime_status compatibility key.
             "agent_known_count": selected_jobs.len(),
-            "local_known_count": 0,
-            "active_count": agent_active,
+            "active_count": runner_active,
             "running_count": running_count,
             "queued_count": queued_count,
             "recovering_count": recovering_count,
@@ -674,10 +662,10 @@ impl ToolRuntime {
                 "client_id": client.client_id,
                 "connected": client.connected,
                 "status": client.status,
-                "agent_instance_id": client.agent_instance_id,
+                "agent_instance_id": client.runner_instance_id,
                 "build": client.build,
                 "project_count": project_count,
-                "active_jobs": agent_active,
+                "active_jobs": runner_active,
                 "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
                 "compatibility_status": target_runner.get("status").cloned().unwrap_or(Value::Null),
                 "source_alignment": source_alignment,
@@ -693,7 +681,7 @@ impl ToolRuntime {
                 "mixed_builds_present": mismatched_agents_count > 0 || source_mismatched_agents_count > 0,
             },
             "projects": projects,
-            "agents": agents,
+            "agents": runners,
             "version_compatibility": target_compatibility,
             "jobs": jobs,
             "tools": tools,
@@ -808,7 +796,7 @@ pub(crate) fn compact_runtime_status(status: &Value) -> Value {
 }
 
 fn compact_runner_clients(status: &Value) -> Vec<Value> {
-    let agents = status
+    let runners = status
         .pointer("/agents/clients")
         .and_then(Value::as_array)
         .cloned()
@@ -819,32 +807,32 @@ fn compact_runner_clients(status: &Value) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
 
-    agents
+    runners
         .iter()
-        .filter_map(|agent| {
-            let client_id = agent.get("client_id")?.as_str()?;
+        .filter_map(|runner| {
+            let client_id = runner.get("client_id")?.as_str()?;
             let compat = compatibility
                 .iter()
                 .find(|candidate| candidate.get("client_id").and_then(Value::as_str) == Some(client_id));
             let mut compact = json!({
                 "client_id": client_id,
-                "agent_instance_id": agent.get("agent_instance_id").cloned().unwrap_or(Value::Null),
-                "status": agent.get("status").cloned().unwrap_or(Value::Null),
-                "transport": agent.get("transport").cloned().unwrap_or(Value::Null),
+                "agent_instance_id": runner.get("agent_instance_id").cloned().unwrap_or(Value::Null),
+                "status": runner.get("status").cloned().unwrap_or(Value::Null),
+                "transport": runner.get("transport").cloned().unwrap_or(Value::Null),
                 "build_git_commit": compat.and_then(|value| value.get("build_git_commit")).cloned().unwrap_or(Value::Null),
                 "build_git_dirty": compat.and_then(|value| value.get("build_git_dirty")).cloned().unwrap_or(Value::Null),
                 "version_matches_server": compat.and_then(|value| value.get("version_matches_server")).cloned().unwrap_or(Value::Null),
                 "source_alignment": compat.and_then(|value| value.get("source_alignment")).cloned().unwrap_or_else(|| json!({"status": "unknown"})),
             });
             if status.get("focus").is_none() {
-                compact["host_context"] = agent.get("host_context").cloned().unwrap_or(Value::Null);
+                compact["host_context"] = runner.get("host_context").cloned().unwrap_or(Value::Null);
             }
             Some(compact)
         })
         .collect()
 }
 
-fn host_context_projection(context: Option<&crate::shell_protocol::AgentHostContext>) -> Value {
+fn host_context_projection(context: Option<&crate::runner_protocol::RunnerHostContext>) -> Value {
     match context {
         Some(context) => json!({
             "source": "runner_config",
@@ -859,7 +847,7 @@ fn host_context_projection(context: Option<&crate::shell_protocol::AgentHostCont
 }
 
 /// Stale threshold for runner-derived layers (heartbeat window).
-const RUNNER_STALE_AFTER_SECS: i64 = crate::shell_client::CLIENT_ONLINE_WINDOW_SECS;
+const RUNNER_STALE_AFTER_SECS: i64 = crate::runner_http::RUNNER_ONLINE_WINDOW_SECS;
 /// Stale threshold for connector/tool-call activity observations.
 const ACTIVITY_STALE_AFTER_SECS: i64 = 600;
 
@@ -892,7 +880,7 @@ fn layer_observation(
 }
 
 fn connection_layers(
-    clients: &[ShellClientView],
+    clients: &[RunnerView],
     registered_projects: usize,
     online_projects: usize,
     observations: &super::observations::RuntimeObservations,
@@ -901,7 +889,7 @@ fn connection_layers(
 ) -> Value {
     // Freshest client drives single-value observations; counts stay explicit.
     let freshest = clients.iter().max_by_key(|c| c.last_seen);
-    let online: Vec<&ShellClientView> = clients.iter().filter(|c| c.connected).collect();
+    let online: Vec<&RunnerView> = clients.iter().filter(|c| c.connected).collect();
     let freshest_online = online.iter().max_by_key(|c| c.last_seen).copied();
 
     // -- runner_process: process observation, distinct from transport --------
@@ -923,7 +911,7 @@ fn connection_layers(
                 now,
                 json!({
                     "client_id": client.client_id,
-                    "agent_instance_id": client.agent_instance_id,
+                    "agent_instance_id": client.runner_instance_id,
                     "process_started_at": client.process_started_at,
                 }),
             )
@@ -937,7 +925,7 @@ fn connection_layers(
             now,
             json!({
                 "client_id": client.client_id,
-                "agent_instance_id": client.agent_instance_id,
+                "agent_instance_id": client.runner_instance_id,
                 "process_started_at": client.process_started_at,
             }),
         ),
@@ -964,7 +952,7 @@ fn connection_layers(
             json!({
                 "connected_clients": online.len(),
                 "transport": client.transport,
-                "connection_instance": client.agent_instance_id,
+                "connection_instance": client.runner_instance_id,
                 "connected_at": client.connected_at,
                 "last_heartbeat_at": client.last_seen,
             }),
@@ -979,7 +967,7 @@ fn connection_layers(
             json!({
                 "connected_clients": 0,
                 "transport": client.transport,
-                "connection_instance": client.agent_instance_id,
+                "connection_instance": client.runner_instance_id,
                 "connected_at": client.connected_at,
                 "disconnected_at": client.disconnected_at,
             }),
@@ -1006,7 +994,7 @@ fn connection_layers(
             now,
             json!({
                 "registered_clients": clients.len(),
-                "runner_instance": client.agent_instance_id,
+                "runner_instance": client.runner_instance_id,
                 "registered_at": client.registered_at,
                 "last_refreshed_at": client.last_seen,
             }),
@@ -1020,7 +1008,7 @@ fn connection_layers(
             now,
             json!({
                 "registered_clients": clients.len(),
-                "runner_instance": client.agent_instance_id,
+                "runner_instance": client.runner_instance_id,
                 "registered_at": client.registered_at,
                 "last_refreshed_at": client.last_seen,
             }),
@@ -1058,7 +1046,7 @@ fn connection_layers(
             json!({
                 "registered_projects": registered_projects,
                 "online_projects": online_projects,
-                "providing_instance": freshest_online.map(|c| c.agent_instance_id.clone()),
+                "providing_instance": freshest_online.map(|c| c.runner_instance_id.clone()),
             }),
         )
     } else {
@@ -1171,7 +1159,7 @@ fn connection_layers(
 /// Mixed-version diagnostics: a connected runner is not automatically
 /// capability-compatible. Reports facts about which side to upgrade without
 /// exposing paths or environment.
-fn version_compatibility(clients: &[ShellClientView]) -> Value {
+fn version_compatibility(clients: &[RunnerView]) -> Value {
     let build = crate::build_info::runtime_build_info();
     version_compatibility_against(
         clients,
@@ -1183,7 +1171,7 @@ fn version_compatibility(clients: &[ShellClientView]) -> Value {
 }
 
 fn version_compatibility_against(
-    clients: &[ShellClientView],
+    clients: &[RunnerView],
     server_version: &str,
     server_git_commit: Option<&str>,
     server_git_dirty: Option<bool>,
@@ -1260,7 +1248,7 @@ fn version_compatibility_against(
             }
             json!({
                 "client_id": client.client_id,
-                "agent_protocol_generation": client.agent_protocol_generation.get(),
+                "agent_protocol_generation": client.runner_protocol_generation.get(),
                 "build_version": build_version,
                 "build_git_commit": build_git_commit,
                 "build_git_dirty": build_git_dirty,
@@ -1297,7 +1285,7 @@ fn valid_target_client_id(client_id: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn version_compatibility_for_test(
-    clients: &[ShellClientView],
+    clients: &[RunnerView],
     server_version: &str,
     server_git_commit: Option<&str>,
     server_git_dirty: Option<bool>,
@@ -1315,7 +1303,7 @@ pub(crate) fn version_compatibility_for_test(
     )
 }
 
-fn enabled_projects_count(client: &ShellClientView) -> usize {
+fn enabled_projects_count(client: &RunnerView) -> usize {
     client
         .projects
         .iter()
@@ -1323,15 +1311,16 @@ fn enabled_projects_count(client: &ShellClientView) -> usize {
         .count()
 }
 
-fn last_seen_age_secs(client: &ShellClientView, now: i64) -> i64 {
+fn last_seen_age_secs(client: &RunnerView, now: i64) -> i64 {
     now.saturating_sub(client.last_seen)
 }
 
-fn active_jobs_for_client(agent_jobs: &[ShellJobInfo], client_id: &str) -> usize {
-    agent_jobs
+fn active_jobs_for_client(runner_jobs: &[ShellJobInfo], client_id: &str) -> usize {
+    runner_jobs
         .iter()
         .filter(|job| {
-            job.client_id == client_id && ACTIVE_JOB_STATUSES.contains(&job.status.as_str())
+            job.client_id == client_id
+                && webcodex_runner_registry::job_status_is_active(&job.status)
         })
         .count()
 }
@@ -1340,23 +1329,19 @@ fn job_status_is_running(status: &str) -> bool {
     RUNNING_JOB_STATUSES.contains(&status)
 }
 
-fn job_status_is_agent_queued(status: &str) -> bool {
-    AGENT_QUEUED_JOB_STATUSES.contains(&status)
+fn job_status_is_runner_queued(status: &str) -> bool {
+    RUNNER_QUEUED_JOB_STATUSES.contains(&status)
 }
 
-fn job_status_is_local_queued(status: &str) -> bool {
-    LOCAL_QUEUED_JOB_STATUSES.contains(&status)
-}
-
-fn job_concurrency_for_client(client: &ShellClientView, agent_jobs: &[ShellJobInfo]) -> Value {
+fn job_concurrency_for_client(client: &RunnerView, runner_jobs: &[ShellJobInfo]) -> Value {
     let mut running = 0usize;
     let mut queued = 0usize;
-    for job in agent_jobs
+    for job in runner_jobs
         .iter()
         .filter(|job| job.client_id == client.client_id)
     {
         running += usize::from(job_status_is_running(&job.status));
-        queued += usize::from(job_status_is_agent_queued(&job.status));
+        queued += usize::from(job_status_is_runner_queued(&job.status));
     }
     json!({
         "limit": client.job_concurrency_limit,
@@ -1365,9 +1350,9 @@ fn job_concurrency_for_client(client: &ShellClientView, agent_jobs: &[ShellJobIn
     })
 }
 
-fn agent_health_clients(
-    clients: &[ShellClientView],
-    agent_jobs: &[ShellJobInfo],
+fn runner_health_clients(
+    clients: &[RunnerView],
+    runner_jobs: &[ShellJobInfo],
     now: i64,
 ) -> Vec<Value> {
     clients
@@ -1381,18 +1366,14 @@ fn agent_health_clients(
                 "projects_count": enabled_projects_count(client),
                 "project_inventory": client.project_inventory,
                 "pending_requests": client.pending_requests,
-                "active_jobs": active_jobs_for_client(agent_jobs, &client.client_id),
-                "job_concurrency": job_concurrency_for_client(client, agent_jobs),
+                "active_jobs": active_jobs_for_client(runner_jobs, &client.client_id),
+                "job_concurrency": job_concurrency_for_client(client, runner_jobs),
             })
         })
         .collect()
 }
 
-fn agent_health_summary(
-    clients: &[ShellClientView],
-    agent_jobs: &[ShellJobInfo],
-    now: i64,
-) -> Value {
+fn runner_health_summary(clients: &[RunnerView], runner_jobs: &[ShellJobInfo], now: i64) -> Value {
     let online = clients.iter().filter(|client| client.connected).count();
     let stale = clients
         .iter()
@@ -1404,18 +1385,18 @@ fn agent_health_summary(
         "online": online,
         "offline": offline,
         "stale": stale,
-        "clients": agent_health_clients(clients, agent_jobs, now),
+        "clients": runner_health_clients(clients, runner_jobs, now),
     })
 }
 
 /// Build the sanitized policy summary JSON exposed in `runtime_status` and
-/// `listAgents`. Only the safe fields are carried: `allow_raw_shell`,
+/// `list_runners`. Only the safe fields are carried: `allow_raw_shell`,
 /// `allow_cwd_anywhere`, `allowed_roots`, `max_timeout_secs`,
 /// `max_output_bytes`. The agent token, shell env values, init_script
 /// contents, and full Runner config contents are NEVER included. Older agents
 /// that registered without a policy produce `Value::Null` so the field is
 /// present-but-null for clients that expect it.
-fn sanitized_policy_summary(policy: Option<&crate::shell_protocol::AgentPolicySummary>) -> Value {
+fn sanitized_policy_summary(policy: Option<&crate::runner_protocol::RunnerPolicySummary>) -> Value {
     match policy {
         Some(p) => json!({
             "allow_raw_shell": p.allow_raw_shell,
@@ -1429,14 +1410,14 @@ fn sanitized_policy_summary(policy: Option<&crate::shell_protocol::AgentPolicySu
 }
 
 /// Build the sanitized shell-profiles summary JSON exposed in
-/// `runtime_status`, `listAgents`, and `listProjects`. Only safe metadata is
+/// `runtime_status`, `list_runners`, and `list_projects`. Only safe metadata is
 /// carried: default profile name, configured count, prepared-cache count, and
 /// per-profile name / has_init_script (boolean) / env_keys_count / program /
 /// args_count. NEVER includes init_script bodies, env values, tokens, or the
 /// full env snapshot. Older agents that did not report a summary produce
 /// `Value::Null`.
 fn sanitized_shell_profiles_summary(
-    summary: Option<&crate::shell_protocol::ShellProfilesSummary>,
+    summary: Option<&crate::runner_protocol::ShellProfilesSummary>,
 ) -> Value {
     match summary {
         Some(s) => {
@@ -1489,14 +1470,12 @@ mod phase_e2_status_tests {
     fn concurrency_counts_use_only_canonical_running_and_queued_statuses() {
         for status in ["running", "started"] {
             assert!(job_status_is_running(status), "{status}");
-            assert!(!job_status_is_agent_queued(status), "{status}");
+            assert!(!job_status_is_runner_queued(status), "{status}");
         }
         for status in ["queued", "agent_queued"] {
-            assert!(job_status_is_agent_queued(status), "{status}");
+            assert!(job_status_is_runner_queued(status), "{status}");
             assert!(!job_status_is_running(status), "{status}");
         }
-        assert!(job_status_is_local_queued("queued"));
-        assert!(!job_status_is_local_queued("agent_queued"));
         for status in [
             "stop_requested",
             "recovering",
@@ -1509,8 +1488,7 @@ mod phase_e2_status_tests {
             "cancelled",
         ] {
             assert!(!job_status_is_running(status), "{status}");
-            assert!(!job_status_is_agent_queued(status), "{status}");
-            assert!(!job_status_is_local_queued(status), "{status}");
+            assert!(!job_status_is_runner_queued(status), "{status}");
         }
     }
 
@@ -1543,6 +1521,7 @@ mod phase_e2_status_tests {
                 codex: None,
                 result: None,
                 validation_progress: None,
+                activity: None,
                 validation: None,
                 recovery_state: None,
                 recovered_after_server_restart: false,
@@ -1557,9 +1536,9 @@ mod phase_e2_status_tests {
             }
         }
 
-        let client = ShellClientView {
+        let client = RunnerView {
             client_id: "shared-runner".to_string(),
-            agent_instance_id: "shared-instance".to_string(),
+            runner_instance_id: "shared-instance".to_string(),
             display_name: None,
             owner: None,
             hostname: None,
@@ -1572,7 +1551,7 @@ mod phase_e2_status_tests {
             pending_requests: 0,
             projects: Vec::new(),
             project_inventory: None,
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             transport: "websocket".to_string(),
             policy: None,
             registered_at: 0,

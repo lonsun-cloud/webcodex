@@ -12,9 +12,8 @@ use super::shell::shell_quote;
 use super::shell::shell_quote_powershell;
 use super::shell::{base_shell_env, cwd_allowed};
 use super::ssh::SshConnectionPool;
-use crate::shell_protocol::{
-    PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest,
-    RAW_SHELL_COMMAND_MAX_BYTES,
+use crate::runner_protocol::{
+    PersistentShellRequest, PersistentShellResult, RunnerRequest, RAW_SHELL_COMMAND_MAX_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -53,8 +52,8 @@ impl PersistentShellManager {
         shell: &ShellConfig,
         ssh: &SshConfig,
         ssh_generation: u64,
-        projects_dir: &Path,
-        request: &ShellAgentShellRequest,
+        project_registry_dir: &Path,
+        request: &RunnerRequest,
     ) -> PersistentShellResult {
         self.processes.update_limits(limits(shell));
         let ssh_resource = request
@@ -74,27 +73,32 @@ impl PersistentShellManager {
             return self.close(operation);
         }
 
-        let project =
-            match validate_boundary(policy, shell, projects_dir, &request.client_id, operation) {
-                Ok(project) => project,
-                Err((code, message)) => {
-                    if operation.action != "open" {
-                        let _ = self.processes.close(
-                            &operation.shell_id,
-                            &operation.workflow_session_id,
-                            &operation.runtime_project_id,
-                            code,
-                        );
-                    }
-                    return error_result(
+        let project = match validate_boundary(
+            policy,
+            shell,
+            project_registry_dir,
+            &request.client_id,
+            operation,
+        ) {
+            Ok(project) => project,
+            Err((code, message)) => {
+                if operation.action != "open" {
+                    let _ = self.processes.close(
                         &operation.shell_id,
                         &operation.workflow_session_id,
                         &operation.runtime_project_id,
                         code,
-                        message,
                     );
                 }
-            };
+                return error_result(
+                    &operation.shell_id,
+                    &operation.workflow_session_id,
+                    &operation.runtime_project_id,
+                    code,
+                    message,
+                );
+            }
+        };
 
         match operation.action.as_str() {
             "open" => {
@@ -142,7 +146,7 @@ impl PersistentShellManager {
         policy: &RunnerPolicy,
         ssh: &SshConfig,
         ssh_generation: u64,
-        request: &ShellAgentShellRequest,
+        request: &RunnerRequest,
         operation: &PersistentShellRequest,
         resource_name: &str,
         _project: &RunnerProjectShellContext,
@@ -242,7 +246,7 @@ impl PersistentShellManager {
         _policy: &RunnerPolicy,
         _ssh: &SshConfig,
         _ssh_generation: u64,
-        _request: &ShellAgentShellRequest,
+        _request: &RunnerRequest,
         operation: &PersistentShellRequest,
         _resource_name: &str,
         _project: &RunnerProjectShellContext,
@@ -388,7 +392,7 @@ impl PersistentShellManager {
         &self,
         policy: &RunnerPolicy,
         shell: &ShellConfig,
-        request: &ShellAgentShellRequest,
+        request: &RunnerRequest,
         operation: &PersistentShellRequest,
         project: &RunnerProjectShellContext,
     ) -> PersistentShellResult {
@@ -629,7 +633,7 @@ fn limits(shell: &ShellConfig) -> ShellLimits {
 fn validate_boundary(
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     client_id: &str,
     operation: &PersistentShellRequest,
 ) -> Result<RunnerProjectShellContext, (&'static str, String)> {
@@ -651,7 +655,7 @@ fn validate_boundary(
                 "runtime project does not belong to this Runner".to_string(),
             )
         })?;
-    find_project_shell_context_by_id(projects_dir, project_id).ok_or_else(|| {
+    find_project_shell_context_by_id(project_registry_dir, project_id).ok_or_else(|| {
         (
             "persistent_shell_project_unavailable",
             "project is disabled, unregistered, or not executable by this Runner".to_string(),
@@ -815,7 +819,7 @@ fn selected_profile<'a>(
 fn build_launch(
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     operation: &PersistentShellRequest,
     project: &RunnerProjectShellContext,
 ) -> Result<ShellLaunch, (&'static str, String)> {
@@ -833,7 +837,7 @@ fn build_launch(
 
 fn build_launch_at_cwd(
     shell: &ShellConfig,
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     operation: &PersistentShellRequest,
     project: &RunnerProjectShellContext,
     cwd: PathBuf,
@@ -1142,11 +1146,11 @@ fn error_result(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::shell_protocol::ShellAgentShellRequest;
+    use crate::runner_protocol::RunnerRequest;
     use std::collections::BTreeMap;
 
-    fn request(action: &str, shell_id: &str, command: Option<&str>) -> ShellAgentShellRequest {
-        ShellAgentShellRequest {
+    fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
+        RunnerRequest {
             request_id: format!("req-{action}"),
             client_id: "agent-1".to_string(),
             kind: "persistent_shell".to_string(),
@@ -1171,6 +1175,7 @@ mod tests {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
@@ -1189,7 +1194,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let projects = temp.path().join("projects.d");
+        let projects = temp.path().join("project-registry");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join("sub")).unwrap();
         std::fs::create_dir_all(&projects).unwrap();
@@ -1534,11 +1539,11 @@ mod windows_tests {
     use super::super::config::SshResourceConfig;
     use super::super::ssh::SshConnectionPool;
     use super::*;
-    use crate::shell_protocol::ShellAgentShellRequest;
+    use crate::runner_protocol::RunnerRequest;
     use std::collections::BTreeMap;
 
-    fn request(action: &str, shell_id: &str, command: Option<&str>) -> ShellAgentShellRequest {
-        ShellAgentShellRequest {
+    fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
+        RunnerRequest {
             request_id: format!("req-{action}"),
             client_id: "msi".to_string(),
             kind: "persistent_shell".to_string(),
@@ -1563,6 +1568,7 @@ mod windows_tests {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
@@ -1583,7 +1589,7 @@ mod windows_tests {
         shell_id: &str,
         resource: &str,
         command: Option<&str>,
-    ) -> ShellAgentShellRequest {
+    ) -> RunnerRequest {
         serde_json::from_value(serde_json::json!({
             "request_id": format!("req-ssh-{action}-{shell_id}"),
             "client_id": "msi",
@@ -1620,7 +1626,7 @@ mod windows_tests {
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let projects = temp.path().join("projects.d");
+        let projects = temp.path().join("project-registry");
         std::fs::create_dir_all(project.join("sub")).unwrap();
         std::fs::create_dir_all(&projects).unwrap();
         let escaped = project.to_string_lossy().replace('\\', "\\\\");

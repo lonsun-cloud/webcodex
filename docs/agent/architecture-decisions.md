@@ -303,10 +303,10 @@ it never infers readiness from configuration.
 | Layer envelope | Every layer carries `{status, observed_at, source, age_secs, stale_after_secs, reason_code}` plus layer facts |
 | No config-inferred readiness | `connector_endpoint` readiness comes only from readiness probes or successful connector requests; configuration presence never implies `ready`. `runner_process` never fakes "running"; a stale registration is never presented as callable |
 | Explicit Workflow targeting | Full-runtime Workflow Sessions have no process-local or durable window binding. `runtime_status` exposes no Workflow binding layer. Ordinary project tools without an explicit business Session or authorized wrapper recorder execute unlinked to Workflow Session state. This remains separate from Connector-owned window/project/task continuity |
-| Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. The internal `StartCodingTask` primitive is implementation plumbing, not a wire/API continuation entry |
+| Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. `work_on_project` calls the shared coding workflow engine directly; there is no second internal ToolCall identity |
 | Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. A startup-selected model surface may project that universe more narrowly: `local_coding` lists its focused typed set, `adaptive_runtime` lists a smaller typed core plus one long-tail gateway, and `full_operator_runtime` expands the runtime universe. Retired wire names such as `start_coding_task` fail closed before dispatch and never contribute selector names or flattened model fields |
 | Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `local_coding`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Gateway calls keep the target tool's existing scope, authority, permission, argument, effect, and Session/ACK semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
-| Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
+| Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_runners`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
 | Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
 
 ---
@@ -315,9 +315,9 @@ it never infers readiness from configuration.
 
 `work_on_project` is the only external runtime coding bootstrap. The retired
 `start_coding_task` wire/API name and its advanced input schema are not accepted.
-The internal `StartCodingTask` primitive may still use
-`detail=minimal|standard|full` to build bounded startup projections for shared
-implementation paths; that control is not a public tool argument.
+The shared coding workflow engine owns startup behavior directly. Bounded
+`minimal|standard|full` diagnostic projections are retained only behind test
+seams; those controls are not a public tool argument or ToolCall identity.
 
 | Decision | Choice |
 |---|---|
@@ -447,6 +447,44 @@ profile directory before environment defaults are considered.
 `WEBCODEX_RUNNER_CONFIG` is the canonical default-path env override, while
 `WEBCODEX_AGENT_CONFIG` remains a legacy alias; setting both is an error only
 when environment defaults are actually consulted.
+
+The same pre-`v0.4.0` normalization applies to the Runner-owned project
+registry: `project_registry_dir` and `project-registry/` are canonical for new
+state, while a sole legacy `projects_dir` field or `projects.d/` directory may
+continue to identify existing state in place. New and legacy fields together,
+or both default directory names together, fail closed; WebCodex does not merge,
+copy, rename, or choose between two registries implicitly. The registry remains
+a directory of Runner-owned project registration records, not a second workspace
+or project-root abstraction.
+
+Project registration provenance is also normalized before the `v0.4.0` floor.
+The generic project-record `kind` field remains open project metadata, while the
+optional `registration_source` field describes how the record entered the
+Runner registry (`explicit` or `auto_registered`). New path auto-registration
+persists `registration_source = "auto_registered"` and does not persist a fake
+`kind`. For old records only, absent `registration_source` plus the exact
+historical `kind = "auto_registered"` sentinel remains a compatibility fallback;
+a present new field is authoritative. This interpretation is kept separate from
+the raw record representation used for project revision/CAS hashing, so merely
+upgrading WebCodex does not change an unchanged legacy record's revision. During
+rolling upgrades a new Runner may still project the historical sentinel on its
+inventory and path-operation wire results for a newly auto-registered project
+with no genuine kind so an old Server can classify it, while new Servers use the
+explicit additive provenance field.
+Public `list_projects.source` remains `agent_registered` / `auto_registered`.
+
+The pre-0.4 managed-temporary-project lifecycle is retired rather than carried
+into the `v0.4.0` product contract. Current project creation uses explicit
+`create_project`; existing directories use `work_on_project(path)` or
+`register_project`. For one pre-0.4 config compatibility window, the old
+`temporary_projects_root` key is parsed with its former absolute-path validation,
+then warned and ignored. Existing project-registry records whose generic
+`kind = "managed_temporary"` value predates this cleanup remain readable as
+ordinary registrations; current Server projections do not treat that value as
+an active lifecycle. A legacy Server request containing the old
+`managed_temporary_project` create flag fails closed on a new Runner before any
+filesystem mutation. This retirement does not change protocol generation,
+baseline capabilities, `client_id`, `agent_project_id`, or runtime project ids.
 
 Other older `agent_*` names are compatibility vocabulary and remain frozen
 rather than being cosmetically duplicated. In particular,

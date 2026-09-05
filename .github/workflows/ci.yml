@@ -34,7 +34,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - name: Install frontend dependencies
         run: npm ci --prefix frontend
       - name: Check frontend contracts
@@ -42,6 +44,13 @@ jobs:
           npm --prefix frontend run typecheck
           npm --prefix frontend test
           npm --prefix frontend run check:dist
+      - name: Install Desktop frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Check Desktop frontend contracts
+        run: |
+          npm --prefix apps/desktop run typecheck
+          npm --prefix apps/desktop test
+          npm --prefix apps/desktop run build
       - name: Verify workspace boundaries
         run: |
           bash scripts/workspace_boundary_check.sh --self-test
@@ -84,13 +93,9 @@ jobs:
             packages: "-p webcodex-runner"
           - shard: workspace-crates
             packages: >-
-              -p webcodex-admin
-              -p webcodex-runner-config
-              -p webcodex-core
-              -p webcodex-cli
-              -p webcodex-persistent-shell
-              -p webcodex-workspace
-              -p webcodex-process
+              --workspace
+              --exclude webcodex
+              --exclude webcodex-runner
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -181,8 +186,8 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.user.login != github.repository_owner ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
-    # Native macOS gates for both published architectures plus the Runner's
-    # detached ownership/restart suites. Keep these ahead of immutable tagging.
+    # Native macOS gates for both published architectures plus the Runner and
+    # Computer platform suites. Keep these ahead of immutable tagging.
     strategy:
       fail-fast: false
       matrix:
@@ -212,13 +217,16 @@ jobs:
           rust_host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$rust_host" = "$EXPECTED_RUST_HOST"
       - name: Check macOS release production surfaces
-        run: cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner
-      - name: Run native macOS Runner tests
-        run: cargo test --locked -p webcodex-runner
+        run: cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner -p webcodex-computer
+      - name: Run native macOS Runner and Computer tests
+        run: cargo test --locked -p webcodex-runner -p webcodex-computer
 
   # Keep Windows process-heavy suites isolated on separate hosted VMs. The
-  # webcodex-runner lane remains test-function-serial because its real
-  # PowerShell/process-tree fixtures can starve each other on hosted Windows.
+  # webcodex-runner lane caps libtest at two concurrent test functions: default
+  # parallelism can starve real PowerShell/process-tree startup on hosted Windows,
+  # while one thread needlessly serializes the entire mixed-cost Runner suite.
+  # Keep webcodex-computer in the same native lane so platform tests continue
+  # running after the Computer runtime was split out of the Runner crate.
   # Core/library and packaging coverage can run independently in parallel.
   test-windows-core:
     needs: contract
@@ -258,12 +266,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-runner-ci
-      - name: Run Windows Runner tests
-        # The Runner suite starts many real PowerShell/process-tree fixtures. On
-        # hosted Windows, parallel test functions can starve process startup long
-        # enough to trip intentionally tight command timeouts. Serialize only
-        # the test functions; concurrency exercised inside each test is unchanged.
-        run: cargo test --locked -p webcodex-runner -- --test-threads=1
+      - name: Run Windows Runner and Computer tests
+        # Keep process contention bounded without forcing all 700+ Runner tests
+        # through one test thread. Concurrency exercised inside each test is unchanged.
+        run: cargo test --locked -p webcodex-runner -p webcodex-computer -- --test-threads=2
 
   test-windows-package:
     needs: contract
@@ -293,6 +299,101 @@ jobs:
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/npm_install_windows_smoke.ps1
 
+  test-windows-desktop:
+    needs: contract
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.user.login != github.repository_owner ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-desktop-ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install Desktop dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Check Desktop frontend
+        run: |
+          npm --prefix apps/desktop run typecheck
+          npm --prefix apps/desktop test
+          npm --prefix apps/desktop run build
+      - name: Check Desktop Rust
+        shell: pwsh
+        run: |
+          cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+          if ($LASTEXITCODE -ne 0) { throw "Desktop cargo check failed" }
+          cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "Desktop cargo test failed" }
+      - name: Build exact local WebCodex runtime
+        id: runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = (git rev-parse HEAD).Trim()
+          $short = (git rev-parse --short=12 HEAD).Trim()
+          $version = (node -e "console.log(require('./npm/webcodex/package.json').version)").Trim()
+          $builtAt = [Int64]((git show -s --format=%ct HEAD).Trim())
+          $env:WEBCODEX_BUILT_AT = "$builtAt"
+          cargo build --locked --release -p webcodex -p webcodex-cli -p webcodex-runner
+          if ($LASTEXITCODE -ne 0) { throw "WebCodex runtime build failed" }
+          foreach ($name in @("webcodex", "webcodex-server", "webcodex-runner")) {
+            $binary = Join-Path "target\release" "$name.exe"
+            $actual = @(& $binary --version | Select-Object -First 1)[0].TrimEnd()
+            $expected = "$name $version (commit $short, dirty=false, built_at=$builtAt)"
+            if ($actual -ne $expected) { throw "Unexpected $name identity: $actual" }
+          }
+          "source=$source" >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "built_at=$builtAt" >> $env:GITHUB_OUTPUT
+      - name: Stage exact runtime for Desktop bundle
+        id: desktop_bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $env:GITHUB_WORKSPACE "target\desktop-ci-bundle"
+          & .\scripts\prepare_desktop_bundle.ps1 `
+            -BinDir "target\release" `
+            -Version "${{ steps.runtime.outputs.version }}" `
+            -SourceSha "${{ steps.runtime.outputs.source }}" `
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
+            -OutputDir $stage
+          if ($LASTEXITCODE -ne 0) { throw "Desktop bundle staging failed" }
+          "config=$(Join-Path $stage 'tauri.bundle.conf.json')" >> $env:GITHUB_OUTPUT
+      - name: Build unsigned NSIS installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CARGO_TARGET_DIR = Join-Path $env:GITHUB_WORKSPACE "target\desktop-ci-tauri"
+          npm --prefix apps/desktop exec tauri -- build --bundles nsis --config "${{ steps.desktop_bundle.outputs.config }}" --ci --no-sign
+          if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS build failed" }
+          $bundleDir = Join-Path $env:CARGO_TARGET_DIR "release\bundle\nsis"
+          $built = @(Get-ChildItem -LiteralPath $bundleDir -Filter "*-setup.exe" -File)
+          if ($built.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($built.Count)" }
+          New-Item -ItemType Directory -Force -Path "target\desktop-ci-dist" | Out-Null
+          $installer = Join-Path "target\desktop-ci-dist" "webcodex-desktop-ci-${{ steps.runtime.outputs.short }}-v${{ steps.runtime.outputs.version }}-win32-x64-setup.exe"
+          Copy-Item -LiteralPath $built[0].FullName -Destination $installer
+          "DESKTOP_CI_INSTALLER=$([System.IO.Path]::GetFullPath($installer))" >> $env:GITHUB_ENV
+      - name: Smoke newly-built Desktop installer
+        shell: pwsh
+        run: |
+          & .\scripts\desktop_install_windows_smoke.ps1 `
+            -Installer $env:DESKTOP_CI_INSTALLER `
+            -Version "${{ steps.runtime.outputs.version }}" `
+            -SourceSha "${{ steps.runtime.outputs.source }}" `
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}")
+          if ($LASTEXITCODE -ne 0) { throw "Desktop installer smoke failed" }
+
   # The x64 Windows lanes above exercise full process/package behavior. Keep one
   # native ARM64 compile gate on exact main so the release workflow is not the
   # first place target-specific Windows code is compiled.
@@ -320,7 +421,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
 
   test-windows:
-    needs: [contract, test-windows-core, test-windows-runner, test-windows-package, test-windows-arm64]
+    needs: [contract, test-windows-core, test-windows-runner, test-windows-package, test-windows-desktop, test-windows-arm64]
     # Preserve the historical required Windows status while moving the expensive
     # work into parallel VMs. Eligible heavy runs inspect every lane even after a
     # failure so branch protection cannot see a false-success aggregate.
@@ -340,14 +441,50 @@ jobs:
           CORE_RESULT: ${{ needs.test-windows-core.result }}
           RUNNER_RESULT: ${{ needs.test-windows-runner.result }}
           PACKAGE_RESULT: ${{ needs.test-windows-package.result }}
+          DESKTOP_RESULT: ${{ needs.test-windows-desktop.result }}
           ARM64_RESULT: ${{ needs.test-windows-arm64.result }}
         run: |
-          echo "contract=$CONTRACT_RESULT core=$CORE_RESULT runner=$RUNNER_RESULT package=$PACKAGE_RESULT arm64=$ARM64_RESULT"
+          echo "contract=$CONTRACT_RESULT core=$CORE_RESULT runner=$RUNNER_RESULT package=$PACKAGE_RESULT desktop=$DESKTOP_RESULT arm64=$ARM64_RESULT"
           if [ "$CONTRACT_RESULT" != success ] || \
              [ "$CORE_RESULT" != success ] || \
              [ "$RUNNER_RESULT" != success ] || \
              [ "$PACKAGE_RESULT" != success ] || \
+             [ "$DESKTOP_RESULT" != success ] || \
              [ "$ARM64_RESULT" != success ]; then
             echo "required Windows CI lane did not succeed" >&2
+            exit 1
+          fi
+
+  test-native:
+    needs: [contract, test-linux-arm64, test-macos, test-windows]
+    # Always publish one stable native-coverage result. Owner-authored PRs may
+    # still start cheaply, but skipped native lanes remain visibly unsatisfied
+    # until the PR opts into the heavy matrix with `run-ci`.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful native lanes
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          LINUX_ARM64_RESULT: ${{ needs.test-linux-arm64.result }}
+          MACOS_RESULT: ${{ needs.test-macos.result }}
+          WINDOWS_RESULT: ${{ needs.test-windows.result }}
+        run: |
+          echo "contract=$CONTRACT_RESULT linux_arm64=$LINUX_ARM64_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT"
+          if [ "$CONTRACT_RESULT" != success ]; then
+            echo "contract CI did not succeed" >&2
+            exit 1
+          fi
+          if [ "$LINUX_ARM64_RESULT" = skipped ] || \
+             [ "$MACOS_RESULT" = skipped ] || \
+             [ "$WINDOWS_RESULT" = skipped ]; then
+            echo "native CI was skipped; owner-authored PRs must add the run-ci label before merge" >&2
+            exit 1
+          fi
+          if [ "$LINUX_ARM64_RESULT" != success ] || \
+             [ "$MACOS_RESULT" != success ] || \
+             [ "$WINDOWS_RESULT" != success ]; then
+            echo "required native CI lane did not succeed" >&2
             exit 1
           fi

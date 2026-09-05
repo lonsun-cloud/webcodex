@@ -46,13 +46,13 @@ fi
 # The release operator first binds one successful exact-source main-push CI run;
 # that CI already owns the deterministic release/static contract, complete Linux
 # Rust coverage, frontend checks, both native macOS Runner suites, Windows x64
-# runtime/package coverage, and lightweight Linux/Windows arm64 production-target
-# compilation. Readiness revalidates that exact CI run attempt, then runs only:
+# runtime/package/Desktop-installer coverage, and lightweight Linux/Windows arm64
+# production-target compilation. Readiness revalidates that exact CI run attempt, then runs only:
 #   - WebSocket + polling zero-config E2E
 #   - EVAL_MODE=compare bash scripts/eval_coding_loop.sh with prebuilt debug fixtures
 #   - disposable linux/amd64 + linux/arm64 Server-image/runtime/bootstrap validation
-# Six-platform release-profile/ABI/package candidates are built exactly once after
-# immutable tagging by .github/workflows/release-build.yml.
+# Six-platform release-profile/ABI/package candidates plus the Windows x64 Desktop
+# installer are built exactly once after immutable tagging by release-build.yml.
 #
 # Usage:
 #   bash scripts/release_check.sh
@@ -197,6 +197,12 @@ if bash scripts/test_python_tooling.sh \
     && python3 scripts/release_operator.py collect --help >/dev/null \
     && python3 scripts/release_operator.py stage-npm --help >/dev/null \
     && python3 scripts/release_operator.py verify-draft --help >/dev/null \
+    && test -f scripts/prepare_desktop_bundle.ps1 \
+    && test -f scripts/desktop_install_windows_smoke.ps1 \
+    && grep -Fq 'test-windows-desktop:' .github/workflows/ci.yml \
+    && grep -Fq 'DESKTOP_RESULT' .github/workflows/ci.yml \
+    && grep -Fq 'desktop_artifacts' .github/workflows/release-build.yml \
+    && grep -Fq 'prepare_desktop_bundle.ps1' .github/workflows/release-build.yml \
     && python3 scripts/check_markdown_links.py \
     && bash scripts/tests/test_npm_package_smoke_existing_binaries.sh; then
     ok "release verification tooling self-tests"
@@ -235,15 +241,15 @@ fi
 # Stage 11: static — no python runtime helper regressions
 # ----------------------------------------------------------------------------
 stage_start "static: no python runtime helper regressions"
-if grep -R "python3 -c" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
+if grep -R "python3 -c" -n src/tool_runtime src/runner_http crates/webcodex-runner/src; then
     die "python3 -c in runtime paths"
 else
     ok "no python3 -c in runtime paths"
 fi
-if grep -R "run_agent_helper" -n src/tool_runtime src/shell_client crates/webcodex-runner/src; then
-    die "run_agent_helper in runtime paths"
+if grep -R "run_runner_helper" -n src/tool_runtime src/runner_http crates/webcodex-runner/src; then
+    die "run_runner_helper in runtime paths"
 else
-    ok "no run_agent_helper in runtime paths"
+    ok "no run_runner_helper in runtime paths"
 fi
 
 # ----------------------------------------------------------------------------
@@ -258,6 +264,7 @@ SENSITIVE_PATTERNS=(
     'agent.toml'
     'webcodex.env'
     '.env'
+    'project-registry'
     'projects.d'
 )
 violations=""

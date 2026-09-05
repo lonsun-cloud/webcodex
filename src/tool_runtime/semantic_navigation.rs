@@ -1,17 +1,17 @@
 //! Compact project-specific semantic navigation capability for coding startup.
 //!
-//! The startup probe uses only the typed agent `Status` operation. It never
+//! The startup probe uses only the typed Runner `Status` transport operation. It never
 //! enters public ToolCall dispatch, starts a language server, or exposes the
-//! raw agent transport/result envelope.
+//! raw Runner transport/result envelope.
 
-use super::lsp_tools::agent_local_project_id;
+use super::lsp_tools::runner_local_project_id;
 use super::project_resolution::ResolvedProject;
 use super::ToolRuntime;
 use crate::lsp_bridge::{
-    parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspRequest, LspAvailabilityStatus,
-    LspStatusResult,
+    parse_runner_lsp_result_envelope, LspAvailabilityStatus, LspStatusResult, RunnerLspPayload,
+    RunnerLspRequest,
 };
-use crate::shell_client::{EnqueueLspError, RunnerFeature};
+use crate::runner_http::{EnqueueLspError, RunnerFeature};
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -63,8 +63,11 @@ pub(crate) enum SemanticNavigationStartupStatus {
     Crashed,
     Unavailable,
     NotApplicable,
-    AgentUnavailable,
-    AgentCapabilityUnavailable,
+    #[serde(rename = "agent_unavailable")]
+    RunnerUnavailable,
+    // Stable serialized compatibility status retained for pre-0.4 consumers.
+    #[serde(rename = "agent_capability_unavailable")]
+    RunnerCapabilityUnavailable,
     ProbeTimeout,
     ProbeFailed,
 }
@@ -72,21 +75,26 @@ pub(crate) enum SemanticNavigationStartupStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SemanticNavigationReasonCode {
-    ProjectNotAgentBacked,
     RustNotDetected,
-    AgentNotConnected,
+    #[serde(rename = "agent_not_connected")]
+    RunnerNotConnected,
     LspCapabilityNotAdvertised,
     ServerCrashed,
     ServerUnavailable,
     StatusProbeTimedOut,
     StatusProbeFailed,
-    MalformedAgentResult,
+    #[serde(rename = "malformed_agent_result")]
+    MalformedRunnerResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SemanticNavigationStartupSummary {
     supported: bool,
-    available: bool,
+    /// `None` means the bounded startup status probe did not complete, so the
+    /// Server has no fresh executable/slot availability fact. This is
+    /// intentionally distinct from `Some(false)`, which is reserved for a
+    /// positive unavailable observation.
+    available: Option<bool>,
     recommended: bool,
     status: SemanticNavigationStartupStatus,
     language: Option<&'static str>,
@@ -105,7 +113,7 @@ impl SemanticNavigationStartupSummary {
     ) -> Self {
         Self {
             supported: false,
-            available: false,
+            available: Some(false),
             recommended: false,
             status,
             language: None,
@@ -124,7 +132,7 @@ impl SemanticNavigationStartupSummary {
     ) -> Self {
         Self {
             supported: true,
-            available: false,
+            available: Some(false),
             recommended: false,
             status,
             language: None,
@@ -139,10 +147,31 @@ impl SemanticNavigationStartupSummary {
         }
     }
 
+    fn probe_timeout() -> Self {
+        Self {
+            supported: true,
+            available: None,
+            recommended: false,
+            status: SemanticNavigationStartupStatus::ProbeTimeout,
+            language: None,
+            server: None,
+            position_encoding: None,
+            tools: SEMANTIC_NAVIGATION_TOOLS.to_vec(),
+            preferred_flow: Vec::new(),
+            limitations: vec![
+                "read_only",
+                "workspace_only",
+                "no_dependency_navigation",
+                "full_text_sync_only",
+            ],
+            reason_code: Some(SemanticNavigationReasonCode::StatusProbeTimedOut),
+        }
+    }
+
     fn rust_not_detected() -> Self {
         Self {
             supported: true,
-            available: false,
+            available: Some(false),
             recommended: false,
             status: SemanticNavigationStartupStatus::NotApplicable,
             language: None,
@@ -157,14 +186,14 @@ impl SemanticNavigationStartupSummary {
 
     fn from_enqueue_error(error: &EnqueueLspError) -> Self {
         match error {
-            EnqueueLspError::UnknownClient { .. } | EnqueueLspError::ClientOffline { .. } => {
+            EnqueueLspError::UnknownRunner { .. } | EnqueueLspError::RunnerOffline { .. } => {
                 Self::unsupported(
-                    SemanticNavigationStartupStatus::AgentUnavailable,
-                    SemanticNavigationReasonCode::AgentNotConnected,
+                    SemanticNavigationStartupStatus::RunnerUnavailable,
+                    SemanticNavigationReasonCode::RunnerNotConnected,
                 )
             }
             EnqueueLspError::UnsupportedCapability { .. } => Self::unsupported(
-                SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
+                SemanticNavigationStartupStatus::RunnerCapabilityUnavailable,
                 SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
             ),
             EnqueueLspError::InvalidRequest { .. } | EnqueueLspError::QueueFull { .. } => {
@@ -181,7 +210,7 @@ impl SemanticNavigationStartupSummary {
         expected_project_id: &str,
     ) -> Result<Self, SemanticNavigationReasonCode> {
         if result.project != expected_project_id {
-            return Err(SemanticNavigationReasonCode::MalformedAgentResult);
+            return Err(SemanticNavigationReasonCode::MalformedRunnerResult);
         }
         // Preserve the pre-existing Rust-first behavior in mixed workspaces.
         // Go is additive: a Go-only workspace selects gopls, while existing
@@ -214,14 +243,14 @@ impl SemanticNavigationStartupSummary {
             .iter()
             .find(|entry| entry.language == language && entry.server == server_name)
         else {
-            return Err(SemanticNavigationReasonCode::MalformedAgentResult);
+            return Err(SemanticNavigationReasonCode::MalformedRunnerResult);
         };
         if server
             .position_encoding
             .as_deref()
             .is_some_and(|encoding| !matches!(encoding, "utf-8" | "utf-16" | "utf-32"))
         {
-            return Err(SemanticNavigationReasonCode::MalformedAgentResult);
+            return Err(SemanticNavigationReasonCode::MalformedRunnerResult);
         }
 
         let (available, recommended, status, reason_code, position_encoding) = match server.status {
@@ -247,7 +276,7 @@ impl SemanticNavigationStartupSummary {
                 None,
             ),
             // A crashed slot restarts on the next request, so navigation is
-            // still worth offering — but only while the agent reports the
+            // still worth offering — but only while the Runner reports the
             // executable itself as available. Hardcoding `true` here would
             // advertise navigation after the binary was removed.
             LspAvailabilityStatus::Crashed => (
@@ -268,7 +297,7 @@ impl SemanticNavigationStartupSummary {
 
         Ok(Self {
             supported: true,
-            available,
+            available: Some(available),
             recommended,
             status,
             language: Some(language),
@@ -291,44 +320,30 @@ impl ToolRuntime {
         &self,
         resolved: &ResolvedProject,
     ) -> SemanticNavigationStartupSummary {
-        if !resolved.config.is_agent() {
-            return SemanticNavigationStartupSummary::unsupported(
-                SemanticNavigationStartupStatus::NotApplicable,
-                SemanticNavigationReasonCode::ProjectNotAgentBacked,
-            );
-        }
-        let client_id = match resolved.config.agent_client_id() {
-            Ok(client_id) => client_id.to_string(),
-            Err(_) => {
-                return SemanticNavigationStartupSummary::unsupported(
-                    SemanticNavigationStartupStatus::AgentUnavailable,
-                    SemanticNavigationReasonCode::AgentNotConnected,
-                )
-            }
-        };
+        let client_id = resolved.config.client_id.clone();
         let Some(client) = self
-            .shell_clients
-            .get_client_semantic_view(&client_id)
+            .runner_registry
+            .get_runner_semantic_view(&client_id)
             .await
         else {
             return SemanticNavigationStartupSummary::unsupported(
-                SemanticNavigationStartupStatus::AgentUnavailable,
-                SemanticNavigationReasonCode::AgentNotConnected,
+                SemanticNavigationStartupStatus::RunnerUnavailable,
+                SemanticNavigationReasonCode::RunnerNotConnected,
             );
         };
         if !client.view.connected {
             return SemanticNavigationStartupSummary::unsupported(
-                SemanticNavigationStartupStatus::AgentUnavailable,
-                SemanticNavigationReasonCode::AgentNotConnected,
+                SemanticNavigationStartupStatus::RunnerUnavailable,
+                SemanticNavigationReasonCode::RunnerNotConnected,
             );
         }
         if !client.supports(RunnerFeature::LspReadOnlyNavigation) {
             return SemanticNavigationStartupSummary::unsupported(
-                SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
+                SemanticNavigationStartupStatus::RunnerCapabilityUnavailable,
                 SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
             );
         }
-        let Some(agent_project_id) = agent_local_project_id(&resolved.resolved_id) else {
+        let Some(agent_project_id) = runner_local_project_id(&resolved.resolved_id) else {
             return SemanticNavigationStartupSummary::supported_failure(
                 SemanticNavigationStartupStatus::ProbeFailed,
                 SemanticNavigationReasonCode::StatusProbeFailed,
@@ -336,14 +351,14 @@ impl ToolRuntime {
         };
 
         let deadline = Instant::now() + self.semantic_navigation_probe_timeout;
-        let payload = AgentLspPayload {
+        let payload = RunnerLspPayload {
             project_id: agent_project_id.to_string(),
-            request: AgentLspRequest::Status,
+            request: RunnerLspRequest::Status,
         };
         let timeout_secs = self.semantic_navigation_probe_timeout.as_secs().max(1);
         let enqueued = tokio::time::timeout_at(
             deadline,
-            self.shell_clients.enqueue_lsp(
+            self.runner_registry.enqueue_lsp(
                 client_id,
                 payload,
                 "coding_startup_probe".to_string(),
@@ -352,26 +367,18 @@ impl ToolRuntime {
         )
         .await;
         let (request_id, receiver) = match enqueued {
-            Err(_) => {
-                return SemanticNavigationStartupSummary::supported_failure(
-                    SemanticNavigationStartupStatus::ProbeTimeout,
-                    SemanticNavigationReasonCode::StatusProbeTimedOut,
-                )
-            }
+            Err(_) => return SemanticNavigationStartupSummary::probe_timeout(),
             Ok(Err(error)) => return SemanticNavigationStartupSummary::from_enqueue_error(&error),
             Ok(Ok(request)) => request,
         };
 
         let response = match tokio::time::timeout_at(deadline, receiver).await {
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
-                return SemanticNavigationStartupSummary::supported_failure(
-                    SemanticNavigationStartupStatus::ProbeTimeout,
-                    SemanticNavigationReasonCode::StatusProbeTimedOut,
-                );
+                self.runner_registry.cancel_request(&request_id).await;
+                return SemanticNavigationStartupSummary::probe_timeout();
             }
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return SemanticNavigationStartupSummary::supported_failure(
                     SemanticNavigationStartupStatus::ProbeFailed,
                     SemanticNavigationReasonCode::StatusProbeFailed,
@@ -388,15 +395,15 @@ impl ToolRuntime {
         let Some(stdout) = response.stdout.as_deref() else {
             return SemanticNavigationStartupSummary::supported_failure(
                 SemanticNavigationStartupStatus::ProbeFailed,
-                SemanticNavigationReasonCode::MalformedAgentResult,
+                SemanticNavigationReasonCode::MalformedRunnerResult,
             );
         };
-        let envelope = match parse_agent_lsp_result_envelope(stdout) {
+        let envelope = match parse_runner_lsp_result_envelope(stdout) {
             Ok(envelope) => envelope,
             Err(_) => {
                 return SemanticNavigationStartupSummary::supported_failure(
                     SemanticNavigationStartupStatus::ProbeFailed,
-                    SemanticNavigationReasonCode::MalformedAgentResult,
+                    SemanticNavigationReasonCode::MalformedRunnerResult,
                 )
             }
         };
@@ -409,7 +416,7 @@ impl ToolRuntime {
         let Some(result) = envelope.result else {
             return SemanticNavigationStartupSummary::supported_failure(
                 SemanticNavigationStartupStatus::ProbeFailed,
-                SemanticNavigationReasonCode::MalformedAgentResult,
+                SemanticNavigationReasonCode::MalformedRunnerResult,
             );
         };
         let result = match serde_json::from_value::<LspStatusResult>(result) {
@@ -417,7 +424,7 @@ impl ToolRuntime {
             Err(_) => {
                 return SemanticNavigationStartupSummary::supported_failure(
                     SemanticNavigationStartupStatus::ProbeFailed,
-                    SemanticNavigationReasonCode::MalformedAgentResult,
+                    SemanticNavigationReasonCode::MalformedRunnerResult,
                 )
             }
         };
@@ -454,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn crashed_available_follows_agent_reported_executable_availability() {
+    fn crashed_available_follows_runner_reported_executable_availability() {
         // Executable still present: the slot restarts on demand.
         let summary =
             SemanticNavigationStartupSummary::from_lsp_status(crashed_status(true), "demo")
@@ -534,36 +541,42 @@ mod tests {
     }
 
     #[test]
-    fn non_agent_summary_is_bounded_and_not_applicable() {
-        let summary = SemanticNavigationStartupSummary::unsupported(
-            SemanticNavigationStartupStatus::NotApplicable,
-            SemanticNavigationReasonCode::ProjectNotAgentBacked,
+    fn runner_semantic_navigation_names_preserve_legacy_wire_codes() {
+        assert_eq!(
+            serde_json::to_value(SemanticNavigationStartupStatus::RunnerUnavailable).unwrap(),
+            "agent_unavailable"
         );
-        let value = serde_json::to_value(summary).unwrap();
-        assert_eq!(value["status"], "not_applicable");
-        assert_eq!(value["reason_code"], "project_not_agent_backed");
-        assert_eq!(value["tools"], serde_json::json!([]));
-        assert_eq!(value["preferred_flow"], serde_json::json!([]));
-        assert_eq!(value["limitations"], serde_json::json!([]));
+        assert_eq!(
+            serde_json::to_value(SemanticNavigationStartupStatus::RunnerCapabilityUnavailable)
+                .unwrap(),
+            "agent_capability_unavailable"
+        );
+        assert_eq!(
+            serde_json::to_value(SemanticNavigationReasonCode::RunnerNotConnected).unwrap(),
+            "agent_not_connected"
+        );
+        assert_eq!(
+            serde_json::to_value(SemanticNavigationReasonCode::MalformedRunnerResult).unwrap(),
+            "malformed_agent_result"
+        );
     }
 
     #[test]
     fn enqueue_error_classification_uses_variants_not_display_text() {
         let cases = [
             (
-                EnqueueLspError::UnknownClient {
-                    client_id: "agent does not support navigation".to_string(),
+                EnqueueLspError::UnknownRunner {
+                    client_id: "runner does not support navigation".to_string(),
                 },
-                SemanticNavigationStartupStatus::AgentUnavailable,
-                SemanticNavigationReasonCode::AgentNotConnected,
+                SemanticNavigationStartupStatus::RunnerUnavailable,
+                SemanticNavigationReasonCode::RunnerNotConnected,
             ),
             (
                 EnqueueLspError::UnsupportedCapability {
                     client_id: "unknown shell client wording".to_string(),
-                    capability:
-                        crate::shell_protocol::SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+                    capability: crate::runner_protocol::RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
                 },
-                SemanticNavigationStartupStatus::AgentCapabilityUnavailable,
+                SemanticNavigationStartupStatus::RunnerCapabilityUnavailable,
                 SemanticNavigationReasonCode::LspCapabilityNotAdvertised,
             ),
             (

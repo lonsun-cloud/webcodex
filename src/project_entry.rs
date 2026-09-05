@@ -10,6 +10,8 @@ mod client_handoff_service;
 mod cloudflared_service;
 #[path = "project_entry_openai_tunnel.rs"]
 mod openai_tunnel_service;
+#[path = "project_entry_regular_tunnel.rs"]
+mod regular_tunnel_service;
 #[path = "project_entry_setup.rs"]
 mod setup_service;
 #[path = "project_entry_share.rs"]
@@ -18,6 +20,7 @@ mod share_service;
 #[path = "project_entry_windows.rs"]
 mod windows_private_state;
 
+pub(crate) use regular_tunnel_service::{run_regular_server_tunnel, RegularServerTunnelOptions};
 use setup_service::{
     create_private_dir, local_readiness, prepare_runtime_private_state, read_private_value,
     read_project_agent_token, read_project_credential, read_toml_optional,
@@ -39,6 +42,8 @@ use tokio::process::{Child, Command};
 
 const DEFAULT_PROFILE: &str = "personal";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTOR_PROJECT_REGISTRY_DIR_ENV: &str = "WEBCODEX_CONNECTOR_PROJECT_REGISTRY_DIR";
+const LEGACY_CONNECTOR_PROJECTS_DIR_ENV: &str = "WEBCODEX_CONNECTOR_PROJECTS_DIR";
 
 const NPM_WRAPPER_NETWORK_ENV_KEYS: [&str; 8] = [
     "npm_config_https_proxy",
@@ -55,6 +60,15 @@ fn remove_npm_wrapper_network_environment(command: &mut Command) {
     for key in NPM_WRAPPER_NETWORK_ENV_KEYS {
         command.env_remove(key);
     }
+}
+
+fn configure_connector_project_registry_environment(command: &mut Command, path: &Path) {
+    // `Command` inherits the parent environment. Clear the pre-0.4 alias before
+    // setting the canonical variable so a stale shell/service environment cannot
+    // make the child Server observe both names and fail its dual-alias fence.
+    command
+        .env_remove(LEGACY_CONNECTOR_PROJECTS_DIR_ENV)
+        .env(CONNECTOR_PROJECT_REGISTRY_DIR_ENV, path);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +199,7 @@ pub(crate) struct LocalTaskState {
     pub state: PathBuf,
     pub data: PathBuf,
     pub runs: PathBuf,
-    pub projects: PathBuf,
+    pub project_registry: PathBuf,
     pub cargo_target: PathBuf,
     pub logical_project_id: String,
 }
@@ -208,7 +222,7 @@ pub(crate) fn parse_options(
             "--root" => options.root = PathBuf::from(value(&mut index)?),
             "--profile" => options.profile = value(&mut index)?,
             "--state-dir" => options.state_dir = Some(PathBuf::from(value(&mut index)?)),
-            "--json" if !matches!(command, "run" | "share") => options.json = true,
+            "--json" if command != "run" => options.json = true,
             "--console-assets-dir" if command == "run" => {
                 let directory = PathBuf::from(value(&mut index)?);
                 if !directory.is_absolute() {
@@ -228,9 +242,10 @@ pub(crate) fn parse_options(
 }
 
 pub(crate) fn usage() -> &'static str {
-    "Usage: webcodex share [--root PATH] [--profile NAME] [--state-dir PATH]\n\
+    "Usage: webcodex share [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
                      [--tunnel cloudflare|openai|none] [--auth bearer|query-token|oauth]\n\
                      [--oauth-redirect-uri URL] [--public-url URL] [--no-copy-url]\n\
+                     [--stop-on-stdin-eof]\n\
        webcodex status [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex doctor [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex setup [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
@@ -244,7 +259,8 @@ OpenAI Secure MCP Tunnel provider uses a pinned verified `tunnel-client` and kee
 the temporary WebCodex Bearer credential local. Public URL sharing best-effort\n\
 copies only the MCP URL by default; `--auth query-token` explicitly opts into a\n\
 single sensitive URL carrying the temporary share credential. Use `--no-copy-url`\n\
-to disable clipboard access.\n\
+to disable clipboard access. `--stop-on-stdin-eof` is a `--json` machine-integration\n\
+lifecycle hook: the foreground share exits cleanly when its supervising parent closes stdin.\n\
 `setup`, `doctor`, and `run` remain the local/manual workflow; setup writes private state without\n\
 starting services. `run` is the explicit foreground local runtime step. Its optional\n\
 `--console-assets-dir` enables loopback-only development assets for that run.\n\
@@ -764,6 +780,7 @@ pub(super) async fn start_local_runtime(
     for name in &runtime_options.child_environment_remove {
         server_command.env_remove(name);
     }
+    configure_connector_project_registry_environment(&mut server_command, &paths.project_registry);
     server_command
         .current_dir(&paths.state)
         .env_remove("WEBCODEX_ENV_FILE")
@@ -805,7 +822,6 @@ pub(super) async fn start_local_runtime(
         .env("WEBCODEX_CONNECTOR_EXECUTOR_ROOT", &config.root)
         .env("WEBCODEX_CONNECTOR_RUNS_ROOT", &paths.runs)
         .env("WEBCODEX_CONNECTOR_RESULTS_ROOT", &paths.results)
-        .env("WEBCODEX_CONNECTOR_PROJECTS_DIR", &paths.projects)
         .env("WEBCODEX_CONNECTOR_PROFILE", &config.profile)
         .stdout(Stdio::from(server_log))
         .stderr(Stdio::from(server_error))

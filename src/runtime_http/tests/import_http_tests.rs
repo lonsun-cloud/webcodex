@@ -13,6 +13,31 @@ const IMPORT_TEST_AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const IMPORT_TEST_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const IMPORT_TEST_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn run_import_http_in_large_stack_test_thread<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    // The host-ref artifact import fixture retains the HTTP/import runtime and
+    // upload protocol state across several awaits. Keep that integration stack
+    // local to the test instead of requiring a suite-wide RUST_MIN_STACK.
+    let result = std::thread::Builder::new()
+        .name("runtime-http-import-test".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build isolated runtime HTTP import test runtime")
+                .block_on(test());
+        })
+        .expect("spawn isolated runtime HTTP import test thread")
+        .join();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn lock_import_http_test() -> tokio::sync::MutexGuard<'static, ()> {
     tokio::time::timeout(
         IMPORT_TEST_LOCK_TIMEOUT,
@@ -112,16 +137,16 @@ struct ImportUploadFixtureOutcome {
 }
 
 async fn next_import_agent_request(
-    registry: &crate::shell_client::ShellClientRegistry,
-) -> crate::shell_protocol::ShellAgentShellRequest {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    registry: &crate::runner_http::RunnerRegistry,
+) -> crate::runner_protocol::RunnerRequest {
+    use crate::runner_protocol::RunnerPollRequest;
 
     tokio::time::timeout(IMPORT_TEST_AGENT_REQUEST_TIMEOUT, async {
         loop {
             if let Some(request) = registry
-                .poll(ShellAgentPollRequest {
+                .poll(RunnerPollRequest {
                     client_id: "importer".to_string(),
-                    agent_instance_id: "inst-import".to_string(),
+                    runner_instance_id: "inst-import".to_string(),
                 })
                 .await
                 .unwrap()
@@ -136,10 +161,10 @@ async fn next_import_agent_request(
 }
 
 async fn complete_import_artifact_uploads(
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     upload_count: usize,
 ) -> Vec<ImportUploadFixtureOutcome> {
-    use crate::shell_protocol::ShellAgentResultRequest;
+    use crate::runner_protocol::RunnerResultRequest;
     use sha2::{Digest, Sha256};
 
     let mut outcomes = Vec::with_capacity(upload_count);
@@ -157,9 +182,9 @@ async fn complete_import_artifact_uploads(
         let full_path = std::path::Path::new(request.cwd.as_deref().unwrap()).join(&path);
         if full_path.exists() && payload["overwrite"] == false {
             registry
-                .complete(ShellAgentResultRequest {
+                .complete(RunnerResultRequest {
                     client_id: "importer".to_string(),
-                    agent_instance_id: "inst-import".to_string(),
+                    runner_instance_id: "inst-import".to_string(),
                     request_id: request.request_id,
                     exit_code: Some(0),
                     stdout: Some(
@@ -182,9 +207,9 @@ async fn complete_import_artifact_uploads(
 
         let upload_id = format!("wc_upload_import_fixture_{index}");
         registry
-            .complete(ShellAgentResultRequest {
+            .complete(RunnerResultRequest {
                 client_id: "importer".to_string(),
-                agent_instance_id: "inst-import".to_string(),
+                runner_instance_id: "inst-import".to_string(),
                 request_id: request.request_id,
                 exit_code: Some(0),
                 stdout: Some(
@@ -230,9 +255,9 @@ async fn complete_import_artifact_uploads(
                     bytes.extend_from_slice(&chunk);
                     chunk_count += 1;
                     registry
-                        .complete(ShellAgentResultRequest {
+                        .complete(RunnerResultRequest {
                             client_id: "importer".to_string(),
-                            agent_instance_id: "inst-import".to_string(),
+                            runner_instance_id: "inst-import".to_string(),
                             request_id: request.request_id,
                             exit_code: Some(0),
                             stdout: Some(
@@ -261,9 +286,9 @@ async fn complete_import_artifact_uploads(
                     std::fs::write(&full_path, &bytes).unwrap();
                     let sha256 = format!("{:x}", Sha256::digest(&bytes));
                     registry
-                        .complete(ShellAgentResultRequest {
+                        .complete(RunnerResultRequest {
                             client_id: "importer".to_string(),
-                            agent_instance_id: "inst-import".to_string(),
+                            runner_instance_id: "inst-import".to_string(),
                             request_id: request.request_id,
                             exit_code: Some(0),
                             stdout: Some(
@@ -295,9 +320,9 @@ async fn complete_import_artifact_uploads(
                 }
                 "file_artifact_upload_abort" => {
                     registry
-                        .complete(ShellAgentResultRequest {
+                        .complete(RunnerResultRequest {
                             client_id: "importer".to_string(),
-                            agent_instance_id: "inst-import".to_string(),
+                            runner_instance_id: "inst-import".to_string(),
                             request_id: request.request_id,
                             exit_code: Some(0),
                             stdout: Some(
@@ -425,10 +450,9 @@ async fn import_http_accepts_office_mime_and_extension_policy() {
     }
 }
 
-#[tokio::test]
-async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path() {
+async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path_body() {
     use crate::auth::{AuthContext, AuthKind};
-    use crate::shell_protocol::ShellClientCapabilities;
+    use crate::runner_protocol::RunnerCapabilities;
     use crate::tool_runtime::kernel::{
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
     };
@@ -447,7 +471,7 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path()
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = super::register_import_agent_with_capabilities(
         tmp.path(),
-        Some(ShellClientCapabilities {
+        Some(RunnerCapabilities {
             file_write: true,
             ..Default::default()
         }),
@@ -524,16 +548,23 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path()
     );
 }
 
+#[test]
+fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path() {
+    run_import_http_in_large_stack_test_thread(|| {
+        runtime_conversation_import_host_ref_saves_pptx_through_artifact_path_body()
+    });
+}
+
 #[tokio::test]
 async fn runtime_conversation_import_rejects_non_mcp_transport() {
     use crate::auth::{AuthContext, AuthKind};
-    use crate::shell_protocol::ShellClientCapabilities;
+    use crate::runner_protocol::RunnerCapabilities;
     use crate::tool_runtime::ToolCall;
 
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, _registry) = super::register_import_agent_with_capabilities(
         tmp.path(),
-        Some(ShellClientCapabilities {
+        Some(RunnerCapabilities {
             file_write: true,
             ..Default::default()
         }),
@@ -641,7 +672,7 @@ async fn import_http_existing_png_pdf_zip_text_formats_still_import() {
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = super::register_import_agent_with_capabilities(
         tmp.path(),
-        Some(crate::shell_protocol::ShellClientCapabilities {
+        Some(crate::runner_protocol::RunnerCapabilities {
             file_write: true,
             ..Default::default()
         }),
@@ -705,7 +736,7 @@ async fn import_http_streams_download_in_bounded_upload_chunks() {
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = super::register_import_agent_with_capabilities(
         tmp.path(),
-        Some(crate::shell_protocol::ShellClientCapabilities {
+        Some(crate::runner_protocol::RunnerCapabilities {
             file_write: true,
             ..Default::default()
         }),
@@ -766,7 +797,7 @@ async fn import_http_preserves_overwrite_false_protection() {
     std::fs::write(&existing, b"original").unwrap();
     let (runtime, registry) = super::register_import_agent_with_capabilities(
         tmp.path(),
-        Some(crate::shell_protocol::ShellClientCapabilities {
+        Some(crate::runner_protocol::RunnerCapabilities {
             file_write: true,
             ..Default::default()
         }),

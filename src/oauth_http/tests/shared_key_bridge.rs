@@ -104,6 +104,81 @@ fn bridge_local_mcp_scope_requires_explicit_client_ceiling_opt_in() {
     );
 }
 
+#[test]
+fn bridge_local_plugin_scope_requires_explicit_client_ceiling_opt_in() {
+    assert!(!bridge_oauth_scopes().contains(&crate::auth::SCOPE_PLUGIN_LOCAL));
+    assert!(!crate::auth::DIRECT_SHARED_KEY_MODEL_SCOPES.contains(&crate::auth::SCOPE_PLUGIN_LOCAL));
+
+    let baseline = bridge_oauth_scopes()
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    let mut opted_in = baseline.clone();
+    opted_in.push(crate::auth::SCOPE_PLUGIN_LOCAL.to_string());
+    assert!(normalize_bridge_oauth_scopes(
+        Some(crate::auth::SCOPE_PLUGIN_LOCAL),
+        &opted_in.join(" "),
+    )
+    .is_ok());
+    assert!(normalize_bridge_oauth_scopes(
+        Some(crate::auth::SCOPE_PLUGIN_LOCAL),
+        &baseline.join(" "),
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn bridge_authorize_local_plugin_requires_shared_key_owned_opt_in() {
+    let config = test_config(oauth2_enabled_bridge());
+    let (_tmp, db) = test_db();
+    let shared_key = "local-plugin-owned-shared-key";
+    let allowed_scopes = format!(
+        "{} {}",
+        bridge_oauth_scopes().join(" "),
+        crate::auth::SCOPE_PLUGIN_LOCAL
+    );
+    let (owned, _) = seed_shared_key_bridge_client(
+        &db,
+        shared_key,
+        "https://local-plugin.example/callback",
+        &allowed_scopes,
+    );
+    let service = Service::new(build_router(config.clone(), db.clone()));
+    let owned_url = valid_bridge_authorize_url(
+        &owned,
+        "https://local-plugin.example/callback",
+        "runtime:read plugin:local",
+    );
+    let mut owned_response = TestClient::get(&owned_url).send(&service).await;
+    assert_eq!(owned_response.status_code, Some(StatusCode::OK));
+    let owned_html = owned_response.take_string().await.unwrap_or_default();
+    assert!(owned_html.contains("plugin:local"));
+
+    let user = seed_user(&db, "local-plugin-legacy-owner");
+    let legacy = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://legacy-local-plugin.example/callback",
+        &allowed_scopes,
+    );
+    let legacy_url = valid_bridge_authorize_url(
+        &legacy,
+        "https://legacy-local-plugin.example/callback",
+        "runtime:read plugin:local",
+    );
+    let legacy_response = TestClient::get(&legacy_url).send(&service).await;
+    assert_eq!(legacy_response.status_code, Some(StatusCode::FOUND));
+    let location = url::Url::parse(&location_header(&legacy_response).unwrap()).unwrap();
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("invalid_scope")
+    );
+}
+
 #[tokio::test]
 async fn bridge_authorize_local_mcp_requires_shared_key_owned_opt_in() {
     let config = test_config(oauth2_enabled_bridge());
@@ -241,31 +316,31 @@ fn normalize_bridge_oauth_scopes_accepts_offline_access_as_protocol_scope() {
     assert_eq!(normalized, "runtime:read offline_access");
 }
 
-async fn register_shared_key_runner(registry: &crate::ShellClientRegistry, shared_key: &str) {
+async fn register_shared_key_runner(registry: &crate::RunnerRegistry, shared_key: &str) {
     register_shared_key_runner_with_capabilities(
         registry,
         shared_key,
         "bridge-runner",
         "bridge-instance",
-        crate::shell_protocol::ShellClientCapabilities::default(),
+        crate::runner_protocol::RunnerCapabilities::default(),
     )
     .await;
 }
 
 async fn register_shared_key_runner_with_capabilities(
-    registry: &crate::ShellClientRegistry,
+    registry: &crate::RunnerRegistry,
     shared_key: &str,
     client_id: &str,
     instance_id: &str,
-    capabilities: crate::shell_protocol::ShellClientCapabilities,
+    capabilities: crate::runner_protocol::RunnerCapabilities,
 ) {
     let auth = crate::auth::shared_key_context(shared_key);
     registry
         .register_with_auth(
-            crate::shell_protocol::ShellClientRegisterRequest {
+            crate::runner_protocol::RunnerRegisterRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: instance_id.to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
@@ -279,14 +354,14 @@ async fn register_shared_key_runner_with_capabilities(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
             },
-            Some(&auth),
+            Some(&crate::test_support::runner_access(&auth)),
         )
         .await
         .unwrap();
 }
 
-fn all_optional_computer_capabilities() -> crate::shell_protocol::ShellClientCapabilities {
-    crate::shell_protocol::ShellClientCapabilities {
+fn all_optional_computer_capabilities() -> crate::runner_protocol::RunnerCapabilities {
+    crate::runner_protocol::RunnerCapabilities {
         computer_application_discovery: true,
         computer_application_launch: true,
         computer_display_observe: true,
@@ -303,7 +378,7 @@ async fn shared_key_client_provision_is_group_bound_and_preserves_narrow_scope_o
     env.enable_direct_shared_key();
     let config = test_config(oauth2_enabled_bridge());
     let (_tmp, db) = test_db();
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     let shared_key = "ordinary-connect-shared-key";
     register_shared_key_runner(&registry, shared_key).await;
     let service = Service::new(build_router_with_session_and_registry(
@@ -477,7 +552,7 @@ async fn shared_key_client_provision_rejects_invalid_computer_enabled_previous_c
     env.enable_direct_shared_key();
     let config = test_config(oauth2_enabled_bridge());
     let (_tmp, db) = test_db();
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     let shared_key = "invalid-computer-ceiling-shared-key";
     register_shared_key_runner(&registry, shared_key).await;
     let service = Service::new(build_router_with_session_and_registry(
@@ -521,7 +596,7 @@ async fn shared_key_client_provision_fails_closed_on_client_lookup_error() {
     env.enable_direct_shared_key();
     let config = test_config(oauth2_enabled_bridge());
     let (_tmp, db) = test_db();
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     let shared_key = "ordinary-connect-shared-key";
     register_shared_key_runner(&registry, shared_key).await;
     db.conn_for_tests()
@@ -805,7 +880,7 @@ async fn bridge_authorize_picker_is_only_for_explicit_computer_enabled_owned_cli
         "https://partial-optional.example/callback",
         "runtime:read project:read computer:launch",
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
@@ -899,7 +974,7 @@ async fn bridge_authorize_picker_respects_explicit_requested_scope_and_launch_de
         "https://scope.example/callback",
         &bridge_oauth_computer_enabled_scopes().join(" "),
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
@@ -998,7 +1073,7 @@ async fn bridge_authorize_omitted_scope_grants_baseline_but_not_optional_permiss
         "https://omitted.example/callback",
         &bridge_oauth_computer_enabled_scopes().join(" "),
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
@@ -1070,7 +1145,7 @@ async fn bridge_authorize_permission_ids_are_closed_and_server_side_bundles_are_
         "https://bundle.example/callback",
         &bridge_oauth_computer_enabled_scopes().join(" "),
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
@@ -1192,13 +1267,13 @@ async fn bridge_picker_requires_capabilities_on_one_same_runner_and_rechecks_pos
         "https://same-runner.example/callback",
         &bridge_oauth_computer_enabled_scopes().join(" "),
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
         "display-only-runner",
         "display-only-instance",
-        crate::shell_protocol::ShellClientCapabilities {
+        crate::runner_protocol::RunnerCapabilities {
             computer_display_observe: true,
             ..Default::default()
         },
@@ -1209,7 +1284,7 @@ async fn bridge_picker_requires_capabilities_on_one_same_runner_and_rechecks_pos
         shared_key,
         "pointer-only-runner",
         "pointer-only-instance",
-        crate::shell_protocol::ShellClientCapabilities {
+        crate::runner_protocol::RunnerCapabilities {
             computer_pointer_control: true,
             ..Default::default()
         },
@@ -1248,7 +1323,7 @@ async fn bridge_picker_requires_capabilities_on_one_same_runner_and_rechecks_pos
         shared_key,
         "display-only-runner",
         "display-only-instance",
-        crate::shell_protocol::ShellClientCapabilities::default(),
+        crate::runner_protocol::RunnerCapabilities::default(),
     )
     .await;
     let before = auth_code_count(&db);
@@ -1531,7 +1606,7 @@ async fn bridge_authorize_code_exchanges_to_shared_key_tokens_and_verifies() {
         "runtime:read",
     );
     let expected_hash = bridge_shared_key_hash(shared_key).unwrap();
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner(&registry, shared_key).await;
     let service = Service::new(build_router_with_session_and_registry(
         config.clone(),
@@ -1663,7 +1738,7 @@ async fn selected_launch_scope_survives_code_access_and_refresh_rotation_without
         "https://launch.example/callback",
         &bridge_oauth_computer_enabled_scopes().join(" "),
     );
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner_with_capabilities(
         &registry,
         shared_key,
@@ -1791,7 +1866,7 @@ async fn explicit_computer_opt_in_expands_existing_client_and_revokes_existing_g
     let user = seed_user(&db, "grant-holder");
     let (access_record, _) = seed_access_token(&db, &client, &user, "runtime:read");
     let (refresh_record, _) = seed_refresh_token(&db, &client, &user, "runtime:read");
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner(&registry, shared_key).await;
     let service = Service::new(build_router_with_session_and_registry(
         config,
@@ -1983,7 +2058,7 @@ async fn bridge_issued_access_token_is_rejected_on_agent_path_without_updating_l
         "runtime:read",
     );
     let expected_hash = bridge_shared_key_hash(shared_key).unwrap();
-    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let registry = Arc::new(crate::RunnerRegistry::default());
     register_shared_key_runner(&registry, shared_key).await;
     let service = Service::new(build_router_with_session_and_registry(
         config,

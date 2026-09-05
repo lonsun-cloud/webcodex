@@ -253,7 +253,7 @@ fn render_oauth_profile(profile: &OAuthConnectProfile) -> Result<String, String>
         .map_err(|error| format!("failed to render OAuth connect profile: {error}"))
 }
 
-fn validate_existing_oauth_agent(
+fn validate_existing_oauth_runner(
     config: Option<&ExistingRunnerConfig>,
     server_url: &str,
 ) -> Result<(), String> {
@@ -266,7 +266,9 @@ fn validate_existing_oauth_agent(
         return Err("selected OAuth hosted profile belongs to a different Server".to_string());
     }
     if !config.token.trim().starts_with("wc_agent_") {
-        return Err("OAuth hosted profile Runner credential is not an Agent token".to_string());
+        return Err(
+            "OAuth hosted profile Runner credential is not a Runner transport token".to_string(),
+        );
     }
     Ok(())
 }
@@ -324,7 +326,7 @@ async fn create_oauth_client(
     Ok((client_id, client_secret))
 }
 
-async fn create_agent_token(
+async fn create_runner_token(
     server_url: &str,
     opts: &ConnectOptions,
     token: &str,
@@ -343,17 +345,17 @@ async fn create_agent_token(
         }),
     })
     .await?;
-    let agent_token = value
+    let runner_token = value
         .get("token")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Agent token create response omitted token".to_string())?
+        .ok_or_else(|| "Runner transport token create response omitted token".to_string())?
         .to_string();
     let token_id = value
         .get("token_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Agent token create response omitted token_id".to_string())?
+        .ok_or_else(|| "Runner transport token create response omitted token_id".to_string())?
         .to_string();
-    Ok((agent_token, token_id))
+    Ok((runner_token, token_id))
 }
 
 async fn revoke_oauth_client(
@@ -372,7 +374,7 @@ async fn revoke_oauth_client(
     .await;
 }
 
-async fn revoke_agent_token(
+async fn revoke_runner_token(
     server_url: &str,
     opts: &ConnectOptions,
     token: &str,
@@ -573,7 +575,9 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
     let _lock = ProfileLock::acquire(&state_dir)?;
     let config_path = webcodex_runner_config::paths::resolve_runner_config_path(&profile_dir)?;
     let oauth_path = profile_dir.join(OAUTH_PROFILE_FILE);
-    let projects_dir = ensure_private_directory(&profile_dir.join("projects.d"))?;
+    let project_registry_dir =
+        webcodex_runner_config::paths::select_project_registry_dir(&profile_dir)?;
+    let project_registry_dir = ensure_private_directory(&project_registry_dir)?;
     let existing_config = read_existing_runner_config(&config_path)?;
     let existing_oauth = read_oauth_profile(&oauth_path)?;
     let previous_oauth_bytes = if oauth_path.exists() {
@@ -613,7 +617,7 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
     };
 
     let (project_path, project, already_registered) = resolve_project(
-        &projects_dir,
+        &project_registry_dir,
         &canonical_project,
         opts.project_id.as_deref(),
     )?;
@@ -626,11 +630,11 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
             "webcodex-runner was not found beside webcodex or in an absolute PATH entry".to_string()
         })?;
 
-    let (agent_token, oauth_profile, created_agent, created_oauth) = if let Some(
+    let (runner_token, oauth_profile, created_runner_token, created_oauth) = if let Some(
         mut oauth_profile,
     ) = existing_oauth
     {
-        validate_existing_oauth_agent(existing_config.as_ref(), &canonical_server.url)?;
+        validate_existing_oauth_runner(existing_config.as_ref(), &canonical_server.url)?;
         if oauth_profile.server_url != canonical_server.url
             || !oauth_profile
                 .username
@@ -660,15 +664,15 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
             &mut oauth_profile,
         )
         .await?;
-        let agent_token = existing_config
+        let runner_token = existing_config
             .as_ref()
             .expect("validated existing OAuth config")
             .token
             .trim()
             .to_string();
-        (agent_token, oauth_profile, false, created_oauth)
+        (runner_token, oauth_profile, false, created_oauth)
     } else {
-        let (agent_token, agent_token_id) = create_agent_token(
+        let (runner_token, agent_token_id) = create_runner_token(
             &canonical_server.url,
             &opts,
             &identity.user_token,
@@ -689,7 +693,7 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
         {
             Ok(client) => client,
             Err(error) => {
-                revoke_agent_token(
+                revoke_runner_token(
                     &canonical_server.url,
                     &opts,
                     &identity.user_token,
@@ -701,7 +705,7 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
             }
         };
         (
-            agent_token,
+            runner_token,
             OAuthConnectProfile {
                 version: OAUTH_PROFILE_VERSION,
                 server_url: canonical_server.url.clone(),
@@ -720,9 +724,9 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
     let runner_content = match render_runner_document(
         &config_path,
         &canonical_server.url,
-        &agent_token,
+        &runner_token,
         &client_id,
-        &projects_dir,
+        &project_registry_dir,
         &canonical_project,
     ) {
         Ok(content) => content,
@@ -736,8 +740,8 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
                 )
                 .await;
             }
-            if created_agent {
-                revoke_agent_token(
+            if created_runner_token {
+                revoke_runner_token(
                     &canonical_server.url,
                     &opts,
                     &identity.user_token,
@@ -761,8 +765,8 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
                 )
                 .await;
             }
-            if created_agent {
-                revoke_agent_token(
+            if created_runner_token {
+                revoke_runner_token(
                     &canonical_server.url,
                     &opts,
                     &identity.user_token,
@@ -784,8 +788,8 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
             )
             .await;
         }
-        if created_agent {
-            revoke_agent_token(
+        if created_runner_token {
+            revoke_runner_token(
                 &canonical_server.url,
                 &opts,
                 &identity.user_token,
@@ -816,8 +820,8 @@ pub(super) async fn run_oauth_connect(opts: ConnectOptions) -> Result<ConnectRes
             )
             .await;
         }
-        if created_agent {
-            revoke_agent_token(
+        if created_runner_token {
+            revoke_runner_token(
                 &canonical_server.url,
                 &opts,
                 &identity.user_token,
@@ -953,6 +957,7 @@ mod tests {
             oauth_redirect_uri: Some("https://client.example/callback".to_string()),
             oauth_computer_permissions: false,
             oauth_local_mcp: false,
+            oauth_local_plugins: false,
             oauth_coding_agent: false,
             username: None,
             project: PathBuf::from("."),
@@ -1264,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_disconnect_uses_managed_pat_instead_of_runner_agent_token() {
+    fn oauth_disconnect_uses_managed_pat_instead_of_runner_transport_token() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("config");
         let profile_dir = base.join("clients/oauth-profile");

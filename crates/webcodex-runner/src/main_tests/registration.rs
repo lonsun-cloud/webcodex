@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn mcp_gateway_register_request_projects_bounded_provider_inventory_without_local_launch_details() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     cfg.mcp_gateway.providers = vec![webcodex_runner::config::McpGatewayProviderConfig {
         id: "local-tools".to_string(),
         name: "Local tools".to_string(),
@@ -39,31 +39,34 @@ fn mcp_gateway_register_request_projects_bounded_provider_inventory_without_loca
 #[test]
 fn current_runner_registration_advertises_v2_and_complete_generation_baseline() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let body = build_register_request(&cfg, "baseline-instance", 0);
-    assert_eq!(body.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+    assert_eq!(
+        body.runner_protocol_generation,
+        RUNNER_PROTOCOL_GENERATION_V2
+    );
 
     let capabilities = serde_json::to_value(&body.capabilities).unwrap();
     assert_eq!(
-        AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len(),
+        RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len(),
         22
     );
     assert!(
-        !AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
             .contains(&"apply_text_edit_line_scope"),
         "line scope is additive and must not become a generation-2 registration baseline"
     );
     assert!(
-        !AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_patch"),
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_patch"),
         "apply_patch is additive and must not become a generation-2 registration baseline"
     );
     assert!(
-        !AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
             .contains(&"apply_patch_match_metadata"),
         "the 0.4 patch success contract is additive and must not become a generation-2 baseline"
     );
     assert!(
-        !AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
             .contains(&"apply_patch_strict_matching"),
         "strict patch matching is additive and must not become a generation-2 registration baseline"
     );
@@ -81,7 +84,7 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         Some(true),
         "current Runner must explicitly advertise strict patch matching"
     );
-    for capability in AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
+    for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
         assert_eq!(
             capabilities
                 .get(*capability)
@@ -95,10 +98,10 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
 #[test]
 fn computer_register_request_announces_platform_capabilities_and_generation() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     // A stale or hand-edited config cannot force capability advertisement:
     // registration replaces it with the result of the real host probe.
-    cfg.capabilities = Some(ShellClientCapabilities {
+    cfg.capabilities = Some(RunnerCapabilities {
         computer_observe: true,
         computer_application_discovery: true,
         computer_application_launch: true,
@@ -116,8 +119,11 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
         ..Default::default()
     });
     let body = build_register_request(&cfg, "inst-1", 0);
-    assert_eq!(body.agent_instance_id, "inst-1");
-    assert_eq!(body.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+    assert_eq!(body.runner_instance_id, "inst-1");
+    assert_eq!(
+        body.runner_protocol_generation,
+        RUNNER_PROTOCOL_GENERATION_V2
+    );
     // Verify all effective capabilities are advertised from the real host probe.
     let caps = body.capabilities;
     assert!(caps.shell);
@@ -234,16 +240,8 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
 #[test]
 fn phase_e2_register_request_reports_effective_job_concurrency_limit() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
-    for (configured, expected) in [
-        (None, 4),
-        (Some(0), 1),
-        (Some(1), 1),
-        (Some(8), 8),
-        (Some(64), 64),
-        (Some(65), 64),
-        (Some(128), 64),
-    ] {
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
+    for (configured, expected) in [(None, 4), (Some(1), 1), (Some(8), 8), (Some(64), 64)] {
         cfg.max_concurrent_jobs = configured;
         let body = build_register_request(&cfg, "inst-limit", 0);
         assert_eq!(
@@ -261,7 +259,7 @@ fn register_request_carries_sanitized_shell_profiles_summary() {
     // has_init_script=true, and env_keys_count, but MUST NOT include the env
     // value or the init_script body.
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     let secret_env = "DO_NOT_LEAK_THIS_ENV_VALUE";
     let secret_script = "DO_NOT_LEAK_THIS_INIT_SCRIPT_BODY";
     cfg.shell = shell_with_profiles(

@@ -1,4 +1,4 @@
-//! Shared model-facing projection for `start_coding_task`.
+//! Shared model-facing projection for canonical coding workflow startup.
 //!
 //! The runtime builds this once and every transport carries the same core
 //! value. The projection is deterministic, bounded, path-safe, and contains
@@ -38,9 +38,11 @@ const MAX_FAILURE_FILE_JSON_BYTES: usize = 160;
 const MAX_ACTION_JSON_BYTES: usize = 384;
 const MAX_INSTRUCTION_EXCERPT_JSON_BYTES: usize = 768;
 
-pub(crate) const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub(crate) const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 5;
-pub(crate) const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
+#[cfg(test)]
+pub(crate) use webcodex_core::runtime_contract::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS;
+pub(crate) use webcodex_core::runtime_contract::{
+    BUILTIN_CODING_WORKFLOW_CONTRACT, BUILTIN_CODING_WORKFLOW_VERSION,
+};
 
 /// Stable model-facing coding/review semantics owned by WebCodex itself.
 ///
@@ -60,6 +62,8 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "session_message_ack": "When session_attention has open requires_ack guidance still in context, echo its id in ack_session_message_ids. This request-scoped model-context proof neither resolves messages nor grants authority or gates execution.",
             "session_message_resolution": "Resolve a handled non-todo by attaching session_message_resolution to the next ordinary call with recording_session_id; ACK-required guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
             "context_sidecar": "context_request adds bounded context after the main tool and never authorizes its effect. Recover lost project.instructions on an observation call before dependent mutation.",
+            "runner_targeting": "When the user supplies an exact Runner client_id, query that Runner with runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent from a broad fleet snapshot.",
+            "persistent_shell": "For repeated commands in one Workflow Session, especially on a named SSH resource, prefer open_session_shell plus session_shell_exec. Keep run_process for isolated one-shot native commands.",
             "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved validation/evidence or handoff/debug detail."
         },
         "roles": {
@@ -253,10 +257,14 @@ fn semantic_navigation_projection(value: &Value) -> Value {
             .get("status")
             .cloned()
             .unwrap_or_else(|| json!("probe_failed")),
+        // Preserve an indeterminate startup observation as null. Coercing a
+        // timed-out status probe to false would turn "not observed" into a
+        // false semantic-navigation unavailability claim.
         "available": value
             .get("available")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .filter(|available| available.is_boolean() || available.is_null())
+            .cloned()
+            .unwrap_or(Value::Null),
         "provider": value.get("server").cloned().unwrap_or(Value::Null),
         "capability": if value
             .get("supported")
@@ -876,6 +884,7 @@ fn normalized_validation_status(status: Option<&str>) -> &'static str {
     match status {
         Some("passed") => "passed",
         Some("failed") => "failed",
+        Some("expected") => "expected",
         Some("not_run") => "not_run",
         Some("unavailable") => "unavailable",
         _ => "unknown",
@@ -984,7 +993,7 @@ fn startup_issues(
     if blocking_jobs > 0 {
         push_unique(&mut blockers, "active_jobs_blocking");
     }
-    if input.resolved.config.is_agent() && input.owning_runner_available == Some(false) {
+    if input.owning_runner_available == Some(false) {
         push_unique(&mut blockers, "runner_unavailable");
     }
     if input.runtime_status_call_failed {
@@ -1393,191 +1402,7 @@ pub(crate) fn validate_schema_instance_for_test(
     instance: &Value,
     schema: &Value,
 ) -> Result<(), String> {
-    validate_schema_instance_at(instance, schema, "$")
-}
-
-#[cfg(test)]
-fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> Result<(), String> {
-    if let Some(schemas) = schema.get("allOf").and_then(Value::as_array) {
-        for child in schemas {
-            validate_schema_instance_at(instance, child, path)?;
-        }
-    }
-    if let Some(condition) = schema.get("if") {
-        let branch = if validate_schema_instance_at(instance, condition, path).is_ok() {
-            schema.get("then")
-        } else {
-            schema.get("else")
-        };
-        if let Some(branch) = branch {
-            validate_schema_instance_at(instance, branch, path)?;
-        }
-    }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        let results = variants
-            .iter()
-            .map(|variant| validate_schema_instance_at(instance, variant, path))
-            .collect::<Vec<_>>();
-        let successes = results.iter().filter(|result| result.is_ok()).count();
-        return (successes == 1).then_some(()).ok_or_else(|| {
-            let errors = results
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, result)| {
-                    result
-                        .err()
-                        .map(|error| format!("variant {index}: {error}"))
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!("{path}: expected exactly one matching schema, got {successes}; {errors}")
-        });
-    }
-    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-        return variants
-            .iter()
-            .find_map(|variant| {
-                validate_schema_instance_at(instance, variant, path)
-                    .ok()
-                    .map(|_| ())
-            })
-            .ok_or_else(|| format!("{path}: no anyOf variant matched"));
-    }
-    if let Some(expected) = schema.get("const") {
-        if instance != expected {
-            return Err(format!("{path}: const mismatch"));
-        }
-    }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.iter().any(|value| value == instance) {
-            return Err(format!("{path}: value is outside the declared enum"));
-        }
-    }
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected_type {
-            "object" => instance.is_object(),
-            "array" => instance.is_array(),
-            "string" => instance.is_string(),
-            "boolean" => instance.is_boolean(),
-            "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
-            "number" => instance.is_number(),
-            "null" => instance.is_null(),
-            _ => true,
-        };
-        if !matches {
-            return Err(format!("{path}: expected {expected_type}"));
-        }
-    }
-    if let Some(object) = instance.as_object() {
-        let properties = schema.get("properties").and_then(Value::as_object);
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for field in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(field) {
-                    return Err(format!("{path}: missing required field {field}"));
-                }
-            }
-        }
-        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
-            let properties = properties
-                .ok_or_else(|| format!("{path}: strict object schema is missing properties"))?;
-            for field in object.keys() {
-                if !properties.contains_key(field) {
-                    return Err(format!("{path}: unknown field {field}"));
-                }
-            }
-        }
-        if let Some(properties) = properties {
-            for (field, value) in object {
-                if let Some(child_schema) = properties.get(field) {
-                    validate_schema_instance_at(value, child_schema, &format!("{path}.{field}"))?;
-                }
-            }
-        }
-    }
-    if let Some(array) = instance.as_array() {
-        if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
-            if array.len() > max_items as usize {
-                return Err(format!("{path}: maxItems exceeded"));
-            }
-        }
-        if schema.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
-            for (index, item) in array.iter().enumerate() {
-                if array[..index].iter().any(|earlier| earlier == item) {
-                    return Err(format!("{path}: duplicate array item"));
-                }
-            }
-        }
-        if let Some(item_schema) = schema.get("items") {
-            for (index, item) in array.iter().enumerate() {
-                validate_schema_instance_at(item, item_schema, &format!("{path}[{index}]"))?;
-            }
-        }
-    }
-    if let Some(value) = instance.as_str() {
-        if schema
-            .get("maxLength")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| value.chars().count() > maximum as usize)
-        {
-            return Err(format!("{path}: maxLength exceeded"));
-        }
-    }
-    if let Some(number) = instance.as_i64() {
-        if schema
-            .get("minimum")
-            .and_then(Value::as_i64)
-            .is_some_and(|minimum| number < minimum)
-        {
-            return Err(format!("{path}: below minimum"));
-        }
-        if schema
-            .get("maximum")
-            .and_then(Value::as_i64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            return Err(format!("{path}: above maximum"));
-        }
-    } else if let Some(number) = instance.as_u64() {
-        if schema
-            .get("maximum")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            return Err(format!("{path}: above maximum"));
-        }
-    }
-    if let (Some(value), Some(pattern)) = (
-        instance.as_str(),
-        schema.get("pattern").and_then(Value::as_str),
-    ) {
-        let matches = match pattern {
-            "^wc_sess_[A-Za-z0-9_]+$" => value.strip_prefix("wc_sess_").is_some_and(|tail| {
-                !tail.is_empty()
-                    && tail
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            }),
-            "^[0-9a-f]{64}$" => {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }
-            "^repository:v1:[0-9a-f]{64}$" => {
-                value.strip_prefix("repository:v1:").is_some_and(|digest| {
-                    digest.len() == 64
-                        && digest
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
-            }
-            _ => true,
-        };
-        if !matches {
-            return Err(format!("{path}: pattern mismatch"));
-        }
-    }
-    Ok(())
+    webcodex_tool_contracts::test_support::validate_schema_instance(instance, schema)
 }
 
 #[cfg(test)]
@@ -1587,6 +1412,24 @@ mod tests {
     use crate::tool_runtime::project_instructions::LoadedInstructionCandidate;
     use crate::tool_runtime::sessions::SessionGuards;
     use crate::tool_runtime::{SessionMode, ToolRuntime};
+
+    #[test]
+    fn semantic_navigation_projection_preserves_probe_timeout_as_unknown() {
+        let source = json!({
+            "supported": true,
+            "available": Value::Null,
+            "status": "probe_timeout",
+            "server": Value::Null,
+            "reason_code": "status_probe_timed_out",
+        });
+        let projection = semantic_navigation_projection(&source);
+        assert_eq!(projection["supported"], true);
+        assert_eq!(projection["available"], Value::Null);
+        assert_eq!(projection["status"], "probe_timeout");
+        assert_eq!(projection["provider"], Value::Null);
+        assert_eq!(projection["capability"], "lsp_read_only_navigation");
+        assert_eq!(projection["reason_code"], "status_probe_timed_out");
+    }
 
     #[test]
     fn repository_scan_projection_keeps_only_fixed_fields() {

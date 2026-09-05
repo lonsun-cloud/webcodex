@@ -1,4 +1,68 @@
 use super::*;
+use crate::webcodex_runner::config::restart_required_fields;
+
+#[test]
+fn runner_config_accepts_legacy_projects_dir_alias_and_normalizes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    let registry = tmp.path().join("projects.d");
+    std::fs::write(
+        &path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nprojects_dir = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
+            registry.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let cfg = load_config(&path).unwrap();
+    assert_eq!(
+        cfg.project_registry_dir.as_deref(),
+        Some(registry.as_path())
+    );
+    assert!(cfg.legacy_projects_dir.is_none());
+}
+
+#[test]
+fn runner_config_alias_only_migration_does_not_require_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runner.toml");
+    let registry = tmp.path().join("projects.d");
+    let render = |field: &str| {
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\n{field} = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
+            registry.to_string_lossy()
+        )
+    };
+
+    std::fs::write(&path, render("projects_dir")).unwrap();
+    let legacy = load_config(&path).unwrap();
+    std::fs::write(&path, render("project_registry_dir")).unwrap();
+    let canonical = load_config(&path).unwrap();
+
+    assert!(legacy.legacy_projects_dir.is_none());
+    assert!(canonical.legacy_projects_dir.is_none());
+    assert_eq!(legacy.project_registry_dir, canonical.project_registry_dir);
+    assert!(restart_required_fields(&legacy, &canonical).is_empty());
+}
+
+#[test]
+fn runner_config_rejects_new_and_legacy_registry_fields_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    let current = tmp.path().join("project-registry");
+    let legacy = tmp.path().join("projects.d");
+    std::fs::write(
+        &path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = {:?}\nprojects_dir = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
+            current.to_string_lossy(),
+            legacy.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let error = load_config(&path).unwrap_err();
+    assert!(error.contains("cannot both be configured"), "{error}");
+}
 
 #[test]
 fn runner_config_defaults_transport_to_websocket_without_quic_section() {
@@ -34,7 +98,7 @@ fn runner_config_rejects_zero_websocket_connect_timeout() {
 server_url = "http://127.0.0.1:8000"
 token = "t"
 client_id = "oe"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 websocket_connect_timeout_secs = 0
 "#,
     )
@@ -48,6 +112,45 @@ websocket_connect_timeout_secs = 0
 }
 
 #[test]
+fn runner_config_bounds_polling_idle_floor_but_not_unused_websocket_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+
+    for transport in [TRANSPORT_POLLING, TRANSPORT_AUTO] {
+        std::fs::write(
+            &path,
+            format!(
+                "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\ntransport = \"{transport}\"\npoll_interval_ms = {}\nproject_registry_dir = \"project-registry\"\n[policy]\nallow_cwd_anywhere = true\n",
+                webcodex_runner_config::MAX_POLL_INTERVAL_MS + 1
+            ),
+        )
+        .unwrap();
+        let error = load_config(&path).unwrap_err();
+        assert!(error.contains("must be <= 30000"), "{transport}: {error}");
+
+        std::fs::write(
+            &path,
+            format!(
+                "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\ntransport = \"{transport}\"\npoll_interval_ms = {}\nproject_registry_dir = \"project-registry\"\n[policy]\nallow_cwd_anywhere = true\n",
+                webcodex_runner_config::MAX_POLL_INTERVAL_MS
+            ),
+        )
+        .unwrap();
+        load_config(&path).unwrap();
+    }
+
+    std::fs::write(
+        &path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\ntransport = \"websocket\"\npoll_interval_ms = {}\nproject_registry_dir = \"project-registry\"\n[policy]\nallow_cwd_anywhere = true\n",
+            webcodex_runner_config::MAX_POLL_INTERVAL_MS + 1
+        ),
+    )
+    .unwrap();
+    load_config(&path).unwrap();
+}
+
+#[test]
 fn runner_config_rejects_relative_temporary_projects_root() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("agent.toml");
@@ -57,7 +160,7 @@ fn runner_config_rejects_relative_temporary_projects_root() {
 server_url = "http://127.0.0.1:8000"
 token = "t"
 client_id = "oe"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 temporary_projects_root = "temporary"
 "#,
     )
@@ -68,6 +171,24 @@ temporary_projects_root = "temporary"
         err.contains("temporary_projects_root must be a non-empty absolute path"),
         "{err}"
     );
+}
+
+#[test]
+fn runner_config_accepts_absolute_legacy_temporary_projects_root_as_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runner.toml");
+    let legacy_root = tmp.path().join("legacy-temporary-projects");
+    let legacy_root = toml::Value::String(legacy_root.to_string_lossy().into_owned()).to_string();
+    std::fs::write(
+        &path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = \"project-registry\"\ntemporary_projects_root = {legacy_root}\n[policy]\nallow_cwd_anywhere = true\n"
+        ),
+    )
+    .unwrap();
+
+    let cfg = load_config(&path).unwrap();
+    assert_eq!(cfg.deprecated_temporary_projects_root, None);
 }
 
 #[test]
@@ -422,7 +543,7 @@ fn empty_tokens_config_parser_accepts_empty_and_whitespace_token() {
         std::fs::write(
                 &path,
                 format!(
-                    "server_url = \"http://127.0.0.1:8000\"\ntoken = \"{}\"\nclient_id = \"open-agent\"\nprojects_dir = \"projects.d\"\n[policy]\nallow_cwd_anywhere = true\nallowed_roots = [\".\"]\n",
+                    "server_url = \"http://127.0.0.1:8000\"\ntoken = \"{}\"\nclient_id = \"open-agent\"\nproject_registry_dir = \"project-registry\"\n[policy]\nallow_cwd_anywhere = true\nallowed_roots = [\".\"]\n",
                     token
                 ),
             )
@@ -444,7 +565,7 @@ fn runner_config_host_context_is_normalized_closed_and_restart_scoped() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [host_context]
 role = " server_host "
@@ -471,7 +592,7 @@ allowed_roots = ["."]
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 [host_context]
 role = "server_host"
 arbitrary = "not allowed"
@@ -495,7 +616,7 @@ fn runner_config_without_shell_section_parses() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -547,7 +668,7 @@ fn runner_config_loads_named_ssh_resources_without_authentication_material() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allowed_roots = ["."]
@@ -585,7 +706,7 @@ fn runner_config_shell_profiles_parse() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -646,7 +767,7 @@ fn runner_config_shell_default_profile_must_exist() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -676,7 +797,7 @@ fn runner_config_shell_profile_name_must_be_safe() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -703,7 +824,7 @@ fn runner_config_shell_profile_type_errors_are_reported() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -729,7 +850,7 @@ fn runner_config_shell_profile_env_type_errors_are_reported() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -757,7 +878,7 @@ fn runner_config_shell_errors_do_not_include_init_script_body() {
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -801,6 +922,7 @@ doctor = ["git status --short"]
     assert_eq!(summary.name.as_deref(), Some("webcodex"));
     assert_eq!(summary.path, "/root/git/webcodex");
     assert_eq!(summary.kind.as_deref(), Some("rust"));
+    assert_eq!(summary.registration_source.as_deref(), Some("explicit"));
     assert_eq!(summary.hooks, vec!["doctor", "precommit"]);
     assert_eq!(summary.updated_at, 123456);
     assert_eq!(summary.git_branch, None);
@@ -831,7 +953,7 @@ path = "/root/webcodex-smoke"
     assert!(err.contains("missing field"), "{err}");
     assert!(err.contains("server projects.toml"), "{err}");
     assert!(
-        err.contains("Runner projects.d files must use top-level fields"),
+        err.contains("Runner project registration records must use top-level fields"),
         "{err}"
     );
     assert!(err.contains("id = \"smoke\""), "{err}");
@@ -852,43 +974,52 @@ shell_profile = "../rust"
 }
 
 #[test]
-fn missing_projects_dir_returns_empty_list() {
+fn missing_project_registry_dir_returns_empty_list() {
     let tmp = tempfile::tempdir().unwrap();
-    let missing = tmp.path().join("missing-projects.d");
+    let missing = tmp.path().join("missing-project-registry");
     let projects = load_runner_project_summaries_from_dir(&missing);
     assert!(projects.is_empty());
 }
 
 #[test]
-fn phase_e2_max_concurrent_jobs_normalizes_to_inventory_capacity() {
+fn phase_e2_max_concurrent_jobs_uses_valid_configured_value() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     assert_eq!(DEFAULT_MAX_CONCURRENT_JOBS, 4);
     assert_eq!(max_concurrent_jobs(&cfg), DEFAULT_MAX_CONCURRENT_JOBS);
 
-    cfg.max_concurrent_jobs = Some(0);
-    assert_eq!(max_concurrent_jobs(&cfg), 1);
+    for value in [1, 4, 8, 64] {
+        cfg.max_concurrent_jobs = Some(value);
+        assert_eq!(max_concurrent_jobs(&cfg), value);
+    }
+}
 
-    cfg.max_concurrent_jobs = Some(1);
-    assert_eq!(max_concurrent_jobs(&cfg), 1);
+#[test]
+fn runner_config_rejects_max_concurrent_jobs_outside_valid_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    for value in [0, 65] {
+        std::fs::write(
+            &path,
+            format!(
+                r#"server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+project_registry_dir = "project-registry"
+max_concurrent_jobs = {value}
 
-    cfg.max_concurrent_jobs = Some(4);
-    assert_eq!(max_concurrent_jobs(&cfg), 4);
-
-    cfg.max_concurrent_jobs = Some(8);
-    assert_eq!(max_concurrent_jobs(&cfg), 8);
-
-    cfg.max_concurrent_jobs = Some(64);
-    assert_eq!(max_concurrent_jobs(&cfg), 64);
-
-    cfg.max_concurrent_jobs = Some(65);
-    assert_eq!(max_concurrent_jobs(&cfg), 64);
-
-    cfg.max_concurrent_jobs = Some(128);
-    assert_eq!(max_concurrent_jobs(&cfg), 64);
-
-    cfg.max_concurrent_jobs = Some(usize::MAX);
-    assert_eq!(max_concurrent_jobs(&cfg), 64);
+[policy]
+allow_cwd_anywhere = true
+"#
+            ),
+        )
+        .unwrap();
+        let error = load_config(&path).unwrap_err();
+        assert!(
+            error.contains("max_concurrent_jobs must be between 1 and 64"),
+            "configured={value}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -916,7 +1047,7 @@ fn runner_config_accepts_static_literal_mcp_gateway_provider() {
 server_url = "http://127.0.0.1:8000"
 token = "t"
 client_id = "oe"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allowed_roots = ["."]
@@ -970,7 +1101,7 @@ fn runner_config_mcp_gateway_provider_timeout_defaults_to_gateway_timeout() {
 server_url = "http://127.0.0.1:8000"
 token = "t"
 client_id = "oe"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allowed_roots = ["."]
@@ -1044,7 +1175,7 @@ executable = {executable}
 server_url = "http://127.0.0.1:8000"
 token = "t"
 client_id = "oe"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allowed_roots = ["."]

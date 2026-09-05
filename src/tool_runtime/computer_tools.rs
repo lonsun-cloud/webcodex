@@ -1,11 +1,11 @@
 use super::files::{validate_artifact_file_path, validate_artifact_mime_for_path};
-use super::shell::{agent_command_lifecycle, dispatch_uncertainty_lifecycle};
+use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::tool_call::ComputerSnapshotRegion;
 use super::{RecoveryKind, RecoveryTool, ToolCall, ToolResult, ToolRuntime};
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
 use crate::auth::AuthContext;
-use crate::shell_client::RunnerFeature;
-use crate::shell_protocol::{ShellCommandExecutionState, ShellFileOpRequest};
+use crate::runner_http::RunnerFeature;
+use crate::runner_protocol::{ShellCommandExecutionState, ShellFileOpRequest};
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -701,13 +701,7 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(error) => return error.into_tool_result(),
         };
-        if !resolved.config.is_agent() {
-            return ToolResult::err("computer_save_snapshot requires an agent-registered project");
-        }
-        let target_client_id = match resolved.config.agent_client_id() {
-            Ok(client_id) => client_id.to_string(),
-            Err(error) => return ToolResult::err(error),
-        };
+        let target_client_id = resolved.config.client_id.clone();
         let target_cwd = resolved.config.path.clone();
         let project_id = resolved.resolved_id;
         let expected_project_prefix = format!("agent:{target_client_id}:");
@@ -828,15 +822,15 @@ impl ToolRuntime {
             create_dirs: false,
             wait_timeout_secs: wait_timeout,
         };
-        let requested_by = crate::shell_client::requested_by_from_auth(auth);
+        let requested_by = crate::runner_http::requested_by_from_auth(auth);
         let (request_id, receiver) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_computer_snapshot_artifact(
                 request,
                 &target_agent_project_id,
                 &target_cwd,
                 requested_by,
-                auth,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
             )
             .await
         {
@@ -859,7 +853,7 @@ impl ToolRuntime {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
                 let state = dispatch_uncertainty_lifecycle(
-                    self.shell_clients
+                    self.runner_registry
                         .cancel_request_dispatch_state(&request_id)
                         .await,
                 );
@@ -875,7 +869,7 @@ impl ToolRuntime {
             }
             Err(_) => {
                 let state = dispatch_uncertainty_lifecycle(
-                    self.shell_clients
+                    self.runner_registry
                         .cancel_request_dispatch_state(&request_id)
                         .await,
                 );
@@ -890,7 +884,7 @@ impl ToolRuntime {
                 );
             }
         };
-        let state = agent_command_lifecycle(&response, wait_timeout);
+        let state = runner_command_lifecycle(&response, wait_timeout);
         if state == ShellCommandExecutionState::NotStarted {
             return computer_snapshot_artifact_lifecycle_failure(
                 "snapshot artifact write did not start",
@@ -1001,8 +995,10 @@ impl ToolRuntime {
 
     async fn computer_list_targets(&self, auth: Option<&AuthContext>) -> ToolResult {
         let clients = self
-            .shell_clients
-            .list_client_semantic_views_for_auth(auth)
+            .runner_registry
+            .list_runner_semantic_views_for_auth(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
             .await;
         let mut total_count = 0usize;
         let mut targets = Vec::new();
@@ -1155,8 +1151,11 @@ impl ToolRuntime {
             _ => return computer_error("invalid_request", "unsupported computer request kind"),
         };
         let client = match self
-            .shell_clients
-            .get_client_semantic_view_checked_for_auth(client_id, auth)
+            .runner_registry
+            .get_runner_semantic_view_checked_for_auth(
+                client_id,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
             .await
         {
             Ok(client) => client,
@@ -1269,15 +1268,15 @@ impl ToolRuntime {
                 return computer_error("invalid_request", "could not encode computer request")
             }
         };
-        let requested_by = crate::shell_client::requested_by_from_auth(auth);
+        let requested_by = crate::runner_http::requested_by_from_auth(auth);
         let (request_id, receiver) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_computer(
                 client_id.to_string(),
                 kind,
                 payload,
                 requested_by,
-                auth,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
                 COMPUTER_WAIT_SECS,
             )
             .await
@@ -1319,7 +1318,7 @@ impl ToolRuntime {
             Ok(Ok(response)) => response,
             Ok(Err(_)) if is_effect => {
                 let request_dispatched = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 if is_application_launch {
@@ -1353,7 +1352,7 @@ impl ToolRuntime {
             }
             Err(_) if is_effect => {
                 let request_dispatched = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 if is_application_launch {

@@ -5,7 +5,7 @@ use crate::artifact_policy::{
     has_safe_octet_stream_artifact_extension, octet_stream_safe_extension_error, DOCX_MIME,
     MAX_MCP_IMAGE_BYTES, PPTX_MIME, XLSX_MIME,
 };
-use crate::shell_protocol::ShellAgentShellRequest;
+use crate::runner_protocol::RunnerRequest;
 use base64::{engine::general_purpose, Engine as _};
 use flate2::read::DeflateDecoder;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xml::reader::{EventReader, XmlEvent};
@@ -62,12 +62,13 @@ pub(crate) fn validate_artifact_runner_path(path: &str) -> Result<(), String> {
         return Err("path cannot contain NUL bytes".to_string());
     }
     let p = Path::new(path);
-    if p.is_absolute() {
+    let bytes = path.as_bytes();
+    let windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if p.has_root() || path.starts_with('\\') || windows_drive_prefix {
         return Err("path must be project-relative".to_string());
     }
-    if p.components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    if path.split(['/', '\\']).any(|component| component == "..") {
         return Err("path cannot contain parent traversal".to_string());
     }
     if is_sensitive_artifact_path(path) {
@@ -77,21 +78,10 @@ pub(crate) fn validate_artifact_runner_path(path: &str) -> Result<(), String> {
 }
 
 fn is_sensitive_artifact_path(path: &str) -> bool {
-    for comp in path.to_lowercase().split('/') {
-        if matches!(
-            comp,
-            ".git" | "target" | "node_modules" | "secrets" | "tokens"
-        ) {
-            return true;
-        }
-        if comp == ".env" || comp.starts_with(".env") || comp.ends_with(".pem") {
-            return true;
-        }
-    }
-    false
+    webcodex_core::sensitive_paths::is_bulk_skipped_path(path)
 }
 
-fn parse_json_payload(request: &ShellAgentShellRequest) -> Result<Value, String> {
+fn parse_json_payload(request: &RunnerRequest) -> Result<Value, String> {
     let Some(content) = request.content.as_deref() else {
         return Err("invalid json: missing file-op payload".to_string());
     };
@@ -182,7 +172,7 @@ fn validate_upload_id(upload_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn project_root(request: &ShellAgentShellRequest) -> Result<std::path::PathBuf, String> {
+fn project_root(request: &RunnerRequest) -> Result<std::path::PathBuf, String> {
     let Some(cwd) = request.cwd.as_deref() else {
         return Err("artifact request missing project root".to_string());
     };
@@ -1358,7 +1348,7 @@ fn read_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn handle_artifact_file_request(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -1415,7 +1405,7 @@ pub(crate) fn handle_artifact_file_request(
 }
 
 fn handle_save_project_artifact(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -1513,7 +1503,7 @@ fn handle_save_project_artifact(
 }
 
 fn handle_artifact_upload_begin(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -1724,7 +1714,7 @@ fn handle_artifact_upload_begin(
 }
 
 fn handle_artifact_upload_chunk(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -1946,7 +1936,7 @@ fn handle_artifact_upload_chunk(
 }
 
 fn handle_artifact_upload_finish(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -2087,7 +2077,7 @@ fn handle_artifact_upload_finish(
 }
 
 fn handle_artifact_upload_abort(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -2169,7 +2159,7 @@ fn handle_artifact_upload_abort(
 }
 
 fn handle_read_project_artifact_metadata(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -2321,7 +2311,7 @@ fn handle_read_project_artifact_metadata(
 }
 
 fn handle_read_project_artifact_export_chunk(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -2462,7 +2452,7 @@ fn handle_read_project_artifact_export_chunk(
 }
 
 fn handle_read_project_artifact(
-    request: &ShellAgentShellRequest,
+    request: &RunnerRequest,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
@@ -2605,6 +2595,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn artifact_runner_path_validation_is_cross_platform_and_uses_shared_sensitive_policy() {
+        assert!(validate_artifact_runner_path("artifacts/report.bin").is_ok());
+        for path in [
+            "/absolute/report.bin",
+            "\\rooted\\report.bin",
+            "C:\\absolute\\report.bin",
+            "C:drive-relative\\report.bin",
+            "../report.bin",
+            "nested\\..\\report.bin",
+            ".git\\config",
+            "secrets\\token.bin",
+            "certs\\server.key",
+            "config\\runner.toml",
+            "project-registry\\demo.toml",
+        ] {
+            assert!(
+                validate_artifact_runner_path(path).is_err(),
+                "{path} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn atomic_artifact_write_create_only_never_replaces_existing_target() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("artifact.bin");
@@ -2637,13 +2650,8 @@ mod tests {
         assert!(!part.exists());
     }
 
-    fn artifact_request(
-        root: &Path,
-        kind: &str,
-        path: &str,
-        payload: Value,
-    ) -> ShellAgentShellRequest {
-        ShellAgentShellRequest {
+    fn artifact_request(root: &Path, kind: &str, path: &str, payload: Value) -> RunnerRequest {
+        RunnerRequest {
             request_id: format!("req-{kind}"),
             client_id: "agent-1".to_string(),
             kind: kind.to_string(),
@@ -2668,6 +2676,7 @@ mod tests {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: None,
         }

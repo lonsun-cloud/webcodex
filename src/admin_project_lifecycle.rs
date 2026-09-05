@@ -1,7 +1,7 @@
 use crate::auth::AuthContext;
 use crate::db::AdminProjectAudit;
-use crate::shell_client::{RunnerFeature, ShellClientRegistry};
-use crate::shell_protocol::ShellAgentProjectSummary;
+use crate::runner_http::{RunnerFeature, RunnerRegistry};
+use crate::runner_protocol::RunnerProjectSummary;
 use crate::tool_runtime::{ToolResult, ToolRuntime};
 use crate::Database;
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ pub(crate) struct CreateProjectRequest {
     #[serde(default)]
     pub template: Option<String>,
     #[serde(default)]
-    pub allow_existing_empty: bool,
+    pub adopt_existing_empty: bool,
     pub idempotency_key: String,
 }
 
@@ -75,7 +75,7 @@ pub(crate) struct ServiceResponse {
 }
 
 struct ProjectUnregisterFence {
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
     project: String,
 }
 
@@ -177,7 +177,7 @@ impl AdminProjectLifecycleService {
                         request.allow_patch,
                         request.template.clone(),
                         request.git_init,
-                        request.allow_existing_empty,
+                        request.adopt_existing_empty,
                         false,
                         Some(auth),
                     )
@@ -250,6 +250,7 @@ impl AdminProjectLifecycleService {
     ) -> Result<ServiceResponse, ServiceResponse> {
         validate_revision(expected_revision)?;
         let (client_id, project_id) = parse_runtime_project(target)?;
+        let access = crate::runner_http::runner_access_from_auth(auth);
         // Authenticated ordinary-runtime callers keep the explicit Runner owner/access
         // fence used by the HTTP unregister path. `auth=None` is the trusted in-process
         // / open-runtime path: visibility is intentionally unfiltered there, matching
@@ -257,14 +258,14 @@ impl AdminProjectLifecycleService {
         // reject otherwise reachable unowned Runners.
         if require_owner_access && auth.is_some() {
             runtime
-                .shell_clients
-                .assert_client_access(auth, &client_id)
+                .runner_registry
+                .assert_runner_access(access.as_ref(), &client_id)
                 .await
                 .map_err(|_| api_error(503, "agent_unavailable"))?;
         }
         let client = runtime
-            .shell_clients
-            .get_client_semantic_view_for_auth(&client_id, auth)
+            .runner_registry
+            .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
             .await
             .ok_or_else(|| api_error(503, "agent_unavailable"))?;
         if !client.view.connected || client.view.status != "online" {
@@ -279,8 +280,8 @@ impl AdminProjectLifecycleService {
         }
         let (active_jobs, _unregister_fence) = if action == "unregister" {
             let active = runtime
-                .shell_clients
-                .begin_project_unregister(auth, target)
+                .runner_registry
+                .begin_project_unregister(access.as_ref(), target)
                 .await
                 .map_err(|_| api_error(500, "operation_failed"))?;
             if active > 0 {
@@ -292,15 +293,15 @@ impl AdminProjectLifecycleService {
             (
                 active,
                 Some(ProjectUnregisterFence {
-                    registry: runtime.shell_clients.clone(),
+                    registry: runtime.runner_registry.clone(),
                     project: target.to_string(),
                 }),
             )
         } else {
             (
                 runtime
-                    .shell_clients
-                    .count_active_jobs_for_project(auth, target)
+                    .runner_registry
+                    .count_active_jobs_for_project(access.as_ref(), target)
                     .await,
                 None,
             )
@@ -312,14 +313,14 @@ impl AdminProjectLifecycleService {
         .map_err(|_| api_error(500, "operation_failed"))?;
         let kind = format!("project_lifecycle_{action}");
         let (request_id, receiver) = runtime
-            .shell_clients
+            .runner_registry
             .enqueue_project_op(client_id.clone(), &kind, payload, requester.to_string())
             .await
             .map_err(|_| api_error(503, "agent_unavailable"))?;
         let response = match tokio::time::timeout(Duration::from_secs(WAIT_SECS), receiver).await {
             Ok(Ok(value)) => value,
             Ok(Err(_)) | Err(_) => {
-                runtime.shell_clients.cancel_request(&request_id).await;
+                runtime.runner_registry.cancel_request(&request_id).await;
                 return Err(api_error(503, "operation_indeterminate"));
             }
         };
@@ -345,10 +346,10 @@ impl AdminProjectLifecycleService {
         let revision = output.get("revision").cloned().unwrap_or(Value::Null);
         if action == "unregister" && matches!(outcome, "unregistered" | "already_unregistered") {
             if runtime
-                .shell_clients
-                .remove_client_project_for_instance(
+                .runner_registry
+                .remove_runner_project_for_instance(
                     &client_id,
-                    &client.view.agent_instance_id,
+                    &client.view.runner_instance_id,
                     &project_id,
                 )
                 .await
@@ -373,10 +374,10 @@ impl AdminProjectLifecycleService {
                 ));
             };
             if runtime
-                .shell_clients
-                .upsert_client_project_for_instance(
+                .runner_registry
+                .upsert_runner_project_for_instance(
                     &client_id,
-                    &client.view.agent_instance_id,
+                    &client.view.runner_instance_id,
                     summary,
                 )
                 .await
@@ -610,9 +611,10 @@ async fn require_online_client(
     auth: &AuthContext,
     client_id: &str,
 ) -> Result<(), ServiceResponse> {
+    let access = crate::runner_http::runner_access_from_auth(Some(auth));
     let client = runtime
-        .shell_clients
-        .get_client_view_for_auth(client_id, Some(auth))
+        .runner_registry
+        .get_runner_view_for_auth(client_id, access.as_ref())
         .await
         .ok_or_else(|| api_error(503, "agent_unavailable"))?;
     if !client.connected || client.status != "online" {
@@ -669,8 +671,8 @@ fn map_create_result(
     })
 }
 
-fn lifecycle_summary(output: &Value, id: &str) -> Option<ShellAgentProjectSummary> {
-    Some(ShellAgentProjectSummary {
+fn lifecycle_summary(output: &Value, id: &str) -> Option<RunnerProjectSummary> {
+    Some(RunnerProjectSummary {
         id: id.to_string(),
         name: output
             .get("name")
@@ -682,7 +684,14 @@ fn lifecycle_summary(output: &Value, id: &str) -> Option<ShellAgentProjectSummar
             .get("allow_patch")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        kind: None,
+        kind: output
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        registration_source: output
+            .get("registration_source")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         description: output
             .get("description")
             .and_then(Value::as_str)
@@ -819,6 +828,7 @@ fn map_agent_error(error: &str) -> ServiceResponse {
         "project_not_found" => api_error(404, "project_not_found"),
         "path_outside_allowed_roots" => api_error(400, "path_outside_allowed_roots"),
         "path_not_empty" => api_error(409, "path_not_empty"),
+        "path_exists" => api_error(409, "path_exists"),
         "project_already_exists" => api_error(409, "project_already_exists"),
         "unsupported_runner_version" => api_error(409, "unsupported_runner_version"),
         "agent_unavailable" => api_error(503, "agent_unavailable"),
@@ -834,10 +844,8 @@ fn map_agent_error(error: &str) -> ServiceResponse {
 mod tests {
     use super::*;
     use crate::auth::AuthKind;
-    use crate::shell_client::ShellJobStartMetadata;
-    use crate::shell_protocol::{
-        ShellClientCapabilities, ShellClientRegisterRequest, ShellJobOpRequest,
-    };
+    use crate::runner_http::ShellJobStartMetadata;
+    use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest, ShellJobOpRequest};
 
     fn user_auth(username: &str) -> AuthContext {
         AuthContext {
@@ -873,20 +881,21 @@ mod tests {
 
     #[tokio::test]
     async fn project_unregister_rejects_cross_owner_before_active_job_fence() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let revision = format!("sha256:{}", "a".repeat(64));
         let target = "agent:owned-runner:demo";
         registry
             .register(crate::test_support::current_runner_registration(
-                ShellClientRegisterRequest {
+                RunnerRegisterRequest {
                     client_id: "owned-runner".to_string(),
-                    agent_instance_id: "instance-owned".to_string(),
-                    agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                    runner_instance_id: "instance-owned".to_string(),
+                    runner_protocol_generation:
+                        crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                     display_name: None,
                     owner: Some("alice".to_string()),
                     hostname: None,
                     host_context: None,
-                    capabilities: ShellClientCapabilities {
+                    capabilities: RunnerCapabilities {
                         jobs: true,
                         async_jobs: true,
                         async_shell_jobs: true,
@@ -907,31 +916,34 @@ mod tests {
 
         let alice = user_auth("alice");
         let bob = user_auth("bob");
+        let alice_access = crate::test_support::runner_access(&alice);
+        let bob_access = crate::test_support::runner_access(&bob);
         registry
-            .start_job_with_metadata_for_auth(
+            .start_job_with_metadata_for_access(
                 active_job_request("owned-runner", "sleep 60"),
                 "alice".to_string(),
                 ShellJobStartMetadata {
                     project_id: Some(target.to_string()),
                     ..Default::default()
                 },
-                Some(&alice),
+                Some(&alice_access),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(
             registry
-                .count_active_jobs_for_project(Some(&alice), target)
+                .count_active_jobs_for_project(Some(&alice_access), target)
                 .await,
             1
         );
         assert_eq!(
-            registry.count_active_jobs_for_project(Some(&bob), target).await,
+            registry.count_active_jobs_for_project(Some(&bob_access), target).await,
             0,
             "the regression requires the cross-owner principal to be unable to see the owner's active Job"
         );
 
-        let runtime = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
+        let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
             registry.clone(),
         ));
         let (_tmp, db) = crate::test_support::test_db();
@@ -948,20 +960,21 @@ mod tests {
         assert_eq!(response.body["error"]["code"], "agent_unavailable");
 
         registry
-            .start_job_with_metadata_for_auth(
+            .start_job_with_metadata_for_access(
                 active_job_request("owned-runner", "echo still-allowed"),
                 "alice".to_string(),
                 ShellJobStartMetadata {
                     project_id: Some(target.to_string()),
                     ..Default::default()
                 },
-                Some(&alice),
+                Some(&alice_access),
+                None,
             )
             .await
             .expect("rejected cross-owner unregister must not leave an unregister fence behind");
         assert_eq!(
             registry
-                .begin_project_unregister(Some(&alice), target)
+                .begin_project_unregister(Some(&alice_access), target)
                 .await
                 .unwrap(),
             2,
@@ -973,6 +986,7 @@ mod tests {
     fn project_lifecycle_error_mapping_is_stable_and_safe() {
         assert_eq!(map_agent_error("agent_unavailable").status, 503);
         assert_eq!(map_agent_error("revision_conflict").status, 409);
+        assert_eq!(map_agent_error("path_exists").status, 409);
         assert_eq!(map_agent_error("secret internal backtrace").status, 500);
         assert_eq!(
             map_agent_error("secret internal backtrace").body["error"]["code"],

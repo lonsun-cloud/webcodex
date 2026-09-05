@@ -609,7 +609,7 @@ impl ToolRuntime {
     /// Main dispatch — call from MCP handler or GPT Actions handler.
     ///
     /// This no-auth convenience defaults the caller context to `None`, which
-    /// means agent-backed tools are rejected (no owner can be proven). HTTP
+    /// means Runner-backed tools are rejected (no owner can be proven). HTTP
     /// wrappers should prefer `dispatch_with_auth` so the depot `AuthContext`
     /// is forwarded. Tests use this wrapper for local-executor projects.
     #[cfg(test)]
@@ -617,9 +617,9 @@ impl ToolRuntime {
         self.dispatch_with_auth(call, None).await
     }
 
-    /// Dispatch carrying the caller's auth context. Agent-backed tools enforce
+    /// Dispatch carrying the caller's auth context. Runner-backed tools enforce
     /// the owner boundary and capability requirements through
-    /// `authorize_agent_tool`; local-executor tools are unaffected. Wrappers
+    /// `authorize_runner_tool`; local-executor tools are unaffected. Wrappers
     /// stay thin: they only forward the depot `AuthContext` here.
     pub async fn dispatch_with_auth(
         &self,
@@ -779,12 +779,12 @@ impl ToolRuntime {
             tool,
             project: project.map(str::to_string),
             client: project
-                .and_then(super::activity::agent_client_from_project)
+                .and_then(super::activity::runner_client_from_project)
                 .map(str::to_string),
             command: match call {
                 ToolCall::RunProcess {
                     executable, args, ..
-                } => Some(crate::shell_client::process_preview(
+                } => Some(crate::runner_http::process_preview(
                     executable,
                     args.iter().map(String::as_str),
                 )),
@@ -796,7 +796,7 @@ impl ToolRuntime {
                     script,
                     args,
                     ..
-                } => Some(crate::shell_client::script_preview(
+                } => Some(crate::runner_http::script_preview(
                     language.as_str(),
                     script.len(),
                     args.len(),
@@ -887,7 +887,7 @@ impl ToolRuntime {
             .and_then(|resolution| resolution.as_ref().ok());
         // Preserve the canonical project for activity attribution before the
         // session recorder consumes the resolved value below. Short aliases
-        // must not turn a real agent execution into a client-less row.
+        // must not turn a real Runner execution into a client-less row.
         let activity_project = resolved_project
             .as_ref()
             .map(|resolved| resolved.resolved_id.clone());
@@ -898,7 +898,8 @@ impl ToolRuntime {
         };
         // work_on_project.session_id is explicit coding-resume business input,
         // never a generic tool recorder. Its implementation delegates exact
-        // Session/project/lifecycle/authority handling to start_coding_task.
+        // Session/project/lifecycle/authority handling to the coding workflow
+        // engine.
         let defer_work_session = matches!(&call, ToolCall::WorkOnProject { .. });
         // session_handoff_summary.session_id remains business input for direct
         // internal dispatch. When the kernel already has an explicit outer
@@ -941,6 +942,7 @@ impl ToolRuntime {
         } else {
             None
         };
+        let session_contract = super::sessions::session_tool_contract(call.tool_name());
         let session_project_mismatch = session_id.as_deref().and_then(|session_id| {
             match (
                 self.sessions.session_project(session_id),
@@ -967,6 +969,7 @@ impl ToolRuntime {
                 &call.session_log_arguments(),
                 Some(mismatch.request_project.clone()),
                 recorder_metadata.clone(),
+                session_contract,
             );
             let mut result =
                 session_project_mismatch_result(session_id, call.tool_name(), mismatch);
@@ -1033,6 +1036,7 @@ impl ToolRuntime {
                     &call.session_log_arguments(),
                     None,
                     recorder_metadata.clone(),
+                    session_contract,
                 );
                 self.record_dispatch_session_result(
                     &mut result,
@@ -1051,7 +1055,10 @@ impl ToolRuntime {
         }
         if let Some(session_id) = session_id.as_deref() {
             // Lifecycle denial is orthogonal to mode/guards and wins first.
-            if let Some(denial) = self.sessions.lifecycle_denial(session_id, call.tool_name()) {
+            if let Some(denial) =
+                self.sessions
+                    .lifecycle_denial(session_id, call.tool_name(), session_contract)
+            {
                 let session_start = self.sessions.record_tool_call_started_with_metadata(
                     Some(session_id),
                     transport,
@@ -1059,6 +1066,7 @@ impl ToolRuntime {
                     &call.session_log_arguments(),
                     None,
                     recorder_metadata.clone(),
+                    session_contract,
                 );
                 let mut result =
                     session_lifecycle_denied_result(session_id, call.tool_name(), denial);
@@ -1087,7 +1095,7 @@ impl ToolRuntime {
                 .await;
                 return result;
             }
-            if let Some(denial) = self.sessions.guard_denial(session_id, call.tool_name()) {
+            if let Some(denial) = self.sessions.guard_denial(session_id, session_contract) {
                 let session_start = self.sessions.record_tool_call_started_with_metadata(
                     Some(session_id),
                     transport,
@@ -1095,6 +1103,7 @@ impl ToolRuntime {
                     &call.session_log_arguments(),
                     None,
                     recorder_metadata.clone(),
+                    session_contract,
                 );
                 let mut result = session_guard_denied_result(session_id, call.tool_name(), denial);
                 decorate_structured_execution_prestart_denial(
@@ -1126,12 +1135,13 @@ impl ToolRuntime {
                 &call.session_log_arguments(),
                 resolved_project,
                 recorder_metadata.clone(),
+                session_contract,
             )
         } else {
             None
         };
         if let Err(err) = self
-            .authorize_agent_tool(
+            .authorize_runner_tool(
                 &call,
                 ssh_resource.as_deref(),
                 auth,
@@ -1261,7 +1271,7 @@ impl ToolRuntime {
                 error_summary: result.error.as_deref(),
                 // Derived from the verified caller here, not looked up later
                 // from whoever holds this client id at read time.
-                scope: super::activity::ActivityScope::from_auth(auth),
+                scope: super::activity::activity_scope_from_auth(auth),
             });
         }
         if result.success && super::observations::is_meaningful_activity_tool(tool_name) {
@@ -1342,7 +1352,7 @@ impl ToolRuntime {
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
-            | ToolCall::ListAgents { .. }
+            | ToolCall::ListRunners { .. }
             | ToolCall::RuntimeStatus { .. }
             | ToolCall::ReadToolTrace { .. }
             | ToolCall::ToolManifest { .. }) => self.dispatch_discovery_tool(call, auth).await,
@@ -1362,9 +1372,7 @@ impl ToolRuntime {
                 self.dispatch_session_tool(call, auth, transport).await
             }
 
-            call @ (ToolCall::StartCodingTask { .. }
-            | ToolCall::WorkOnProject { .. }
-            | ToolCall::FinishCodingTask { .. }) => {
+            call @ (ToolCall::WorkOnProject { .. } | ToolCall::FinishCodingTask { .. }) => {
                 self.dispatch_coding_task_tool(
                     call,
                     auth,
@@ -2012,6 +2020,7 @@ impl ToolRuntime {
 
             call @ (ToolCall::GitRestorePaths { .. }
             | ToolCall::DiscardUntracked { .. }
+            | ToolCall::GitCommitPaths { .. }
             | ToolCall::GitStatus { .. }
             | ToolCall::GitDiff { .. }
             | ToolCall::GitDiffHunks { .. }

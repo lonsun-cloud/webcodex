@@ -1,9 +1,7 @@
-use super::reconnect::dispatch_start_coding_task_in_window;
+use super::reconnect::dispatch_coding_call_in_window;
 use super::support::*;
-use crate::shell_client::ShellJobStartMetadata;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellClientCapabilities, ShellJobOpRequest,
-};
+use crate::runner_http::ShellJobStartMetadata;
+use crate::runner_protocol::{RunnerCapabilities, RunnerJobUpdateRequest, ShellJobOpRequest};
 use crate::tool_runtime::startup_brief::{
     startup_brief_size, validate_schema_instance_for_test, STANDARD_STARTUP_HARD_MAX_BYTES,
 };
@@ -14,44 +12,72 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-fn start_call(
-    project: &str,
-    detail: StartupDetail,
-    title: &str,
-    resume_session_id: Option<&str>,
-) -> ToolCall {
-    ToolCall::StartCodingTask {
-        project: project.to_string(),
-        client_id: None,
-        path: None,
-        temporary_project_name: None,
-        title: Some(title.to_string()),
-        mode: SessionMode::Normal,
-        detail,
-        deny_write_tools: false,
-        deny_shell_tools: false,
-        resume_session_id: resume_session_id.map(str::to_string),
-        execution_context: None,
-    }
-}
-
 async fn start(
     runtime: &ToolRuntime,
     client_id: &str,
     project: &str,
-    window: &str,
+    _window: &str,
     detail: StartupDetail,
     title: &str,
     resume_session_id: Option<&str>,
 ) -> ToolResult {
-    dispatch_start_coding_task_in_window(
-        runtime,
-        client_id,
-        start_call(project, detail, title, resume_session_id),
-        Some(&auth_context(None, true)),
-        window,
-    )
-    .await
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        let title = title.to_string();
+        let resume_session_id = resume_session_id.map(str::to_string);
+        let auth = auth_context(None, true);
+        async move {
+            runtime
+                .start_coding_workflow_for_test(
+                    project,
+                    None,
+                    None,
+                    Some(title),
+                    SessionMode::Normal,
+                    false,
+                    false,
+                    detail,
+                    resume_session_id,
+                    None,
+                    Some(&auth),
+                    None,
+                    None,
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                )
+                .await
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "coding workflow did not finish within the 10-second test deadline"
+        );
+        if let Some(req) = runtime
+            .runner_registry
+            .poll(crate::runner_protocol::RunnerPollRequest {
+                client_id: client_id.to_string(),
+                runner_instance_id: "inst".to_string(),
+            })
+            .await
+            .unwrap()
+        {
+            let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&req);
+            complete_patch_agent_request(
+                runtime,
+                client_id,
+                &req.request_id,
+                exit_code,
+                &stdout,
+                &stderr,
+            )
+            .await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    task.await.unwrap()
 }
 
 fn seed_rules(root: &Path) {
@@ -82,7 +108,7 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 5);
+    assert_eq!(workflow["version"], 6);
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
@@ -133,6 +159,21 @@ fn assert_builtin_workflow(output: &Value) {
     assert!(sidecar_guidance.contains("after the main tool"));
     assert!(sidecar_guidance.contains("never authorizes"));
     assert!(sidecar_guidance.contains("observation call before dependent mutation"));
+    let runner_targeting_guidance = workflow["model_protocol"]["runner_targeting"]
+        .as_str()
+        .expect("exact Runner targeting guidance");
+    assert!(runner_targeting_guidance.contains("exact Runner client_id"));
+    assert!(runner_targeting_guidance.contains("runtime_status(client_id=...)"));
+    assert!(runner_targeting_guidance.contains("list_projects(client_id=...)"));
+    assert!(runner_targeting_guidance.contains("before treating it as absent"));
+    let persistent_shell_guidance = workflow["model_protocol"]["persistent_shell"]
+        .as_str()
+        .expect("persistent shell guidance");
+    assert!(persistent_shell_guidance.contains("repeated commands in one Workflow Session"));
+    assert!(persistent_shell_guidance.contains("named SSH resource"));
+    assert!(persistent_shell_guidance.contains("open_session_shell"));
+    assert!(persistent_shell_guidance.contains("session_shell_exec"));
+    assert!(persistent_shell_guidance.contains("run_process"));
     let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
         .as_str()
         .expect("normal closeout guidance");
@@ -182,7 +223,7 @@ async fn fresh_coding_task_session_loads_all_bounded_repository_rules() {
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-fresh", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-fresh", "demo", root.path()).await;
 
     let result = start(
         &runtime,
@@ -244,7 +285,7 @@ async fn repository_without_project_instructions_still_receives_builtin_workflow
     commit_file(root.path(), "README.md", "hello\n", "initial");
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "workflow-no-rules", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "workflow-no-rules", "demo", root.path()).await;
 
     let result = start(
         &runtime,
@@ -272,7 +313,7 @@ async fn explicit_coding_task_resume_reuses_rules_without_repeating_content() {
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-reuse", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-reuse", "demo", root.path()).await;
 
     let first = start(
         &runtime,
@@ -342,7 +383,7 @@ async fn changed_and_deleted_repository_rule_sources_are_reported_incrementally(
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-change", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-change", "demo", root.path()).await;
 
     let first = start(
         &runtime,
@@ -455,7 +496,7 @@ async fn repository_rule_truncation_state_change_invalidates_the_snapshot() {
     fs::write(root.path().join("AGENTS.md"), &initial).unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-truncate", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-truncate", "demo", root.path()).await;
     let first = start(
         &runtime,
         "rules-truncate",
@@ -508,7 +549,7 @@ async fn explicit_resume_reuses_unchanged_rules_without_repeating_body() {
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-explicit", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-explicit", "demo", root.path()).await;
     let first = start(
         &runtime,
         "rules-explicit",
@@ -567,7 +608,7 @@ async fn explicit_resume_reports_changed_rules_with_new_bounded_body() {
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-explicit-change", "demo", root.path())
+        register_runner_project_at_path(&runtime, "rules-explicit-change", "demo", root.path())
             .await;
     let first = start(
         &runtime,
@@ -642,7 +683,7 @@ async fn coding_task_project_switching_keeps_rule_snapshots_isolated() {
         &runtime,
         "rules-switch",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: false,
             git: true,
             file_read: true,
@@ -655,8 +696,8 @@ async fn coding_task_project_switching_keeps_rule_snapshots_isolated() {
         ],
     )
     .await;
-    let project_a = crate::tool_runtime::agent_project_runtime_id("rules-switch", "a");
-    let project_b = crate::tool_runtime::agent_project_runtime_id("rules-switch", "b");
+    let project_a = crate::tool_runtime::runner_project_runtime_id("rules-switch", "a");
+    let project_b = crate::tool_runtime::runner_project_runtime_id("rules-switch", "b");
 
     let first_a = start(
         &runtime,
@@ -739,13 +780,15 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
 
     let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
     let project =
-        register_agent_project_at_path(&runtime1, "rules-restart", "demo", root.path()).await;
-    let first = dispatch_start_coding_task_in_window(
+        register_runner_project_at_path(&runtime1, "rules-restart", "demo", root.path()).await;
+    let first = start(
         &runtime1,
         "rules-restart",
-        start_call(&project, StartupDetail::Standard, "before restart", None),
-        Some(&auth),
+        &project,
         "rules-restart-window",
+        StartupDetail::Standard,
+        "before restart",
+        None,
     )
     .await;
     assert!(first.success, "{:?}", first.error);
@@ -753,7 +796,7 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
         .as_str()
         .unwrap()
         .to_string();
-    let read = dispatch_start_coding_task_in_window(
+    let read = dispatch_coding_call_in_window(
         &runtime1,
         "rules-restart",
         ToolCall::ReadFile {
@@ -777,18 +820,15 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
     drop(runtime1);
 
     let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    register_agent_project_at_path(&runtime2, "rules-restart", "demo", root.path()).await;
-    let restored = dispatch_start_coding_task_in_window(
+    register_runner_project_at_path(&runtime2, "rules-restart", "demo", root.path()).await;
+    let restored = start(
         &runtime2,
         "rules-restart",
-        start_call(
-            &project,
-            StartupDetail::Standard,
-            "after restart",
-            Some(&session_id),
-        ),
-        Some(&auth),
+        &project,
         "rules-restart-window",
+        StartupDetail::Standard,
+        "after restart",
+        Some(&session_id),
     )
     .await;
 
@@ -842,7 +882,7 @@ async fn unavailable_repository_rules_fail_conservatively_without_leaking_errors
         &runtime,
         "rules-unavailable",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             git: true,
             file_read: false,
@@ -852,7 +892,7 @@ async fn unavailable_repository_rules_fail_conservatively_without_leaking_errors
         vec![registered_project("demo", &root.path().to_string_lossy())],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id("rules-unavailable", "demo");
+    let project = crate::tool_runtime::runner_project_runtime_id("rules-unavailable", "demo");
 
     let result = start(
         &runtime,
@@ -885,7 +925,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     seed_rules(root_a.path());
     seed_rules(root_b.path());
     let runtime = ToolRuntime::new_for_tests();
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         git: true,
         file_read: true,
@@ -904,10 +944,10 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
         ],
     )
     .await;
-    let project_a = crate::tool_runtime::agent_project_runtime_id("startup-jobs", "a");
-    let project_b = crate::tool_runtime::agent_project_runtime_id("startup-jobs", "b");
+    let project_a = crate::tool_runtime::runner_project_runtime_id("startup-jobs", "a");
+    let project_b = crate::tool_runtime::runner_project_runtime_id("startup-jobs", "b");
     let job = runtime
-        .shell_clients
+        .runner_registry
         .start_job_with_metadata(
             ShellJobOpRequest {
                 op: "start".to_string(),
@@ -931,13 +971,14 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
         )
         .await
         .unwrap();
-    let start_request = wait_for_agent_request_for_instance(&runtime, "startup-jobs", "inst").await;
+    let start_request =
+        wait_for_runner_request_for_instance(&runtime, "startup-jobs", "inst").await;
     assert_eq!(start_request.kind, "start_job");
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: "startup-jobs".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: job.job_id.clone(),
             request_id: Some(start_request.request_id.clone()),
             update_seq: None,
@@ -952,6 +993,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            activity: None,
             finished: false,
         })
         .await
@@ -1029,12 +1071,12 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     assert_eq!(other_project.output["startup_verdict"]["blocking"], false);
 
     let stopped = runtime
-        .shell_clients
+        .runner_registry
         .stop_job(&job.job_id, "startup-test".to_string())
         .await
         .unwrap();
     assert_eq!(stopped.status, "stop_requested");
-    let stop_request = wait_for_agent_request_for_instance(&runtime, "startup-jobs", "inst").await;
+    let stop_request = wait_for_runner_request_for_instance(&runtime, "startup-jobs", "inst").await;
     assert_eq!(stop_request.kind, "stop_job");
     assert_eq!(stop_request.job_id.as_deref(), Some(job.job_id.as_str()));
 
@@ -1072,10 +1114,10 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     );
 
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: "startup-jobs".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: job.job_id.clone(),
             request_id: Some(start_request.request_id),
             update_seq: None,
@@ -1090,13 +1132,14 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            activity: None,
             finished: true,
         })
         .await
         .unwrap();
     assert_eq!(
         runtime
-            .shell_clients
+            .runner_registry
             .get_job(&job.job_id)
             .await
             .unwrap()
@@ -1110,12 +1153,12 @@ async fn startup_runner_health_uses_the_exact_project_client() {
     let target_root = tempfile::tempdir().unwrap();
     let peer_root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
-    let target_project = crate::tool_runtime::agent_project_runtime_id("startup-target", "demo");
+    let target_project = crate::tool_runtime::runner_project_runtime_id("startup-target", "demo");
     register_agent_with_projects(
         &runtime,
         "startup-target",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project(
             "demo",
             &target_root.path().to_string_lossy(),
@@ -1126,7 +1169,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
         &runtime,
         "startup-peer",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project(
             "peer",
             &peer_root.path().to_string_lossy(),
@@ -1134,7 +1177,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
     )
     .await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("startup-target", "inst")
         .await;
 
@@ -1152,14 +1195,21 @@ async fn startup_runner_health_uses_the_exact_project_client() {
 
     let auth = auth_context(None, true);
     let unavailable = runtime
-        .dispatch_with_auth(
-            start_call(
-                &target_project,
-                StartupDetail::Full,
-                "inspect unavailable target runner",
-                None,
-            ),
+        .start_coding_workflow_for_test(
+            target_project.clone(),
+            None,
+            None,
+            Some("inspect unavailable target runner".to_string()),
+            SessionMode::Normal,
+            false,
+            false,
+            StartupDetail::Full,
+            None,
+            None,
             Some(&auth),
+            None,
+            None,
+            crate::tool_runtime::sessions::SessionTransport::Api,
         )
         .await;
     assert!(unavailable.success, "{:?}", unavailable.error);
@@ -1187,7 +1237,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
         &runtime,
         "startup-target",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project(
             "demo",
             &target_root.path().to_string_lossy(),
@@ -1195,7 +1245,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
     )
     .await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("startup-peer", "inst")
         .await;
     let available = start(
@@ -1227,13 +1277,13 @@ async fn startup_runner_health_uses_the_exact_project_client() {
 }
 
 #[tokio::test]
-async fn minimal_standard_and_full_coding_task_outputs_validate_against_strict_schema() {
+async fn minimal_standard_and_full_coding_workflow_diagnostics_validate_against_strict_schema() {
     let root = tempfile::tempdir().unwrap();
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-schema", "demo", root.path()).await;
-    let schema = registry::output_schema_for_tool("start_coding_task");
+        register_runner_project_at_path(&runtime, "rules-schema", "demo", root.path()).await;
+    let schema = registry::coding_workflow_diagnostic_output_schema_for_test();
     let recorder = runtime.sessions.start_session_with_guards(
         Some(project.clone()),
         Some("startup schema recorder".to_string()),
@@ -1345,7 +1395,7 @@ async fn worst_case_startup_with_huge_repository_stays_below_hard_limit() {
     seed_rules(root.path());
     let runtime = ToolRuntime::new_for_tests();
     let project =
-        register_agent_project_at_path(&runtime, "rules-worst", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "rules-worst", "demo", root.path()).await;
 
     // A worst-case repository: many tracked manifests, key files, top-level
     // entries, and per-class roots, all with long names, alongside a large
@@ -1389,7 +1439,7 @@ async fn worst_case_startup_with_huge_repository_stays_below_hard_limit() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["repository"]["status"], "available");
 
-    let schema = registry::output_schema_for_tool("start_coding_task");
+    let schema = registry::coding_workflow_diagnostic_output_schema_for_test();
     let value = json!({
         "success": result.success,
         "output": result.output,

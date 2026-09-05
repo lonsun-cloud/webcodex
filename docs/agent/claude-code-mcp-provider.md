@@ -86,14 +86,14 @@ with the provider disabled or enabled.
 The bounded version reported by MCP `initialize.serverInfo` is exposed in
 provider status after a successful start. A version is retained only when it
 matches a small version-string character allowlist. Status queries are passive:
-`runtime_status`, `list_agents`, and local snapshot reads never start Claude.
+`runtime_status`, `list_runners`, and local snapshot reads never start Claude.
 With the default Runner configuration, the expected snapshot is
 `strategy=native`, `enabled=false`, and `process_state=not_started`; this confirms
 that observability is deployed but does not mean Claude has been configured or
 started. The executable path is not exposed, and a missing command never
 prevents the agent from starting.
 
-`runtime_status` and `listAgents` expose the current bounded snapshot under
+`runtime_status` and `list_runners` expose the current bounded snapshot under
 `tool_providers`. Registration and reconnect carry a complete snapshot. Later
 changed revisions reuse the existing agent transport: polling agents attach
 them to their next poll, while WebSocket/QUIC agents send a changed-only
@@ -127,16 +127,16 @@ Provider.
 
 Identity, server/auth, registration, project source, concurrency, and transport
 fields still require restart: `server_url`, `token`, `client_id`,
-`display_name`, `owner`, `hostname`, `projects_dir`, `poll_interval_ms`,
-`temporary_projects_root`, `capabilities`, `max_concurrent_jobs`, `transport`,
-`websocket_connect_timeout_secs`, and `quic.*`. A mixed reload applies the hot
+`display_name`, `owner`, `hostname`, `project_registry_dir`, `poll_interval_ms`,
+`capabilities`, `max_concurrent_jobs`, `transport`, `websocket_connect_timeout_secs`,
+and `quic.*`. A mixed reload applies the hot
 sections and reports these field names as `restart_required_fields`; it never
 reports their values. Read, parse, validation, or Provider-config failure keeps
 the active generation unchanged.
 
 The latest bounded result is exposed as `tool_providers.config_reload`
 (`generation`, result/error code, and restart-required summary). Generation
-starts at 1 and advances only after a valid reload. `projects.d/*.toml` keeps
+starts at 1 and advances only after a valid reload. `project-registry/*.toml` keeps
 its existing independent cache refresh. Reload does not change public MCP
 tools, refresh MCP metadata, or add an OpenAPI operation.
 

@@ -1,7 +1,7 @@
 use super::*;
-use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellClientRegisterRequest,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerPollRequest, RunnerProjectSummary, RunnerRegisterRequest,
+    RunnerResultRequest,
 };
 use base64::engine::general_purpose;
 use sha2::{Digest, Sha256};
@@ -185,6 +185,8 @@ mod model_ergonomics;
 mod model_surface;
 #[path = "mcp_tests/oauth_scope.rs"]
 mod oauth_scope;
+#[path = "mcp_tests/plugin_tools.rs"]
+mod plugin_tools;
 #[path = "mcp_tests/project_connector.rs"]
 mod project_connector;
 #[path = "mcp_tests/protocol.rs"]

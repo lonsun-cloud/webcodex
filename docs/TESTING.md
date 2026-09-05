@@ -41,25 +41,35 @@ The lanes above define test semantics; workflows decide when to run them.
   Release readiness must not be the first place complete Linux package suites or
   release-tooling tests execute. The historical `test` job id remains the aggregate
   Linux status check and always evaluates `contract` plus both Linux lanes, failing
-  unless every required result is `success`. Native macOS and Windows lanes still
-  retain the existing main/external-PR/owner-`run-ci` policy so routine owner PRs do
-  not automatically consume the full cross-platform matrix. This is CI orchestration,
-  not a claim that the repository now has perfectly pure fast/integration/platform suites.
+  unless every required result is `success`. Native macOS and Windows lanes plus
+  Linux arm64 retain the existing main/external-PR/owner-`run-ci` policy so routine
+  owner PRs do not automatically consume the full cross-platform matrix. The
+  always-evaluated `test-native` aggregate fails when those native lanes are skipped
+  instead of treating missing platform evidence as success; it provides one stable
+  check for branch protection once an owner PR opts into `run-ci`. This is CI
+  orchestration, not a claim that the repository now has perfectly pure
+  fast/integration/platform suites.
 - Linux Rust execution is package-sharded without test-name filters: the server
   package `webcodex`, the integration-rich Runner package `webcodex-runner`, and
   the remaining workspace crates run as three complete package groups in
-  parallel. Each workspace package appears in exactly one group, so sharding is
-  an execution optimization rather than a semantic coverage reduction. Package
+  parallel. The remainder shard uses the workspace selector
+  `--workspace --exclude webcodex --exclude webcodex-runner`, so newly added
+  workspace members enter CI automatically rather than depending on a
+  hand-maintained package list. Each
+  workspace package therefore executes in exactly one Linux Rust group; sharding
+  is an execution optimization rather than a semantic coverage reduction. Package
   boundaries do not imply that every test inside a shard has the same cost or
   integration characteristics.
 - Linux tooling runs in parallel with the Rust shards and retains
   release-verification tooling, Markdown-link validation, and npm package-smoke
   tooling; within the Linux heavy split, only this tooling lane installs Node
   because those smoke scripts invoke Node/npm directly. macOS still owns release-surface compilation and the native
-  Runner suite, including detached ownership/restart recovery. The local-`sshd`
+  Runner suite on both published architectures, including detached ownership/restart recovery. The local-`sshd`
   SSH integration fixture remains Linux-only because it depends on Linux daemon
-  account/auth configuration; Windows still owns its native library, CLI and
-  serialized Runner suites, npm tests, and artifact-to-install smoke.
+  account/auth configuration; Windows still owns its native library, CLI, Runner,
+  npm, and artifact-to-install coverage. The Windows Runner + Computer lane caps
+  libtest at two concurrent test functions so process startup remains bounded
+  without serializing the whole Runner suite.
 - Exact-source release acceptance is a separate trust boundary from ordinary CI.
   Its Stage 1 runs the canonical release contract, the complete locked Rust
   workspace suite as package shards without test-name filters, frontend, E2E, and

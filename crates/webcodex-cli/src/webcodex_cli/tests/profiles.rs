@@ -43,8 +43,8 @@ fn runner_init_defaults_to_client_id_profile_paths() {
         client_profile_runner_config("special-container").unwrap()
     );
     assert_eq!(
-        opts.projects_dir,
-        client_profile_projects_dir("special-container").unwrap()
+        opts.project_registry_dir,
+        client_profile_project_registry_dir("special-container").unwrap()
     );
 }
 
@@ -70,13 +70,13 @@ fn runner_init_profile_overrides_client_id_profile_paths() {
         client_profile_runner_config("special").unwrap()
     );
     assert_eq!(
-        opts.projects_dir,
-        client_profile_projects_dir("special").unwrap()
+        opts.project_registry_dir,
+        client_profile_project_registry_dir("special").unwrap()
     );
 }
 
 #[test]
-fn runner_init_explicit_output_and_projects_dir_win() {
+fn runner_init_explicit_output_and_project_registry_dir_win() {
     let opts = parse_cli_runner_init(&args(&[
         "--server-url",
         "https://example.test",
@@ -90,12 +90,33 @@ fn runner_init_explicit_output_and_projects_dir_win() {
         "alice",
         "--output",
         "/tmp/a.toml",
+        "--project-registry-dir",
+        "/tmp/project-registry",
+    ]))
+    .unwrap();
+    assert_eq!(opts.output, PathBuf::from("/tmp/a.toml"));
+    assert_eq!(
+        opts.project_registry_dir,
+        PathBuf::from("/tmp/project-registry")
+    );
+}
+
+#[test]
+fn runner_init_accepts_legacy_projects_dir_alias() {
+    let opts = parse_cli_runner_init(&args(&[
+        "--server-url",
+        "https://example.test",
+        "--token",
+        "agent_fake_token",
+        "--client-id",
+        "special-container",
+        "--owner",
+        "alice",
         "--projects-dir",
         "/tmp/projects.d",
     ]))
     .unwrap();
-    assert_eq!(opts.output, PathBuf::from("/tmp/a.toml"));
-    assert_eq!(opts.projects_dir, PathBuf::from("/tmp/projects.d"));
+    assert_eq!(opts.project_registry_dir, PathBuf::from("/tmp/projects.d"));
 }
 
 #[cfg(unix)]
@@ -127,7 +148,27 @@ fn user_scope_runner_config_keeps_legacy_only_and_rejects_dual_names() {
 }
 
 #[test]
-fn runner_init_explicit_output_without_profile_preserves_legacy_projects_dir() {
+fn runner_init_rejects_new_and_legacy_registry_flags_together() {
+    let error = parse_cli_runner_init(&args(&[
+        "--server-url",
+        "https://example.test",
+        "--token",
+        "agent_fake_token",
+        "--client-id",
+        "special-container",
+        "--owner",
+        "alice",
+        "--project-registry-dir",
+        "/tmp/project-registry",
+        "--projects-dir",
+        "/tmp/projects.d",
+    ]))
+    .unwrap_err();
+    assert!(error.contains("use only one"), "{error}");
+}
+
+#[test]
+fn runner_init_explicit_output_without_profile_preserves_legacy_project_registry_dir() {
     let opts = parse_cli_runner_init(&args(&[
         "--server-url",
         "https://example.test",
@@ -142,7 +183,10 @@ fn runner_init_explicit_output_without_profile_preserves_legacy_projects_dir() {
     ]))
     .unwrap();
     assert_eq!(opts.output, PathBuf::from("/tmp/a.toml"));
-    assert_eq!(opts.projects_dir, PathBuf::from(DEFAULT_INIT_PROJECTS_DIR));
+    assert_eq!(
+        opts.project_registry_dir,
+        PathBuf::from(DEFAULT_INIT_PROJECT_REGISTRY_DIR)
+    );
 }
 
 #[test]
@@ -184,8 +228,8 @@ fn runner_status_profile_derives_config_and_token_paths() {
         Some(client_profile_user_token_file_for_scope(ServiceScope::System, "special").unwrap())
     );
     assert_eq!(
-        opts.agent_token_file,
-        Some(client_profile_agent_token_file_for_scope(ServiceScope::System, "special").unwrap())
+        opts.runner_token_file,
+        Some(client_profile_runner_token_file_for_scope(ServiceScope::System, "special").unwrap())
     );
     assert!(opts.local_state_dir.is_none());
 }
@@ -205,14 +249,14 @@ fn runner_status_explicit_paths_win_and_no_profile_uses_canonical_default() {
         "/tmp/agent.toml",
         "--user-token-file",
         "/tmp/user-token",
-        "--agent-token-file",
+        "--runner-token-file",
         "/tmp/agent-token",
     ]))
     .unwrap();
     assert_eq!(opts.config, PathBuf::from("/tmp/agent.toml"));
     assert_eq!(opts.user_token_file, Some(PathBuf::from("/tmp/user-token")));
     assert_eq!(
-        opts.agent_token_file,
+        opts.runner_token_file,
         Some(PathBuf::from("/tmp/agent-token"))
     );
 
@@ -223,7 +267,23 @@ fn runner_status_explicit_paths_win_and_no_profile_uses_canonical_default() {
         PathBuf::from("/etc/systemd/system/webcodex-runner.service")
     );
     assert_eq!(default.user_token_file, None);
-    assert_eq!(default.agent_token_file, None);
+    assert_eq!(default.runner_token_file, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_runner_status_agent_token_file_flag_is_an_alias() {
+    let opts = parse_runner_status(&args(&[
+        "--scope",
+        "system",
+        "--agent-token-file",
+        "/tmp/legacy-runner-token",
+    ]))
+    .unwrap();
+    assert_eq!(
+        opts.runner_token_file,
+        Some(PathBuf::from("/tmp/legacy-runner-token"))
+    );
 }
 
 /// Unix-only: derives systemd service paths, which require Unix
@@ -619,7 +679,7 @@ fn omitted_scope_hosted_status_keeps_xdg_profile_paths_for_root() {
         ))
     );
     assert_eq!(
-        opts.agent_token_file,
+        opts.runner_token_file,
         Some(PathBuf::from(
             "/tmp/test-xdg/webcodex/clients/hosted/webcodex-runner-token"
         ))

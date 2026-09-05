@@ -107,7 +107,7 @@ async fn http_projects_register_rejects_unknown_client_id() {
     assert!(
         body["error"]
             .as_str()
-            .is_some_and(|e| e.contains("unknown agent")),
+            .is_some_and(|e| e.contains("unknown Runner")),
         "register_project should reject unknown client_id: {:?}",
         body["error"]
     );
@@ -137,9 +137,105 @@ async fn http_projects_create_rejects_unknown_client_id() {
     assert!(
         body["error"]
             .as_str()
-            .is_some_and(|e| e.contains("unknown agent")),
+            .is_some_and(|e| e.contains("unknown Runner")),
         "create_project should reject unknown client_id: {:?}",
         body["error"]
+    );
+}
+
+#[tokio::test]
+async fn http_projects_create_keeps_unrelated_unknown_field_tolerance() {
+    let config = super::test_config(Some("secret"));
+    let (_tmp, db) = super::test_db();
+    let tmp_proj = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(super::runtime_with_local_project(tmp_proj.path(), "demo"));
+    let service = Service::new(super::build_projects_router(config, db, runtime));
+
+    let mut resp = TestClient::post("http://localhost/api/projects/create")
+        .bearer_auth("secret")
+        .json(&json!({
+            "client_id": "no-such-agent",
+            "id": "hello",
+            "name": "Hello",
+            "path": "/root/git/hello",
+            "unrelated_legacy_field": "ignored"
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(super::effective_status(&resp), StatusCode::BAD_REQUEST);
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown Runner")),
+        "unrelated unknown fields should keep the endpoint's historical tolerance: {:?}",
+        body["error"]
+    );
+}
+
+#[tokio::test]
+async fn http_projects_create_rejects_retired_managed_temporary_field_before_dispatch() {
+    let config = super::test_config(Some("secret"));
+    let (_tmp, db) = super::test_db();
+    let tmp_proj = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(super::runtime_with_local_project(tmp_proj.path(), "demo"));
+    let service = Service::new(super::build_projects_router(config, db, runtime));
+
+    let mut resp = TestClient::post("http://localhost/api/projects/create")
+        .bearer_auth("secret")
+        .json(&json!({
+            "client_id": "no-such-agent",
+            "id": "legacy-temp",
+            "name": "Legacy Temp",
+            "path": "/root/git/legacy-temp",
+            "managed_temporary_project": true
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(super::effective_status(&resp), StatusCode::BAD_REQUEST);
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["success"], false);
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("managed_temporary_project"), "{error}");
+    assert!(error.contains("no longer supported"), "{error}");
+    assert!(
+        !error.contains("unknown agent"),
+        "retired field must fail before project dispatch: {error}"
+    );
+}
+
+#[tokio::test]
+async fn http_projects_create_rejects_retired_allow_existing_empty_before_dispatch() {
+    let config = super::test_config(Some("secret"));
+    let (_tmp, db) = super::test_db();
+    let tmp_proj = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(super::runtime_with_local_project(tmp_proj.path(), "demo"));
+    let service = Service::new(super::build_projects_router(config, db, runtime));
+
+    let mut resp = TestClient::post("http://localhost/api/projects/create")
+        .bearer_auth("secret")
+        .json(&json!({
+            "client_id": "no-such-agent",
+            "id": "existing-empty",
+            "name": "Existing Empty",
+            "path": "/root/git/existing-empty",
+            "allow_existing_empty": true
+        }))
+        .send(&service)
+        .await;
+
+    assert_eq!(super::effective_status(&resp), StatusCode::BAD_REQUEST);
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["success"], false);
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("allow_existing_empty"), "{error}");
+    assert!(error.contains("adopt_existing_empty"), "{error}");
+    assert!(
+        !error.contains("unknown Runner"),
+        "retired field must fail before project dispatch: {error}"
     );
 }
 

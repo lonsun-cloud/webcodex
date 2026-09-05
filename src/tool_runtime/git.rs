@@ -2,6 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
@@ -12,12 +13,13 @@ use super::git_committed::{
     CommittedGitScope,
 };
 use super::helpers::{
-    decode_git_quoted_path, run_command_sync_bounded, shell_escape_simple,
-    validate_limited_cleanup_paths, validate_project_relative_path, LocalRunFailure,
+    decode_git_quoted_path, shell_escape_simple, validate_limited_cleanup_paths,
+    validate_project_relative_path,
 };
-use super::tool_result::ToolResult;
+use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
+use super::tool_result::{RecoveryKind, ToolResult};
 use super::ToolRuntime;
-use crate::shell_protocol::ShellRunRequest;
+use crate::runner_protocol::{ShellCommandExecutionState, ShellRunRequest};
 use crate::tool_runtime::sessions::{SessionEvent, SessionSummary};
 
 /// Sentinel separating `git status --porcelain` from `git diff --stat` in the
@@ -32,7 +34,7 @@ const DEFAULT_MAX_HUNKS: usize = 30;
 const MAX_MAX_HUNKS: usize = 100;
 const DEFAULT_MAX_HUNK_LINES: usize = 160;
 const MAX_MAX_HUNK_LINES: usize = 400;
-pub(crate) const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 512;
+pub(crate) use webcodex_core::runtime_contract::GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES;
 const GIT_DIFF_HUNKS_CONTINUATION_PREFIX: &str = "wcdh1.";
 const GIT_DIFF_HUNKS_CONTINUATION_VERSION: u8 = 1;
 const GIT_DIFF_HUNKS_COMMITTED_CONTINUATION_VERSION: u8 = 2;
@@ -42,6 +44,10 @@ const GIT_DIFF_HUNKS_BLOCK_TRAILER_BYTES: usize = 30;
 const GIT_DIFF_HUNKS_BLOCK_MAGIC: &[u8; 6] = b"WCDH1:";
 const SHOW_CHANGES_DEFAULT_MAX_HUNKS: usize = 20;
 const SHOW_CHANGES_MAX_HUNKS: usize = 100;
+const GIT_COMMIT_PATHS_MAX_PATHS: usize = 32;
+const GIT_COMMIT_PATH_MAX_CHARS: usize = 512;
+const GIT_COMMIT_MESSAGE_MAX_CHARS: usize = 1000;
+pub(crate) const GIT_COMMIT_RESULT_PREFIX: &str = "@@WEBCODEX_GIT_COMMIT@@";
 const SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES: usize = 80;
 const SHOW_CHANGES_MAX_HUNK_LINES: usize = 240;
 const SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT: usize = 30;
@@ -1613,6 +1619,7 @@ fn untracked_preview_path_is_sensitive(path: &str) -> bool {
                 ".git"
                     | "target"
                     | "node_modules"
+                    | "project-registry"
                     | "projects.d"
                     | "runner.toml"
                     | "agent.toml"
@@ -1678,6 +1685,7 @@ fn untracked_preview_from_bytes(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn collect_show_changes_untracked_previews_for_root(
     root: &Path,
     untracked_paths: &[String],
@@ -2078,11 +2086,31 @@ fn set_show_changes_verdict(output: &mut Value) {
         let hunk_line_truncated = diff_truncation_reasons
             .iter()
             .any(|reason| *reason == "diff_hunk_line_limit");
+        // show_changes currently reports line truncation at the aggregate diff
+        // level, not as authoritative per-hunk provenance. Keep whole-worktree
+        // scope rather than guessing which returned path owns the omitted lines.
+        let suggested_paths: Vec<String> = Vec::new();
+        let suggested_max_hunk_lines = if hunk_line_truncated {
+            MAX_MAX_HUNK_LINES
+        } else {
+            DEFAULT_MAX_HUNK_LINES
+        };
+        let project = output
+            .get("project")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         output["diff_review_handoff"] = json!({
             "tool": "git_diff_hunks",
             "scope": "worktree",
             "reason": "show_changes_diff_truncated",
             "truncation_reasons": diff_truncation_reasons,
+            "suggested_call": {
+                "project": project,
+                "cached": false,
+                "paths": suggested_paths,
+                "max_hunks": DEFAULT_MAX_HUNKS,
+                "max_hunk_lines": suggested_max_hunk_lines,
+            },
         });
         push_unique_reason(&mut warning_reasons, "truncated_by_limit");
         push_unique_action(
@@ -3197,6 +3225,177 @@ pub(crate) fn parse_porcelain_summary(porcelain: &str) -> PorcelainSummary {
     summary
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitCommitMarker {
+    pub(crate) status: String,
+    pub(crate) previous_head: Option<String>,
+    pub(crate) actual_head: Option<String>,
+    pub(crate) new_head: Option<String>,
+}
+
+fn validate_git_commit_paths_input(
+    expected_head: &str,
+    paths: &[String],
+    message: &str,
+) -> Result<(String, Vec<String>, String), String> {
+    let expected_head = normalize_exact_commit_id(expected_head)
+        .map_err(|_| "expected_head must be one exact 40-hex commit id".to_string())?;
+    if paths.len() > GIT_COMMIT_PATHS_MAX_PATHS {
+        return Err(format!(
+            "paths may contain at most {GIT_COMMIT_PATHS_MAX_PATHS} entries"
+        ));
+    }
+    let paths = validate_limited_cleanup_paths(paths, true)?;
+    for path in &paths {
+        if path.chars().count() > GIT_COMMIT_PATH_MAX_CHARS {
+            return Err(format!(
+                "commit path exceeds {GIT_COMMIT_PATH_MAX_CHARS} characters"
+            ));
+        }
+        if path.chars().any(char::is_control) {
+            return Err("commit paths must not contain control characters".to_string());
+        }
+    }
+    if message.trim().is_empty() {
+        return Err("message must not be empty or whitespace-only".to_string());
+    }
+    if message.chars().count() > GIT_COMMIT_MESSAGE_MAX_CHARS {
+        return Err(format!(
+            "message may contain at most {GIT_COMMIT_MESSAGE_MAX_CHARS} characters"
+        ));
+    }
+    if message.contains('\0') {
+        return Err("message must not contain NUL".to_string());
+    }
+    Ok((expected_head, paths, message.to_string()))
+}
+
+fn git_commit_paths_script(expected_head: &str, paths: &[String], message: &str) -> String {
+    let expected = shell_escape_simple(expected_head);
+    let message = shell_escape_simple(message);
+    let mut path_checks = String::new();
+    let mut index_adds = String::new();
+    let mut requested_lines = String::new();
+    let mut reset_args = String::new();
+    for path in paths {
+        let quoted = shell_escape_simple(path);
+        path_checks.push_str(&format!(
+            "if [ -d {quoted} ]; then printf '{GIT_COMMIT_RESULT_PREFIX} status=directory_path\\n'; exit 23; fi\n\
+             if [ ! -e {quoted} ] && [ ! -L {quoted} ] && ! git ls-files --error-unmatch -- {quoted} >/dev/null 2>&1; then printf '{GIT_COMMIT_RESULT_PREFIX} status=missing_path\\n'; exit 24; fi\n\
+             if [ -z \"$(git status --porcelain=v1 --untracked-files=all -- {quoted})\" ]; then printf '{GIT_COMMIT_RESULT_PREFIX} status=unchanged_path\\n'; exit 25; fi\n"
+        ));
+        index_adds.push_str(&format!(
+            "if ! GIT_INDEX_FILE=\"$index_file\" git add -A -- {quoted}; then printf '{GIT_COMMIT_RESULT_PREFIX} status=stage_failed\\n'; exit 26; fi\n"
+        ));
+        requested_lines.push_str(&format!("printf '%s\\n' {quoted} >> \"$req_file\"\n"));
+        reset_args.push(' ');
+        reset_args.push_str(&quoted);
+    }
+
+    format!(
+        "set -eu\n\
+         export LC_ALL=C GIT_PAGER=cat GIT_TERMINAL_PROMPT=0\n\
+         unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE\n\
+         expected={expected}\n\
+         index_file=$(mktemp \"${{TMPDIR:-/tmp}}/webcodex-index.XXXXXX\")\n\
+         req_file=$(mktemp \"${{TMPDIR:-/tmp}}/webcodex-req.XXXXXX\")\n\
+         req_sorted=$(mktemp \"${{TMPDIR:-/tmp}}/webcodex-req-sorted.XXXXXX\")\n\
+         staged_file=$(mktemp \"${{TMPDIR:-/tmp}}/webcodex-staged.XXXXXX\")\n\
+         msg_file=$(mktemp \"${{TMPDIR:-/tmp}}/webcodex-msg.XXXXXX\")\n\
+         rm -f \"$index_file\"\n\
+         cleanup() {{ rm -f \"$index_file\" \"$req_file\" \"$req_sorted\" \"$staged_file\" \"$msg_file\"; }}\n\
+         trap cleanup EXIT HUP INT TERM\n\
+         actual=$(git rev-parse --verify HEAD 2>/dev/null || true)\n\
+         if [ \"$actual\" != \"$expected\" ]; then printf '{GIT_COMMIT_RESULT_PREFIX} status=head_mismatch actual=%s\\n' \"$actual\"; exit 20; fi\n\
+         if [ -n \"$(git diff --name-only --diff-filter=U)\" ]; then printf '{GIT_COMMIT_RESULT_PREFIX} status=conflicts\\n'; exit 21; fi\n\
+         if ! git diff --cached --quiet --exit-code; then printf '{GIT_COMMIT_RESULT_PREFIX} status=existing_staged\\n'; exit 22; fi\n\
+         {path_checks}\
+         {requested_lines}\
+         if ! GIT_INDEX_FILE=\"$index_file\" git read-tree \"$expected\"; then printf '{GIT_COMMIT_RESULT_PREFIX} status=index_init_failed\\n'; exit 26; fi\n\
+         {index_adds}\
+         LC_ALL=C sort -u \"$req_file\" > \"$req_sorted\"\n\
+         GIT_INDEX_FILE=\"$index_file\" git -c core.quotepath=false diff --cached --name-only --no-renames \"$expected\" | LC_ALL=C sort -u > \"$staged_file\"\n\
+         if ! cmp -s \"$req_sorted\" \"$staged_file\"; then printf '{GIT_COMMIT_RESULT_PREFIX} status=staged_set_mismatch\\n'; exit 27; fi\n\
+         if GIT_INDEX_FILE=\"$index_file\" git diff --cached --quiet --exit-code \"$expected\"; then printf '{GIT_COMMIT_RESULT_PREFIX} status=no_changes\\n'; exit 25; fi\n\
+         if [ -n \"$(git diff --name-only --diff-filter=U)\" ] || ! git diff --cached --quiet --exit-code; then printf '{GIT_COMMIT_RESULT_PREFIX} status=staged_state_changed\\n'; exit 28; fi\n\
+         actual=$(git rev-parse --verify HEAD 2>/dev/null || true)\n\
+         if [ \"$actual\" != \"$expected\" ]; then printf '{GIT_COMMIT_RESULT_PREFIX} status=head_changed actual=%s\\n' \"$actual\"; exit 29; fi\n\
+         tree=$(GIT_INDEX_FILE=\"$index_file\" git write-tree) || {{ printf '{GIT_COMMIT_RESULT_PREFIX} status=tree_failed\\n'; exit 30; }}\n\
+         printf '%s' {message} > \"$msg_file\"\n\
+         new=$(git commit-tree \"$tree\" -p \"$expected\" < \"$msg_file\") || {{ printf '{GIT_COMMIT_RESULT_PREFIX} status=commit_create_failed\\n'; exit 31; }}\n\
+         if ! git update-ref -m 'webcodex git_commit_paths' HEAD \"$new\" \"$expected\"; then actual=$(git rev-parse --verify HEAD 2>/dev/null || true); printf '{GIT_COMMIT_RESULT_PREFIX} status=head_update_failed actual=%s\\n' \"$actual\"; exit 32; fi\n\
+         if ! git reset -q \"$new\" --{reset_args}; then printf '{GIT_COMMIT_RESULT_PREFIX} status=index_cleanup_failed previous=%s new=%s\\n' \"$expected\" \"$new\"; exit 33; fi\n\
+         printf '{GIT_COMMIT_RESULT_PREFIX} status=success previous=%s new=%s\\n' \"$expected\" \"$new\"\n"
+    )
+}
+
+pub(crate) fn parse_git_commit_marker(stdout: &str) -> Option<GitCommitMarker> {
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with(GIT_COMMIT_RESULT_PREFIX))?;
+    let mut status = None;
+    let mut previous_head = None;
+    let mut actual_head = None;
+    let mut new_head = None;
+    for field in line[GIT_COMMIT_RESULT_PREFIX.len()..].split_whitespace() {
+        let (key, value) = field.split_once('=')?;
+        match key {
+            "status" => status = Some(value.to_string()),
+            "previous" => previous_head = normalize_exact_commit_id(value).ok(),
+            "actual" => actual_head = normalize_exact_commit_id(value).ok(),
+            "new" => new_head = normalize_exact_commit_id(value).ok(),
+            _ => {}
+        }
+    }
+    Some(GitCommitMarker {
+        status: status?,
+        previous_head,
+        actual_head,
+        new_head,
+    })
+}
+
+fn git_commit_paths_failure_output(
+    expected_head: &str,
+    failure_kind: &str,
+    actual_head: Option<String>,
+) -> Value {
+    json!({
+        "committed": false,
+        "expected_head": expected_head,
+        "previous_head": null,
+        "actual_head": actual_head,
+        "new_head": null,
+        "committed_paths": [],
+        "state_changed": false,
+        "outcome_unknown": false,
+        "failure_kind": failure_kind,
+        "hook_policy": "bypassed_exact_tree",
+    })
+}
+
+fn git_commit_paths_outcome_unknown(expected_head: &str, reason: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!(
+            "git_commit_paths outcome is unknown: {reason}. Do not retry the commit blindly; observe HEAD/status first."
+        ),
+        json!({
+            "committed": null,
+            "expected_head": expected_head,
+            "previous_head": null,
+            "actual_head": null,
+            "new_head": null,
+            "committed_paths": [],
+            "state_changed": null,
+            "outcome_unknown": true,
+            "failure_kind": "outcome_unknown",
+            "hook_policy": "bypassed_exact_tree",
+        }),
+    )
+    .with_recovery(RecoveryKind::Reobserve, None)
+}
+
 impl ToolRuntime {
     async fn collect_show_changes_untracked_previews(
         &self,
@@ -3204,12 +3403,8 @@ impl ToolRuntime {
         untracked_paths: &[String],
     ) -> (Vec<Value>, bool) {
         let truncated = untracked_paths.len() > SHOW_CHANGES_UNTRACKED_PREVIEW_MAX_FILES;
-        let proj = match self.resolve_project(project).await {
-            Ok(proj) => proj,
-            Err(_) => return (Vec::new(), truncated),
-        };
-        if !proj.is_agent() {
-            return collect_show_changes_untracked_previews_for_root(&proj.root(), untracked_paths);
+        if self.resolve_project(project).await.is_err() {
+            return (Vec::new(), truncated);
         }
         let mut previews = Vec::new();
         for path in untracked_paths
@@ -3293,57 +3488,38 @@ impl ToolRuntime {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
-        if proj.is_agent() {
-            let client_id = match proj.agent_client_id() {
-                Ok(id) => id.to_string(),
-                Err(e) => return ToolResult::err(e),
-            };
-            let (req_id, rx) = match self
-                .shell_clients
-                .enqueue_run(
-                    ShellRunRequest {
-                        client_id,
-                        cwd: Some(proj.path.clone()),
-                        command: "git status --porcelain".to_string(),
-                        stdin: None,
-                        timeout_secs: 30,
-                        wait_timeout_secs: 32,
-                    },
-                    "tool_runtime".to_string(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return ToolResult::err(e),
-            };
-            match tokio::time::timeout(Duration::from_secs(34), rx).await {
-                Ok(Ok(resp)) => ToolResult::ok(json!({
-                    "stdout": resp.stdout,
-                    "stderr": resp.stderr,
-                    "exit_code": resp.exit_code,
-                })),
-                Ok(Err(_)) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("request dropped")
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("timed out")
-                }
+        let client_id = proj.client_id.clone();
+        let (req_id, rx) = match self
+            .runner_registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id,
+                    cwd: Some(proj.path.clone()),
+                    command: "git status --porcelain".to_string(),
+                    stdin: None,
+                    timeout_secs: 30,
+                    wait_timeout_secs: 32,
+                },
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::err(e),
+        };
+        match tokio::time::timeout(Duration::from_secs(34), rx).await {
+            Ok(Ok(resp)) => ToolResult::ok(json!({
+                "stdout": resp.stdout,
+                "stderr": resp.stderr,
+                "exit_code": resp.exit_code,
+            })),
+            Ok(Err(_)) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("request dropped")
             }
-        } else {
-            let root = proj.root();
-            match run_command_sync_bounded("git status --porcelain".to_string(), root, 30).await {
-                Ok((exit_code, stdout, stderr, _)) => ToolResult::ok(json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": exit_code,
-                })),
-                Err(LocalRunFailure::HardTimeout { bound_secs }) => ToolResult::err(format!(
-                    "local git status did not return within {} seconds (hard bound)",
-                    bound_secs
-                )),
-                Err(LocalRunFailure::Join(e)) => ToolResult::err(format!("task join error: {}", e)),
+            Err(_) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("timed out")
             }
         }
     }
@@ -3360,57 +3536,38 @@ impl ToolRuntime {
             let escaped: Vec<String> = diff_args.iter().map(|a| shell_escape_simple(a)).collect();
             format!("git diff -- {}", escaped.join(" "))
         };
-        if proj.is_agent() {
-            let client_id = match proj.agent_client_id() {
-                Ok(id) => id.to_string(),
-                Err(e) => return ToolResult::err(e),
-            };
-            let (req_id, rx) = match self
-                .shell_clients
-                .enqueue_run(
-                    ShellRunRequest {
-                        client_id,
-                        cwd: Some(proj.path.clone()),
-                        command: cmd,
-                        stdin: None,
-                        timeout_secs: 30,
-                        wait_timeout_secs: 32,
-                    },
-                    "tool_runtime".to_string(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return ToolResult::err(e),
-            };
-            match tokio::time::timeout(Duration::from_secs(34), rx).await {
-                Ok(Ok(resp)) => ToolResult::ok(json!({
-                    "stdout": resp.stdout,
-                    "stderr": resp.stderr,
-                    "exit_code": resp.exit_code,
-                })),
-                Ok(Err(_)) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("request dropped")
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("timed out")
-                }
+        let client_id = proj.client_id.clone();
+        let (req_id, rx) = match self
+            .runner_registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id,
+                    cwd: Some(proj.path.clone()),
+                    command: cmd,
+                    stdin: None,
+                    timeout_secs: 30,
+                    wait_timeout_secs: 32,
+                },
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::err(e),
+        };
+        match tokio::time::timeout(Duration::from_secs(34), rx).await {
+            Ok(Ok(resp)) => ToolResult::ok(json!({
+                "stdout": resp.stdout,
+                "stderr": resp.stderr,
+                "exit_code": resp.exit_code,
+            })),
+            Ok(Err(_)) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("request dropped")
             }
-        } else {
-            let root = proj.root();
-            match run_command_sync_bounded(cmd, root, 30).await {
-                Ok((exit_code, stdout, stderr, _)) => ToolResult::ok(json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": exit_code,
-                })),
-                Err(LocalRunFailure::HardTimeout { bound_secs }) => ToolResult::err(format!(
-                    "local git diff did not return within {} seconds (hard bound)",
-                    bound_secs
-                )),
-                Err(LocalRunFailure::Join(e)) => ToolResult::err(format!("task join error: {}", e)),
+            Err(_) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("timed out")
             }
         }
     }
@@ -3882,61 +4039,194 @@ impl ToolRuntime {
         }
     }
 
+    pub(crate) async fn git_commit_paths(
+        &self,
+        project: String,
+        expected_head: String,
+        paths: Vec<String>,
+        message: String,
+    ) -> ToolResult {
+        let (expected_head, paths, message) =
+            match validate_git_commit_paths_input(&expected_head, &paths, &message) {
+                Ok(values) => values,
+                Err(error) => return ToolResult::err(error),
+            };
+        let proj = match self.resolve_project(&project).await {
+            Ok(project) => project,
+            Err(error) => return ToolResult::err(error),
+        };
+        let script = git_commit_paths_script(&expected_head, &paths, &message);
+        let client_id = proj.client_id.clone();
+        let (request_id, rx) = match self
+            .runner_registry
+            .enqueue_internal_posix_script(
+                client_id,
+                Some(proj.path.clone()),
+                script,
+                60,
+                60,
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return ToolResult::err_with_output(
+                    error,
+                    git_commit_paths_failure_output(&expected_head, "runner_rejected", None),
+                )
+            }
+        };
+
+        match tokio::time::timeout(Duration::from_secs(64), rx).await {
+            Ok(Ok(response)) => {
+                let lifecycle = runner_command_lifecycle(&response, 60);
+                if lifecycle == ShellCommandExecutionState::NotStarted {
+                    return ToolResult::err_with_output(
+                        response
+                            .error
+                            .unwrap_or_else(|| "git commit request was not started".to_string()),
+                        git_commit_paths_failure_output(&expected_head, "not_started", None),
+                    );
+                }
+                if matches!(
+                    lifecycle,
+                    ShellCommandExecutionState::OutcomeUnknown
+                        | ShellCommandExecutionState::TimedOut
+                ) {
+                    return git_commit_paths_outcome_unknown(
+                        &expected_head,
+                        response.error.as_deref().unwrap_or(
+                            "Runner did not provide a trustworthy terminal commit result",
+                        ),
+                    );
+                }
+
+                let stdout = response.stdout.unwrap_or_default();
+                let Some(marker) = parse_git_commit_marker(&stdout) else {
+                    return git_commit_paths_outcome_unknown(
+                        &expected_head,
+                        "completed Runner response omitted the structured commit marker",
+                    );
+                };
+                match marker.status.as_str() {
+                    "success"
+                        if response.exit_code == Some(0)
+                            && marker.previous_head.as_deref() == Some(expected_head.as_str())
+                            && marker.new_head.is_some() =>
+                    {
+                        let new_head = marker.new_head.expect("checked above");
+                        ToolResult::ok(json!({
+                            "committed": true,
+                            "expected_head": expected_head,
+                            "previous_head": expected_head,
+                            "actual_head": new_head,
+                            "new_head": new_head,
+                            "committed_paths": paths,
+                            "state_changed": true,
+                            "outcome_unknown": false,
+                            "failure_kind": null,
+                            "hook_policy": "bypassed_exact_tree",
+                        }))
+                    }
+                    "index_cleanup_failed"
+                        if marker.previous_head.as_deref() == Some(expected_head.as_str())
+                            && marker.new_head.is_some() =>
+                    {
+                        let new_head = marker.new_head.expect("checked above");
+                        ToolResult::err_with_output(
+                            "commit was created and HEAD advanced, but the real index could not be aligned to the new commit; do not retry the commit",
+                            json!({
+                                "committed": true,
+                                "expected_head": expected_head,
+                                "previous_head": expected_head,
+                                "actual_head": new_head,
+                                "new_head": new_head,
+                                "committed_paths": paths,
+                                "state_changed": true,
+                                "outcome_unknown": false,
+                                "failure_kind": "index_cleanup_failed",
+                                "hook_policy": "bypassed_exact_tree",
+                            }),
+                        )
+                        .with_recovery(RecoveryKind::Reobserve, None)
+                    }
+                    "success" | "index_cleanup_failed" => git_commit_paths_outcome_unknown(
+                        &expected_head,
+                        "Runner returned a mutation-like commit marker with inconsistent SHA or exit-code evidence",
+                    ),
+                    status => ToolResult::err_with_output(
+                        format!("git_commit_paths rejected or failed: {status}"),
+                        git_commit_paths_failure_output(&expected_head, status, marker.actual_head),
+                    ),
+                }
+            }
+            Ok(Err(_)) => {
+                let dispatch = self
+                    .runner_registry
+                    .cancel_request_dispatch_state(&request_id)
+                    .await;
+                if dispatch_uncertainty_lifecycle(dispatch)
+                    == ShellCommandExecutionState::NotStarted
+                {
+                    ToolResult::err_with_output(
+                        "git commit request waiter was dropped before Runner dispatch",
+                        git_commit_paths_failure_output(&expected_head, "not_started", None),
+                    )
+                } else {
+                    git_commit_paths_outcome_unknown(
+                        &expected_head,
+                        "git commit request waiter was dropped after dispatch may have occurred",
+                    )
+                }
+            }
+            Err(_) => {
+                let dispatch = self
+                    .runner_registry
+                    .cancel_request_dispatch_state(&request_id)
+                    .await;
+                if dispatch_uncertainty_lifecycle(dispatch)
+                    == ShellCommandExecutionState::NotStarted
+                {
+                    ToolResult::err_with_output(
+                        "timed out before git commit request reached the Runner",
+                        git_commit_paths_failure_output(&expected_head, "not_started", None),
+                    )
+                } else {
+                    git_commit_paths_outcome_unknown(
+                        &expected_head,
+                        "timed out after Runner dispatch may have occurred",
+                    )
+                }
+            }
+        }
+    }
+
     pub(crate) async fn git_diff_summary(&self, project: String) -> ToolResult {
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e),
         };
         let cmd = git_diff_summary_command();
-        if proj.is_agent() {
-            let client_id = match proj.agent_client_id() {
-                Ok(id) => id.to_string(),
-                Err(e) => return ToolResult::err(e),
-            };
-            let (req_id, rx) = match self
-                .shell_clients
-                .enqueue_internal_posix_script(
-                    client_id,
-                    Some(proj.path.clone()),
-                    cmd,
-                    30,
-                    32,
-                    "tool_runtime".to_string(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return ToolResult::err(e),
-            };
-            return match tokio::time::timeout(Duration::from_secs(34), rx).await {
-                Ok(Ok(resp)) => {
-                    let stdout = resp.stdout.unwrap_or_default();
-                    let (porcelain, diff_stat) = split_diff_summary(&stdout);
-                    let porcelain_summary = parse_porcelain_summary(&porcelain);
-                    ToolResult::ok(json!({
-                        "porcelain": porcelain,
-                        "diff_stat": diff_stat,
-                        "changed_files": porcelain_summary.changed_files,
-                        "changed_files_count": porcelain_summary.changed_files_count,
-                        "tracked_changed_files": porcelain_summary.tracked_changed_files,
-                        "untracked_files": porcelain_summary.untracked_files,
-                        "ignored_files": porcelain_summary.ignored_files,
-                        "exit_code": resp.exit_code,
-                    }))
-                }
-                Ok(Err(_)) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("request dropped")
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    ToolResult::err("timed out")
-                }
-            };
-        }
-        let root = proj.root();
-        match run_command_sync_bounded(cmd, root, 30).await {
-            Ok((exit_code, stdout, _stderr, _)) => {
+        let client_id = proj.client_id.clone();
+        let (req_id, rx) = match self
+            .runner_registry
+            .enqueue_internal_posix_script(
+                client_id,
+                Some(proj.path.clone()),
+                cmd,
+                30,
+                32,
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::err(e),
+        };
+        match tokio::time::timeout(Duration::from_secs(34), rx).await {
+            Ok(Ok(resp)) => {
+                let stdout = resp.stdout.unwrap_or_default();
                 let (porcelain, diff_stat) = split_diff_summary(&stdout);
                 let porcelain_summary = parse_porcelain_summary(&porcelain);
                 ToolResult::ok(json!({
@@ -3947,14 +4237,17 @@ impl ToolRuntime {
                     "tracked_changed_files": porcelain_summary.tracked_changed_files,
                     "untracked_files": porcelain_summary.untracked_files,
                     "ignored_files": porcelain_summary.ignored_files,
-                    "exit_code": exit_code,
+                    "exit_code": resp.exit_code,
                 }))
             }
-            Err(LocalRunFailure::HardTimeout { bound_secs }) => ToolResult::err(format!(
-                "local git diff summary did not return within {} seconds (hard bound)",
-                bound_secs
-            )),
-            Err(LocalRunFailure::Join(e)) => ToolResult::err(format!("task join error: {}", e)),
+            Ok(Err(_)) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("request dropped")
+            }
+            Err(_) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                ToolResult::err("timed out")
+            }
         }
     }
 

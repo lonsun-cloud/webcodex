@@ -20,7 +20,7 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     snapshot.duration_ms = Some(1);
     RunningJob {
         client_id: "test-agent".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
         snapshot,
         child: None,
         stop_requested: Arc::new(AtomicBool::new(false)),
@@ -39,7 +39,7 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
         active.job_id.clone(),
         RunningJob {
             client_id: "test-agent".to_string(),
-            agent_instance_id: "test-instance".to_string(),
+            runner_instance_id: "test-instance".to_string(),
             snapshot: active,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -99,7 +99,7 @@ fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
         active.job_id.clone(),
         RunningJob {
             client_id: "test-agent".to_string(),
-            agent_instance_id: "test-instance".to_string(),
+            runner_instance_id: "test-instance".to_string(),
             snapshot: active,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -142,7 +142,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         snapshot.job_id.clone(),
         RunningJob {
             client_id: "test-agent".to_string(),
-            agent_instance_id: "test-instance".to_string(),
+            runner_instance_id: "test-instance".to_string(),
             snapshot,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -151,11 +151,11 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    tx.try_send(AgentEnvelope::Ping { ts: 17 }).unwrap();
+    tx.try_send(RunnerEnvelope::Ping { ts: 17 }).unwrap();
     manager.install_sink(RunnerSink::WebSocket {
         tx,
         client_id: "test-agent".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
     });
     manager.update_and_send(
         "offline-terminal-job",
@@ -246,7 +246,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     manager.install_sink(RunnerSink::WebSocket {
         tx: reconnected_tx,
         client_id: "test-agent".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
     assert!(wait_until(Duration::from_secs(2), || {
@@ -258,7 +258,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     manager.install_sink(RunnerSink::WebSocket {
         tx: fresh_tx,
         client_id: "test-agent".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
     assert!(
@@ -367,7 +367,7 @@ fn detached_job_request(
         job_id: job_id.to_string(),
         request_id: format!("request-{job_id}"),
         client_id: "detached-agent".to_string(),
-        agent_instance_id: "old-runner-instance".to_string(),
+        runner_instance_id: "old-runner-instance".to_string(),
         context: ShellJobContext {
             runtime_project_id: Some("agent:detached-agent:project".to_string()),
             workflow_session_id: None,
@@ -379,7 +379,7 @@ fn detached_job_request(
             command_preview: "detached test process".to_string(),
             validation_steps: Vec::new(),
             validation: None,
-            structured_execution: Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+            structured_execution: Some(runner_protocol::ShellJobStructuredExecutionMetadata {
                 execution_source: "run_process".to_string(),
                 language: None,
                 script_bytes: None,
@@ -391,7 +391,7 @@ fn detached_job_request(
             }),
         },
         launch: DetachedLaunchSpec {
-            process: shell_protocol::ShellProcessArgv {
+            process: runner_protocol::ShellProcessArgv {
                 executable: std::env::current_exe()
                     .unwrap()
                     .to_string_lossy()
@@ -484,7 +484,7 @@ fn detached_recovery_uses_same_inventory_and_observes_terminal_output() {
         .get(&request.job_id)
         .cloned()
         .unwrap();
-    assert_eq!(local.agent_instance_id, "new-runner-instance");
+    assert_eq!(local.runner_instance_id, "new-runner-instance");
     assert!(local.child.is_none());
     assert!(lock_unpoison(&manager.detached_jobs).contains_key(&request.job_id));
 
@@ -757,7 +757,7 @@ fn job_manager_stop_terminates_the_process_group() {
         "process-group-job".into(),
         RunningJob {
             client_id: "test-agent".into(),
-            agent_instance_id: "test-instance".into(),
+            runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("process-group-job"),
             child: Some(child.clone()),
             stop_requested: stop_requested.clone(),
@@ -804,7 +804,7 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
         "term-responsive".into(),
         RunningJob {
             client_id: "test-agent".into(),
-            agent_instance_id: "test-instance".into(),
+            runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-responsive"),
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
@@ -852,7 +852,7 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
         "term-ignoring".into(),
         RunningJob {
             client_id: "test-agent".into(),
-            agent_instance_id: "test-instance".into(),
+            runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-ignoring"),
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
@@ -901,15 +901,15 @@ fn poisoned_job_mutex_does_not_panic_shutdown() {
 /// One run of the fail-fast plan, plus the side effect the plan must not have.
 #[cfg(unix)]
 struct FailFastAttempt {
-    updates: Vec<ShellAgentJobUpdateRequest>,
+    updates: Vec<RunnerJobUpdateRequest>,
     test_step_ran: bool,
 }
 
 fn recv_envelope_until(
     runtime: &tokio::runtime::Runtime,
-    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
     deadline: Instant,
-) -> Result<Option<AgentEnvelope>, tokio::time::error::Elapsed> {
+) -> Result<Option<RunnerEnvelope>, tokio::time::error::Elapsed> {
     runtime.block_on(async {
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx.recv()).await
     })
@@ -918,21 +918,21 @@ fn recv_envelope_until(
 /// Drain ordered JobUpdates until one reports `finished`, the channel closes,
 /// or one absolute wall-clock deadline expires. Unrelated envelopes are ignored.
 fn collect_job_updates(
-    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
     timeout: Duration,
-) -> Vec<ShellAgentJobUpdateRequest> {
+) -> Vec<RunnerJobUpdateRequest> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("JobUpdate collection runtime");
     let deadline = Instant::now() + timeout;
-    let mut updates: Vec<ShellAgentJobUpdateRequest> = Vec::new();
+    let mut updates: Vec<RunnerJobUpdateRequest> = Vec::new();
     loop {
         if updates.last().is_some_and(|update| update.finished) {
             break;
         }
         match recv_envelope_until(&runtime, rx, deadline) {
-            Ok(Some(AgentEnvelope::JobUpdate { payload })) => updates.push(payload),
+            Ok(Some(RunnerEnvelope::JobUpdate { payload })) => updates.push(payload),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }
@@ -941,10 +941,10 @@ fn collect_job_updates(
 }
 
 fn recv_job_update(
-    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
     timeout: Duration,
     label: &str,
-) -> ShellAgentJobUpdateRequest {
+) -> RunnerJobUpdateRequest {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -952,7 +952,7 @@ fn recv_job_update(
     let deadline = Instant::now() + timeout;
     loop {
         match recv_envelope_until(&runtime, rx, deadline) {
-            Ok(Some(AgentEnvelope::JobUpdate { payload })) => return payload,
+            Ok(Some(RunnerEnvelope::JobUpdate { payload })) => return payload,
             Ok(Some(_)) => {}
             Ok(None) => panic!("channel closed while waiting for {label}"),
             Err(_) => panic!("timed out waiting for {label}"),
@@ -1010,7 +1010,7 @@ fn structured_process_context(
     let mut context = test_job_context(cwd, Vec::new());
     context.shell = Some("direct_argv".to_string());
     context.command_preview = "structured process test".to_string();
-    context.structured_execution = Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
         execution_source: "run_process".to_string(),
         language: None,
         script_bytes: None,
@@ -1037,7 +1037,7 @@ fn detached_process_context(cwd: &Path, arg_count: usize, stdin_present: bool) -
 #[cfg(unix)]
 fn structured_script_context(
     cwd: &Path,
-    language: shell_protocol::ShellScriptLanguage,
+    language: runner_protocol::ShellScriptLanguage,
     script_bytes: usize,
     arg_count: usize,
     stdin_present: bool,
@@ -1048,7 +1048,7 @@ fn structured_script_context(
         "{} script ({script_bytes} bytes, {arg_count} args)",
         language.as_str()
     );
-    context.structured_execution = Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
         execution_source: "run_script".to_string(),
         language: Some(language),
         script_bytes: Some(script_bytes),
@@ -1064,13 +1064,13 @@ fn structured_script_context(
 fn structured_test_sink(
     client_id: &str,
     instance_id: &str,
-) -> (RunnerSink, tokio::sync::mpsc::Receiver<AgentEnvelope>) {
+) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     (
         RunnerSink::WebSocket {
             tx,
             client_id: client_id.to_string(),
-            agent_instance_id: instance_id.to_string(),
+            runner_instance_id: instance_id.to_string(),
         },
         rx,
     )
@@ -1125,7 +1125,7 @@ fn enqueue_structured_process_job_with_policy(
             policy,
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: cwd.join("projects.d"),
+            project_registry_dir: cwd.join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": format!("request-{job_id}"),
                 "client_id": "structured-agent",
@@ -1170,7 +1170,7 @@ fn enqueue_detached_process_job(
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: cwd.join("projects.d"),
+            project_registry_dir: cwd.join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": format!("request-{job_id}"),
                 "client_id": "structured-agent",
@@ -1296,7 +1296,7 @@ fn enqueue_shell_job(
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: cwd.join("projects.d"),
+            project_registry_dir: cwd.join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": format!("request-{job_id}"),
                 "client_id": "backpressure-agent",
@@ -1386,7 +1386,7 @@ fn enqueue_gated_structured_job_for_project(
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: cwd.join("projects.d"),
+            project_registry_dir: cwd.join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": format!("request-{}", job.job_id),
                 "client_id": "structured-agent",
@@ -1506,6 +1506,7 @@ fn phase_e2_default_four_gates_fifth_and_promotes_same_job_once() {
         .expect("promoted fifth Job retains its record");
     assert_eq!(promoted.status, "running");
     assert_eq!(promoted.request_id, "request-default-5");
+    assert_eq!(promoted.activity, Some(process_running_activity()));
 
     for job in &jobs[1..] {
         job.release();
@@ -1521,6 +1522,7 @@ fn phase_e2_default_four_gates_fifth_and_promotes_same_job_once() {
             .unwrap();
         assert_eq!(snapshot.status, "completed");
         assert_eq!(snapshot.request_id, format!("request-{}", job.job_id));
+        assert!(snapshot.activity.is_none());
     }
 }
 
@@ -1737,7 +1739,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
         failed_job_id.to_string(),
         RunningJob {
             client_id: "structured-agent".to_string(),
-            agent_instance_id: "structured-instance".to_string(),
+            runner_instance_id: "structured-instance".to_string(),
             snapshot: failed_snapshot,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -1748,7 +1750,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
     let queued = GatedStructuredJob::new(temp.path(), "after-prestart-failure");
     enqueue_gated_structured_job(&manager, &sink, temp.path(), &helper, &queued);
     assert!(!queued.started.exists());
-    let failed_request: ShellAgentShellRequest = serde_json::from_value(json!({
+    let failed_request: RunnerRequest = serde_json::from_value(json!({
         "request_id": "request-prestart-failure",
         "client_id": "structured-agent",
         "kind": "start_process_job",
@@ -1768,7 +1770,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
             ..RunnerPolicy::default()
         },
         ShellConfig::default(),
-        temp.path().join("projects.d"),
+        temp.path().join("project-registry"),
         failed_request,
     );
 
@@ -1881,7 +1883,7 @@ fn phase_e2_validation_job_shares_the_same_job_manager_slot_limit() {
             },
             shell,
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "request-validation-shared-slot",
                 "client_id": "structured-agent",
@@ -2012,11 +2014,11 @@ fn chatty_job_and_queued_job_progress_while_stream_transport_is_full() {
     let helper = structured_process_helper();
     let queued_marker = temp.path().join("queued-progressed");
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.try_send(AgentEnvelope::Ping { ts: 1 }).unwrap();
+    tx.try_send(RunnerEnvelope::Ping { ts: 1 }).unwrap();
     let sink = RunnerSink::WebSocket {
         tx,
         client_id: "backpressure-agent".into(),
-        agent_instance_id: "backpressure-instance".into(),
+        runner_instance_id: "backpressure-instance".into(),
     };
     let manager = JobManager::new(1);
 
@@ -2073,7 +2075,7 @@ fn chatty_job_and_queued_job_progress_while_stream_transport_is_full() {
         .expect("queued job retained");
     assert_eq!(queued.status, "completed", "{queued:?}");
 
-    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 1 })));
+    assert!(matches!(rx.try_recv(), Ok(RunnerEnvelope::Ping { ts: 1 })));
 }
 
 #[test]
@@ -2086,7 +2088,7 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
         snapshot.job_id.clone(),
         RunningJob {
             client_id: "test-agent".into(),
-            agent_instance_id: "test-instance".into(),
+            runner_instance_id: "test-instance".into(),
             snapshot,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -2094,11 +2096,11 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
         },
     );
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.try_send(AgentEnvelope::Ping { ts: 7 }).unwrap();
+    tx.try_send(RunnerEnvelope::Ping { ts: 7 }).unwrap();
     manager.install_sink(RunnerSink::WebSocket {
         tx,
         client_id: "test-agent".into(),
-        agent_instance_id: "test-instance".into(),
+        runner_instance_id: "test-instance".into(),
     });
 
     manager.update_and_send(
@@ -2187,7 +2189,7 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
     assert_eq!(immutable.update_seq, 103);
     assert_eq!(immutable.stdout.next_line, 102_403);
 
-    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 7 })));
+    assert!(matches!(rx.try_recv(), Ok(RunnerEnvelope::Ping { ts: 7 })));
     let updates = collect_job_updates(&mut rx, Duration::from_secs(5));
     assert_eq!(updates.len(), 2, "{updates:?}");
     assert_eq!(updates[0].status, "running");
@@ -2762,7 +2764,7 @@ fn phase_f_windows_shell_job_stream_reconstructs_split_utf8_and_oem() {
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "request-phase-f-stream",
                 "client_id": "structured-agent",
@@ -2807,7 +2809,7 @@ fn phase_f_windows_shell_job_stream_reconstructs_split_utf8_and_oem() {
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "request-phase-f-oem-stream",
                 "client_id": "structured-agent",
@@ -2891,14 +2893,14 @@ fn structured_script_job_keeps_its_temporary_file_until_terminal_then_removes_it
     ];
     let context = structured_script_context(
         temp.path(),
-        shell_protocol::ShellScriptLanguage::Sh,
+        runner_protocol::ShellScriptLanguage::Sh,
         script.len(),
         args.len(),
         false,
     );
     let (sink, mut rx) = structured_test_sink("structured-agent", "structured-instance");
     let manager = JobManager::new(1);
-    let request: ShellAgentShellRequest = serde_json::from_value(json!({
+    let request: RunnerRequest = serde_json::from_value(json!({
         "request_id": "request-structured-script",
         "client_id": "structured-agent",
         "kind": "start_script_job",
@@ -2929,7 +2931,7 @@ fn structured_script_job_keeps_its_temporary_file_until_terminal_then_removes_it
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request,
         },
     );
@@ -2988,7 +2990,7 @@ fn structured_script_job_drains_large_output_without_log_observation_and_runs_on
     let args = vec![marker.to_string_lossy().into_owned()];
     let context = structured_script_context(
         temp.path(),
-        shell_protocol::ShellScriptLanguage::Sh,
+        runner_protocol::ShellScriptLanguage::Sh,
         script.len(),
         args.len(),
         false,
@@ -3008,7 +3010,7 @@ fn structured_script_job_drains_large_output_without_log_observation_and_runs_on
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "request-structured-script-chatty",
                 "client_id": "structured-agent",
@@ -3074,7 +3076,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
     snapshot.status = "running".to_string();
     snapshot.started_at = Some(snapshot.created_at + 1);
     snapshot.context.structured_execution =
-        Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+        Some(runner_protocol::ShellJobStructuredExecutionMetadata {
             execution_source: "run_process".to_string(),
             language: None,
             script_bytes: None,
@@ -3088,7 +3090,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
         snapshot.job_id.clone(),
         RunningJob {
             client_id: "structured-agent".to_string(),
-            agent_instance_id: "structured-instance".to_string(),
+            runner_instance_id: "structured-instance".to_string(),
             snapshot,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -3126,7 +3128,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
 /// keeps a machine-level spawn failure from being read as a fail-fast
 /// regression.
 #[cfg(unix)]
-fn is_validation_spawn_failure(update: &ShellAgentJobUpdateRequest) -> bool {
+fn is_validation_spawn_failure(update: &RunnerJobUpdateRequest) -> bool {
     update.finished
         && update.status == "failed"
         && update.exit_code.is_none()
@@ -3134,7 +3136,7 @@ fn is_validation_spawn_failure(update: &ShellAgentJobUpdateRequest) -> bool {
 }
 
 #[cfg(unix)]
-fn describe_update(update: &ShellAgentJobUpdateRequest) -> String {
+fn describe_update(update: &RunnerJobUpdateRequest) -> String {
     format!(
         "status={:?} finished={} exit_code={:?} error={:?} progress={:?}",
         update.status, update.finished, update.exit_code, update.error, update.validation_progress
@@ -3159,7 +3161,7 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
     let sink = RunnerSink::WebSocket {
         tx,
         client_id: "validation-agent".into(),
-        agent_instance_id: "validation-instance".into(),
+        runner_instance_id: "validation-instance".into(),
     };
     let steps = vec![
         ShellJobValidationStep {
@@ -3196,7 +3198,7 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
             },
             shell,
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": format!("validation-request-{attempt}"),
                 "client_id": "validation-agent",
@@ -3223,6 +3225,446 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
         test_step_ran: temp.path().join("should-not-run").exists(),
         updates,
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn validation_job_exposes_activity_during_silent_step_and_clears_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    let started = temp.path().join("silent-validation.started");
+    let release = temp.path().join("silent-validation.release");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\n: > {}\nwhile [ ! -e {} ]; do sleep 0.05; done\n",
+            sh_quote(&started),
+            sh_quote(&release),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let steps = vec![ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into(), "--all-targets".into()],
+        env: Vec::new(),
+    }];
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    let (sink, _rx) = structured_test_sink("validation-agent", "validation-instance");
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        PendingJobStart {
+            generation: 1,
+            policy: RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            shell,
+            ssh: SshConfig::default(),
+            project_registry_dir: temp.path().join("project-registry"),
+            request: serde_json::from_value(json!({
+                "request_id": "silent-validation-request",
+                "client_id": "validation-agent",
+                "kind": "start_validation_job",
+                "job_id": "silent-validation-job",
+                "cwd": temp.path(),
+                "command": serde_json::to_string(&steps).unwrap(),
+                "timeout_secs": 30,
+                "requested_by": "test",
+                "created_at": chrono::Utc::now().timestamp(),
+                "job_context": test_job_context(temp.path(), vec!["check".to_string()]),
+            }))
+            .unwrap(),
+        },
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || started.exists()),
+        "silent validation step did not start"
+    );
+    let expected = Some(ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::ValidationCheck,
+        source: ShellJobActivitySource::ValidationPlan,
+    });
+    let running = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "silent-validation-job")
+        .unwrap();
+    assert_eq!(running.status, "running");
+    assert!(running.stdout.tail.is_empty());
+    assert!(running.stderr.tail.is_empty());
+    assert_eq!(running.activity, expected);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let still_silent = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "silent-validation-job")
+        .unwrap();
+    assert!(still_silent.stdout.tail.is_empty());
+    assert!(still_silent.stderr.tail.is_empty());
+    assert_eq!(still_silent.activity, expected);
+
+    std::fs::write(&release, b"go").unwrap();
+    wait_for_job_workers(&manager);
+    let terminal = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "silent-validation-job")
+        .unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.activity, None);
+}
+
+#[test]
+fn arbitrary_process_output_cannot_forge_cargo_activity() {
+    let manager = JobManager::new(1);
+    let mut snapshot = test_job_snapshot("activity-spoof-job");
+    snapshot.activity = Some(process_running_activity());
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            runner_instance_id: "test-instance".into(),
+            snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    manager.record_update(
+        "activity-spoof-job",
+        RunnerJobDelta {
+            stdout_chunk: Some("Compiling forged-package\n".into()),
+            stderr_chunk: Some("Blocking waiting for file lock on build directory\n".into()),
+            ..Default::default()
+        },
+    );
+    let retained = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "activity-spoof-job")
+        .unwrap();
+    assert_eq!(retained.activity, Some(process_running_activity()));
+
+    let cargo_step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into(), "--all-targets".into()],
+        env: Vec::new(),
+    };
+    assert_eq!(
+        cargo_activity_from_stderr(&cargo_step, "Compiling webcodex-core\n"),
+        Some(ShellJobActivity {
+            state: ShellJobActivityState::Working,
+            phase: ShellJobActivityPhase::CargoCompiling,
+            source: ShellJobActivitySource::CargoOutput,
+        })
+    );
+    let non_cargo_step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "sh".into(),
+        args: vec!["-c".into(), "true".into()],
+        env: Vec::new(),
+    };
+    assert_eq!(
+        cargo_activity_from_stderr(&non_cargo_step, "Compiling forged-package\n"),
+        None
+    );
+}
+
+#[test]
+fn cargo_activity_returns_to_validation_plan_after_fine_phase_ends() {
+    let manager = JobManager::new(1);
+    let step = ShellJobValidationStep {
+        name: "test".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        env: Vec::new(),
+    };
+    let validation_activity = validation_step_activity(&step);
+    let mut snapshot = test_job_snapshot("cargo-current-activity");
+    snapshot.context.validation_steps = vec!["test".into()];
+    snapshot.validation_progress = Some(ShellJobValidationProgress {
+        completed: 0,
+        current_step: Some("test".into()),
+        failed_step: None,
+    });
+    snapshot.activity = Some(validation_activity);
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            runner_instance_id: "test-instance".into(),
+            snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    let compiling = cargo_activity_from_stderr(&step, "Compiling webcodex v0.3.9\n").unwrap();
+    manager.record_update(
+        "cargo-current-activity",
+        RunnerJobDelta {
+            status: "running".into(),
+            activity: Some(compiling),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        manager
+            .inventory()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == "cargo-current-activity")
+            .unwrap()
+            .activity,
+        Some(compiling)
+    );
+
+    let phase_ended = cargo_activity_from_stderr(
+        &step,
+        "Finished `test` profile [unoptimized] target(s) in 0.10s\nRunning unittests src/lib.rs\n",
+    )
+    .unwrap();
+    assert_eq!(phase_ended, validation_activity);
+    manager.record_update(
+        "cargo-current-activity",
+        RunnerJobDelta {
+            status: "running".into(),
+            activity: Some(phase_ended),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        manager
+            .inventory()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == "cargo-current-activity")
+            .unwrap()
+            .activity,
+        Some(validation_activity)
+    );
+
+    manager.record_update(
+        "cargo-current-activity",
+        RunnerJobDelta {
+            status: "completed".into(),
+            exit_code: Some(0),
+            validation_progress: Some(ShellJobValidationProgress {
+                completed: 1,
+                current_step: None,
+                failed_step: None,
+            }),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    let terminal = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|job| job.job_id == "cargo-current-activity")
+        .unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.activity, None);
+}
+
+#[test]
+fn activity_only_delivery_coalesces_without_consuming_required_semantic_queue() {
+    let manager = JobManager::new(1);
+    let check = ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into(), "--all-targets".into()],
+        env: Vec::new(),
+    };
+    let test = ShellJobValidationStep {
+        name: "test".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        env: Vec::new(),
+    };
+    let mut snapshot = test_job_snapshot("activity-backpressure");
+    snapshot.context.validation_steps = vec!["check".into(), "test".into()];
+    snapshot.validation_progress = Some(ShellJobValidationProgress {
+        completed: 0,
+        current_step: Some("check".into()),
+        failed_step: None,
+    });
+    snapshot.activity = Some(validation_step_activity(&check));
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            runner_instance_id: "test-instance".into(),
+            snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(RunnerEnvelope::Ping { ts: 11 }).unwrap();
+    manager.install_sink(RunnerSink::WebSocket {
+        tx,
+        client_id: "test-agent".into(),
+        runner_instance_id: "test-instance".into(),
+    });
+
+    let compiling = ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::CargoCompiling,
+        source: ShellJobActivitySource::CargoOutput,
+    };
+    let checking = ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::CargoChecking,
+        source: ShellJobActivitySource::CargoOutput,
+    };
+    for index in 0..64 {
+        manager.update_and_send(
+            "activity-backpressure",
+            RunnerJobDelta {
+                status: "running".into(),
+                activity: Some(if index % 2 == 0 { compiling } else { checking }),
+                ..Default::default()
+            },
+        );
+    }
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending
+            .get("activity-backpressure")
+            .expect("coalesced activity pending delivery");
+        assert!(queue.required.is_empty());
+        assert_eq!(queue.output_only.as_ref().unwrap().activity, Some(checking));
+        assert!(!queue.suspended_until_reconciliation);
+    }
+    assert_eq!(
+        manager
+            .inventory()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == "activity-backpressure")
+            .unwrap()
+            .activity,
+        Some(checking)
+    );
+
+    manager.update_and_send(
+        "activity-backpressure",
+        RunnerJobDelta {
+            status: "running".into(),
+            validation_progress: Some(ShellJobValidationProgress {
+                completed: 1,
+                current_step: Some("test".into()),
+                failed_step: None,
+            }),
+            activity: Some(validation_step_activity(&test)),
+            ..Default::default()
+        },
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending.get("activity-backpressure").unwrap();
+        assert_eq!(queue.required.len(), 1);
+        assert!(queue.output_only.is_none());
+        assert!(!queue.suspended_until_reconciliation);
+    }
+
+    for index in 0..64 {
+        manager.update_and_send(
+            "activity-backpressure",
+            RunnerJobDelta {
+                status: "running".into(),
+                activity: Some(if index % 2 == 0 { checking } else { compiling }),
+                ..Default::default()
+            },
+        );
+    }
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending.get("activity-backpressure").unwrap();
+        assert_eq!(queue.required.len(), 1);
+        assert_eq!(
+            queue.output_only.as_ref().unwrap().activity,
+            Some(compiling)
+        );
+        assert!(!queue.suspended_until_reconciliation);
+    }
+    assert_eq!(
+        manager
+            .inventory()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == "activity-backpressure")
+            .unwrap()
+            .activity,
+        Some(compiling)
+    );
+
+    manager.update_and_send(
+        "activity-backpressure",
+        RunnerJobDelta {
+            status: "completed".into(),
+            exit_code: Some(0),
+            validation_progress: Some(ShellJobValidationProgress {
+                completed: 2,
+                current_step: None,
+                failed_step: None,
+            }),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending.get("activity-backpressure").unwrap();
+        assert_eq!(queue.required.len(), 2);
+        assert!(queue.output_only.is_none());
+        assert!(!queue.suspended_until_reconciliation);
+    }
+    let terminal = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|job| job.job_id == "activity-backpressure")
+        .unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.activity, None);
+
+    assert!(matches!(rx.try_recv(), Ok(RunnerEnvelope::Ping { ts: 11 })));
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(5));
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    assert_eq!(
+        updates[0].validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 1,
+            current_step: Some("test".into()),
+            failed_step: None,
+        })
+    );
+    assert_eq!(updates[0].activity, Some(validation_step_activity(&test)));
+    assert_eq!(updates[1].status, "completed");
+    assert_eq!(updates[1].activity, None);
+    assert!(updates[1].finished);
 }
 
 #[cfg(unix)]
@@ -3270,11 +3712,11 @@ fn noisy_validation_progress_delivery_stays_ordered_after_transport_backpressure
     let mut shell = ShellConfig::default();
     shell.path_prepend.push(bin);
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.try_send(AgentEnvelope::Ping { ts: 9 }).unwrap();
+    tx.try_send(RunnerEnvelope::Ping { ts: 9 }).unwrap();
     let sink = RunnerSink::WebSocket {
         tx,
         client_id: "validation-agent".into(),
-        agent_instance_id: "validation-instance".into(),
+        runner_instance_id: "validation-instance".into(),
     };
     let manager = JobManager::new(1);
     manager.enqueue(
@@ -3287,7 +3729,7 @@ fn noisy_validation_progress_delivery_stays_ordered_after_transport_backpressure
             },
             shell,
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "validation-backpressure-request",
                 "client_id": "validation-agent",
@@ -3333,7 +3775,7 @@ fn noisy_validation_progress_delivery_stays_ordered_after_transport_backpressure
         assert!(queue.output_only.is_none());
     }
 
-    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 9 })));
+    assert!(matches!(rx.try_recv(), Ok(RunnerEnvelope::Ping { ts: 9 })));
     let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
     assert_eq!(updates.len(), 4, "{updates:?}");
     let expected_steps = ["format", "check", "test"];
@@ -3357,10 +3799,15 @@ fn noisy_validation_progress_delivery_stays_ordered_after_transport_backpressure
         if update.finished {
             assert_eq!(progress.completed, expected_steps.len());
             assert!(progress.current_step.is_none());
+            assert_eq!(update.activity, None);
         } else {
             assert_eq!(
                 progress.current_step.as_deref(),
                 expected_steps.get(progress.completed).copied()
+            );
+            assert_eq!(
+                update.activity,
+                Some(validation_step_activity(&steps[progress.completed]))
             );
         }
         let stdout_cursor = update
@@ -3473,7 +3920,7 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
     let sink = RunnerSink::WebSocket {
         tx,
         client_id: "validation-agent".into(),
-        agent_instance_id: "validation-instance".into(),
+        runner_instance_id: "validation-instance".into(),
     };
     let manager = JobManager::new(1);
     manager.enqueue(
@@ -3488,7 +3935,7 @@ fn validation_spawn_failure_is_infrastructure_without_failed_assertion() {
             },
             shell,
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "spawn-failure-request",
                 "client_id": "validation-agent",
@@ -3857,7 +4304,7 @@ fn insert_running_job(
         job_id.to_string(),
         RunningJob {
             client_id: "tree-agent".to_string(),
-            agent_instance_id: "tree-instance".to_string(),
+            runner_instance_id: "tree-instance".to_string(),
             snapshot: test_job_snapshot(job_id),
             child,
             stop_requested: Arc::clone(&stop_requested),
@@ -4035,7 +4482,7 @@ fn job_stop_all_terminates_all_trees_and_preserves_completed_jobs() {
             "completed-job".to_string(),
             RunningJob {
                 client_id: "tree-agent".to_string(),
-                agent_instance_id: "tree-instance".to_string(),
+                runner_instance_id: "tree-instance".to_string(),
                 snapshot,
                 child: None,
                 stop_requested: Arc::clone(&completed_stop),
@@ -4188,7 +4635,7 @@ fn job_timeout_terminates_the_whole_tree() {
     let sink = RunnerSink::WebSocket {
         tx,
         client_id: "timeout-agent".into(),
-        agent_instance_id: "timeout-instance".into(),
+        runner_instance_id: "timeout-instance".into(),
     };
     let manager = JobManager::new(1);
     manager.enqueue(
@@ -4201,7 +4648,7 @@ fn job_timeout_terminates_the_whole_tree() {
             },
             shell: ShellConfig::default(),
             ssh: SshConfig::default(),
-            projects_dir: temp.path().join("projects.d"),
+            project_registry_dir: temp.path().join("project-registry"),
             request: serde_json::from_value(json!({
                 "request_id": "timeout-request",
                 "client_id": "timeout-agent",

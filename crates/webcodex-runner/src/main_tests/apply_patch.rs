@@ -1,6 +1,6 @@
 use super::*;
 
-fn apply_patch_request(cwd: &Path, patch: &str, dry_run: bool) -> ShellAgentShellRequest {
+fn apply_patch_request(cwd: &Path, patch: &str, dry_run: bool) -> RunnerRequest {
     apply_patch_request_with_strict(cwd, patch, dry_run, false)
 }
 
@@ -9,7 +9,7 @@ fn apply_patch_request_with_strict(
     patch: &str,
     dry_run: bool,
     strict_matching: bool,
-) -> ShellAgentShellRequest {
+) -> RunnerRequest {
     let mut payload = serde_json::json!({
         "patch": patch,
         "dry_run": dry_run,
@@ -17,7 +17,7 @@ fn apply_patch_request_with_strict(
     if strict_matching {
         payload["strict_matching"] = serde_json::json!(true);
     }
-    ShellAgentShellRequest {
+    RunnerRequest {
         request_id: "req-apply-patch".to_string(),
         client_id: "agent-1".to_string(),
         kind: "file_apply_patch".to_string(),
@@ -42,6 +42,7 @@ fn apply_patch_request_with_strict(
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     }
@@ -280,6 +281,19 @@ fn file_apply_patch_context_conflict_keeps_whole_batch_unchanged() {
     assert_eq!(out["error_kind"], "context_mismatch");
     assert_eq!(out["state_changed"], false);
     assert_eq!(out["execution_state"], "not_started");
+    assert_eq!(out["change_index"], 1);
+    assert_eq!(out["match_diagnostic"]["chunk_index"], 0);
+    assert_eq!(out["match_diagnostic"]["match_source"], "old_lines");
+    assert_eq!(out["match_diagnostic"]["search_start_line"], 1);
+    assert_eq!(out["match_diagnostic"]["expected_line_count"], 1);
+    assert_eq!(out["match_diagnostic"]["available_line_count"], 1);
+    assert_eq!(out["match_diagnostic"]["closest_start_line"], 1);
+    assert_eq!(out["match_diagnostic"]["closest_exact_line_matches"], 0);
+    assert_eq!(out["match_diagnostic"]["first_exact_mismatch_offset"], 1);
+    assert!(
+        out.get("recovery").is_none(),
+        "Runner must return canonical structural facts only; Server derives model-facing recovery"
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("first.txt")).unwrap(),
         "one\n"
@@ -287,6 +301,29 @@ fn file_apply_patch_context_conflict_keeps_whole_batch_unchanged() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("second.txt")).unwrap(),
         "actual\n"
+    );
+}
+
+#[test]
+fn file_apply_patch_context_conflict_does_not_echo_patch_or_source_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("target.txt"), "SOURCE_PRIVATE_TOKEN\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: target.txt\n@@ PATCH_PRIVATE_TOKEN\n-old\n+new\n*** End Patch";
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_patch_request(tmp.path(), patch, false),
+    ));
+    let serialized = serde_json::to_string(&out).unwrap();
+
+    assert_eq!(out["error_kind"], "context_mismatch");
+    assert_eq!(out["match_diagnostic"]["match_source"], "change_context");
+    assert!(!serialized.contains("PATCH_PRIVATE_TOKEN"));
+    assert!(!serialized.contains("SOURCE_PRIVATE_TOKEN"));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+        "SOURCE_PRIVATE_TOKEN\n"
     );
 }
 

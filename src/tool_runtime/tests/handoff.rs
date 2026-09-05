@@ -3,7 +3,7 @@
 use super::super::*;
 use super::support::*;
 use crate::auth::AuthContext;
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::runner_protocol::RunnerCapabilities;
 use crate::tool_runtime::handoff::{
     apply_compact_workflow_outcomes, VALIDATION_IDENTITY_REUSE_ACTION,
 };
@@ -188,7 +188,7 @@ async fn session_handoff_summary_includes_recent_failed_tools() {
         &runtime,
         "handoff-fail",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -223,7 +223,7 @@ async fn session_handoff_summary_includes_recent_failed_tools() {
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "handoff-fail", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "handoff-fail", "inst").await;
     // Return an error to simulate a failed read.
     complete_patch_agent_request(
         &runtime,
@@ -275,7 +275,7 @@ async fn expected_stop_job_failures_are_classified_without_permission_noise() {
         &runtime,
         "expected-stop",
         &auth,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![
             registered_project("alpha", "/tmp/expected-stop-alpha"),
             registered_project("beta", "/tmp/expected-stop-beta"),
@@ -369,7 +369,7 @@ async fn expected_stop_job_failures_are_classified_without_permission_noise() {
     let actions = handoff.output["suggested_next_actions"].as_array().unwrap();
     assert!(!actions
         .iter()
-        .any(|action| action == "expected failure assertions matched"));
+        .any(|action| action == "declared result expectations matched"));
     assert!(!actions.iter().any(|action| action
         .as_str()
         .unwrap_or("")
@@ -467,6 +467,136 @@ async fn failure_history_started_diagnostic_process_failure_remains_actionable_i
 }
 
 #[tokio::test]
+async fn completed_observation_failure_is_expected_and_nonblocking_in_handoff() {
+    let runtime = test_runtime();
+    let session = runtime
+        .sessions
+        .start_session(None, Some("completed observation".to_string()));
+    let sid = session.session_id.clone();
+
+    record_handoff_tool_event(
+        &runtime,
+        &sid,
+        "run_process",
+        json!({"purpose": "diagnostic", "result_expectation": "observe"}),
+        false,
+        json!({
+            "failure_kind": "command_exit_nonzero",
+            "exit_code": 1,
+            "state_changed": false,
+            "command_started": true,
+            "command_completed": true,
+            "execution_state": "completed"
+        }),
+    );
+
+    let summary = runtime.sessions.summary(&sid, Some(20)).unwrap();
+    let event = summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "tool_call_finished")
+        .expect("finished observation event");
+    assert_eq!(
+        event.failure_expectation_result.as_deref(),
+        Some("matched_expected_result")
+    );
+
+    let handoff = handoff_summary(&runtime, &sid).await;
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["tool_failures"]["expected_count"], 1);
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 0);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_reason_list_not_contains(
+        &handoff.output["verdict"],
+        "blocking_reasons",
+        "unexpected_tool_failures",
+    );
+}
+
+#[tokio::test]
+async fn accepted_exit_codes_match_only_completed_known_process_results() {
+    let runtime = test_runtime();
+    let matched = runtime
+        .sessions
+        .start_session(None, Some("accepted exit".to_string()));
+    record_handoff_tool_event(
+        &runtime,
+        &matched.session_id,
+        "run_process",
+        json!({"purpose": "diagnostic", "accepted_exit_codes": [0, 1]}),
+        false,
+        json!({
+            "failure_kind": "command_exit_nonzero",
+            "exit_code": 1,
+            "command_started": true,
+            "command_completed": true,
+            "execution_state": "completed"
+        }),
+    );
+    let handoff = handoff_summary(&runtime, &matched.session_id).await;
+    assert_eq!(handoff.output["tool_failures"]["expected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+
+    let mismatch = runtime
+        .sessions
+        .start_session(None, Some("unexpected exit".to_string()));
+    record_handoff_tool_event(
+        &runtime,
+        &mismatch.session_id,
+        "run_process",
+        json!({"purpose": "diagnostic", "accepted_exit_codes": [0, 1]}),
+        false,
+        json!({
+            "failure_kind": "command_exit_nonzero",
+            "exit_code": 2,
+            "command_started": true,
+            "command_completed": true,
+            "execution_state": "completed"
+        }),
+    );
+    let handoff = handoff_summary(&runtime, &mismatch.session_id).await;
+    assert_eq!(
+        handoff.output["tool_failures"]["expectation_mismatch_count"],
+        1
+    );
+    assert_reason_list_contains(
+        &handoff.output["verdict"],
+        "blocking_reasons",
+        "expectation_mismatches",
+    );
+
+    let unknown = runtime
+        .sessions
+        .start_session(None, Some("unknown observation".to_string()));
+    record_handoff_tool_event(
+        &runtime,
+        &unknown.session_id,
+        "run_process",
+        json!({"purpose": "diagnostic", "result_expectation": "observe"}),
+        false,
+        json!({
+            "failure_kind": "outcome_unknown",
+            "command_started": true,
+            "command_completed": false,
+            "execution_state": "outcome_unknown"
+        }),
+    );
+    let handoff = handoff_summary(&runtime, &unknown.session_id).await;
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        1
+    );
+}
+
+#[tokio::test]
 async fn expectation_mismatch_and_unexpected_success_are_visible() {
     let runtime = test_runtime();
     let auth = open_auth_context();
@@ -474,7 +604,7 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
         &runtime,
         "expect-mismatch",
         &auth,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project("demo", "/tmp/expect-mismatch-demo")],
     )
     .await;
@@ -517,7 +647,7 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
         .unwrap()
         .iter()
         .any(|action| action.as_str().unwrap_or("")
-            == "review expected failure mismatches before proceeding"));
+            == "review result expectation mismatches before proceeding"));
 
     let success_session = runtime
         .sessions
@@ -549,7 +679,7 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
         .unwrap()
         .iter()
         .any(|action| action.as_str().unwrap_or("")
-            == "review expected-failure assertions that unexpectedly succeeded"));
+            == "review failure expectations that unexpectedly succeeded"));
 }
 
 #[tokio::test]
@@ -560,7 +690,7 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
         &runtime,
         "direct-expected-stop",
         &auth,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![
             registered_project("alpha", "/tmp/direct-expected-stop-alpha"),
             registered_project("beta", "/tmp/direct-expected-stop-beta"),
@@ -673,7 +803,7 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
     let actions = handoff.output["suggested_next_actions"].as_array().unwrap();
     assert!(!actions
         .iter()
-        .any(|action| action == "expected failure assertions matched"));
+        .any(|action| action == "declared result expectations matched"));
     assert!(!actions.iter().any(|action| action
         .as_str()
         .unwrap_or("")
@@ -688,12 +818,12 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|note| note.as_str() == Some("expected failure assertions matched")));
+        .any(|note| note.as_str() == Some("declared result expectations matched")));
 
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "direct-mixed", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "direct-mixed", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
     let session = runtime
         .sessions
@@ -805,11 +935,10 @@ async fn direct_typed_dispatch_preserves_failure_expectation_metadata() {
         action.as_str().unwrap_or("") == "review unexpected failed tool calls before proceeding"
     }));
     assert!(actions.iter().any(|action| {
-        action.as_str().unwrap_or("") == "review expected failure mismatches before proceeding"
+        action.as_str().unwrap_or("") == "review result expectation mismatches before proceeding"
     }));
     assert!(actions.iter().any(|action| {
-        action.as_str().unwrap_or("")
-            == "review expected-failure assertions that unexpectedly succeeded"
+        action.as_str().unwrap_or("") == "review failure expectations that unexpectedly succeeded"
     }));
     assert_eq!(handoff.output["verdict"]["status"], "fail");
     assert_reason_list_not_contains(
@@ -839,7 +968,7 @@ async fn real_cargo_nonzero_failures_match_validation_failed_expectations() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "cargo-expected-kind", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "cargo-expected-kind", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
     let session = runtime.sessions.start_session(
         Some(project.clone()),
@@ -923,7 +1052,7 @@ async fn real_cargo_nonzero_failures_match_validation_failed_expectations() {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "cargo validation Agent request readiness timed out"
+                "cargo validation Runner request readiness timed out"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
@@ -987,7 +1116,116 @@ async fn real_cargo_nonzero_failures_match_validation_failed_expectations() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|note| note.as_str() == Some("expected failure assertions matched")));
+        .any(|note| note.as_str() == Some("declared result expectations matched")));
+}
+
+#[tokio::test]
+async fn public_failure_expectation_preserves_raw_cargo_failure_as_expected_validation_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "cargo-public-expectation", "demo", tmp.path())
+            .await;
+    let auth = bootstrap_auth_context();
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("public negative validation".to_string()),
+    );
+    let sid = session.session_id.clone();
+    let assertion_name = "pre-fix regression must fail";
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let project = project.clone();
+        let sid = sid.clone();
+        async move {
+            call_typed_tool_with_metadata(
+                &runtime,
+                "cargo_test",
+                json!({
+                    "project": project,
+                    "session_id": sid,
+                    "filter": "failing",
+                    "timeout_secs": 60,
+                    "result_expectation": "failure",
+                    "assertion_name": assertion_name
+                }),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let req = loop {
+        if let Some(req) = probe_patch_agent_request(&runtime, "cargo-public-expectation").await {
+            break req;
+        }
+        assert!(
+            !task.is_finished(),
+            "cargo_test finished before Agent dispatch"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cargo_test Runner request readiness timed out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    assert_eq!(req.command, "cargo test 'failing'");
+    complete_patch_agent_request(
+        &runtime,
+        "cargo-public-expectation",
+        &req.request_id,
+        101,
+        "test result: FAILED. 0 passed; 1 failed\n",
+        "",
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success, "raw ToolResult must remain a failure");
+    assert_eq!(result.output["exit_code"], 101);
+    assert_eq!(result.output["passed"], false);
+
+    let summary = runtime.sessions.summary(&sid, Some(50)).unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == "tool_call_finished"
+                && event.assertion_name.as_deref() == Some(assertion_name)
+        })
+        .expect("public expected-failure event");
+    assert_eq!(finished.status.as_deref(), Some("failed"));
+    assert_eq!(finished.exit_code, Some(101));
+    assert_eq!(finished.result_expectation.as_deref(), Some("failure"));
+    assert_eq!(
+        finished.failure_expectation_result.as_deref(),
+        Some("matched_expected_failure")
+    );
+
+    let validation = validation_summary_for_session(&summary);
+    assert_eq!(validation["status"], "expected");
+    assert_eq!(validation["current_evidence"]["status"], "expected");
+    assert_eq!(validation["successes"], 0);
+    assert_eq!(validation["failures"], 0);
+    assert_eq!(validation["expected_results"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], false);
+    assert_eq!(validation["latest"]["expectation_satisfied"], true);
+    assert_eq!(validation["latest"]["exit_code"], 101);
+
+    let handoff = handoff_summary_only(&runtime, &sid).await;
+    assert_eq!(handoff.output["tool_failures"]["expected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_reason_list_not_contains(
+        &handoff.output["verdict"],
+        "blocking_reasons",
+        "unexpected_tool_failures",
+    );
 }
 
 #[tokio::test]
@@ -995,7 +1233,7 @@ async fn cargo_test_zero_tests_success_is_detected_and_warns_in_handoff() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "cargo-zero-tests", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "cargo-zero-tests", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
     let session = runtime
         .sessions
@@ -1037,7 +1275,7 @@ async fn cargo_test_zero_tests_success_is_detected_and_warns_in_handoff() {
         );
         assert!(
             std::time::Instant::now() < deadline,
-            "cargo_test Agent request readiness timed out"
+            "cargo_test Runner request readiness timed out"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     };
@@ -1157,7 +1395,7 @@ async fn generic_call_runtime_tool_preserves_flattened_failure_expectations() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "generic-expect", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "generic-expect", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
     let session = runtime.sessions.start_session(
         Some(project.clone()),
@@ -1318,7 +1556,7 @@ async fn generic_call_runtime_tool_recording_session_preserves_failure_expectati
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "generic-recording", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "generic-recording", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
     let business_session = runtime
         .sessions
@@ -1564,12 +1802,12 @@ async fn session_handoff_summary_only_is_compact() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|note| note.as_str() == Some("expected failure assertions matched")));
+        .any(|note| note.as_str() == Some("declared result expectations matched")));
     assert!(!result.output["suggested_next_actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action.as_str() == Some("expected failure assertions matched")));
+        .any(|action| action.as_str() == Some("declared result expectations matched")));
     assert!(verdict["suggested_next_actions"]
         .as_array()
         .unwrap()
@@ -1627,20 +1865,23 @@ async fn handoff_jobs_projection(runtime: &ToolRuntime, session_id: &str) -> Too
 #[tokio::test]
 async fn session_handoff_summary_includes_active_jobs_and_clears_after_stop() {
     let temp = tempfile::tempdir().unwrap();
-    let runtime = runtime_with_project(temp.path(), "demo");
-    let project = "demo";
+    let runtime = test_runtime();
+    let client_id = "handoff-jobs";
+    let auth = auth_context(None, true);
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", temp.path(), &auth)
+            .await;
     let session = runtime
         .sessions
-        .start_session(Some(project.to_string()), Some("handoff jobs".to_string()));
-    let job_id = "11111111-2222-3333-4444-555555555551";
-    seed_session_projection_job(
+        .start_session(Some(project.clone()), Some("handoff jobs".to_string()));
+    let job_id = seed_session_projection_job(
         &runtime,
-        temp.path(),
-        job_id,
-        project,
+        client_id,
+        &project,
         &session.session_id,
         "running",
         "handoff-secret-output\n",
+        &auth,
     )
     .await;
 
@@ -1664,11 +1905,7 @@ async fn session_handoff_summary_includes_active_jobs_and_clears_after_stop() {
     let serialized = serde_json::to_string(&active.output["jobs"]).unwrap();
     assert!(!serialized.contains("handoff-secret-output"));
 
-    std::fs::write(
-        temp.path().join(format!(".codex/jobs/{job_id}/status")),
-        "stopped",
-    )
-    .unwrap();
+    finish_session_projection_job(&runtime, client_id, &job_id, "stopped").await;
     let stopped = handoff_jobs_projection(&runtime, &session.session_id).await;
     assert!(stopped.success, "{:?}", stopped.error);
     assert_eq!(stopped.output["jobs"]["active_count"], 0);
@@ -1684,21 +1921,24 @@ async fn session_handoff_summary_includes_active_jobs_and_clears_after_stop() {
 #[tokio::test]
 async fn session_handoff_summary_treats_stop_requested_as_nonblocking() {
     let temp = tempfile::tempdir().unwrap();
-    let runtime = runtime_with_project(temp.path(), "demo");
-    let project = "demo";
+    let runtime = test_runtime();
+    let client_id = "handoff-stop-pending";
+    let auth = auth_context(None, true);
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", temp.path(), &auth)
+            .await;
     let session = runtime.sessions.start_session(
-        Some(project.to_string()),
+        Some(project.clone()),
         Some("handoff stop pending".to_string()),
     );
-    let job_id = "11111111-2222-3333-4444-555555555552";
-    seed_session_projection_job(
+    let job_id = seed_session_projection_job(
         &runtime,
-        temp.path(),
-        job_id,
-        project,
+        client_id,
+        &project,
         &session.session_id,
         "stop_requested",
         "handoff-stop-pending-secret\n",
+        &auth,
     )
     .await;
 
@@ -2029,7 +2269,7 @@ async fn session_handoff_summary_with_workspace_clean_project() {
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(&runtime, "hw", "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, "hw", "demo", tmp.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("workspace handoff".to_string()));
@@ -2058,7 +2298,8 @@ async fn session_handoff_summary_only_verdict_allows_clean_workspace_without_fai
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "handoff-clean-verdict", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "handoff-clean-verdict", "demo", tmp.path())
+            .await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("clean handoff".to_string()));
@@ -2090,9 +2331,13 @@ async fn session_handoff_does_not_resolve_a_different_validation_identity() {
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project =
-        register_agent_project_at_path(&runtime, "handoff-resolved-validation", "demo", tmp.path())
-            .await;
+    let project = register_runner_project_at_path(
+        &runtime,
+        "handoff-resolved-validation",
+        "demo",
+        tmp.path(),
+    )
+    .await;
     let session = runtime.sessions.start_session(
         Some(project.clone()),
         Some("resolved validation handoff".to_string()),
@@ -2182,7 +2427,7 @@ async fn session_handoff_historical_mixed_current_pass_does_not_block_closeout()
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(
+    let project = register_runner_project_at_path(
         &runtime,
         "handoff-current-evidence-pass",
         "demo",
@@ -2279,7 +2524,7 @@ async fn session_handoff_stale_validation_after_content_change_warns_without_blo
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(
+    let project = register_runner_project_at_path(
         &runtime,
         "handoff-current-evidence-stale",
         "demo",
@@ -2360,7 +2605,7 @@ async fn session_handoff_command_derived_unresolved_does_not_claim_original_asse
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(
+    let project = register_runner_project_at_path(
         &runtime,
         "handoff-command-derived-unresolved",
         "demo",
@@ -2439,7 +2684,7 @@ async fn session_handoff_summary_only_passes_with_resolved_unexpected_cargo_test
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(
+    let project = register_runner_project_at_path(
         &runtime,
         "handoff-resolved-unexpected-test",
         "demo",
@@ -2611,7 +2856,7 @@ async fn session_handoff_summary_only_keeps_cargo_test_failure_blocking_after_ze
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(
+    let project = register_runner_project_at_path(
         &runtime,
         "handoff-zero-tests-does-not-resolve",
         "demo",
@@ -2865,7 +3110,7 @@ async fn session_handoff_summary_non_git_project_does_not_fail_whole_tool() {
     let tmp = tempfile::tempdir().unwrap();
     // Intentionally do NOT init a git repo.
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(&runtime, "ng", "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, "ng", "demo", tmp.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("non-git handoff".to_string()));
@@ -2910,7 +3155,7 @@ async fn session_handoff_summary_includes_latest_last_known_good_checkpoint() {
 
     let runtime = test_runtime().with_checkpoint_state_dir(state.path());
     let project =
-        register_agent_project_at_path(&runtime, "ckpt-handoff", "agent-proj", root).await;
+        register_runner_project_at_path(&runtime, "ckpt-handoff", "agent-proj", root).await;
     let session = runtime.sessions.start_session(
         Some(project.clone()),
         Some("checkpoint handoff".to_string()),
@@ -3030,6 +3275,7 @@ async fn session_handoff_summary_output_is_bounded() {
             crate::tool_runtime::sessions::SessionTransport::Api,
             "list_tools",
             &json!({}),
+            crate::tool_runtime::sessions::session_tool_contract("list_tools"),
         );
         runtime
             .sessions
@@ -3277,6 +3523,7 @@ fn record_handoff_tool_event(
         SessionTransport::Api,
         tool_name,
         &arguments,
+        crate::tool_runtime::sessions::session_tool_contract(tool_name),
     );
     let error = (!success).then_some("tool failed");
     runtime

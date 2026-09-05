@@ -8,7 +8,7 @@ use super::output_text::{
     CapturedOutputEncoding, FullStreamUtf8Validity, LeadingBom, OutputTextSource,
 };
 use super::projects::find_project_shell_context;
-use crate::shell_protocol::{ShellProcessArgv, ShellScriptLanguage, ShellScriptPayload};
+use crate::runner_protocol::{ShellProcessArgv, ShellScriptLanguage, ShellScriptPayload};
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -42,6 +42,15 @@ pub(crate) struct PreparedShellProfile {
     program: String,
     args: Vec<String>,
     dialect: ShellDialect,
+    env_snapshot: HashMap<String, String>,
+}
+
+/// A native-process launch environment produced by the existing Runner shell
+/// profile machinery. It contains only the prepared environment snapshot and
+/// resolves the final executable through that snapshot's PATH; no shell layer
+/// is inserted around the child process.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedExecutionEnvironment {
     env_snapshot: HashMap<String, String>,
 }
 
@@ -1139,6 +1148,82 @@ impl PreparedShellProfileCache {
     }
 }
 
+impl PreparedExecutionEnvironment {
+    pub(crate) fn prepare(
+        generation: u64,
+        shell: &ShellConfig,
+        explicit_profile: Option<&str>,
+        prepare_cwd: &Path,
+        cache: &PreparedShellProfileCache,
+        stop_requested: Option<&AtomicBool>,
+    ) -> Result<Self, String> {
+        let profile_name = explicit_profile.or(shell.default_profile.as_deref());
+        let env_snapshot = match profile_name {
+            Some(profile_name) => cache
+                .get_or_prepare(
+                    generation,
+                    shell,
+                    profile_name,
+                    format!(
+                        "plugin:{}",
+                        prepare_cwd
+                            .canonicalize()
+                            .unwrap_or_else(|_| prepare_cwd.to_path_buf())
+                            .to_string_lossy()
+                    ),
+                    prepare_cwd,
+                    stop_requested,
+                )?
+                .env_snapshot
+                .clone(),
+            None => base_shell_env(shell, &ShellProfileConfig::default())?,
+        };
+        Ok(Self { env_snapshot })
+    }
+
+    pub(crate) fn native_command(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<Command, String> {
+        let requested = {
+            let path = Path::new(program);
+            if !path.is_absolute() && path.components().count() > 1 {
+                cwd.join(path).to_string_lossy().into_owned()
+            } else {
+                program.to_string()
+            }
+        };
+        let path = env_lookup(&self.env_snapshot, "PATH")
+            .map(OsString::from)
+            .unwrap_or_default();
+        let resolved =
+            super::util::resolve_program_in_path(&requested, &path).ok_or_else(|| {
+                format!("plugin executable is unavailable in prepared PATH: {program}")
+            })?;
+        #[cfg(windows)]
+        let native = match resolved {
+            super::util::ResolvedProgram::Native(path) => path,
+            super::util::ResolvedProgram::Batch(_) => {
+                return Err(
+                    "unsupported_executable_type: native Tool Plugins cannot launch Windows .cmd/.bat files; configure a native runtime executable instead"
+                        .to_string(),
+                )
+            }
+        };
+        #[cfg(not(windows))]
+        let native = match resolved {
+            super::util::ResolvedProgram::Native(path) => path,
+        };
+        let mut command = Command::new(native);
+        command.args(args);
+        command.current_dir(cwd);
+        apply_env_snapshot(&mut command, &self.env_snapshot);
+        Ok(command)
+    }
+}
+
 fn shell_profile_project_key(project_id: Option<&str>, path: &Path) -> String {
     let path = path
         .canonicalize()
@@ -1154,14 +1239,14 @@ fn shell_profile_project_key(project_id: Option<&str>, path: &Path) -> String {
 pub(crate) fn resolve_prepared_shell_profile(
     generation: u64,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cwd_path: &Path,
     request_has_cwd: bool,
     cache: &PreparedShellProfileCache,
     stop_requested: Option<&AtomicBool>,
 ) -> Result<Option<Arc<PreparedShellProfile>>, String> {
     let project = request_has_cwd
-        .then(|| find_project_shell_context(projects_dir, cwd_path))
+        .then(|| find_project_shell_context(project_registry_dir, cwd_path))
         .flatten();
     let profile_name = project
         .as_ref()
@@ -1748,7 +1833,7 @@ pub(crate) fn run_process_with_profiles_and_execution_state(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     executable: &str,
@@ -1761,7 +1846,7 @@ pub(crate) fn run_process_with_profiles_and_execution_state(
         generation,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         cwd,
         executable,
@@ -1778,7 +1863,7 @@ pub(crate) fn prepare_detached_process_launch(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     executable: &str,
@@ -1800,7 +1885,7 @@ pub(crate) fn prepare_detached_process_launch(
     let profile = resolve_prepared_shell_profile(
         generation,
         shell,
-        projects_dir,
+        project_registry_dir,
         &cwd_path,
         cwd.is_some(),
         cache,
@@ -1837,7 +1922,7 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_start_hook(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     executable: &str,
@@ -1875,7 +1960,7 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_start_hook(
     let profile = match resolve_prepared_shell_profile(
         generation,
         shell,
-        projects_dir,
+        project_registry_dir,
         &cwd_path,
         cwd.is_some(),
         cache,
@@ -1928,7 +2013,7 @@ pub(crate) fn run_internal_search_script_with_profiles_and_execution_state(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     script: &str,
@@ -1939,7 +2024,7 @@ pub(crate) fn run_internal_search_script_with_profiles_and_execution_state(
         generation,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         cwd,
         script,
@@ -1954,7 +2039,7 @@ pub(crate) fn run_internal_posix_script_with_profiles_and_execution_state(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     script: &str,
@@ -1965,7 +2050,7 @@ pub(crate) fn run_internal_posix_script_with_profiles_and_execution_state(
         generation,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         cwd,
         script,
@@ -1980,7 +2065,7 @@ fn run_internal_posix_script_impl(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     script: &str,
@@ -2001,7 +2086,7 @@ fn run_internal_posix_script_impl(
             generation,
             policy,
             shell,
-            projects_dir,
+            project_registry_dir,
             cache,
             cwd,
             &payload,
@@ -2064,7 +2149,7 @@ fn run_internal_posix_script_impl(
         let profile = match resolve_prepared_shell_profile(
             generation,
             shell,
-            projects_dir,
+            project_registry_dir,
             &cwd_path,
             cwd.is_some(),
             cache,
@@ -2147,7 +2232,7 @@ pub(crate) fn run_script_with_profiles_and_execution_state(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     payload: &ShellScriptPayload,
@@ -2159,7 +2244,7 @@ pub(crate) fn run_script_with_profiles_and_execution_state(
         generation,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         cwd,
         payload,
@@ -2175,7 +2260,7 @@ pub(crate) fn run_script_with_profiles_and_execution_state_with_start_hook(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     payload: &ShellScriptPayload,
@@ -2212,7 +2297,7 @@ pub(crate) fn run_script_with_profiles_and_execution_state_with_start_hook(
     let profile = match resolve_prepared_shell_profile(
         generation,
         shell,
-        projects_dir,
+        project_registry_dir,
         &cwd_path,
         cwd.is_some(),
         cache,
@@ -2328,7 +2413,7 @@ pub(crate) fn run_shell_with_profiles(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     command: &str,
@@ -2340,7 +2425,7 @@ pub(crate) fn run_shell_with_profiles(
         generation,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         cwd,
         command,
@@ -2356,7 +2441,7 @@ pub(crate) fn run_shell_with_profiles_and_execution_state(
     generation: u64,
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: Option<&str>,
     command: &str,
@@ -2367,7 +2452,7 @@ pub(crate) fn run_shell_with_profiles_and_execution_state(
     run_shell_impl(
         policy,
         shell,
-        Some((generation, projects_dir, cache)),
+        Some((generation, project_registry_dir, cache)),
         cwd,
         command,
         stdin,
@@ -2411,10 +2496,10 @@ fn run_shell_impl(
     let start = Instant::now();
     let mut prepared_profile_name = None;
     let cmd = match profiles {
-        Some((generation, projects_dir, cache)) => match resolve_prepared_shell_profile(
+        Some((generation, project_registry_dir, cache)) => match resolve_prepared_shell_profile(
             generation,
             shell,
-            projects_dir,
+            project_registry_dir,
             &cwd_path,
             cwd.is_some(),
             cache,

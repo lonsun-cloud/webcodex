@@ -13,8 +13,9 @@ use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 pub(crate) const MAX_SEARCH_PROJECT_TEXTS_QUERIES: usize = 8;
 pub(crate) const MAX_SEARCH_PROJECT_TEXTS_CONCURRENCY: usize = 2;
 pub(crate) const DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE: Duration = Duration::from_secs(30);
-pub(crate) const DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 64 * 1024;
-pub(crate) const MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 8 * 1024;
+pub(crate) use webcodex_core::runtime_contract::{
+    DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES, MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES,
+};
 
 fn search_request_and_pattern_mode(
     query: SearchProjectTextsQuery,
@@ -125,7 +126,7 @@ fn projected_batch_len(base_len: usize, item_bytes: usize, item_count: usize) ->
         .saturating_add(item_count.saturating_sub(1))
 }
 
-fn retryable_agent_request_failure(result: &ToolResult) -> bool {
+fn retryable_runner_request_failure(result: &ToolResult) -> bool {
     !result.success
         && result.output.get("code").and_then(Value::as_str) == Some("search_request_dropped")
 }
@@ -558,7 +559,7 @@ impl ToolRuntime {
                     let (request, pattern_mode) = search_request_and_pattern_mode(query);
                     let result =
                         match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-                            Ok(options) if project.is_agent() => {
+                            Ok(options) => {
                                 let first = self
                                     .search_one_resolved_project_text(
                                         project,
@@ -567,7 +568,7 @@ impl ToolRuntime {
                                         Some(deadline),
                                     )
                                     .await;
-                                if retryable_agent_request_failure(&first)
+                                if retryable_runner_request_failure(&first)
                                     && Instant::now() < deadline
                                 {
                                     self.search_one_resolved_project_text(
@@ -580,15 +581,6 @@ impl ToolRuntime {
                                 } else {
                                     first
                                 }
-                            }
-                            Ok(options) => {
-                                self.search_one_resolved_project_text(
-                                    project,
-                                    output_project,
-                                    options,
-                                    Some(deadline),
-                                )
-                                .await
                             }
                             Err(error) => error.into_tool_result(),
                         };
@@ -623,7 +615,12 @@ mod tests {
                     "line": match_index + 1,
                     "preview": format!("m{match_index:03}-{}", "界".repeat(preview_bytes / 3)),
                     "context_before": [],
-                    "context_after": []
+                    "context_after": [],
+                    "read_hint": {
+                        "path": format!("src/{index}-{match_index:03}.rs"),
+                        "start_line": 1,
+                        "limit": 80
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -720,7 +717,12 @@ mod tests {
                         "line": 1,
                         "preview": text,
                         "context_before": [],
-                        "context_after": []
+                        "context_after": [],
+                        "read_hint": {
+                            "path": format!("src/{index}.rs"),
+                            "start_line": 1,
+                            "limit": 80
+                        }
                     }],
                     "truncated": false,
                     "truncation_reason": null

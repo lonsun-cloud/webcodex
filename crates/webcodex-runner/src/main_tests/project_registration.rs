@@ -1,10 +1,10 @@
 use super::*;
 
 #[test]
-fn register_project_writes_valid_toml_into_projects_dir() {
+fn register_project_writes_valid_toml_into_project_registry_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     let policy = project_policy(tmp.path());
     let req = project_request(
@@ -18,15 +18,26 @@ fn register_project_writes_valid_toml_into_projects_dir() {
         }),
     );
 
-    let value = project_ok(handle_project_op(&policy, &projects_dir, &req));
+    let value = project_ok(handle_project_op(&policy, &project_registry_dir, &req));
     assert_eq!(value["created_config"], true);
     assert_eq!(value["overwritten"], false);
+    assert_eq!(
+        value["project_record_path"], value["projects_config_path"],
+        "legacy projects_config_path must remain an additive alias"
+    );
+    let expected_record_path =
+        std::fs::canonicalize(project_registry_dir.join("demo.toml")).unwrap();
+    assert_eq!(
+        value["project_record_path"],
+        expected_record_path.to_string_lossy().as_ref()
+    );
 
-    let content = std::fs::read_to_string(projects_dir.join("demo.toml")).unwrap();
+    let content = std::fs::read_to_string(project_registry_dir.join("demo.toml")).unwrap();
     let parsed = parse_runner_project_toml(&content).unwrap();
     assert_eq!(parsed.id, "demo");
     assert_eq!(parsed.name.as_deref(), Some("Demo"));
     assert_eq!(parsed.path, project_dir.to_string_lossy());
+    assert_eq!(parsed.registration_source, None);
     assert!(!parsed.allow_patch);
 }
 
@@ -34,7 +45,7 @@ fn register_project_writes_valid_toml_into_projects_dir() {
 fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_touching_it() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("Example Repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     std::fs::write(project_dir.join("keep.txt"), "unchanged").unwrap();
     let target_entries_before = std::fs::read_dir(&project_dir)
@@ -45,7 +56,7 @@ fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_t
 
     let first = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.join(".").to_string_lossy()}),
@@ -54,11 +65,16 @@ fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_t
     assert_eq!(first["outcome"], "auto_registered");
     assert_eq!(first["registered"], true);
     assert_eq!(first["changed"], true);
+    assert_eq!(first["registration_source"], "auto_registered");
+    assert_eq!(
+        first["kind"], "auto_registered",
+        "legacy kind sentinel is a wire-only old-Server compatibility projection"
+    );
     let project_id = first["agent_project_id"].as_str().unwrap();
     assert!(project_id.starts_with("example-repo-"), "{project_id}");
     assert!(project_id.len() <= 64);
 
-    let config_path = projects_dir.join(format!("{project_id}.toml"));
+    let config_path = project_registry_dir.join(format!("{project_id}.toml"));
     let persisted =
         parse_runner_project_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     assert_eq!(persisted.id, project_id);
@@ -66,7 +82,14 @@ fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_t
         Path::new(&persisted.path),
         project_dir.canonicalize().unwrap()
     );
-    assert_eq!(persisted.kind.as_deref(), Some("auto_registered"));
+    assert_eq!(persisted.kind, None);
+    assert_eq!(
+        persisted.registration_source.as_deref(),
+        Some("auto_registered")
+    );
+    let persisted_text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(persisted_text.contains("registration_source = \"auto_registered\""));
+    assert!(!persisted_text.contains("kind = \"auto_registered\""));
     assert!(persisted.allow_patch);
     assert_eq!(
         std::fs::read_to_string(project_dir.join("keep.txt")).unwrap(),
@@ -79,12 +102,21 @@ fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_t
     assert_eq!(target_entries_after, target_entries_before);
     assert!(!project_dir.join(".git").exists());
 
-    let reloaded = load_runner_project_summaries_from_dir(&projects_dir);
+    let reloaded = load_runner_project_summaries_from_dir(&project_registry_dir);
     assert_eq!(reloaded.len(), 1);
     assert_eq!(reloaded[0].id, project_id);
+    assert_eq!(
+        reloaded[0].registration_source.as_deref(),
+        Some("auto_registered")
+    );
+    assert_eq!(
+        reloaded[0].kind.as_deref(),
+        Some("auto_registered"),
+        "legacy kind sentinel is wire-only rolling-upgrade compatibility"
+    );
     let second = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -94,7 +126,7 @@ fn resolve_or_register_project_persists_and_reuses_canonical_directory_without_t
     assert_eq!(second["registered"], false);
     assert_eq!(second["agent_project_id"], project_id);
     assert_eq!(
-        std::fs::read_dir(&projects_dir).unwrap().count(),
+        std::fs::read_dir(&project_registry_dir).unwrap().count(),
         1,
         "retry created a duplicate registration"
     );
@@ -108,14 +140,14 @@ fn resolve_or_register_project_reuses_symlink_target() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
     let link = tmp.path().join("repo-link");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     symlink(&project_dir, &link).unwrap();
     let policy = project_policy(tmp.path());
 
     let first = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -123,7 +155,7 @@ fn resolve_or_register_project_reuses_symlink_target() {
     ));
     let second = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": link.to_string_lossy()}),
@@ -143,7 +175,7 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
     let first_parent = tmp.path().join("first");
     let second_parent = tmp.path().join("second");
     let manual_dir = tmp.path().join("manual");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     for directory in [
         first_parent.join("repo"),
         second_parent.join("repo"),
@@ -151,9 +183,9 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
     ] {
         std::fs::create_dir_all(directory).unwrap();
     }
-    std::fs::create_dir(&projects_dir).unwrap();
+    std::fs::create_dir(&project_registry_dir).unwrap();
     std::fs::write(
-        projects_dir.join("friendly.toml"),
+        project_registry_dir.join("friendly.toml"),
         format!(
             "id = \"friendly\"\nname = \"Friendly\"\npath = {:?}\nallow_patch = true\n",
             manual_dir.to_string_lossy()
@@ -164,7 +196,7 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
 
     let manual = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": manual_dir.join(".").to_string_lossy()}),
@@ -175,7 +207,7 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
 
     let first = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": first_parent.join("repo").to_string_lossy()}),
@@ -183,7 +215,7 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
     ));
     let second = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": second_parent.join("repo").to_string_lossy()}),
@@ -204,11 +236,11 @@ fn resolve_or_register_project_prefers_manual_id_and_distinguishes_same_basename
 fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
-    std::fs::create_dir(&projects_dir).unwrap();
+    std::fs::create_dir(&project_registry_dir).unwrap();
     std::fs::write(
-        projects_dir.join("disabled.toml"),
+        project_registry_dir.join("disabled.toml"),
         format!(
             "id = \"disabled\"\npath = {:?}\ndisabled = true\n",
             project_dir.to_string_lossy()
@@ -219,7 +251,7 @@ fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches()
 
     let disabled = project_error_value(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -234,7 +266,7 @@ fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches()
     );
 
     std::fs::write(
-        projects_dir.join("alpha.toml"),
+        project_registry_dir.join("alpha.toml"),
         format!(
             "id = \"alpha\"\npath = {:?}\n",
             project_dir.to_string_lossy()
@@ -242,7 +274,7 @@ fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches()
     )
     .unwrap();
     std::fs::write(
-        projects_dir.join("zeta.toml"),
+        project_registry_dir.join("zeta.toml"),
         format!(
             "id = \"zeta\"\npath = {:?}\n",
             project_dir.join(".").to_string_lossy()
@@ -251,7 +283,7 @@ fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches()
     .unwrap();
     let ambiguous = project_error_value(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -269,7 +301,7 @@ fn resolve_or_register_project_fails_closed_for_disabled_and_ambiguous_matches()
 fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_paths() {
     let allowed = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let projects_dir = allowed.path().join("projects.d");
+    let project_registry_dir = allowed.path().join("project-registry");
     let file = allowed.path().join("file.txt");
     std::fs::write(&file, "not a directory").unwrap();
     let policy = project_policy(allowed.path());
@@ -291,7 +323,7 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
     ] {
         let error = project_error_value(handle_resolve_or_register_project(
             &policy,
-            &projects_dir,
+            &project_registry_dir,
             &project_request(
                 "resolve_or_register_project",
                 serde_json::json!({"path": path}),
@@ -300,7 +332,7 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
         assert_eq!(error["error_kind"], expected);
         assert_eq!(error["state_changed"], false);
     }
-    assert!(!projects_dir.exists());
+    assert!(!project_registry_dir.exists());
 
     let unrestricted = RunnerPolicy {
         allow_cwd_anywhere: true,
@@ -315,7 +347,7 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
     let dangerous_path = "/etc";
     let dangerous = project_error_value(handle_resolve_or_register_project(
         &unrestricted,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": dangerous_path}),
@@ -328,7 +360,7 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
 #[test]
 fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
     let tmp = tempfile::tempdir().unwrap();
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     let policy = project_policy(tmp.path());
 
     // The raw path check must fire before canonicalization: these shares do
@@ -341,7 +373,7 @@ fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
     ] {
         let error = project_error_value(handle_resolve_or_register_project(
             &policy,
-            &projects_dir,
+            &project_registry_dir,
             &project_request(
                 "resolve_or_register_project",
                 serde_json::json!({"path": unc_path}),
@@ -353,7 +385,10 @@ fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
         );
         assert_eq!(error["state_changed"], false);
     }
-    assert!(!projects_dir.exists(), "no registration may be attempted");
+    assert!(
+        !project_registry_dir.exists(),
+        "no registration may be attempted"
+    );
 
     // An allowed_roots entry naming a UNC share must not bypass the rule.
     let unc_allowed = RunnerPolicy {
@@ -363,7 +398,7 @@ fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
     };
     let error = project_error_value(handle_resolve_or_register_project(
         &unc_allowed,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": r"\\server\share\repo"}),
@@ -380,7 +415,7 @@ fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
 fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     let policy = project_policy(tmp.path());
 
@@ -389,7 +424,7 @@ fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() 
     assert!(Path::new(&plain).is_absolute());
     let first = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": plain}),
@@ -412,7 +447,7 @@ fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() 
     };
     let second = project_ok(handle_resolve_or_register_project(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": verbatim}),
@@ -421,7 +456,7 @@ fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() 
     assert_eq!(second["outcome"], "reused_existing_registration");
     assert_eq!(second["agent_project_id"], project_id);
     assert_eq!(
-        std::fs::read_dir(&projects_dir).unwrap().count(),
+        std::fs::read_dir(&project_registry_dir).unwrap().count(),
         1,
         "the \\\\?\\ spelling created a duplicate project identity"
     );
@@ -431,12 +466,12 @@ fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() 
 #[test]
 fn register_project_rejects_unc_paths() {
     let tmp = tempfile::tempdir().unwrap();
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     let policy = project_policy(tmp.path());
 
     let error = project_error_value(handle_project_op(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "register_project",
             serde_json::json!({
@@ -449,25 +484,25 @@ fn register_project_rejects_unc_paths() {
         ),
     ));
     assert_eq!(error["error_code"], "unc_project_path_unsupported");
-    assert!(!projects_dir.exists());
+    assert!(!project_registry_dir.exists());
 }
 
 #[test]
 fn concurrent_path_resolution_converges_on_one_registration() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     let policy = project_policy(tmp.path());
     let mut workers = Vec::new();
     for _ in 0..2 {
         let project_dir = project_dir.clone();
-        let projects_dir = projects_dir.clone();
+        let project_registry_dir = project_registry_dir.clone();
         let policy = policy.clone();
         workers.push(std::thread::spawn(move || {
             project_ok(handle_resolve_or_register_project(
                 &policy,
-                &projects_dir,
+                &project_registry_dir,
                 &project_request(
                     "resolve_or_register_project",
                     serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -490,7 +525,7 @@ fn concurrent_path_resolution_converges_on_one_registration() {
             .count(),
         1
     );
-    assert_eq!(std::fs::read_dir(&projects_dir).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&project_registry_dir).unwrap().count(), 1);
 }
 
 #[test]
@@ -500,10 +535,10 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
     let other_dir = tmp.path().join("other");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     std::fs::create_dir(&other_dir).unwrap();
-    std::fs::create_dir(&projects_dir).unwrap();
+    std::fs::create_dir(&project_registry_dir).unwrap();
     let canonical = project_dir.canonicalize().unwrap();
     // Match the Runner's project identity: raw bytes on Unix, normalized
     // (lowercased, `\\?\` stripped) on Windows.
@@ -519,14 +554,14 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
         other_dir.to_string_lossy()
     );
     std::fs::write(
-        projects_dir.join(format!("{colliding_id}.toml")),
+        project_registry_dir.join(format!("{colliding_id}.toml")),
         &colliding_config,
     )
     .unwrap();
 
     let result = project_ok(handle_resolve_or_register_project(
         &project_policy(tmp.path()),
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -536,7 +571,7 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
     assert_ne!(generated, colliding_id);
     assert_eq!(generated, format!("repo-{}", &digest[..12]));
     assert_eq!(
-        std::fs::read_to_string(projects_dir.join(format!("{colliding_id}.toml"))).unwrap(),
+        std::fs::read_to_string(project_registry_dir.join(format!("{colliding_id}.toml"))).unwrap(),
         colliding_config
     );
 }
@@ -545,13 +580,13 @@ fn auto_project_id_collision_extends_hash_without_overwriting() {
 fn path_registration_publish_failure_leaves_no_config_or_temp_file() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     webcodex_runner::projects::fail_next_project_publish_before_rename();
 
     let error = project_error_value(handle_resolve_or_register_project(
         &project_policy(tmp.path()),
-        &projects_dir,
+        &project_registry_dir,
         &project_request(
             "resolve_or_register_project",
             serde_json::json!({"path": project_dir.to_string_lossy()}),
@@ -559,14 +594,14 @@ fn path_registration_publish_failure_leaves_no_config_or_temp_file() {
     ));
     assert_eq!(error["error_kind"], "operation_failed");
     assert_eq!(error["state_changed"], false);
-    assert_eq!(std::fs::read_dir(&projects_dir).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&project_registry_dir).unwrap().count(), 0);
 }
 
 #[test]
 fn register_project_overwrite_semantics_are_accurate() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
     let policy = project_policy(tmp.path());
     let payload = |overwrite| {
@@ -580,7 +615,7 @@ fn register_project_overwrite_semantics_are_accurate() {
 
     let first = project_ok(handle_project_op(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request("register_project", payload(false)),
     ));
     assert_eq!(first["created_config"], true);
@@ -588,7 +623,7 @@ fn register_project_overwrite_semantics_are_accurate() {
 
     let retry = project_ok(handle_project_op(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request("register_project", payload(false)),
     ));
     assert_eq!(retry["recovered"], true);
@@ -596,7 +631,7 @@ fn register_project_overwrite_semantics_are_accurate() {
 
     let overwritten = project_ok(handle_project_op(
         &policy,
-        &projects_dir,
+        &project_registry_dir,
         &project_request("register_project", payload(true)),
     ));
     assert_eq!(overwritten["created_config"], false);

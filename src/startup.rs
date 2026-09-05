@@ -1,4 +1,20 @@
 use crate::{project_entry, task_cli};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegularServerTunnelOptions {
+    pub local_server_url: String,
+    pub user_token_file: PathBuf,
+}
+
+pub async fn run_regular_server_tunnel(options: RegularServerTunnelOptions) -> Result<(), String> {
+    project_entry::run_regular_server_tunnel(&project_entry::RegularServerTunnelOptions {
+        local_server_url: options.local_server_url,
+        user_token_file: options.user_token_file,
+    })
+    .await
+    .map_err(|error| project_entry::render_error(&error, true))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProjectCliAction {
@@ -194,7 +210,10 @@ pub async fn run_project_command(args: Vec<String>) -> CliCommandOutput {
             Ok(()) => CliCommandOutput::success(String::new()),
             Err(error) => CliCommandOutput::failure(
                 1,
-                format!("{}\n", project_entry::render_error(&error, false)),
+                format!(
+                    "{}\n",
+                    project_entry::render_error(&error, options.project.json)
+                ),
             ),
         },
         ProjectCliAction::Task(command) => match task_cli::run(command) {
@@ -250,6 +269,14 @@ mod tests {
             project_cli_action(["share", "--tunnel", "openai"]),
             ProjectCliAction::Share(project_entry::ShareCommandOptions {
                 tunnel: project_entry::TunnelProvider::OpenAiSecure,
+                ..
+            })
+        ));
+        assert!(matches!(
+            project_cli_action(["share", "--tunnel", "none", "--json"]),
+            ProjectCliAction::Share(project_entry::ShareCommandOptions {
+                project: project_entry::ProjectCommandOptions { json: true, .. },
+                tunnel: project_entry::TunnelProvider::None,
                 ..
             })
         ));

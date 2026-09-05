@@ -761,7 +761,7 @@ impl CodingAgentManager {
     pub(crate) fn handle(
         self: &Arc<Self>,
         request: CodingAgentRequest,
-        projects_dir: &Path,
+        project_registry_dir: &Path,
     ) -> CodingAgentResponse {
         if let Err(error) = validate_request(&request) {
             return response_error(
@@ -773,7 +773,7 @@ impl CodingAgentManager {
             );
         }
         match request {
-            CodingAgentRequest::Start(request) => self.start(request, projects_dir),
+            CodingAgentRequest::Start(request) => self.start(request, project_registry_dir),
             CodingAgentRequest::Observe(request) => {
                 let entry = self.runs.lock().unwrap().get(&request.run_id).cloned();
                 match entry {
@@ -1050,7 +1050,7 @@ impl CodingAgentManager {
     fn start(
         self: &Arc<Self>,
         request: webcodex_core::coding_agent::CodingAgentStartRequest,
-        projects_dir: &Path,
+        project_registry_dir: &Path,
     ) -> CodingAgentResponse {
         #[cfg(test)]
         {
@@ -1121,7 +1121,7 @@ impl CodingAgentManager {
             );
         }
         if !project_binding_matches(
-            projects_dir,
+            project_registry_dir,
             &self.client_id,
             &request.runtime_project_id,
             &request.project_root,
@@ -2632,7 +2632,7 @@ fn frame_message(value: &Value) -> std::io::Result<Vec<u8>> {
 }
 
 fn project_binding_matches(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     client_id: &str,
     runtime_project_id: &str,
     root: &str,
@@ -2643,7 +2643,7 @@ fn project_binding_matches(
     if !requested_root.is_dir() {
         return false;
     }
-    load_runner_project_summaries_from_dir(projects_dir)
+    load_runner_project_summaries_from_dir(project_registry_dir)
         .into_iter()
         .any(|project| {
             if format!("agent:{client_id}:{}", project.id) != runtime_project_id
@@ -2981,6 +2981,7 @@ for line in sys.stdin:
   else:
    v=m['params']['value']; opts=[{'id':'mode','name':'Mode','type':'select','currentValue':v,'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   send({'jsonrpc':'2.0','id':rid,'result':{'configOptions':opts}})
+  if scenario=='slow_configs': log({'config_applied':k})
  elif method=='session/prompt':
   if scenario=='crash_after_prompt': sys.exit(7)
   if scenario=='spawn_descendant':
@@ -4299,14 +4300,15 @@ for line in sys.stdin:
                 .and_then(|t| t.error_code.as_deref()),
             Some("coding_agent_setup_timeout")
         );
-        let methods = received_methods(&wire_log(&temp));
+        let log = wire_log(&temp);
+        let methods = received_methods(&log);
+        let completed_configs = log
+            .iter()
+            .filter(|entry| entry.get("config_applied").is_some())
+            .count();
         assert!(
-            methods
-                .iter()
-                .filter(|m| m.as_str() == "session/set_config_option")
-                .count()
-                >= 3,
-            "expected cumulative config setup before total deadline: {methods:?}"
+            completed_configs < 4,
+            "the total run deadline must expire before all slow config responses complete: {log:?}"
         );
         assert_eq!(
             methods
@@ -5358,7 +5360,7 @@ for line in sys.stdin:
     fn real_codex_acp_opt_in_dogfood() {
         let temp = TempDir::new().unwrap();
         let root = std::env::current_dir().unwrap();
-        let projects = temp.path().join("projects.d");
+        let projects = temp.path().join("project-registry");
         fs::create_dir_all(&projects).unwrap();
         fs::write(
             projects.join("dogfood.toml"),

@@ -4,7 +4,6 @@
 //! No HTTP framework types here — pure Rust input/output.
 
 pub mod activity;
-mod agent_authorization;
 mod agent_task;
 mod cargo;
 mod cargo_tools;
@@ -24,6 +23,7 @@ mod file_listing;
 mod file_tools;
 pub(crate) mod files;
 mod git;
+mod runner_authorization;
 #[cfg(test)]
 pub(crate) use git::{framed_clean_show_changes_test_stdout, framed_show_changes_test_block};
 mod git_committed;
@@ -33,12 +33,13 @@ mod handoff;
 mod handoff_brief;
 mod handoff_tools;
 mod helpers;
+#[cfg(test)]
+pub(crate) use helpers::test_shell;
 mod hygiene;
 mod hygiene_tools;
 mod job_tools;
 mod jobs;
 pub(crate) mod kernel;
-mod local_jobs;
 mod lsp_tools;
 pub(crate) mod memory;
 pub(crate) mod metadata;
@@ -83,27 +84,21 @@ mod validation_events;
 pub(crate) mod validation_parser;
 pub(crate) mod validation_profile;
 
-/// Hard repository ceiling for model-facing ToolSpec and OpenAPI operation descriptions.
-/// Prefer 300 characters or fewer when semantics remain complete; brevity must not
-/// remove required authority, retry, continuation, uncertainty, safety, or recovery semantics.
 #[cfg(test)]
-pub(crate) const MODEL_TOOL_DESCRIPTION_MAX_CHARS: usize = 600;
+pub(crate) use webcodex_tool_contracts::MODEL_TOOL_DESCRIPTION_MAX_CHARS;
 
 // Re-export the public API so `crate::tool_runtime::ToolCall` etc. still work.
 #[cfg(test)]
 pub use crate::apply_edits_shared::ApplyTextLineScope;
-#[cfg(test)]
-pub(crate) use agent_authorization::required_agent_capability;
 #[cfg(test)]
 pub(crate) use files::MAX_PROJECT_ARTIFACT_BYTES;
 pub(crate) use files::{
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot,
     MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH,
 };
-pub(crate) use local_jobs::ACTIVE_JOB_STATUSES;
-#[cfg(test)]
-pub(crate) use local_jobs::{LocalJobKiller, LocalJobRecord, SystemJobKiller, TerminateOutcome};
 pub(crate) use patch::MAX_UNIFIED_DIFF_BYTES;
+#[cfg(test)]
+pub(crate) use runner_authorization::required_runner_capability;
 pub use runtime::ToolRuntime;
 pub use runtime_info::RuntimeInfo;
 #[cfg(test)]
@@ -118,31 +113,27 @@ pub(crate) use tool_call::{
 #[cfg(test)]
 pub use tool_definition::is_known_tool_name;
 #[cfg(test)]
-pub(crate) use tool_definition::is_model_hidden_tool_name;
-#[cfg(test)]
 pub(crate) use tool_definition::{
     known_tool_names, model_hidden_tool_names, runtime_tool_category as tool_manifest_category,
-    AgentCapability,
+    RunnerCapabilityRequirement,
 };
-pub use tool_inputs::{
-    default_true, ApplyFileChangeInput, ExecutionPurpose, ExecutionShell, ListToolsOptions,
-};
+#[cfg(test)]
+pub use tool_inputs::ApplyFileChangeInput;
+pub use tool_inputs::{default_true, ExecutionPurpose, ExecutionShell, ListToolsOptions};
 #[cfg(test)]
 pub use tool_inputs::{
     ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, CheckpointValidationInput,
     SessionMode, StartupDetail,
 };
 pub use tool_result::ToolResult;
-pub(crate) use tool_result::{
-    RecoveryKind, RecoveryTool, RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES,
-};
+pub(crate) use tool_result::{RecoveryKind, RecoveryTool, RECOVERY_KIND_VALUES};
 pub use tool_spec::ToolSpec;
 
 use serde_json::json;
 
 #[cfg(test)]
 pub(crate) use project_resolution::ProjectResolverErrorKind;
-pub(crate) use project_resolution::{agent_project_runtime_id, ProjectResolverError};
+pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
 #[cfg(test)]
 pub(crate) use registry::accepted_flattened_args_for_spec;
 pub(crate) use registry::{
@@ -153,7 +144,7 @@ pub(crate) use registry::{
 pub(crate) use session_context::{add_session_hint, unknown_session_result};
 pub(crate) use session_shell::SessionShellRegistry;
 #[cfg(test)]
-pub(crate) use surface::{recommended_flows, registered_tool_categories};
+pub(crate) use surface::registered_tool_categories;
 
 pub(crate) fn tool_disabled_result(tool_name: &str, message: &'static str) -> ToolResult {
     let error_kind = format!("{tool_name}_disabled");

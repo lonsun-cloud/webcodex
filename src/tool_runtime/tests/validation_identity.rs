@@ -46,6 +46,7 @@ fn record_run_process(
         &ledger_arguments,
         Some(project.to_string()),
         metadata,
+        crate::tool_runtime::sessions::session_tool_contract("run_process"),
     );
     let output = json!({
         "exit_code": if success { 0 } else { 1 },
@@ -75,7 +76,7 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
         &runtime,
         "validation-shell-job",
         &auth,
-        crate::shell_protocol::ShellClientCapabilities {
+        crate::runner_protocol::RunnerCapabilities {
             shell: true,
             async_shell_jobs: true,
             ..Default::default()
@@ -117,14 +118,14 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
                 .await
         }
     });
-    let request = wait_for_agent_request_for_client(&runtime, "validation-shell-job").await;
+    let request = wait_for_runner_request_for_client(&runtime, "validation-shell-job").await;
     assert_eq!(request.kind, "start_job");
     let job_id = request.job_id.clone().expect("promoted shell Job id");
     runtime
-        .shell_clients
-        .update_job(crate::shell_protocol::ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(crate::runner_protocol::RunnerJobUpdateRequest {
             client_id: "validation-shell-job".to_string(),
-            agent_instance_id: "inst-validation-shell-job".to_string(),
+            runner_instance_id: "inst-validation-shell-job".to_string(),
             update_seq: None,
             job_id: job_id.clone(),
             request_id: Some(request.request_id.clone()),
@@ -139,6 +140,7 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            activity: None,
             finished: false,
         })
         .await
@@ -149,10 +151,10 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
     assert_eq!(handoff.output["job_id"], job_id);
 
     runtime
-        .shell_clients
-        .update_job(crate::shell_protocol::ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(crate::runner_protocol::RunnerJobUpdateRequest {
             client_id: "validation-shell-job".to_string(),
-            agent_instance_id: "inst-validation-shell-job".to_string(),
+            runner_instance_id: "inst-validation-shell-job".to_string(),
             update_seq: None,
             job_id,
             request_id: Some(request.request_id),
@@ -166,9 +168,10 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
             duration_ms: Some(12),
             error: None,
             command_execution_state: Some(
-                crate::shell_protocol::ShellCommandExecutionState::Completed,
+                crate::runner_protocol::ShellCommandExecutionState::Completed,
             ),
             validation_progress: None,
+            activity: None,
             finished: true,
         })
         .await
@@ -447,6 +450,7 @@ fn generic_assertion_success_cannot_resolve_structured_failure_with_hidden_asser
         &call.session_log_arguments(),
         Some(project.to_string()),
         metadata,
+        crate::tool_runtime::sessions::session_tool_contract("cargo_test"),
     );
     store.record_tool_call_finished(
         start,
