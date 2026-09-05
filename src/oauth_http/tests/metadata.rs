@@ -263,3 +263,45 @@ async fn oauth_protected_resource_metadata_omits_scopes_supported() {
     let body: serde_json::Value = resp.take_json().await.unwrap();
     assert!(body.get("scopes_supported").is_none());
 }
+
+#[tokio::test]
+async fn oauth_authorization_server_metadata_advertises_dcr_only_when_enabled() {
+    for (oauth2, expected) in [
+        (oauth2_enabled(), None),
+        (
+            oauth2_enabled_dcr(),
+            Some("https://codex.example.com/oauth/register"),
+        ),
+    ] {
+        let config = test_config(oauth2);
+        let (_tmp, db) = test_db();
+        let service = Service::new(build_router(config, db));
+        let mut resp = TestClient::get("http://localhost/.well-known/oauth-authorization-server")
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::OK));
+        let body: serde_json::Value = resp.take_json().await.unwrap();
+        assert_eq!(
+            body.get("registration_endpoint")
+                .and_then(|value| value.as_str()),
+            expected
+        );
+        assert_eq!(
+            body["token_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_post"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn oauth_path_specific_protected_resource_metadata_is_public() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let service = Service::new(build_router(config, db));
+    let mut resp = TestClient::get("http://localhost/.well-known/oauth-protected-resource/mcp")
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(body["resource"], "http://localhost/mcp");
+}

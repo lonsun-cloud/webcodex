@@ -2,6 +2,7 @@
 //!
 //! - `POST /oauth/token` — token endpoint (authorization_code, refresh_token)
 //! - `POST /oauth/revoke` — token revocation endpoint (RFC 7009)
+//! - `POST /oauth/register` — optional dynamic client registration (RFC 7591)
 //! - `GET /.well-known/oauth-protected-resource` — protected resource metadata
 //! - `GET /.well-known/oauth-authorization-server` — authorization server metadata
 //!
@@ -18,7 +19,8 @@
 //! - Revocation is idempotent: unknown, already-revoked, and other-client
 //!   tokens all return HTTP 200 without disclosing token state.
 //! - Client secret is verified with constant-time comparison.
-//! - Only `application/x-www-form-urlencoded` content type is accepted.
+//! - Token/revoke accept only `application/x-www-form-urlencoded`; RFC 7591
+//!   registration accepts only `application/json`.
 //! - Request body size is bounded (16 KiB).
 //! - All responses include `Cache-Control: no-store` and `Pragma: no-cache`.
 //! - Plaintext tokens are returned **only once** in the response.
@@ -29,6 +31,7 @@ mod html;
 mod managed_authorize;
 mod metadata;
 mod project_share;
+mod registration;
 mod responses;
 mod revoke;
 mod scope_registry;
@@ -66,6 +69,7 @@ pub(crate) use project_share::oauth_authorize_project;
 pub(crate) use project_share::{
     normalize_project_share_oauth_scopes, PROJECT_SHARE_OAUTH_INVALID_SCOPE_MESSAGE,
 };
+pub(crate) use registration::oauth_register;
 use responses::{apply_oauth_no_store_headers, oauth_error};
 pub(crate) use revoke::oauth_revoke;
 pub(crate) use scope_registry::{

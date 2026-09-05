@@ -2664,53 +2664,81 @@ async fn http_mcp_notification_returns_accepted_with_empty_body() {
         .send(&service)
         .await;
     assert_eq!(effective_status(&resp), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let text = resp.take_string().await.unwrap();
     assert!(text.is_empty(), "notification response body must be empty");
 }
 
 #[tokio::test]
-async fn http_mcp_get_discovery_returns_metadata() {
+async fn http_mcp_get_is_method_not_allowed_for_json_only_transport() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
     let service = Service::new(build_test_router(config, db, runtime));
-    let mut resp = TestClient::get("http://localhost/mcp")
+    let resp = TestClient::get("http://localhost/mcp")
         .bearer_auth("secret")
         .send(&service)
         .await;
-    assert_eq!(effective_status(&resp), StatusCode::OK);
-    let body: Value = resp.take_json().await.unwrap();
-    assert_eq!(body["name"], "webcodex");
-    assert!(body["version"].is_string());
-    assert_eq!(body["protocol"], "mcp");
+    assert_eq!(effective_status(&resp), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(
-        body["runtimeExposure"],
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
+        resp.headers
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
     );
-    assert!(body["protocolVersion"].is_string());
-    assert_eq!(body["endpoint"], "/mcp");
-    let methods = body["methods"].as_array().unwrap();
-    let method_names: Vec<String> = methods
-        .iter()
-        .map(|m| m.as_str().unwrap().to_string())
-        .collect();
-    assert!(method_names.contains(&"initialize".to_string()));
-    assert!(method_names.contains(&"tools/list".to_string()));
-    assert!(method_names.contains(&"tools/call".to_string()));
-    assert!(method_names.contains(&"notifications/initialized".to_string()));
-    assert_eq!(body["auth"]["type"], "bearer");
-    assert_eq!(body["auth"]["required"], true);
-    assert_eq!(
-        body["auth"]["header"],
-        "Authorization: Bearer <shared_key_or_wc_pat>"
-    );
-    let auth_json = body["auth"].to_string();
-    assert!(
-        auth_json.contains("shared_key_or_wc_pat"),
-        "MCP auth metadata must advertise shared key or wc_pat bearer use: {auth_json}"
-    );
-    assert!(
-        !auth_json.contains("wc_pat_user_api_token"),
-        "MCP auth metadata must not regress to PAT-only placeholder: {auth_json}"
-    );
+}
+
+fn contains_empty_enum(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            (key == "enum" && value.as_array().is_some_and(Vec::is_empty))
+                || contains_empty_enum(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_empty_enum),
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn http_mcp_tools_list_has_strict_client_compatible_schemas_and_annotations() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let (status, body) = legacy_mcp_jsonrpc(
+        &service,
+        "secret",
+        json!({"jsonrpc": "2.0", "id": 901, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert!(!tools.is_empty());
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        assert!(
+            !contains_empty_enum(&tool["inputSchema"]),
+            "{name} inputSchema"
+        );
+        if let Some(output_schema) = tool.get("outputSchema") {
+            assert!(!contains_empty_enum(output_schema), "{name} outputSchema");
+        }
+        let annotations = tool["annotations"].as_object().unwrap();
+        for key in [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ] {
+            assert!(
+                annotations.get(key).is_some_and(Value::is_boolean),
+                "{name} annotation {key} must be boolean: {annotations:?}"
+            );
+        }
+    }
 }

@@ -34,20 +34,19 @@ use crate::tool_runtime::{
 #[cfg(test)]
 use base64::Engine as _;
 use futures_util::stream;
-use http_metadata::{request_header, validate_http_protocol, MCP_PROTOCOL_VERSION_HEADER};
+use http_metadata::validate_http_protocol;
 #[cfg(test)]
 use http_metadata::{
-    MCP_HEADER_MISMATCH, MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_UNSUPPORTED_PROTOCOL_VERSION,
+    MCP_HEADER_MISMATCH, MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
+    MCP_UNSUPPORTED_PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use protocol::{
     inferred_protocol_era, request_protocol_version, MCP_CHATGPT_PROTOCOL_VERSION,
+    MCP_DISPATCH_METHODS_FOR_TEST, MCP_PROTOCOL_VERSION, MCP_STATELESS_PROTOCOL_VERSION,
     MCP_SUPPORTED_PROTOCOL_VERSIONS,
 };
-use protocol::{
-    JsonRpcRequest, McpProtocolEra, MCP_INFO_METHODS, MCP_PROTOCOL_VERSION,
-    MCP_STATELESS_PROTOCOL_VERSION,
-};
+use protocol::{JsonRpcRequest, McpProtocolEra};
 use response::{rpc_error, rpc_result};
 use salvo::prelude::*;
 use serde_json::{json, Value};
@@ -208,60 +207,21 @@ fn mcp_tools_list_audit_summary(
 }
 
 #[handler]
-pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+pub async fn mcp_info(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
     if let Err((status, _, message)) = crate::auth::require_same_origin(req) {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
         res.status_code(status);
         res.render(json_error(status, message));
         return;
     }
-    if request_header(req, MCP_PROTOCOL_VERSION_HEADER) == Some(MCP_STATELESS_PROTOCOL_VERSION) {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        return;
-    }
-    let auth_required = crate::auth::get_config(depot)
-        .map(|c| c.is_auth_enabled())
-        .unwrap_or(false);
-    let Some(runtime) = runtime(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Tool runtime not configured",
-        ));
-        return;
-    };
-    let Some(connector_slot) = connector_runtime_slot(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MCP runtime exposure state not configured",
-        ));
-        return;
-    };
-    let runtime_exposure = runtime.runtime_exposure();
-    if let Err(error) =
-        validate_runtime_exposure_state(runtime_exposure, connector_slot.0.is_some())
-    {
-        tracing::error!(%error, "MCP runtime exposure state mismatch");
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
-        return;
-    }
-    res.render(Json(json!({
-        "name": "webcodex",
-        "version": env!("CARGO_PKG_VERSION"),
-        "runtimeExposure": runtime_exposure.name(),
-        "protocol": "mcp",
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "transport": "streamable-http-jsonrpc",
-        "endpoint": "/mcp",
-        "methods": MCP_INFO_METHODS,
-        "auth": {
-            "type": "bearer",
-            "required": auth_required,
-            "header": "Authorization: Bearer <shared_key_or_wc_pat>"
-        }
-    })));
+    // Streamable HTTP reserves GET for an optional SSE stream. WebCodex uses
+    // JSON responses to POST only, so every protocol era must reject GET rather
+    // than returning application/json that strict clients misinterpret as SSE.
+    res.headers_mut().insert(
+        salvo::http::header::ALLOW,
+        salvo::http::HeaderValue::from_static("POST"),
+    );
+    res.status_code(StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[handler]
@@ -734,6 +694,10 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             // with a JSON-RPC body. Acknowledge with 202 and an empty body.
             // Empty body size is known (0) without JSON serialization.
             guard.response_serialized(202, Some(0), Some(true), None, "notification");
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_TYPE,
+                salvo::http::HeaderValue::from_static("application/json"),
+            );
             res.status_code(StatusCode::ACCEPTED);
             guard.handler_returned(202, Some(0), Some(true), None, "notification");
         }

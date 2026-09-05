@@ -104,6 +104,45 @@ When OAuth is enabled, MCP clients can use the authorization-code flow instead o
 
 For ordinary hosted `connect --auth oauth`, the Runner keeps its hosted credential while the MCP client receives a separate OAuth credential. Add `--oauth-computer-permissions` or `--oauth-local-mcp` only when those optional capabilities are needed. Existing clients are not silently widened; a real permission change requires reauthorization.
 
+### Notion Custom MCP
+
+Notion Custom MCP connections require a Business or Enterprise workspace, the
+workspace setting for custom MCP servers to be enabled, and—when the workspace
+uses an approved-only policy—an allow-list entry from an administrator. The MCP
+endpoint must be reachable over public HTTPS; use
+`https://your-domain.example/mcp`, not a loopback address.
+
+WebCodex supports both Notion authentication choices:
+
+- **Bearer/API token:** configure Notion's header-based API-key option with a
+  scoped `wc_pat_*` token. WebCodex accepts it as `Authorization: Bearer ...`.
+  Do not put long-lived tokens in the URL query.
+- **OAuth:** enable OAuth and optionally RFC 7591 dynamic client registration
+  with `WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED=true`. DCR is off by
+  default. When enabled, discovery advertises `/oauth/register`; the registration
+  response returns a confidential client secret once and declares
+  `client_secret_post`. A request for public-client `none` is narrowed to the
+  actually supported confidential-client method. Authorization uses code + PKCE
+  S256, and refresh tokens rotate.
+
+Dynamically registered clients receive only this closed default ceiling:
+`runtime:read`, `project:read`, `project:write`, `job:run`, `computer:read`, and
+`computer:control`. They never receive `account:manage`, `admin`, `job:detach`,
+`agent:*`, or future scopes automatically. At least one enabled managed user must
+exist before registration; the first enabled user owns these clients. Put a
+rate limit on `/oauth/register` at the reverse proxy even though WebCodex also
+caps active dynamic registrations.
+
+The `/mcp` transport is POST-only JSON Streamable HTTP. `GET /mcp` returns 405
+with `Allow: POST`; notifications return 202 with an empty body and explicit
+`application/json`. Every advertised tool schema must be valid JSON Schema (in
+particular, no empty `enum`) and every tool exposes boolean read-only,
+destructive, idempotent, and open-world annotations. Notion scans `tools/list`
+and uses those tool semantics when deciding automatic execution versus user
+confirmation.
+
+For project-first sharing, the authorization page asks for the temporary Project share credential and issues an `oauth2_project` identity carrying only `runtime:read`, `project:read`, `project:write`, and `job:run`. It does not create a managed user and OAuth tokens cannot be used on Runner transport. Quick Tunnel issuer URLs change between runs; use `--tunnel none --public-url https://...` behind your own stable HTTPS proxy/tunnel when the OAuth issuer must remain stable.
+
 Project-first `share --auth oauth` remains bound to that temporary share environment. Managed-user OAuth is a separate advanced flow (`connect --auth managed-oauth`). OAuth credentials are never valid on Runner transport.
 
 For the credential and scope model, see [Authentication](AUTH_MODEL.md#oauth2).

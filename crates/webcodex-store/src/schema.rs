@@ -196,6 +196,8 @@ impl Database {
                 owner_shared_key_hash TEXT,
                 redirect_uris TEXT NOT NULL DEFAULT '',
                 allowed_scopes TEXT NOT NULL DEFAULT '',
+                refresh_token_mode TEXT NOT NULL DEFAULT 'rotating'
+                    CHECK(refresh_token_mode IN ('rotating', 'confidential_reuse')),
                 created_at INTEGER NOT NULL,
                 revoked_at INTEGER,
                 CHECK (
@@ -596,6 +598,8 @@ impl Database {
             ",
         )?;
 
+        Self::ensure_oauth_client_refresh_token_mode_schema(&mut conn)?;
+
         // Durable Agent identity and Conversation state are an independent
         // communication domain. Workflow Session and project Memory ledgers
         // remain separate authoritative stores.
@@ -618,6 +622,30 @@ impl Database {
         // are created above with the current execution schema; any pre-current
         // persisted shape must be recreated instead of being altered in place.
         Self::ensure_current_execution_schema(&conn)?;
+        Ok(())
+    }
+
+    fn ensure_oauth_client_refresh_token_mode_schema(conn: &mut Connection) -> anyhow::Result<()> {
+        if table_columns(conn, "oauth_clients")?
+            .iter()
+            .any(|column| column == "refresh_token_mode")
+        {
+            return Ok(());
+        }
+
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin OAuth client refresh-token mode migration")?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE oauth_clients
+                 ADD COLUMN refresh_token_mode TEXT NOT NULL DEFAULT 'rotating'
+                 CHECK(refresh_token_mode IN ('rotating', 'confidential_reuse'));",
+            )
+            .context("add OAuth client refresh-token mode")?;
+        transaction
+            .commit()
+            .context("commit OAuth client refresh-token mode migration")?;
         Ok(())
     }
 

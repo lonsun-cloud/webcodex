@@ -9,9 +9,9 @@ pub(super) const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     MCP_CHATGPT_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION,
 ];
-/// Single source of truth for the JSON-RPC methods advertised by `GET /mcp`.
-/// Must match the facade router; pinned by `mcp_info_advertised_methods_match_dispatch`.
-pub(super) const MCP_INFO_METHODS: &[&str] = &[
+/// Curated method set pinned by the MCP dispatch coverage test.
+#[cfg(test)]
+pub(super) const MCP_DISPATCH_METHODS_FOR_TEST: &[&str] = &[
     "server/discover",
     "initialize",
     "ping",

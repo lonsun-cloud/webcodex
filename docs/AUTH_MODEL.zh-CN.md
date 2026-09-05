@@ -93,6 +93,23 @@ OAuth 允许 MCP/GPT client 使用 authorization-code flow，而不是在 client
 - **refresh token** —— 用于刷新 access token；`offline_access` 本身不增加 WebCodex 权限；
 - **allowed scopes** —— 这个 client 最多可以请求哪些 WebCodex 权限。
 
+Server 支持 authorization-code grant、token 撤销、OAuth metadata，以及可选的
+RFC 7591 动态 client 注册。DCR 默认关闭；显式开启后，会为 Notion 等 MCP host 签发
+最小权限的 confidential `client_secret_post` client。OIDC、JWKS/JWT ID token 与
+device-code 流程未实现。OAuth 设置步骤见[部署指南](DEPLOYMENT.zh-CN.md#oauth2)。
+
+每个 OAuth client 的 refresh token 默认使用严格轮换：每次刷新都会撤销当前
+refresh token 并签发新 token。运维者可以改为让特定的受信任 confidential client
+使用稳定、不轮换的 refresh token（见[部署指南](DEPLOYMENT.zh-CN.md#oauth2)）。这种
+`confidential_reuse` client 必须是通过 DCR 注册、以 `client_secret_post` 认证的
+confidential client，且注册的唯一 redirect URI 必须与服务端 allow-list 精确匹配——
+client name 或 User-Agent 不能带来该信任；注册了额外 redirect URI 的 client 仍保持
+严格轮换。可复用的 refresh token 保持固定的绝对有效期，刷新不会延长；每次刷新只
+返回新的 access token，不签发新 refresh token；撤销、过期或任何
+client/subject/scope/resource/绑定不匹配仍会立即失败。已撤销的旧 refresh token 绝不
+会恢复。allow-list 只影响修改后新注册的 client；已有 client 保持严格轮换，需要重新
+注册并重新连接。
+
 WebCodex 新增 scope 时不会静默扩大已有 OAuth client 的权限上限。修改 allow-list 是显式管理操作，并会让旧 grant 失效，要求 client 重新授权。
 
 普通 hosted shared-key OAuth 使用 `webcodex connect ... --auth oauth`：Runner 继续使用 shared key，而 MCP client 获得独立 OAuth credential。`--oauth-computer-permissions` 显式开放该流程中的额外 Computer 权限；`--oauth-local-mcp` 显式开放 Runner-owned local MCP provider。Managed-user OAuth 仍是另一条高级流程（`--auth managed-oauth`）。

@@ -177,18 +177,19 @@ async fn http_project_connector_lists_and_dispatches_only_project_capabilities()
     ));
     let service = Service::new(build_connector_test_router(config, db, runtime, &project));
 
-    let mut discovery = TestClient::get("http://localhost/mcp")
+    // GET is reserved for optional SSE streams; the JSON-only transport rejects it.
+    let discovery = TestClient::get("http://localhost/mcp")
         .bearer_auth(user_token)
         .send(&service)
         .await;
-    assert_eq!(effective_status(&discovery), StatusCode::OK);
-    let discovery_body: Value = discovery.take_json().await.unwrap();
+    assert_eq!(effective_status(&discovery), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(
-        discovery_body["runtimeExposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
+        discovery
+            .headers
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
     );
-    assert!(discovery_body.get("modelSurface").is_none());
-    assert!(!discovery_body.to_string().contains("canonical_connector"));
 
     let mut schema = TestClient::get("http://localhost/openapi.json")
         .send(&service)

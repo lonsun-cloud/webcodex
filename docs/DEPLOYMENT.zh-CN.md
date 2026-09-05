@@ -348,6 +348,32 @@ WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
 WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
 
+如果要让 Notion 等 OAuth client 通过 RFC 7591 自动注册，再增加：
+
+```text
+WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED=true
+```
+
+DCR 默认关闭。只应在与 issuer 相同的稳定公网 HTTPS origin 上启用；启用前至少创建一个
+未禁用的 managed user，并在反向代理对 `POST /oauth/register` 限流。DCR 签发固定
+最小权限 ceiling 的 confidential `client_secret_post` client；明文 secret 只返回一次，
+数据库只保存 hash。
+
+DCR 注册的 client 默认使用严格 refresh-token 轮换：每次刷新撤销当前 refresh token
+并返回新 token。如需让特定受信任 MCP 宿主使用稳定的 refresh token，可配置精确匹配
+的 HTTPS redirect URI allow-list（逗号分隔）：
+
+```text
+WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS=https://notion.example/oauth/callback
+```
+
+新注册的 client 只有在恰好注册一个与该 allow-list 精确匹配的 redirect URI、且请求
+`refresh_token` grant 时，才会获得稳定 refresh token；每次刷新仍须以
+`client_secret_post` secret 认证。注册了额外 redirect URI 的 client，以及该配置修改前
+已注册的所有 client，仍保持严格轮换——修改 allow-list 后，这些 client 必须重新注册
+并重新连接。稳定 refresh token 的绝对有效期不会延长，每次刷新只返回新的
+access token（不签发新 refresh token），已撤销或过期的 refresh token 绝不会恢复。
+
 普通仓库机器不需要 managed login，直接使用 MCP 客户端要求的精确 callback：
 
 ```bash
@@ -382,8 +408,8 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 如果启用 ChatGPT MCP host-file import，请把精确的 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`。重新创建 client 会生成新 id，因此应把更新这个设置作为一次显式 trust rotation。Client display name 与 redirect URI 不能替代该精确 client id。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
-撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
-device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级
+撤销 client。OAuth 使用 authorization-code 流程；RFC 7591 DCR 只有显式开启时才
+可用，OIDC 与 device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级
 refresh-token scope，不授予额外 WebCodex 权限。
 
 ## GPT Actions 与 MCP

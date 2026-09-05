@@ -1974,3 +1974,258 @@ async fn refresh_token_scope_parameter_rejected() {
     let json: serde_json::Value = resp.take_json().await.unwrap();
     assert_eq!(json["error"], "invalid_request");
 }
+
+// -----------------------------------------------------------------------
+// refresh_token grant — confidential_reuse refresh-token mode
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn confidential_reuse_refresh_reuses_stable_refresh_token() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_confidential_reuse_client(&db, &user, "Notion");
+    let (old_rt, old_rt_plaintext) = seed_refresh_token(&db, &client, &user, "runtime:read");
+
+    let (at_start, rt_start) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+
+    // The same refresh token can be used repeatedly; each use returns only a
+    // fresh access token.
+    let mut access_tokens = Vec::new();
+    for _ in 0..2 {
+        let body = form_body(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &old_rt_plaintext),
+            ("client_id", &client.client_id),
+            ("client_secret", &secret),
+        ]);
+        let mut resp = post_form("http://localhost/oauth/token", body)
+            .send(&service)
+            .await;
+        assert_eq!(resp.status_code, Some(StatusCode::OK));
+        let json: serde_json::Value = resp.take_json().await.unwrap();
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(json["expires_in"], 3600);
+        assert_eq!(json["scope"], "runtime:read");
+        assert!(
+            json.get("refresh_token").is_none(),
+            "confidential reuse must not return a new refresh token"
+        );
+        access_tokens.push(json["access_token"].as_str().unwrap().to_string());
+    }
+    assert_ne!(
+        access_tokens[0], access_tokens[1],
+        "each refresh returns a distinct access token"
+    );
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_start + 2, at_after, "one access token per refresh");
+    assert_eq!(rt_start, rt_after, "no refresh token is created or rotated");
+
+    let conn = db.conn_for_tests();
+    let (revoked_at, last_used_at, expires_at): (Option<i64>, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT revoked_at, last_used_at, expires_at FROM oauth_refresh_tokens WHERE id = ?1",
+            [&old_rt.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(revoked_at.is_none(), "reusable refresh token stays active");
+    assert!(last_used_at.is_some(), "reusable refresh token records use");
+    assert_eq!(
+        expires_at, old_rt.expires_at,
+        "refresh expiry must not be extended"
+    );
+}
+
+#[tokio::test]
+async fn confidential_reuse_refresh_wrong_secret_mutates_nothing() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, _) = seed_confidential_reuse_client(&db, &user, "Notion");
+    let (old_rt, old_rt_plaintext) = seed_refresh_token(&db, &client, &user, "runtime:read");
+
+    let (at_before, rt_before) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &old_rt_plaintext),
+        ("client_id", &client.client_id),
+        ("client_secret", "wrong-secret"),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::UNAUTHORIZED));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_client");
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after, "no access token on wrong secret");
+    assert_eq!(rt_before, rt_after, "no refresh token on wrong secret");
+    let last_used_at: Option<i64> = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT last_used_at FROM oauth_refresh_tokens WHERE id = ?1",
+            [&old_rt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_used_at, None, "wrong secret must not record token use");
+}
+
+#[tokio::test]
+async fn confidential_reuse_refresh_rejects_other_client() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, _) = seed_confidential_reuse_client(&db, &user, "Notion");
+    let (_, old_rt_plaintext) = seed_refresh_token(&db, &client, &user, "runtime:read");
+    // A second trusted client still must not use the first client's token.
+    let (other_client, other_secret) = seed_confidential_reuse_client(&db, &user, "Other");
+
+    let (at_before, rt_before) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &old_rt_plaintext),
+        ("client_id", &other_client.client_id),
+        ("client_secret", &other_secret),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after, "no access token on client mismatch");
+    assert_eq!(rt_before, rt_after, "no refresh token on client mismatch");
+}
+
+#[tokio::test]
+async fn confidential_reuse_refresh_rejects_resource_switch() {
+    let config = test_config(oauth2_enabled_no_pkce_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_confidential_reuse_client(&db, &user, "Notion");
+    let (_old_rt, old_rt_plaintext) = seed_refresh_token_with_resource(
+        &db,
+        &client,
+        &user,
+        "runtime:read",
+        Some("https://example.test/mcp"),
+    );
+
+    let (at_before, rt_before) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &old_rt_plaintext),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("resource", "https://example.test/other"),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_target");
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after, "no access token on resource switch");
+    assert_eq!(rt_before, rt_after, "no refresh token on resource switch");
+}
+
+#[tokio::test]
+async fn confidential_reuse_refresh_rejects_expired_refresh_token() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_confidential_reuse_client(&db, &user, "Notion");
+
+    // Create an already-expired refresh token.
+    let now = chrono::Utc::now().timestamp();
+    let plaintext = crate::auth::generate_oauth_refresh_token();
+    let record = crate::models::OAuthRefreshTokenRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: hash_token(&plaintext),
+        client_id: client.client_id.clone(),
+        subject_kind: "managed_user".to_string(),
+        subject_id: user.id.clone(),
+        user_id: Some(user.id.clone()),
+        scopes: "runtime:read".to_string(),
+        resource: None,
+        shared_key_hash: None,
+        created_at: now - 600,
+        expires_at: now - 1, // already expired
+        revoked_at: None,
+        last_used_at: None,
+        rotated_from_id: None,
+    };
+    db.insert_oauth_refresh_token(&record).unwrap();
+
+    let (at_before, rt_before) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &plaintext),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after, "no access token on expired refresh");
+    assert_eq!(rt_before, rt_after, "no refresh token on expired refresh");
+}
+
+#[tokio::test]
+async fn confidential_reuse_refresh_never_revives_revoked_token() {
+    let config = test_config(oauth2_enabled_no_pkce());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_confidential_reuse_client(&db, &user, "Notion");
+    let (old_rt, old_rt_plaintext) = seed_refresh_token(&db, &client, &user, "runtime:read");
+
+    // Revoke the refresh token.
+    let now = chrono::Utc::now().timestamp();
+    db.revoke_oauth_refresh_token(&old_rt.id, now).unwrap();
+
+    let (at_before, rt_before) = oauth_token_counts(&db);
+    let service = Service::new(build_router(config, db.clone()));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &old_rt_plaintext),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+    ]);
+    let mut resp = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+    let json: serde_json::Value = resp.take_json().await.unwrap();
+    assert_eq!(json["error"], "invalid_grant");
+
+    let (at_after, rt_after) = oauth_token_counts(&db);
+    assert_eq!(at_before, at_after, "no access token on revoked refresh");
+    assert_eq!(rt_before, rt_after, "no refresh token on revoked refresh");
+    let revoked_at: Option<i64> = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT revoked_at FROM oauth_refresh_tokens WHERE id = ?1",
+            [&old_rt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revoked_at, Some(now), "revoked refresh token stays revoked");
+}

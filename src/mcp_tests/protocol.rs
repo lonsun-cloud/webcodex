@@ -82,9 +82,9 @@ async fn mcp_2026_ping_is_removed() {
 }
 
 #[tokio::test]
-async fn mcp_info_advertised_methods_match_dispatch() {
+async fn mcp_supported_methods_match_dispatch() {
     let runtime = test_runtime();
-    for method in MCP_INFO_METHODS {
+    for method in MCP_DISPATCH_METHODS_FOR_TEST {
         let params = match *method {
             "server/discover" | "resources/list" => mcp_2026_ui_params(json!({})),
             "resources/read" => mcp_2026_ui_params(json!({ "uri": MCP_COMPUTER_UI_RESOURCE_URI })),

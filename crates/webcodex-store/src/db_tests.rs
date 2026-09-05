@@ -1682,3 +1682,470 @@ fn rotate_refresh_token_rejects_subject_mismatch_with_old_refresh() {
         .unwrap();
     assert_eq!(access_count, 0);
 }
+
+// -----------------------------------------------------------------------
+// OAuth2 client refresh-token mode (rotating default / confidential reuse)
+// -----------------------------------------------------------------------
+
+fn oauth_refresh_record(
+    client: &OAuthClientRecord,
+    user: &UserRecord,
+    now: i64,
+) -> OAuthRefreshTokenRecord {
+    OAuthRefreshTokenRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: oauth_fixture_hash(&oauth_fixture_plaintext("refresh_token")),
+        client_id: client.client_id.clone(),
+        subject_kind: "managed_user".to_string(),
+        subject_id: user.id.clone(),
+        user_id: Some(user.id.clone()),
+        scopes: "runtime:read".to_string(),
+        resource: None,
+        shared_key_hash: None,
+        created_at: now,
+        expires_at: now + 2_592_000,
+        revoked_at: None,
+        last_used_at: None,
+        rotated_from_id: None,
+    }
+}
+
+fn oauth_access_record_for_refresh(
+    refresh: &OAuthRefreshTokenRecord,
+    now: i64,
+) -> OAuthAccessTokenRecord {
+    OAuthAccessTokenRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: oauth_fixture_hash(&oauth_fixture_plaintext("access_token")),
+        client_id: refresh.client_id.clone(),
+        subject_kind: refresh.subject_kind.clone(),
+        subject_id: refresh.subject_id.clone(),
+        user_id: refresh.user_id.clone(),
+        scopes: refresh.scopes.clone(),
+        resource: refresh.resource.clone(),
+        shared_key_hash: refresh.shared_key_hash.clone(),
+        created_at: now,
+        expires_at: now + 3600,
+        revoked_at: None,
+        last_used_at: None,
+    }
+}
+
+fn oauth_access_and_refresh_counts(db: &Database) -> (i64, i64) {
+    let conn = db.conn_for_tests();
+    let at: i64 = conn
+        .query_row("SELECT COUNT(*) FROM oauth_access_tokens", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let rt: i64 = conn
+        .query_row("SELECT COUNT(*) FROM oauth_refresh_tokens", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    (at, rt)
+}
+
+#[test]
+fn fresh_oauth_clients_table_declares_refresh_token_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let conn = db.conn_for_tests();
+    let cols = table_column_names(&conn, "oauth_clients");
+    assert!(
+        cols.iter().any(|c| c == "refresh_token_mode"),
+        "oauth_clients must declare refresh_token_mode"
+    );
+}
+
+#[test]
+fn insert_oauth_client_defaults_to_rotating_refresh_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let (client, _) = oauth_seed_client(&db, &user, "Test App");
+    assert_eq!(
+        db.get_oauth_client_refresh_token_mode(&client.client_id)
+            .unwrap(),
+        Some(OAuthRefreshTokenMode::Rotating)
+    );
+}
+
+#[test]
+fn confidential_reuse_mode_persists_and_is_hidden_after_revoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let now = chrono::Utc::now().timestamp();
+    let record = OAuthClientRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        client_id: format!(
+            "wc_client_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        client_secret_hash: oauth_fixture_hash(&oauth_fixture_plaintext("client_secret")),
+        name: "[dynamic] Notion".to_string(),
+        owner_user_id: Some(user.id.clone()),
+        owner_project_grant_id: None,
+        owner_shared_key_hash: None,
+        redirect_uris: "https://notion.example/oauth/callback".to_string(),
+        allowed_scopes: "runtime:read offline_access".to_string(),
+        created_at: now,
+        revoked_at: None,
+    };
+    db.insert_oauth_client_with_refresh_token_mode(
+        &record,
+        OAuthRefreshTokenMode::ConfidentialReuse,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_oauth_client_refresh_token_mode(&record.client_id)
+            .unwrap(),
+        Some(OAuthRefreshTokenMode::ConfidentialReuse)
+    );
+
+    // A revoked client no longer resolves to any refresh mode.
+    db.revoke_oauth_client(&record.id, now + 10).unwrap();
+    assert_eq!(
+        db.get_oauth_client_refresh_token_mode(&record.client_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn oauth_clients_refresh_token_mode_check_rejects_unknown_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let conn = db.conn_for_tests();
+    let result = conn.execute(
+        "INSERT INTO oauth_clients (
+            id, client_id, client_secret_hash, name, owner_user_id,
+            owner_project_grant_id, owner_shared_key_hash, redirect_uris,
+            allowed_scopes, refresh_token_mode, created_at, revoked_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, '', '', ?6, 0, NULL)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            format!("wc_client_{}", uuid::Uuid::new_v4().simple()),
+            oauth_fixture_hash("secret"),
+            "Bad Mode App",
+            user.id,
+            "sliding",
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "an unknown refresh_token_mode must be rejected by the CHECK constraint"
+    );
+}
+
+#[test]
+fn legacy_oauth_clients_table_gains_refresh_token_mode_on_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("oauth.db");
+    {
+        // Build a pre-migration database: oauth_clients has no
+        // refresh_token_mode column and one historical client row.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                display_name TEXT,
+                role TEXT NOT NULL DEFAULT 'user',
+                disabled_at INTEGER,
+                updated_at INTEGER
+            );
+            INSERT INTO users (id, username, created_at) VALUES ('u-legacy', 'legacy', 1);
+            CREATE TABLE oauth_clients (
+                id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL UNIQUE,
+                client_secret_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                owner_user_id TEXT,
+                owner_project_grant_id TEXT,
+                owner_shared_key_hash TEXT,
+                redirect_uris TEXT NOT NULL DEFAULT '',
+                allowed_scopes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                CHECK (
+                    (owner_user_id IS NOT NULL AND owner_project_grant_id IS NULL AND owner_shared_key_hash IS NULL)
+                    OR (owner_user_id IS NULL AND owner_project_grant_id IS NOT NULL AND owner_shared_key_hash IS NULL)
+                    OR (owner_user_id IS NULL AND owner_project_grant_id IS NULL AND owner_shared_key_hash IS NOT NULL)
+                ),
+                FOREIGN KEY(owner_user_id) REFERENCES users(id)
+            );
+            INSERT INTO oauth_clients (
+                id, client_id, client_secret_hash, name, owner_user_id,
+                redirect_uris, allowed_scopes, created_at
+            ) VALUES (
+                'legacy-row', 'wc_client_legacy', 'hash-legacy', 'Legacy App',
+                'u-legacy', 'https://legacy.example/cb', 'runtime:read', 1
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    {
+        let conn = db.conn_for_tests();
+        let cols = table_column_names(&conn, "oauth_clients");
+        assert!(
+            cols.iter().any(|c| c == "refresh_token_mode"),
+            "open must add refresh_token_mode to a legacy oauth_clients table"
+        );
+        // Historical clients migrate to rotating; none are silently trusted.
+        let mode: String = conn
+            .query_row(
+                "SELECT refresh_token_mode FROM oauth_clients WHERE client_id = 'wc_client_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "rotating");
+    }
+    assert_eq!(
+        db.get_oauth_client_refresh_token_mode("wc_client_legacy")
+            .unwrap(),
+        Some(OAuthRefreshTokenMode::Rotating)
+    );
+    drop(db);
+
+    // Reopening a migrated database must be a no-op, not an error.
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_oauth_client_refresh_token_mode("wc_client_legacy")
+            .unwrap(),
+        Some(OAuthRefreshTokenMode::Rotating)
+    );
+}
+
+#[test]
+fn reusable_refresh_issues_only_access_token_and_keeps_refresh_stable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let (client, _) = oauth_seed_client(&db, &user, "Test App");
+    let now = chrono::Utc::now().timestamp();
+    let refresh = oauth_refresh_record(&client, &user, now);
+    db.insert_oauth_refresh_token(&refresh).unwrap();
+
+    let (at_start, rt_start) = oauth_access_and_refresh_counts(&db);
+
+    // First use at an explicit timestamp.
+    let first = oauth_access_record_for_refresh(&refresh, now + 60);
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &refresh.token_hash,
+            &client.client_id,
+            now + 60,
+            &first,
+        )
+        .unwrap();
+    let ReusableRefreshResult::Issued(issued) = result else {
+        panic!("first reusable refresh must succeed");
+    };
+    assert_eq!(issued.id, refresh.id);
+    assert_eq!(issued.last_used_at, Some(now + 60));
+    assert_eq!(issued.expires_at, refresh.expires_at);
+
+    // The same refresh token still succeeds ten hours later.
+    let second = oauth_access_record_for_refresh(&refresh, now + 36_000);
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &refresh.token_hash,
+            &client.client_id,
+            now + 36_000,
+            &second,
+        )
+        .unwrap();
+    let ReusableRefreshResult::Issued(issued) = result else {
+        panic!("second reusable refresh must succeed");
+    };
+    assert_eq!(issued.last_used_at, Some(now + 36_000));
+
+    // Each refresh adds exactly one access token; no refresh token is created.
+    let (at_after, rt_after) = oauth_access_and_refresh_counts(&db);
+    assert_eq!(at_after, at_start + 2, "each refresh adds one access token");
+    assert_eq!(rt_after, rt_start, "no refresh token is created");
+
+    // The original refresh token is not revoked, its absolute expiry is
+    // unchanged, and last_used_at tracks the latest use.
+    let conn = db.conn_for_tests();
+    let (revoked_at, last_used_at, expires_at): (Option<i64>, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT revoked_at, last_used_at, expires_at FROM oauth_refresh_tokens WHERE id = ?1",
+            [&refresh.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        revoked_at, None,
+        "reusable refresh token must not be revoked"
+    );
+    assert_eq!(last_used_at, Some(now + 36_000));
+    assert_eq!(
+        expires_at, refresh.expires_at,
+        "absolute expiry must not be extended"
+    );
+}
+
+#[test]
+fn reusable_refresh_rejects_revoked_expired_unknown_and_foreign_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let (client, _) = oauth_seed_client(&db, &user, "Test App");
+    let now = chrono::Utc::now().timestamp();
+
+    let (at_start, rt_start) = oauth_access_and_refresh_counts(&db);
+
+    // Unknown token hash.
+    let ghost = oauth_refresh_record(&client, &user, now);
+    let access = oauth_access_record_for_refresh(&ghost, now);
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &ghost.token_hash,
+            &client.client_id,
+            now,
+            &access,
+        )
+        .unwrap();
+    assert!(matches!(result, ReusableRefreshResult::NotFound));
+
+    // Revoked token.
+    let mut revoked = oauth_refresh_record(&client, &user, now);
+    revoked.revoked_at = Some(now - 10);
+    db.insert_oauth_refresh_token(&revoked).unwrap();
+    let access = oauth_access_record_for_refresh(&revoked, now);
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &revoked.token_hash,
+            &client.client_id,
+            now,
+            &access,
+        )
+        .unwrap();
+    assert!(matches!(result, ReusableRefreshResult::Revoked));
+
+    // Expired token.
+    let mut expired = oauth_refresh_record(&client, &user, now - 600);
+    expired.expires_at = now - 1;
+    db.insert_oauth_refresh_token(&expired).unwrap();
+    let access = oauth_access_record_for_refresh(&expired, now);
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &expired.token_hash,
+            &client.client_id,
+            now,
+            &access,
+        )
+        .unwrap();
+    assert!(matches!(result, ReusableRefreshResult::Expired));
+
+    // Token owned by another client.
+    let (other_client, _) = oauth_seed_client(&db, &user, "Other App");
+    let foreign = oauth_refresh_record(&other_client, &user, now);
+    db.insert_oauth_refresh_token(&foreign).unwrap();
+    let foreign_access = OAuthAccessTokenRecord {
+        client_id: client.client_id.clone(),
+        ..oauth_access_record_for_refresh(&foreign, now)
+    };
+    let result = db
+        .issue_oauth_access_token_from_reusable_refresh_token(
+            &foreign.token_hash,
+            &client.client_id,
+            now,
+            &foreign_access,
+        )
+        .unwrap();
+    assert!(matches!(result, ReusableRefreshResult::ClientMismatch));
+
+    // Failed attempts write nothing: no new access tokens, no last_used_at.
+    let (at_after, rt_after) = oauth_access_and_refresh_counts(&db);
+    assert_eq!(at_after, at_start, "no access token may be inserted");
+    assert_eq!(
+        rt_after,
+        rt_start + 3,
+        "only the seeded refresh tokens exist"
+    );
+    let conn = db.conn_for_tests();
+    let touched: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_refresh_tokens WHERE last_used_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(touched, 0, "failed attempts must not update last_used_at");
+}
+
+#[test]
+fn reusable_refresh_rejects_binding_mismatch_without_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let (client, _) = oauth_seed_client(&db, &user, "Test App");
+    let now = chrono::Utc::now().timestamp();
+    let refresh = oauth_refresh_record(&client, &user, now);
+    db.insert_oauth_refresh_token(&refresh).unwrap();
+    let (at_start, rt_start) = oauth_access_and_refresh_counts(&db);
+
+    let mismatches: Vec<OAuthAccessTokenRecord> = vec![
+        // Different scope set.
+        OAuthAccessTokenRecord {
+            scopes: "runtime:read project:read".to_string(),
+            ..oauth_access_record_for_refresh(&refresh, now)
+        },
+        // Different subject.
+        OAuthAccessTokenRecord {
+            subject_id: "u-other".to_string(),
+            user_id: Some("u-other".to_string()),
+            ..oauth_access_record_for_refresh(&refresh, now)
+        },
+        // Resource added on refresh.
+        OAuthAccessTokenRecord {
+            resource: Some("https://example.test/mcp".to_string()),
+            ..oauth_access_record_for_refresh(&refresh, now)
+        },
+        // Shared-key binding added on refresh.
+        OAuthAccessTokenRecord {
+            shared_key_hash: Some("hash-b".to_string()),
+            ..oauth_access_record_for_refresh(&refresh, now)
+        },
+    ];
+    for access in mismatches {
+        let result = db
+            .issue_oauth_access_token_from_reusable_refresh_token(
+                &refresh.token_hash,
+                &client.client_id,
+                now,
+                &access,
+            )
+            .unwrap();
+        assert!(
+            matches!(result, ReusableRefreshResult::BindingMismatch),
+            "binding mismatch expected"
+        );
+    }
+
+    let (at_after, rt_after) = oauth_access_and_refresh_counts(&db);
+    assert_eq!(at_after, at_start, "no access token may be inserted");
+    assert_eq!(rt_after, rt_start, "no refresh token may be inserted");
+    let stored = db
+        .get_oauth_refresh_token_by_hash(&refresh.token_hash)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.last_used_at, None,
+        "failed refresh must not update last_used_at"
+    );
+}

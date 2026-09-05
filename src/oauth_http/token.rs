@@ -584,13 +584,11 @@ async fn handle_refresh_token_grant(
 
     let rt_hash = hash_token(plaintext_rt);
     let at_expires_at = now + config.oauth2.access_token_ttl_secs;
-    let new_rt_expires_at = now + config.oauth2.refresh_token_ttl_secs;
 
-    // Generate tokens upfront — they'll be inserted inside the transaction.
+    // Generate the access token upfront; it is inserted only inside the
+    // selected refresh transaction.
     let new_access_token = generate_oauth_access_token();
-    let new_refresh_token = generate_oauth_refresh_token();
     let new_at_hash = hash_token(&new_access_token);
-    let new_rt_hash = hash_token(&new_refresh_token);
 
     // We need user_id/scopes/resource/shared_key_hash from the old refresh token
     // to construct the new records. The DB helper handles the lookup, but we
@@ -702,6 +700,15 @@ async fn handle_refresh_token_grant(
             return;
         }
     };
+    if token_resource != old_rt_metadata.resource {
+        oauth_error(
+            res,
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "resource does not match refresh token",
+        );
+        return;
+    }
 
     let at_record = OAuthAccessTokenRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -719,6 +726,85 @@ async fn handle_refresh_token_grant(
         last_used_at: None,
     };
 
+    let refresh_token_mode = match db.get_oauth_client_refresh_token_mode(&client.client_id) {
+        Ok(Some(mode)) => mode,
+        Ok(None) => {
+            oauth_error(
+                res,
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "client is not active",
+            );
+            return;
+        }
+        Err(_) => {
+            oauth_error(
+                res,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            );
+            return;
+        }
+    };
+
+    if refresh_token_mode == crate::OAuthRefreshTokenMode::ConfidentialReuse {
+        match db.issue_oauth_access_token_from_reusable_refresh_token(
+            &rt_hash,
+            &client.client_id,
+            now,
+            &at_record,
+        ) {
+            Ok(crate::ReusableRefreshResult::Issued(refresh_token)) => {
+                let mut body = serde_json::json!({
+                    "access_token": new_access_token,
+                    "token_type": "Bearer",
+                    "expires_in": config.oauth2.access_token_ttl_secs,
+                });
+                if !refresh_token.scopes.is_empty() {
+                    body["scope"] = serde_json::Value::String(refresh_token.scopes);
+                }
+                apply_oauth_no_store_headers(res);
+                res.render(Json(body));
+            }
+            Ok(crate::ReusableRefreshResult::NotFound) => oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token is invalid",
+            ),
+            Ok(crate::ReusableRefreshResult::Revoked) => oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token has been revoked",
+            ),
+            Ok(crate::ReusableRefreshResult::Expired) => oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token has expired",
+            ),
+            Ok(crate::ReusableRefreshResult::ClientMismatch)
+            | Ok(crate::ReusableRefreshResult::BindingMismatch) => oauth_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token does not belong to this client",
+            ),
+            Err(_) => oauth_error(
+                res,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            ),
+        }
+        return;
+    }
+
+    let new_refresh_token = generate_oauth_refresh_token();
+    let new_rt_hash = hash_token(&new_refresh_token);
+    let new_rt_expires_at = now + config.oauth2.refresh_token_ttl_secs;
     let new_rt_record = OAuthRefreshTokenRecord {
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: new_rt_hash,

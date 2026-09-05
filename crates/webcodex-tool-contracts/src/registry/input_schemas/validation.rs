@@ -191,9 +191,9 @@ pub fn cargo_test_input_schema() -> Value {
         },
         "then": {
             "properties": {
-                "require_tests": { "enum": [false] },
-                "min_tests": { "enum": [] }
-            }
+                "require_tests": { "enum": [false] }
+            },
+            "not": { "required": ["min_tests"] }
         }
     }]);
     with_optional_result_expectation(schema)

@@ -93,6 +93,29 @@ The user-facing OAuth concepts are:
 - **refresh token** — protocol credential used to refresh access; `offline_access` adds no WebCodex permission by itself;
 - **allowed scopes** — the maximum WebCodex permissions that client may request.
 
+The server supports the authorization-code grant, token revocation, OAuth
+metadata, and optional RFC 7591 dynamic client registration. Dynamic
+registration is disabled by default and, when explicitly enabled, issues
+least-privilege confidential `client_secret_post` clients for MCP hosts such as
+Notion. OIDC, JWKS/JWT ID tokens, and the device-code flow are not implemented.
+OAuth setup steps are in [Deployment](DEPLOYMENT.md#oauth2).
+
+Every OAuth client's refresh tokens use strict rotation by default: each
+refresh revokes the presented refresh token and issues a new one. A server
+operator can instead allow stable, non-rotating refresh tokens for specific
+trusted confidential clients (see [Deployment](DEPLOYMENT.md#oauth2)). Such a
+`confidential_reuse` client must be a dynamically registered confidential
+client that authenticates with `client_secret_post`, and its single registered
+redirect URI must exactly match the server-side allow-list — the client name
+or User-Agent never grant this trust, and a client that registers additional
+redirect URIs stays on strict rotation. A reusable refresh token keeps a fixed
+absolute expiry that refreshing never extends, each refresh returns only a new
+access token and no new refresh token, and revocation, expiry, or any
+client/subject/scope/resource/binding mismatch still fails immediately. A
+revoked refresh token is never revived. The allow-list applies only to clients
+registered after it changes; existing clients keep strict rotation until they
+register again and reconnect.
+
 WebCodex never silently expands an existing OAuth client's allowed permissions when new scopes are introduced. Changing the allow-list is an explicit administrative action and invalidates old grants so the client must authorize again.
 
 For ordinary hosted shared-key OAuth, `webcodex connect ... --auth oauth` keeps the Runner on its shared key and gives the MCP client a separate OAuth credential. `--oauth-computer-permissions` explicitly enables the additional Computer permissions offered by that flow; `--oauth-local-mcp` explicitly enables access to configured Runner-owned local MCP providers. Managed-user OAuth remains a separate advanced flow (`--auth managed-oauth`).

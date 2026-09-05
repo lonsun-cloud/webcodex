@@ -98,6 +98,39 @@ hosted Server 可以通过同一个 `/mcp` 暴露 Runner-owned 本地 stdio MCP 
 
 普通 hosted `connect --auth oauth` 中，Runner 保持原 hosted credential，MCP client 获得独立 OAuth credential。只有真正需要额外能力时才增加 `--oauth-computer-permissions` 或 `--oauth-local-mcp`。已有 client 不会被静默扩权；真实权限变化要求重新授权。
 
+### Notion Custom MCP
+
+Notion Custom MCP 需要 Business 或 Enterprise workspace；管理员必须启用 custom MCP
+server。如果 workspace 采用 approved-only 策略，还需要管理员把该 Server 加入 allow-list。
+MCP endpoint 必须能从公网通过 HTTPS 访问，填写
+`https://your-domain.example/mcp`，不能填写 loopback 地址。
+
+WebCodex 支持 Notion 的两种认证方式：
+
+- **Bearer/API token：**在 Notion 中选择 header-based API key，并使用受限 scope 的
+  `wc_pat_*`；WebCodex 按 `Authorization: Bearer ...` 验证。不要把长期 token 放进 URL
+  query。
+- **OAuth：**启用 OAuth，并可通过
+  `WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED=true` 开启 RFC 7591 DCR。
+  DCR 默认关闭；开启后 discovery 才发布 `/oauth/register`。注册响应只返回一次
+  confidential client secret，并声明 `client_secret_post`。客户端即使请求 public-client
+  `none`，Server 也会返回实际支持的 confidential-client 方式。授权流程使用
+  authorization code + PKCE S256，refresh token 会轮换。
+
+DCR client 的默认权限是固定闭集：`runtime:read`、`project:read`、`project:write`、
+`job:run`、`computer:read`、`computer:control`；不会自动得到 `account:manage`、
+`admin`、`job:detach`、任何 `agent:*` 或未来新增 scope。注册前至少要有一个未禁用的
+managed user，DCR client 归第一个未禁用用户所有。即使 WebCodex 已限制活动 DCR client
+数量，反向代理仍应对 `/oauth/register` 限流。
+
+`/mcp` 使用只支持 POST JSON 的 Streamable HTTP：`GET /mcp` 返回 405 并带
+`Allow: POST`；notification 返回 202、空 body，并显式设置 `application/json`。
+所有工具的 input/output 都必须是严格合法的 JSON Schema（尤其不能出现空 `enum`），
+并显式提供 boolean 类型的 read-only、destructive、idempotent、open-world annotation。
+Notion 会扫描 `tools/list`，并依据这些工具语义决定自动执行还是要求用户确认。
+
+对于 project-first share，授权页要求输入本次临时 Project share credential，并签发只带 `runtime:read`、`project:read`、`project:write`、`job:run` 的 `oauth2_project` 身份；它不会创建 managed user，OAuth token 也不能用于 Runner transport。Quick Tunnel 的 issuer URL 每次运行都会变化；如果 OAuth issuer 必须稳定，请使用 `--tunnel none --public-url https://...` 并在外部配置稳定 HTTPS proxy/tunnel。
+
 Project-first `share --auth oauth` 仍绑定本次临时 share 环境。Managed-user OAuth 是另一条高级流程（`connect --auth managed-oauth`）。OAuth credential 永远不能用于 Runner transport。
 
 Credential 与 scope 模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。

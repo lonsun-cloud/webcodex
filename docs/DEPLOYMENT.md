@@ -390,6 +390,37 @@ WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
 WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
 
+To let OAuth clients such as Notion register themselves through RFC 7591, add:
+
+```text
+WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED=true
+```
+
+Dynamic registration is disabled by default. Expose it only on the same stable
+public HTTPS origin as the issuer, create at least one enabled managed user, and
+rate-limit `POST /oauth/register` at the reverse proxy. Dynamic registrations
+are confidential `client_secret_post` clients with a fixed least-privilege scope
+ceiling; the plaintext secret is returned once and only its hash is stored.
+
+Dynamically registered clients use strict refresh-token rotation by default:
+each refresh revokes the presented refresh token and returns a new one. To let
+specific trusted MCP hosts keep a stable refresh token instead, configure the
+exact HTTPS redirect URIs that qualify, comma-separated:
+
+```text
+WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS=https://notion.example/oauth/callback
+```
+
+A newly registered client receives stable refresh tokens only when it registers
+exactly one redirect URI that exactly matches this allow-list and it requests
+the `refresh_token` grant; on every refresh it must still authenticate with its
+`client_secret_post` secret. Clients that register extra redirect URIs, and
+every client registered before this setting changed, keep strict rotation — an
+allow-list change requires those clients to register again and reconnect. A
+stable refresh token's absolute expiry never extends, each refresh returns only
+a new access token (no new refresh token), and a revoked or expired refresh
+token is never revived.
+
 For ordinary repository machines, no managed login is required. Connect with the MCP client's exact callback:
 
 ```bash
@@ -425,9 +456,9 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 If ChatGPT MCP host-file import is enabled, configure the exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`. Reprovisioning the client creates a new id, so update this setting as part of that explicit trust rotation. Client display names and redirect URIs are not substitutes for the configured client id.
 
 List and revoke clients with `POST /api/oauth/clients/list` and
-`POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
-dynamic client registration, OIDC, and the device-code flow are not
-implemented. Keep `offline_access` enabled when a host offers it — it is a
+`POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow. RFC
+7591 dynamic client registration is available only when explicitly enabled;
+OIDC and the device-code flow are not implemented. Keep `offline_access` enabled when a host offers it — it is a
 protocol-level refresh-token scope and grants no extra WebCodex permission.
 
 ## GPT Actions and MCP

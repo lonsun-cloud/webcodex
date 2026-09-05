@@ -5,6 +5,32 @@ use crate::models::{
 };
 use rusqlite::params;
 
+/// Server-selected refresh-token behavior for one confidential OAuth client.
+/// New clients default to strict rotation; the reusable mode is assigned only
+/// by an explicit trusted registration policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthRefreshTokenMode {
+    Rotating,
+    ConfidentialReuse,
+}
+
+impl OAuthRefreshTokenMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotating => "rotating",
+            Self::ConfidentialReuse => "confidential_reuse",
+        }
+    }
+
+    fn from_stored(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "rotating" => Ok(Self::Rotating),
+            "confidential_reuse" => Ok(Self::ConfidentialReuse),
+            _ => anyhow::bail!("invalid OAuth refresh token mode"),
+        }
+    }
+}
+
 fn validate_shared_key_owner_hash(value: &str) -> anyhow::Result<()> {
     if value.len() == 64
         && value
@@ -126,13 +152,22 @@ impl Database {
     // --- OAuth clients ---
 
     pub fn insert_oauth_client(&self, record: &OAuthClientRecord) -> anyhow::Result<()> {
+        self.insert_oauth_client_with_refresh_token_mode(record, OAuthRefreshTokenMode::Rotating)
+    }
+
+    pub fn insert_oauth_client_with_refresh_token_mode(
+        &self,
+        record: &OAuthClientRecord,
+        refresh_token_mode: OAuthRefreshTokenMode,
+    ) -> anyhow::Result<()> {
         validate_oauth_client_owner(record)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO oauth_clients (
                 id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
-                owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                owner_shared_key_hash, redirect_uris, allowed_scopes, refresh_token_mode,
+                created_at, revoked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 record.id,
                 record.client_id,
@@ -143,11 +178,29 @@ impl Database {
                 record.owner_shared_key_hash,
                 record.redirect_uris,
                 record.allowed_scopes,
+                refresh_token_mode.as_str(),
                 record.created_at,
                 record.revoked_at,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_oauth_client_refresh_token_mode(
+        &self,
+        client_id: &str,
+    ) -> anyhow::Result<Option<OAuthRefreshTokenMode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT refresh_token_mode
+             FROM oauth_clients
+             WHERE client_id = ?1 AND revoked_at IS NULL",
+        )?;
+        let mut rows = stmt.query_map(params![client_id], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(value) => Ok(Some(OAuthRefreshTokenMode::from_stored(&value?)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn get_oauth_client_by_client_id(
@@ -952,6 +1005,110 @@ impl Database {
             Ok(RotateResult::Rotated(rotated))
         } // MutexGuard dropped here.
     }
+
+    /// Issue only a new access token while keeping one confidential client's
+    /// refresh token stable. The token's absolute expiry is never extended.
+    /// Client, subject, scope, resource, and bridge binding are rechecked in the
+    /// same transaction that records use and inserts the access token.
+    pub fn issue_oauth_access_token_from_reusable_refresh_token(
+        &self,
+        refresh_token_hash: &str,
+        client_id: &str,
+        now: i64,
+        access_token_record: &OAuthAccessTokenRecord,
+    ) -> anyhow::Result<ReusableRefreshResult> {
+        validate_oauth_access_token_subject(access_token_record)?;
+        if access_token_record.client_id != client_id {
+            return Ok(ReusableRefreshResult::BindingMismatch);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old = {
+            let mut stmt = tx.prepare(
+                "SELECT id, token_hash, client_id, subject_kind, subject_id, user_id,
+                        scopes, resource, shared_key_hash, created_at, expires_at,
+                        revoked_at, last_used_at, rotated_from_id
+                 FROM oauth_refresh_tokens
+                 WHERE token_hash = ?1",
+            )?;
+            let mut rows =
+                stmt.query_map(params![refresh_token_hash], row_to_oauth_refresh_token)?;
+            match rows.next() {
+                Some(record) => record?,
+                None => return Ok(ReusableRefreshResult::NotFound),
+            }
+        };
+
+        if old.revoked_at.is_some() {
+            return Ok(ReusableRefreshResult::Revoked);
+        }
+        if old.expires_at <= now {
+            return Ok(ReusableRefreshResult::Expired);
+        }
+        if old.client_id != client_id {
+            return Ok(ReusableRefreshResult::ClientMismatch);
+        }
+        validate_oauth_refresh_token_subject(&old)?;
+        if old.subject_kind != access_token_record.subject_kind
+            || old.subject_id != access_token_record.subject_id
+            || old.user_id != access_token_record.user_id
+            || old.scopes != access_token_record.scopes
+            || old.resource != access_token_record.resource
+            || old.shared_key_hash != access_token_record.shared_key_hash
+        {
+            return Ok(ReusableRefreshResult::BindingMismatch);
+        }
+
+        let changed = tx.execute(
+            "UPDATE oauth_refresh_tokens
+             SET last_used_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+            params![old.id, now],
+        )?;
+        if changed != 1 {
+            return Ok(ReusableRefreshResult::NotFound);
+        }
+
+        tx.execute(
+            "INSERT INTO oauth_access_tokens (
+                id, token_hash, client_id, subject_kind, subject_id, user_id,
+                scopes, resource, shared_key_hash, created_at, expires_at,
+                revoked_at, last_used_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                access_token_record.id,
+                access_token_record.token_hash,
+                access_token_record.client_id,
+                access_token_record.subject_kind,
+                access_token_record.subject_id,
+                access_token_record.user_id,
+                access_token_record.scopes,
+                access_token_record.resource,
+                access_token_record.shared_key_hash,
+                access_token_record.created_at,
+                access_token_record.expires_at,
+                access_token_record.revoked_at,
+                access_token_record.last_used_at,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(ReusableRefreshResult::Issued(OAuthRefreshTokenRecord {
+            last_used_at: Some(now),
+            ..old
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub enum ReusableRefreshResult {
+    Issued(OAuthRefreshTokenRecord),
+    NotFound,
+    Revoked,
+    Expired,
+    ClientMismatch,
+    BindingMismatch,
 }
 
 /// Result of a refresh token rotation attempt.

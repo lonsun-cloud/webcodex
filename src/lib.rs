@@ -74,7 +74,7 @@ pub(crate) use config::parse_env_file_line;
 pub use config::CodexConfig;
 pub use config::Config;
 pub use config::OAuth2Config;
-pub use db::{Database, RotateResult};
+pub use db::{Database, OAuthRefreshTokenMode, ReusableRefreshResult, RotateResult};
 pub use models::{ActionEventRecord, ActionSessionRecord};
 pub(crate) use openapi::openapi_json;
 pub(crate) use runner_http::{
@@ -674,9 +674,13 @@ only for local/trusted-network demos."
         .push(console_router)
         .push(runtime_console_router)
         .push(admin_router)
-        // OAuth2 token, revocation, and discovery endpoints — public, no
-        // AuthMiddleware. Token/revoke clients authenticate via
-        // client_id + client_secret in the form body.
+        // OAuth2 token, revocation, registration, and discovery endpoints —
+        // public, no AuthMiddleware. Token/revoke clients authenticate via
+        // client_id + client_secret in the form body; registration uses JSON.
+        .push(
+            Router::with_path(route_metadata::root_path(RouteId::OAuthRegister))
+                .post(oauth_http::oauth_register),
+        )
         .push(
             Router::with_path(route_metadata::root_path(RouteId::OAuthToken))
                 .post(oauth_http::oauth_token),
@@ -716,6 +720,12 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::root_path(
                 RouteId::WellKnownProtectedResource,
+            ))
+            .get(oauth_http::oauth_metadata),
+        )
+        .push(
+            Router::with_path(route_metadata::root_path(
+                RouteId::WellKnownProtectedResourceMcp,
             ))
             .get(oauth_http::oauth_metadata),
         )

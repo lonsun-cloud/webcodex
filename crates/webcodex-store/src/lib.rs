@@ -76,7 +76,7 @@ pub use self::memory::{
     memory_definition_hash, memory_state_revision, validate_memory_body, validate_memory_key,
     validate_memory_summary, MAX_MEMORIES_PER_PROJECT, MEMORY_SCOPE_IDENTITY_ATTRIBUTED,
 };
-pub use self::oauth::RotateResult;
+pub use self::oauth::{OAuthRefreshTokenMode, ReusableRefreshResult, RotateResult};
 pub use self::server_instance::ServerInstanceGuard;
 pub use self::task_kernel::{
     AppliedPaths, ConnectorApproval, ConnectorApprovalGate, ConnectorBinding,

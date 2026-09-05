@@ -63,7 +63,7 @@ pub(crate) async fn oauth_authorization_server_metadata(depot: &mut Depot, res: 
         .unwrap_or("http://localhost");
     let endpoint_base = issuer.trim_end_matches('/');
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", endpoint_base),
         "token_endpoint": format!("{}/oauth/token", endpoint_base),
@@ -75,6 +75,11 @@ pub(crate) async fn oauth_authorization_server_metadata(depot: &mut Depot, res: 
         "authorization_response_iss_parameter_supported": authorization_response_issuer(&config).is_some(),
         "scopes_supported": oauth_discovery_scopes_supported(),
     });
+
+    if config.oauth2.dynamic_client_registration_enabled {
+        metadata["registration_endpoint"] =
+            serde_json::json!(format!("{}/oauth/register", endpoint_base));
+    }
 
     res.render(Json(metadata));
 }

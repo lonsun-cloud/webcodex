@@ -26,6 +26,11 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
             validate_schema_instance_at(instance, branch, path)?;
         }
     }
+    if let Some(forbidden) = schema.get("not") {
+        if validate_schema_instance_at(instance, forbidden, path).is_ok() {
+            return Err(format!("{path}: instance matches forbidden 'not' schema"));
+        }
+    }
     if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
         let results = variants
             .iter()

@@ -29,6 +29,14 @@ pub(super) fn oauth2_enabled_bridge() -> OAuth2Config {
     }
 }
 
+pub(super) fn oauth2_enabled_dcr() -> OAuth2Config {
+    OAuth2Config {
+        dynamic_client_registration_enabled: true,
+        issuer: Some("https://codex.example.com".to_string()),
+        ..oauth2_enabled()
+    }
+}
+
 pub(super) const TEST_PROJECT_GRANT_ID: &str = "wc_pgrant_111111111111111111111111";
 pub(super) const TEST_PROJECT_SHARE_SESSION_ID: &str =
     "wc_share_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -145,6 +153,39 @@ pub(super) fn seed_client(
         revoked_at: None,
     };
     db.insert_oauth_client(&record).unwrap();
+    (record, plaintext_secret)
+}
+
+/// Seed a confidential client that the server treats as trusted for stable,
+/// non-rotating refresh tokens (the store-level equivalent of a DCR client
+/// whose single registered redirect URI is on the confidential-reuse
+/// allow-list).
+pub(super) fn seed_confidential_reuse_client(
+    db: &crate::Database,
+    user: &UserRecord,
+    name: &str,
+) -> (OAuthClientRecord, String) {
+    let now = chrono::Utc::now().timestamp();
+    let plaintext_secret = crate::auth::generate_oauth_client_secret();
+    let secret_hash = hash_token(&plaintext_secret);
+    let record = OAuthClientRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        client_id: crate::auth::generate_oauth_client_id(),
+        client_secret_hash: secret_hash,
+        name: name.to_string(),
+        owner_user_id: Some(user.id.clone()),
+        owner_project_grant_id: None,
+        owner_shared_key_hash: None,
+        redirect_uris: "https://notion.example/oauth/callback".to_string(),
+        allowed_scopes: "runtime:read project:read offline_access".to_string(),
+        created_at: now,
+        revoked_at: None,
+    };
+    db.insert_oauth_client_with_refresh_token_mode(
+        &record,
+        crate::OAuthRefreshTokenMode::ConfidentialReuse,
+    )
+    .unwrap();
     (record, plaintext_secret)
 }
 
@@ -744,6 +785,7 @@ pub(super) fn build_router_with_session_and_registry(
         .hoop(salvo::prelude::affix_state::inject(registry))
         .push(Router::with_path("oauth/token").post(oauth_token))
         .push(Router::with_path("oauth/revoke").post(oauth_revoke))
+        .push(Router::with_path("oauth/register").post(oauth_register))
         .push(
             Router::with_path("oauth/authorize")
                 .get(oauth_authorize)
@@ -771,6 +813,7 @@ pub(super) fn build_router_with_session_and_registry(
                 .post(test_agent_register_handler),
         )
         .push(Router::with_path(".well-known/oauth-protected-resource").get(oauth_metadata))
+        .push(Router::with_path(".well-known/oauth-protected-resource/mcp").get(oauth_metadata))
         .push(
             Router::with_path(".well-known/oauth-authorization-server")
                 .get(oauth_authorization_server_metadata),

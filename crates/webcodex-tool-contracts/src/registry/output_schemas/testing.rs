@@ -5,6 +5,12 @@ use super::common::{
     permission_decision_schema, schema_type, session_hint_schema,
 };
 
+/// A valid JSON Schema object that accepts no instance. This keeps branch-local
+/// forbidden properties strict without emitting the invalid `enum: []` shape.
+fn never_schema() -> Value {
+    json!({"not": {}})
+}
+
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test" => Some(cargo_output_schema(name)),
@@ -265,16 +271,16 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "job_id": {"type": "string", "minLength": 1},
                             "job_status": {"type": "string", "minLength": 1},
                             "observation_token": {"type": "string", "minLength": 1, "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN},
-                            "passed": {"enum": []},
-                            "failure_kind": {"enum": []},
-                            "warnings_count": {"enum": []},
-                            "errors_count": {"enum": []},
-                            "tests_detected": {"enum": []},
-                            "tests_run_count": {"enum": []},
-                            "tests_passed": {"enum": []},
-                            "tests_failed": {"enum": []},
-                            "zero_tests_run": {"enum": []},
-                            "diagnostics": {"enum": []}
+                            "passed": never_schema(),
+                            "failure_kind": never_schema(),
+                            "warnings_count": never_schema(),
+                            "errors_count": never_schema(),
+                            "tests_detected": never_schema(),
+                            "tests_run_count": never_schema(),
+                            "tests_passed": never_schema(),
+                            "tests_failed": never_schema(),
+                            "zero_tests_run": never_schema(),
+                            "diagnostics": never_schema()
                         }
                     }
                 }
@@ -292,10 +298,10 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "command_completed": {"const": true},
                             "execution_state": {"const": "completed"},
                             "passed": {"const": true},
-                            "failure_kind": {"enum": []},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "failure_kind": never_schema(),
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema()
                         }
                     }
                 }
@@ -315,9 +321,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "execution_state": {"const": "timed_out"},
                             "passed": {"const": false},
                             "failure_kind": {"const": "timeout"},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema()
                         }
                     }
                 }
@@ -337,9 +343,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "execution_state": {"const": "outcome_unknown"},
                             "passed": {"const": false},
                             "failure_kind": {"const": "outcome_unknown"},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema()
                         }
                     }
                 }
@@ -359,9 +365,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "execution_state": {"const": "not_started"},
                             "passed": {"const": false},
                             "failure_kind": {"enum": ["permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema()
                         }
                     }
                 }
@@ -381,9 +387,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "execution_state": {"const": "completed"},
                             "passed": {"const": false},
                             "failure_kind": {"enum": ["validation_failed", "process_exit"]},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema()
                         }
                     }
                 }
@@ -399,12 +405,12 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "command_started": {"const": false},
                             "command_completed": {"const": false},
                             "failure_kind": {"enum": ["invalid_arguments", "capability_unavailable", "permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "observation_token": {"enum": []},
-                            "passed": {"enum": []},
-                            "promoted_to_job": {"enum": []},
-                            "terminal": {"enum": []}
+                            "job_id": never_schema(),
+                            "job_status": never_schema(),
+                            "observation_token": never_schema(),
+                            "passed": never_schema(),
+                            "promoted_to_job": never_schema(),
+                            "terminal": never_schema()
                         }
                     }
                 }

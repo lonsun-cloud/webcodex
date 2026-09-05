@@ -451,9 +451,16 @@ pub struct OAuth2Config {
     /// Whether the public shared-key OAuth bridge authorize flow is enabled.
     /// Default `false`.
     pub shared_key_bridge_enabled: bool,
+    /// Whether unauthenticated RFC 7591 dynamic client registration is exposed.
+    /// Default `false`; operators should enable it only behind public HTTPS.
+    pub dynamic_client_registration_enabled: bool,
     /// Exact server-generated OAuth client IDs whose active registrations may
     /// use the ChatGPT MCP host-file import path. Empty by default.
     pub trusted_mcp_file_client_ids: Vec<String>,
+    /// Exact HTTPS redirect URIs that may opt a newly registered confidential
+    /// DCR client into stable, non-rotating refresh tokens. Empty by default.
+    /// A client must register exactly one URI and it must match this allow-list.
+    pub confidential_reuse_redirect_uris: Vec<String>,
     /// Exact project grant active for a project-first OAuth share session.
     /// Unset on managed/self-hosted OAuth servers.
     pub project_share_grant_id: Option<String>,
@@ -472,7 +479,9 @@ impl Default for OAuth2Config {
             authorization_code_ttl_secs: 300,
             require_pkce: true,
             shared_key_bridge_enabled: false,
+            dynamic_client_registration_enabled: false,
             trusted_mcp_file_client_ids: Vec::new(),
+            confidential_reuse_redirect_uris: Vec::new(),
             project_share_grant_id: None,
             project_share_session_id: None,
         }
@@ -490,6 +499,23 @@ fn normalize_trusted_mcp_file_client_id(value: &str) -> Option<String> {
         return None;
     }
     Some(value)
+}
+
+fn normalize_confidential_reuse_redirect_uri(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 2048 {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 impl OAuth2Config {
@@ -522,6 +548,8 @@ impl OAuth2Config {
         let require_pkce = env_flag("WEBCODEX_OAUTH2_REQUIRE_PKCE").unwrap_or(true);
         let shared_key_bridge_enabled =
             env_flag("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE").unwrap_or(false);
+        let dynamic_client_registration_enabled =
+            env_flag("WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED").unwrap_or(false);
         let trusted_mcp_file_client_ids =
             std::env::var("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS")
                 .ok()
@@ -536,6 +564,23 @@ impl OAuth2Config {
                         }
                     }
                     client_ids
+                })
+                .unwrap_or_default();
+        let confidential_reuse_redirect_uris =
+            std::env::var("WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS")
+                .ok()
+                .map(|value| {
+                    let mut redirect_uris = Vec::new();
+                    for value in value.split(',') {
+                        let Some(redirect_uri) = normalize_confidential_reuse_redirect_uri(value)
+                        else {
+                            continue;
+                        };
+                        if !redirect_uris.contains(&redirect_uri) {
+                            redirect_uris.push(redirect_uri);
+                        }
+                    }
+                    redirect_uris
                 })
                 .unwrap_or_default();
         let project_share_grant_id = std::env::var("WEBCODEX_OAUTH2_PROJECT_SHARE_GRANT_ID")
@@ -554,10 +599,20 @@ impl OAuth2Config {
             authorization_code_ttl_secs,
             require_pkce,
             shared_key_bridge_enabled,
+            dynamic_client_registration_enabled,
             trusted_mcp_file_client_ids,
+            confidential_reuse_redirect_uris,
             project_share_grant_id,
             project_share_session_id,
         }
+    }
+
+    pub fn dynamic_client_uses_confidential_reuse(&self, redirect_uris: &[String]) -> bool {
+        redirect_uris.len() == 1
+            && self
+                .confidential_reuse_redirect_uris
+                .iter()
+                .any(|trusted| trusted == &redirect_uris[0])
     }
 }
 
@@ -828,6 +883,7 @@ mod tests {
         env.remove("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS");
         env.remove("WEBCODEX_OAUTH2_REQUIRE_PKCE");
         env.remove("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE");
+        env.remove("WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED");
         env.remove("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
 
         let cfg = OAuth2Config::from_env();
@@ -838,6 +894,7 @@ mod tests {
         assert_eq!(cfg.authorization_code_ttl_secs, 300);
         assert!(cfg.require_pkce);
         assert!(!cfg.shared_key_bridge_enabled);
+        assert!(!cfg.dynamic_client_registration_enabled);
         assert!(cfg.trusted_mcp_file_client_ids.is_empty());
     }
 
@@ -851,6 +908,10 @@ mod tests {
         env.set("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS", "600");
         env.set("WEBCODEX_OAUTH2_REQUIRE_PKCE", "false");
         env.set("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE", "true");
+        env.set(
+            "WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED",
+            "true",
+        );
         let trusted_a = format!("wc_client_{}", "a".repeat(64));
         let trusted_b = format!("wc_client_{}", "b".repeat(64));
         env.set(
@@ -869,6 +930,7 @@ mod tests {
         assert_eq!(cfg.authorization_code_ttl_secs, 600);
         assert!(!cfg.require_pkce);
         assert!(cfg.shared_key_bridge_enabled);
+        assert!(cfg.dynamic_client_registration_enabled);
         assert_eq!(cfg.trusted_mcp_file_client_ids, vec![trusted_a, trusted_b]);
 
         env.remove("WEBCODEX_OAUTH2_ENABLED");
@@ -988,5 +1050,102 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(explicit_reader, ToolRequestTraceMode::Full);
+    }
+
+    #[test]
+    fn oauth2_config_confidential_reuse_redirect_uris_default_empty() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.remove("WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS");
+
+        let cfg = OAuth2Config::from_env();
+        assert!(cfg.confidential_reuse_redirect_uris.is_empty());
+        // An empty allow-list fails closed for every registration shape.
+        assert!(!cfg.dynamic_client_uses_confidential_reuse(&[]));
+        assert!(!cfg
+            .dynamic_client_uses_confidential_reuse(&["https://client.example/cb".to_string(),]));
+    }
+
+    #[test]
+    fn oauth2_config_confidential_reuse_redirect_uris_parse_and_dedup() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set(
+            "WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS",
+            " https://notion.example/oauth/cb ,https://notion.example/oauth/cb, https://other.example/cb ",
+        );
+
+        let cfg = OAuth2Config::from_env();
+        assert_eq!(
+            cfg.confidential_reuse_redirect_uris,
+            vec![
+                "https://notion.example/oauth/cb".to_string(),
+                "https://other.example/cb".to_string(),
+            ]
+        );
+
+        env.remove("WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS");
+    }
+
+    #[test]
+    fn oauth2_config_confidential_reuse_redirect_uris_ignores_invalid_entries() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set(
+            "WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS",
+            [
+                "http://notion.example/oauth/cb",            // not HTTPS
+                "https://notion.example/oauth/cb#fragment",  // fragment
+                "https://user@notion.example/oauth/cb",      // username
+                "https://user:pass@notion.example/oauth/cb", // password
+                "notion.example/oauth/cb",                   // not absolute
+                "/oauth/cb",                                 // relative path
+                "",                                          // empty entry
+                "https://good.example/oauth/cb",             // the only valid entry
+            ]
+            .join(","),
+        );
+
+        let cfg = OAuth2Config::from_env();
+        assert_eq!(
+            cfg.confidential_reuse_redirect_uris,
+            vec!["https://good.example/oauth/cb".to_string()]
+        );
+
+        env.remove("WEBCODEX_OAUTH2_CONFIDENTIAL_REUSE_REDIRECT_URIS");
+    }
+
+    #[test]
+    fn dynamic_client_uses_confidential_reuse_requires_exact_single_uri_match() {
+        let cfg = OAuth2Config {
+            confidential_reuse_redirect_uris: vec!["https://notion.example/oauth/cb".to_string()],
+            ..OAuth2Config::default()
+        };
+        let trusted = "https://notion.example/oauth/cb".to_string();
+
+        // Exactly one registered URI, identical to the allow-list entry.
+        assert!(cfg.dynamic_client_uses_confidential_reuse(&[trusted.clone()]));
+
+        // A trusted URI combined with any additional URI must not qualify.
+        assert!(!cfg.dynamic_client_uses_confidential_reuse(&[
+            trusted.clone(),
+            "https://attacker.example/oauth/cb".to_string(),
+        ]));
+
+        // Lookalike URIs that differ from the configured entry must not match.
+        for lookalike in [
+            "http://notion.example/oauth/cb",       // different scheme
+            "https://notion.example:8443/oauth/cb", // explicit port
+            "https://notion.example./oauth/cb",     // trailing dot in host
+            "https://notion.example/oauth/cb/",     // trailing slash
+            "https://notion.example/oauth/cb2",     // longer path
+            "https://notion.example/oauth/cb?x=1",  // query string
+            " https://notion.example/oauth/cb",     // untrimmed
+        ] {
+            assert!(
+                !cfg.dynamic_client_uses_confidential_reuse(&[lookalike.to_string()]),
+                "{lookalike} must not match the allow-list"
+            );
+        }
+
+        // An empty redirect URI set never qualifies.
+        assert!(!cfg.dynamic_client_uses_confidential_reuse(&[]));
     }
 }
