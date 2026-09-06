@@ -46,3 +46,4 @@ data*
 
 # Watched frontend development output.
 /frontend/.dev-dist/
+logs/
