@@ -799,6 +799,36 @@ impl ToolRuntime {
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
     ) -> ToolResult {
+        self.dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_read_projection(
+            call,
+            auth,
+            transport,
+            recorder_metadata,
+            window,
+            inner_model_facing_recording,
+            context_request,
+            material_capabilities,
+        )
+        .await
+        .0
+    }
+
+    /// Kernel-only companion that returns the Read projection after the same
+    /// authoritative Project resolution used for execution. Other callers keep
+    /// the existing ToolResult-only API and cannot observe this internal state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_read_projection(
+        &self,
+        call: ToolCall,
+        auth: Option<&AuthContext>,
+        transport: sessions::SessionTransport,
+        recorder_metadata: sessions::ToolCallRecorderMetadata,
+        window: Option<&crate::client_window::ClientWindow>,
+        inner_model_facing_recording: bool,
+        context_request: Vec<String>,
+        material_capabilities: super::context_projection::ContextMaterialCapabilities,
+    ) -> (ToolResult, super::read_files::ReadModelProjection) {
+        let mut read_projection = super::read_files::ReadModelProjection::capture(&call);
         // Edit usage telemetry retains only fixed safe classifications. For
         // apply_patch it captures the requested matching enum before the call is
         // moved, never the patch/path/content arguments.
@@ -813,6 +843,7 @@ impl ToolRuntime {
                 inner_model_facing_recording,
                 context_request.clone(),
                 material_capabilities,
+                &mut read_projection,
             )
             .await;
         // Early project/session/auth failures can return before the normal
@@ -832,7 +863,7 @@ impl ToolRuntime {
         if let Some(guard) = edit_usage.as_mut() {
             guard.finish_with_result(&result);
         }
-        result
+        (result, read_projection)
     }
 
     /// Everything the activity ledger needs from a call, captured before the
@@ -944,6 +975,7 @@ impl ToolRuntime {
         inner_model_facing_recording: bool,
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
+        read_projection: &mut super::read_files::ReadModelProjection,
     ) -> ToolResult {
         call = call
             .with_coding_agent_recording_session_id(recorder_metadata.recording_session_id.clone());
@@ -986,6 +1018,7 @@ impl ToolRuntime {
         let resolved_project = project_resolution
             .as_ref()
             .and_then(|resolution| resolution.as_ref().ok());
+        read_projection.bind_resolved_project(resolved_project);
         // Preserve the canonical project for activity attribution before the
         // session recorder consumes the resolved value below. Short aliases
         // must not turn a real Runner execution into a client-less row.
@@ -1408,13 +1441,20 @@ impl ToolRuntime {
         match &batch_budget_projection {
             BatchResponseBudgetProjection::None => {}
             BatchResponseBudgetProjection::ReadFiles { max_result_bytes } => {
-                super::read_files::apply_model_facing_output_budget(&mut result, *max_result_bytes);
+                super::read_files::apply_model_facing_output_budget(
+                    &mut result,
+                    *max_result_bytes,
+                    read_projection,
+                );
                 // Direct/business-Session dispatch has already added every
                 // model-facing Session overlay. Enforce the true final ceiling
                 // against that decorated result before sparse projection. Outer
                 // kernel recording defers sparsification and repeats this exact
                 // hard-cap pass after its own overlays are attached.
-                super::read_files::enforce_final_model_facing_hard_cap(&mut result);
+                super::read_files::enforce_final_model_facing_hard_cap(
+                    &mut result,
+                    read_projection,
+                );
             }
             BatchResponseBudgetProjection::SearchProjectTexts { max_result_bytes } => {
                 let default_timeouts = match &search_projection {
@@ -1437,6 +1477,9 @@ impl ToolRuntime {
         sparsify_terminal_structured_execution_success(tool_name, &mut result);
         if !defer_batch_sparsification {
             sparsify_search_success_for_model(&search_projection, &mut result);
+            if inner_model_facing_recording {
+                super::read_files::add_actionable_read_continuations(read_projection, &mut result);
+            }
             sparsify_complete_read_success(tool_name, &mut result);
         }
         result
