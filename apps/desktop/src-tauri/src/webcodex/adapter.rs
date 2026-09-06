@@ -224,7 +224,12 @@ impl WebCodexAdapter {
         Ok(command)
     }
 
-    pub fn quick_share_command(&self, project: &Path, provider: &str) -> DesktopResult<Command> {
+    pub fn quick_share_command(
+        &self,
+        project: &Path,
+        provider: &str,
+        tunnel_proxy: Option<&str>,
+    ) -> DesktopResult<Command> {
         let binaries = self.binaries()?;
         let tunnel = match provider {
             "cloudflare" | "openai" | "none" => provider,
@@ -232,7 +237,7 @@ impl WebCodexAdapter {
                 return Err(DesktopError::new(
                     "quick_share_provider_invalid",
                     "Unsupported Quick Share provider",
-                    "Choose Cloudflare, OpenAI Secure Tunnel, or Local only.",
+                    "Choose Cloudflare, OpenAI Secure Tunnel, or no external tunnel.",
                 ))
             }
         };
@@ -251,6 +256,7 @@ impl WebCodexAdapter {
             command
                 .env_remove("OPENAI_ADMIN_KEY")
                 .env_remove("OPENAI_API_KEY");
+            configure_tunnel_proxy_environment(&mut command, tunnel_proxy);
         } else {
             remove_tunnel_credentials(&mut command);
         }
@@ -260,7 +266,7 @@ impl WebCodexAdapter {
     pub fn regular_tunnel_command(
         &self,
         env_file: &Path,
-        user_token_file: &Path,
+        tunnel_proxy: Option<&str>,
     ) -> DesktopResult<Command> {
         let binaries = self.binaries()?;
         let mut command = Command::new(&binaries.webcodex);
@@ -271,12 +277,11 @@ impl WebCodexAdapter {
             .arg("openai")
             .arg("--env-file")
             .arg(env_file)
-            .arg("--user-token-file")
-            .arg(user_token_file)
             .arg("--json")
             .arg("--stop-on-stdin-eof")
             .env_remove("OPENAI_ADMIN_KEY")
             .env_remove("OPENAI_API_KEY");
+        configure_tunnel_proxy_environment(&mut command, tunnel_proxy);
         Ok(command)
     }
 
@@ -341,20 +346,26 @@ impl WebCodexAdapter {
                     "Check local app-data permissions and retry.",
                 )
             })?;
+        let args = vec![
+            "login".into(),
+            server_url.into(),
+            "--code-stdin".into(),
+            "--dir".into(),
+            connections_dir.to_string_lossy().to_string(),
+            // Desktop owns this connection directory and may intentionally
+            // re-enroll the same device when its selected/default project
+            // changes. The one-shot pairing code remains the authority for the
+            // replacement; --overwrite never broadens Server authority.
+            "--overwrite".into(),
+            "--allowed-root".into(),
+            project.allowed_root.clone(),
+            "--project".into(),
+            project.path.clone(),
+            "--json".into(),
+        ];
         let output: LoginOutput = run_json(
             &webcodex,
-            &[
-                "login".into(),
-                server_url.into(),
-                "--code-stdin".into(),
-                "--dir".into(),
-                connections_dir.to_string_lossy().to_string(),
-                "--allowed-root".into(),
-                project.allowed_root.clone(),
-                "--project".into(),
-                project.path.clone(),
-                "--json".into(),
-            ],
+            &args,
             Some(pairing_code.as_bytes()),
             true,
             cancellation,
@@ -586,6 +597,30 @@ pub fn validate_server_url(value: &str) -> DesktopResult<String> {
     Ok(value.to_string())
 }
 
+fn configure_tunnel_proxy_environment(command: &mut Command, proxy: Option<&str>) {
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(key);
+    }
+    if let Some(proxy) = proxy {
+        command
+            .env("HTTP_PROXY", proxy)
+            .env("HTTPS_PROXY", proxy)
+            .env("http_proxy", proxy)
+            .env("https_proxy", proxy)
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1");
+    }
+}
+
 fn remove_tunnel_credentials(command: &mut Command) {
     for name in [
         "CONTROL_PLANE_API_KEY",
@@ -663,7 +698,7 @@ mod tests {
             bundled_runtime_dir: None,
         };
         let local = adapter
-            .quick_share_command(Path::new("repo"), "none")
+            .quick_share_command(Path::new("repo"), "none", None)
             .unwrap();
         let local_env: Vec<_> = local.get_envs().collect();
         for key in [
@@ -678,7 +713,7 @@ mod tests {
         }
 
         let openai = adapter
-            .quick_share_command(Path::new("repo"), "openai")
+            .quick_share_command(Path::new("repo"), "openai", Some("http://127.0.0.1:7890"))
             .unwrap();
         let openai_env: Vec<_> = openai.get_envs().collect();
         for key in ["OPENAI_ADMIN_KEY", "OPENAI_API_KEY"] {
@@ -691,10 +726,20 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.to_str() == Some(key)));
         }
+        for key in ["http_proxy", "https_proxy"] {
+            assert!(openai_env.iter().any(|(name, value)| {
+                name.to_string_lossy().eq_ignore_ascii_case(key)
+                    && value.and_then(|value| value.to_str()) == Some("http://127.0.0.1:7890")
+            }));
+        }
+        assert!(openai_env.iter().any(|(name, value)| {
+            name.to_str() == Some("NO_PROXY")
+                && value.and_then(|value| value.to_str()) == Some("127.0.0.1,localhost,::1")
+        }));
     }
 
     #[test]
-    fn regular_tunnel_uses_file_auth_and_only_inherits_control_plane_credentials() {
+    fn regular_tunnel_uses_local_server_bootstrap_auth_and_only_inherits_control_plane_credentials() {
         let binaries = ResolvedBinaries {
             directory: PathBuf::from("bin"),
             webcodex: PathBuf::from("webcodex"),
@@ -709,7 +754,10 @@ mod tests {
             bundled_runtime_dir: None,
         };
         let command = adapter
-            .regular_tunnel_command(Path::new("server.env"), Path::new("user-token"))
+            .regular_tunnel_command(
+                Path::new("server.env"),
+                Some("http://127.0.0.1:7890"),
+            )
             .unwrap();
         let args: Vec<_> = command
             .get_args()
@@ -724,8 +772,6 @@ mod tests {
                 "openai",
                 "--env-file",
                 "server.env",
-                "--user-token-file",
-                "user-token",
                 "--json",
                 "--stop-on-stdin-eof",
             ]
@@ -739,6 +785,10 @@ mod tests {
         for key in ["CONTROL_PLANE_API_KEY", "CONTROL_PLANE_TUNNEL_ID"] {
             assert!(!env.iter().any(|(name, _)| name.to_str() == Some(key)));
         }
+        assert!(env.iter().any(|(name, value)| {
+            name.to_str() == Some("HTTPS_PROXY")
+                && value.and_then(|value| value.to_str()) == Some("http://127.0.0.1:7890")
+        }));
     }
 
     #[test]

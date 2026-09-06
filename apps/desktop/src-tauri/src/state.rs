@@ -4,9 +4,10 @@ use crate::error::{DesktopError, DesktopResult};
 use crate::models::{
     aggregate_readiness, DesktopOperationKind, DesktopStateSnapshot, Enrollment, Experience,
     Exposure, ExposureReadiness, ProjectReadiness, ProjectSelection, QuickShareState,
-    ReadinessNextActionKind, ReadinessSummaryKind, RegularTunnelState, RegularTunnelStatus,
-    RunnerReadiness, RunnerTopology, RuntimeTopology, ServerReadiness, ServerTopology,
-    StoredDesktopConfig, StoredRuntime,
+    ReadinessNextActionKind, ReadinessSummaryKind, RegularConnectionPreference, RegularTunnelState,
+    RegularTunnelStatus, RunnerReadiness, RunnerTopology, RuntimeTopology, ServerReadiness,
+    ServerTopology, StoredDesktopConfig, StoredRuntime, TunnelProxyConfig, TunnelProxyMode,
+    TunnelProxySnapshot,
 };
 use crate::operation::{
     cancelled_error, CancellationContext, CancellationSignal, OperationAdmission,
@@ -39,6 +40,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 const READINESS_CLEANUP_SLACK: Duration = Duration::from_secs(2);
 const SHUTDOWN_OPERATION_WAIT: Duration = Duration::from_secs(5);
 const DESKTOP_STATE_MAX_BYTES: u64 = 256 * 1024;
+const DESKTOP_SERVER_ENV_MAX_BYTES: u64 = 256 * 1024;
+const DESKTOP_MCP_MODEL_SURFACE: &str = "adaptive-runtime-v1";
+const DESKTOP_MCP_COMPACT_SCHEMAS: &str = "true";
 static NEXT_STATE_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 type SharedSupervisor = Arc<Mutex<ProcessSupervisor>>;
@@ -124,9 +128,33 @@ impl AppState {
             .await
     }
 
+    pub async fn resume_saved_runtime(&self) -> DesktopResult<DesktopStateSnapshot> {
+        let (operation, cancellation, mut core, baseline) = self
+            .begin_operation(DesktopOperationKind::RuntimeResume, true)
+            .await?;
+        let result = core.resume_saved_runtime(&cancellation).await;
+        self.finish_operation(operation, cancellation, core, baseline, result)
+            .await
+    }
+
+    pub async fn update_tunnel_proxy(
+        &self,
+        mode: TunnelProxyMode,
+        custom_url: Option<&str>,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        let (operation, cancellation, mut core, baseline) = self
+            .begin_operation(DesktopOperationKind::TunnelProxyUpdate, false)
+            .await?;
+        let result = core
+            .update_tunnel_proxy(mode, custom_url, &cancellation)
+            .await;
+        self.finish_operation(operation, cancellation, core, baseline, result)
+            .await
+    }
+
     pub async fn configure_local_setup(
         &self,
-        project_path: &str,
+        project_path: Option<&str>,
     ) -> DesktopResult<DesktopStateSnapshot> {
         let (operation, cancellation, mut core, baseline) = self
             .begin_operation(DesktopOperationKind::LocalSetup, true)
@@ -402,6 +430,7 @@ fn process_is_active(snapshot: Option<crate::process::ProcessSnapshot>) -> bool 
 
 pub struct DesktopCore {
     data_dir: PathBuf,
+    default_project_dir: PathBuf,
     config_path: PathBuf,
     config: StoredDesktopConfig,
     snapshot: DesktopStateSnapshot,
@@ -414,6 +443,7 @@ pub struct DesktopCore {
 impl DesktopCore {
     fn new(data_dir: PathBuf, resource_dir: PathBuf) -> DesktopResult<Self> {
         let activity = ActivityLog::default();
+        let default_project_dir = default_management_project_dir(&data_dir, &resource_dir);
         let config_path = data_dir.join("desktop-state.json");
         let config = load_config(&config_path, &activity)?;
         let mut snapshot = DesktopStateSnapshot::default();
@@ -421,10 +451,12 @@ impl DesktopCore {
         snapshot.project = project_snapshot(&config);
         snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
         snapshot.regular_tunnel_available = true;
+        apply_config_projection(&mut snapshot, &config);
         let published = Arc::new(RwLock::new(snapshot.clone()));
         let supervisor = Arc::new(Mutex::new(ProcessSupervisor::new(activity.clone())));
         Ok(Self {
             data_dir,
+            default_project_dir,
             config_path,
             config,
             snapshot,
@@ -438,6 +470,7 @@ impl DesktopCore {
     pub async fn get_state(&mut self) -> DesktopResult<DesktopStateSnapshot> {
         self.snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
         self.snapshot.regular_tunnel_available = true;
+        apply_config_projection(&mut self.snapshot, &self.config);
         if self.snapshot.regular_tunnel.is_some() {
             let active = self
                 .process_snapshot(ProcessKind::RegularTunnel)
@@ -575,6 +608,7 @@ impl DesktopCore {
         self.snapshot.activity_sequence = self.activity.latest_sequence();
         self.snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
         self.snapshot.regular_tunnel_available = true;
+        apply_config_projection(&mut self.snapshot, &self.config);
         let snapshot = self.snapshot.clone();
         *self
             .published
@@ -592,6 +626,13 @@ impl DesktopCore {
     ) {
         let observed_binaries = self.snapshot.binaries.clone();
         match kind {
+            DesktopOperationKind::RuntimeResume => {
+                // Resume is a desired-state replay of an already committed setup.
+                // If any step fails or is cancelled, newly owned processes have
+                // already been reclaimed above; restore the last published view
+                // rather than leaving a synthetic "starting" state behind.
+                self.snapshot = baseline.snapshot.clone();
+            }
             DesktopOperationKind::QuickShareStart => {
                 // Quick Share is intentionally ephemeral. Any failed start has
                 // already stopped (or will have cleanup stop) the newly owned
@@ -672,13 +713,88 @@ impl DesktopCore {
         }
     }
 
-    pub async fn configure_local_setup(
+    pub async fn resume_saved_runtime(
         &mut self,
-        project_path: &str,
         cancellation: &CancellationContext,
     ) -> DesktopResult<DesktopStateSnapshot> {
         cancellation.check()?;
-        let project = self.adapter.inspect_project(project_path).await?;
+        let Some(topology) = self.config.topology.clone() else {
+            return self.get_state().await;
+        };
+        if topology.experience != Experience::Full {
+            return self.get_state().await;
+        }
+        let project_path = self
+            .config
+            .project
+            .as_ref()
+            .map(|project| project.path.clone());
+        match topology.server {
+            ServerTopology::Local => {
+                self.configure_local_setup(project_path.as_deref(), cancellation)
+                    .await
+            }
+            ServerTopology::Remote { url } => {
+                let project_path = project_path.ok_or_else(|| {
+                    DesktopError::new(
+                        "project_not_ready",
+                        "The saved remote Desktop runtime no longer has a project selection",
+                        "Choose a project or change the Desktop runtime setup.",
+                    )
+                })?;
+                self.configure_remote_setup(&url, "", &project_path, cancellation)
+                    .await
+            }
+        }
+    }
+
+    pub async fn update_tunnel_proxy(
+        &mut self,
+        mode: TunnelProxyMode,
+        custom_url: Option<&str>,
+        cancellation: &CancellationContext,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        cancellation.check()?;
+        let custom_url = match mode {
+            TunnelProxyMode::Custom => Some(validate_tunnel_proxy_url(custom_url.unwrap_or(""))?),
+            TunnelProxyMode::Auto | TunnelProxyMode::Direct => None,
+        };
+        self.config.tunnel_proxy = TunnelProxyConfig { mode, custom_url };
+        self.save_config().await?;
+        self.get_state().await
+    }
+
+    pub async fn configure_local_setup(
+        &mut self,
+        project_path: Option<&str>,
+        cancellation: &CancellationContext,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        cancellation.check()?;
+        let project = match project_path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => self.adapter.inspect_project(path).await?,
+            None => {
+                tokio::fs::create_dir_all(&self.default_project_dir)
+                    .await
+                    .map_err(|error| {
+                        DesktopError::new(
+                            "default_project_unavailable",
+                            "Desktop could not prepare its default management project",
+                            "Check that the WebCodex Desktop install directory is writable, or choose another project from Change runtime mode.",
+                        )
+                        .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+                    })?;
+                let mut project = self
+                    .adapter
+                    .inspect_project(&self.default_project_dir.to_string_lossy())
+                    .await?;
+                // The automatically registered management project should not
+                // also grant authority to register sibling installation folders.
+                // Equality is a valid allowed-root boundary, so keep this
+                // implicit setup scoped to the installation directory itself.
+                project.allowed_root = project.path.clone();
+                project
+            }
+        };
         cancellation.check()?;
         let binaries = self.adapter.ensure_binaries(cancellation).await?.clone();
         self.snapshot.binaries = Some(binaries.info());
@@ -717,16 +833,19 @@ impl DesktopCore {
         cancellation.check()?;
 
         let server_url = if env_file.is_file() {
+            ensure_desktop_server_defaults(&env_file)?;
             self.adapter
                 .server_status(None, Some(&env_file), None, cancellation)
                 .await?
                 .probe_url
         } else {
             let listen = reserve_loopback_address()?;
-            self.adapter
+            let status = self
+                .adapter
                 .init_local_server(&listen, &data_dir, &env_file, cancellation)
-                .await?
-                .probe_url
+                .await?;
+            ensure_desktop_server_defaults(&env_file)?;
+            status.probe_url
         };
         let reusable_identity = identity_from_config(&self.config).filter(|identity| {
             same_server(&identity.server_url, &server_url)
@@ -734,6 +853,7 @@ impl DesktopCore {
         });
         self.config.topology = self.snapshot.topology.clone();
         self.config.project = Some(project.clone());
+        self.config.runtime_autostart = Some(true);
         self.config.runtime = Some(match reusable_identity.as_ref() {
             Some(identity) => StoredRuntime {
                 server_url: server_url.clone(),
@@ -795,8 +915,8 @@ impl DesktopCore {
         self.snapshot.readiness.server = ServerReadiness::Ready;
         self.publish_snapshot();
 
-        let identity = match reusable_identity {
-            Some(identity) => identity,
+        let (identity, identity_replaced) = match reusable_identity {
+            Some(identity) => (identity, false),
             None => {
                 let pairing_code = self
                     .adapter
@@ -816,16 +936,24 @@ impl DesktopCore {
                 self.store_identity(&project, &identity, Some(env_file.clone()))
                     .await?;
                 cancellation.check()?;
-                identity
+                (identity, true)
             }
         };
 
         let runner_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-        let runner_ready = self
-            .adapter
-            .runner_ready_until(&identity, cancellation, runner_deadline)
-            .await
-            .unwrap_or(false);
+        let runner_ready = if identity_replaced {
+            // A fresh Desktop enrollment may reuse the same client_id while
+            // changing the Runner token or project registry. An older owned
+            // Runner with that client_id is not proof that this exact config is
+            // active, so force replacement instead of accepting stale online
+            // status.
+            false
+        } else {
+            self.adapter
+                .runner_ready_until(&identity, cancellation, runner_deadline)
+                .await
+                .unwrap_or(false)
+        };
         cancellation.check()?;
         let runner_started = if !runner_ready {
             if runner_deadline.is_elapsed() {
@@ -898,6 +1026,8 @@ impl DesktopCore {
         self.snapshot.topology = Some(topology.clone());
         self.snapshot.project = Some(project.clone());
         self.config.topology = Some(topology.clone());
+        self.config.runtime_autostart = Some(true);
+        self.config.preferred_connection = Some(RegularConnectionPreference::NoChatGpt);
         self.snapshot.readiness = aggregate_readiness(
             ServerReadiness::Starting,
             RunnerReadiness::Connecting,
@@ -916,35 +1046,36 @@ impl DesktopCore {
         );
         self.publish_snapshot();
 
-        let identity = match identity_from_config(&self.config).filter(|identity| {
-            same_server(&identity.server_url, &server_url)
-                && same_project(&identity.project_path, &project.path)
-        }) {
-            Some(identity) => identity,
-            None => {
-                if !pairing_code.starts_with("wc_pair_") {
-                    return Err(DesktopError::new(
-                        "pairing_code_invalid",
-                        "The one-time login code is not a WebCodex pairing code",
-                        "Enter the wc_pair_… code issued by the existing Server.",
-                    ));
+        let (identity, identity_replaced) =
+            match identity_from_config(&self.config).filter(|identity| {
+                same_server(&identity.server_url, &server_url)
+                    && same_project(&identity.project_path, &project.path)
+            }) {
+                Some(identity) => (identity, false),
+                None => {
+                    if !pairing_code.starts_with("wc_pair_") {
+                        return Err(DesktopError::new(
+                            "pairing_code_invalid",
+                            "The one-time login code is not a WebCodex pairing code",
+                            "Enter the wc_pair_… code issued by the existing Server.",
+                        ));
+                    }
+                    let identity = self
+                        .adapter
+                        .login_with_pairing(
+                            &server_url,
+                            pairing_code,
+                            &self.data_dir.join("connections"),
+                            &project,
+                            cancellation,
+                        )
+                        .await?;
+                    self.config.topology = Some(topology.clone());
+                    self.store_identity(&project, &identity, None).await?;
+                    cancellation.check()?;
+                    (identity, true)
                 }
-                let identity = self
-                    .adapter
-                    .login_with_pairing(
-                        &server_url,
-                        pairing_code,
-                        &self.data_dir.join("connections"),
-                        &project,
-                        cancellation,
-                    )
-                    .await?;
-                self.config.topology = Some(topology.clone());
-                self.store_identity(&project, &identity, None).await?;
-                cancellation.check()?;
-                identity
-            }
-        };
+            };
 
         let server_deadline = Deadline::after(SERVER_READY_TIMEOUT);
         let server_status = match self
@@ -980,11 +1111,14 @@ impl DesktopCore {
             ));
         }
         let runner_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-        let runner_ready = self
-            .adapter
-            .runner_ready_until(&identity, cancellation, runner_deadline)
-            .await
-            .unwrap_or(false);
+        let runner_ready = if identity_replaced {
+            false
+        } else {
+            self.adapter
+                .runner_ready_until(&identity, cancellation, runner_deadline)
+                .await
+                .unwrap_or(false)
+        };
         cancellation.check()?;
         let runner_started = if !runner_ready {
             if runner_deadline.is_elapsed() {
@@ -1058,9 +1192,12 @@ impl DesktopCore {
             ));
         }
         let deadline = Deadline::after(QUICK_SHARE_READY_TIMEOUT);
-        let command = self
-            .adapter
-            .quick_share_command(Path::new(&project.path), provider)?;
+        let tunnel_proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
+        let command = self.adapter.quick_share_command(
+            Path::new(&project.path),
+            provider,
+            tunnel_proxy.url.as_deref(),
+        )?;
         if deadline.is_elapsed() {
             return Err(readiness_timeout_error(
                 "quick_share_not_ready",
@@ -1292,7 +1429,7 @@ impl DesktopCore {
             return Err(DesktopError::new(
                 "runtime_not_ready",
                 "Local WebCodex runtime is not ready",
-                "Restore the Server, Runner, and project readiness before starting the secure tunnel.",
+                "Restore the Server and Runner readiness before starting the secure tunnel.",
             ));
         }
         let runtime = self.config.runtime.clone().ok_or_else(|| {
@@ -1312,21 +1449,11 @@ impl DesktopCore {
                     "Run Local Setup again.",
                 )
             })?;
-        let user_token_file = runtime
-            .user_token_file
-            .filter(|path| path.is_file())
-            .ok_or_else(|| {
-                DesktopError::new(
-                    "tunnel_auth_invalid",
-                    "Desktop-managed WebCodex user authentication is unavailable",
-                    "Run Local Setup again to restore the managed connection.",
-                )
-            })?;
-
         let deadline = Deadline::after(REGULAR_TUNNEL_READY_TIMEOUT);
+        let tunnel_proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
         let command = self
             .adapter
-            .regular_tunnel_command(&env_file, &user_token_file)?;
+            .regular_tunnel_command(&env_file, tunnel_proxy.url.as_deref())?;
         if deadline.is_elapsed() {
             return Err(readiness_timeout_error(
                 "tunnel_unavailable",
@@ -1350,7 +1477,7 @@ impl DesktopCore {
             ServerReadiness::Ready,
             RunnerReadiness::Ready,
             ExposureReadiness::Starting,
-            ProjectReadiness::Ready,
+            current.readiness.project.clone(),
         );
         self.activity.push(
             ActivityEventKind::RegularTunnelStarting,
@@ -1411,7 +1538,7 @@ impl DesktopCore {
                     ServerReadiness::Ready,
                     RunnerReadiness::Ready,
                     ExposureReadiness::Error,
-                    ProjectReadiness::Ready,
+                    current.readiness.project.clone(),
                 );
                 apply_regular_tunnel_next_action(&mut self.snapshot, &ExposureReadiness::Error);
                 return Err(DesktopError::new(
@@ -1460,13 +1587,29 @@ impl DesktopCore {
             clipboard_contains: event.connection.clipboard_contains,
             ready_for_chatgpt: event.ready_for_chatgpt && handoff_available,
         });
+        self.config.preferred_connection = Some(RegularConnectionPreference::OpenAiTunnel);
+        self.save_config().await?;
+        let exposure = if handoff_available {
+            ExposureReadiness::RemoteReady
+        } else {
+            ExposureReadiness::Degraded
+        };
+        self.snapshot.readiness = aggregate_readiness(
+            ServerReadiness::Ready,
+            RunnerReadiness::Ready,
+            exposure.clone(),
+            current.readiness.project.clone(),
+        );
+        apply_regular_tunnel_next_action(&mut self.snapshot, &exposure);
+        self.snapshot.topology = effective_topology(self.config.topology.as_ref(), true);
+        self.snapshot.project = project_snapshot(&self.config);
         self.activity.push(
             ActivityEventKind::RegularTunnelReady,
             "regular_tunnel",
             ActivityLevel::Info,
             "Regular OpenAI Secure Tunnel reached verified readiness",
         );
-        self.refresh_runtime_status(cancellation).await
+        self.get_state().await
     }
 
     pub async fn stop_regular_tunnel(
@@ -1476,6 +1619,8 @@ impl DesktopCore {
         self.stop_process(ProcessKind::RegularTunnel).await;
         self.snapshot.regular_tunnel = None;
         self.snapshot.topology = self.config.topology.clone();
+        self.config.preferred_connection = Some(RegularConnectionPreference::NoChatGpt);
+        self.save_config().await?;
         self.activity.push(
             ActivityEventKind::RegularTunnelStopped,
             "regular_tunnel",
@@ -1496,6 +1641,8 @@ impl DesktopCore {
         self.stop_process(ProcessKind::RegularTunnel).await;
         self.snapshot.regular_tunnel = None;
         self.stop_process(ProcessKind::LocalRunner).await;
+        self.config.runtime_autostart = Some(false);
+        self.save_config().await?;
         self.stop_process(ProcessKind::LocalServer).await;
         self.snapshot.topology = self.config.topology.clone();
         let exposure = exposure_readiness(self.config.topology.as_ref());
@@ -1818,6 +1965,72 @@ fn readiness_timeout_error(
 ) -> DesktopError {
     DesktopError::new(code, message, action)
         .with_details(serde_json::json!({ "category": "readiness_timeout" }))
+}
+
+// These are Desktop packaging defaults, not process-environment overrides.
+// The Server loads its env file only into keys that are absent from the process
+// environment, so the effective precedence remains built-in defaults < this
+// config file < explicit environment variables.
+fn ensure_desktop_server_defaults(path: &Path) -> DesktopResult<()> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        desktop_state_unavailable("Desktop could not inspect its local Server configuration")
+            .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+    })?;
+    if !metadata.is_file() || metadata.len() > DESKTOP_SERVER_ENV_MAX_BYTES {
+        return Err(desktop_state_unavailable(
+            "Desktop local Server configuration is not a bounded regular file",
+        ));
+    }
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        desktop_state_unavailable("Desktop could not read its local Server configuration")
+            .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+    })?;
+    let has_key = |key: &str| {
+        content.lines().any(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("export ").unwrap_or(line).trim();
+            line.split_once('=')
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
+        })
+    };
+    let mut additions = Vec::new();
+    if !has_key("WEBCODEX_MCP_MODEL_SURFACE") {
+        additions.push(format!(
+            "WEBCODEX_MCP_MODEL_SURFACE={DESKTOP_MCP_MODEL_SURFACE}"
+        ));
+    }
+    if !has_key("WEBCODEX_MCP_COMPACT_SCHEMAS") {
+        additions.push(format!(
+            "WEBCODEX_MCP_COMPACT_SCHEMAS={DESKTOP_MCP_COMPACT_SCHEMAS}"
+        ));
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            desktop_state_unavailable("Desktop could not update its local Server configuration")
+                .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+        })?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        file.write_all(b"\n").map_err(|error| {
+            desktop_state_unavailable("Desktop could not update its local Server configuration")
+                .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+        })?;
+    }
+    for addition in additions {
+        writeln!(file, "{addition}").map_err(|error| {
+            desktop_state_unavailable("Desktop could not update its local Server configuration")
+                .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+        })?;
+    }
+    file.flush().map_err(|error| {
+        desktop_state_unavailable("Desktop could not update its local Server configuration")
+            .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
+    })?;
+    Ok(())
 }
 
 fn machine_event_overflow_error(event: &Value) -> DesktopError {
@@ -2186,6 +2399,137 @@ fn exposure_readiness(topology: Option<&RuntimeTopology>) -> ExposureReadiness {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveTunnelProxy {
+    url: Option<String>,
+    source: &'static str,
+    detected_url: Option<String>,
+}
+
+fn validate_tunnel_proxy_url(value: &str) -> DesktopResult<String> {
+    crate::platform::normalize_proxy_server(value).ok_or_else(|| {
+        DesktopError::new(
+            "tunnel_proxy_invalid",
+            "The Tunnel proxy must be an HTTP or HTTPS proxy URL without embedded credentials",
+            "Use a value such as http://127.0.0.1:7890, or choose automatic proxy detection.",
+        )
+    })
+}
+
+fn environment_tunnel_proxy() -> Option<String> {
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| crate::platform::normalize_proxy_server(&value))
+        })
+}
+
+fn effective_tunnel_proxy(config: &TunnelProxyConfig) -> DesktopResult<EffectiveTunnelProxy> {
+    let system = crate::platform::system_http_proxy_candidate();
+    let detected_url = system.as_ref().map(|candidate| candidate.url.clone());
+    match config.mode {
+        TunnelProxyMode::Direct => Ok(EffectiveTunnelProxy {
+            url: None,
+            source: "direct",
+            detected_url,
+        }),
+        TunnelProxyMode::Custom => Ok(EffectiveTunnelProxy {
+            url: Some(validate_tunnel_proxy_url(
+                config.custom_url.as_deref().unwrap_or(""),
+            )?),
+            source: "custom",
+            detected_url,
+        }),
+        TunnelProxyMode::Auto => {
+            if let Some(url) = environment_tunnel_proxy() {
+                return Ok(EffectiveTunnelProxy {
+                    url: Some(url),
+                    source: "environment",
+                    detected_url,
+                });
+            }
+            if let Some(candidate) = system {
+                if candidate.enabled || crate::platform::proxy_is_loopback(&candidate.url) {
+                    return Ok(EffectiveTunnelProxy {
+                        url: Some(candidate.url),
+                        source: if candidate.enabled {
+                            "windows_system"
+                        } else {
+                            "windows_loopback_candidate"
+                        },
+                        detected_url,
+                    });
+                }
+            }
+            Ok(EffectiveTunnelProxy {
+                url: None,
+                source: "direct",
+                detected_url,
+            })
+        }
+    }
+}
+
+fn runtime_autostart(config: &StoredDesktopConfig) -> bool {
+    config.runtime_autostart.unwrap_or_else(|| {
+        config.runtime.is_some()
+            && config
+                .topology
+                .as_ref()
+                .is_some_and(|topology| topology.experience == Experience::Full)
+    })
+}
+
+fn default_management_project_dir(data_dir: &Path, resource_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = data_dir;
+        // The NSIS package is current-user scoped. Use the actual installation
+        // directory as the default management Project so a fresh Desktop is
+        // immediately manageable without asking the user to choose an unrelated
+        // source checkout first. This intentionally grants the Project the same
+        // install-directory authority the user has requested for Desktop
+        // configuration and maintenance.
+        return resource_dir.to_path_buf();
+    }
+    #[cfg(not(windows))]
+    {
+        // A macOS resource directory lives inside the signed app bundle and is
+        // not a mutable workspace. Keep the same management-project semantics
+        // in the per-user Desktop data directory there.
+        let _ = resource_dir;
+        data_dir.join("workspace")
+    }
+}
+
+fn preferred_connection(config: &StoredDesktopConfig) -> RegularConnectionPreference {
+    config.preferred_connection.unwrap_or_default()
+}
+
+fn apply_config_projection(snapshot: &mut DesktopStateSnapshot, config: &StoredDesktopConfig) {
+    snapshot.runtime_autostart = runtime_autostart(config);
+    snapshot.preferred_connection = preferred_connection(config);
+    snapshot.tunnel_proxy = match effective_tunnel_proxy(&config.tunnel_proxy) {
+        Ok(proxy) => TunnelProxySnapshot {
+            mode: config.tunnel_proxy.mode,
+            custom_url: config.tunnel_proxy.custom_url.clone(),
+            effective_source: proxy.source.to_string(),
+            effective_url: proxy.url,
+            detected_url: proxy.detected_url,
+        },
+        Err(_) => TunnelProxySnapshot {
+            mode: config.tunnel_proxy.mode,
+            custom_url: config.tunnel_proxy.custom_url.clone(),
+            effective_source: "invalid_custom".to_string(),
+            effective_url: None,
+            detected_url: crate::platform::system_http_proxy_candidate()
+                .map(|candidate| candidate.url),
+        },
+    };
+}
+
 fn openai_tunnel_is_configured() -> bool {
     ["CONTROL_PLANE_TUNNEL_ID", "CONTROL_PLANE_API_KEY"]
         .iter()
@@ -2209,6 +2553,55 @@ fn same_project(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_management_project_uses_safe_platform_location() {
+        let data = PathBuf::from(r"C:\Users\test\AppData\Local\WebCodex");
+        let resources = PathBuf::from(r"D:\Apps\WebCodex Desktop");
+        let project = default_management_project_dir(&data, &resources);
+        #[cfg(windows)]
+        assert_eq!(project, resources);
+        #[cfg(not(windows))]
+        assert_eq!(project, data.join("workspace"));
+    }
+
+    #[test]
+    fn desktop_server_defaults_append_missing_values_and_preserve_explicit_config() {
+        let dir = unique_state_dir("server-defaults-explicit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join("webcodex.env");
+        std::fs::write(
+            &env_file,
+            "WEBCODEX_TOKEN=secret\nWEBCODEX_MCP_COMPACT_SCHEMAS=false\n",
+        )
+        .unwrap();
+
+        ensure_desktop_server_defaults(&env_file).unwrap();
+        let once = std::fs::read_to_string(&env_file).unwrap();
+        assert!(once.contains("WEBCODEX_TOKEN=secret\n"));
+        assert!(once.contains("WEBCODEX_MCP_COMPACT_SCHEMAS=false\n"));
+        assert!(once.contains("WEBCODEX_MCP_MODEL_SURFACE=adaptive-runtime-v1\n"));
+        assert_eq!(once.matches("WEBCODEX_MCP_COMPACT_SCHEMAS=").count(), 1);
+
+        ensure_desktop_server_defaults(&env_file).unwrap();
+        assert_eq!(std::fs::read_to_string(&env_file).unwrap(), once);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn desktop_server_defaults_add_both_values_to_fresh_server_env() {
+        let dir = unique_state_dir("server-defaults-fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join("webcodex.env");
+        std::fs::write(&env_file, "WEBCODEX_ADDR=127.0.0.1:12345").unwrap();
+
+        ensure_desktop_server_defaults(&env_file).unwrap();
+        let content = std::fs::read_to_string(&env_file).unwrap();
+        assert!(content.starts_with("WEBCODEX_ADDR=127.0.0.1:12345\n"));
+        assert!(content.contains("WEBCODEX_MCP_MODEL_SURFACE=adaptive-runtime-v1\n"));
+        assert!(content.contains("WEBCODEX_MCP_COMPACT_SCHEMAS=true\n"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn unique_state_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "webcodex-desktop-state-{name}-{}-{}",
@@ -2229,6 +2622,9 @@ mod tests {
                 is_git_repository: false,
                 runtime_project_id: None,
             }),
+            runtime_autostart: None,
+            preferred_connection: None,
+            tunnel_proxy: TunnelProxyConfig::default(),
             runtime: None,
         }
     }
@@ -2344,6 +2740,100 @@ mod tests {
     }
 
     #[test]
+    fn legacy_full_runtime_defaults_to_autostart_but_explicit_stop_is_preserved() {
+        let mut config = test_stored_config("resume");
+        config.topology = Some(RuntimeTopology {
+            experience: Experience::Full,
+            server: ServerTopology::Local,
+            runner: RunnerTopology::Local,
+            exposure: Exposure::None,
+            enrollment: Enrollment::ManagedPairing,
+        });
+        config.runtime = Some(StoredRuntime {
+            server_url: "http://127.0.0.1:58208".to_string(),
+            server_env_file: None,
+            runner_config: None,
+            user_token_file: None,
+            project_id: None,
+            runtime_project_id: None,
+        });
+        assert!(runtime_autostart(&config));
+
+        config.runtime_autostart = Some(false);
+        assert!(!runtime_autostart(&config));
+    }
+
+    #[test]
+    fn explicit_tunnel_proxy_is_bounded_and_direct_mode_clears_routing() {
+        let custom = TunnelProxyConfig {
+            mode: TunnelProxyMode::Custom,
+            custom_url: Some("http://127.0.0.1:7890".to_string()),
+        };
+        let effective = effective_tunnel_proxy(&custom).expect("valid custom proxy");
+        assert_eq!(effective.url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(effective.source, "custom");
+
+        let direct = effective_tunnel_proxy(&TunnelProxyConfig {
+            mode: TunnelProxyMode::Direct,
+            custom_url: Some("http://ignored.example.test:8080".to_string()),
+        })
+        .expect("direct mode");
+        assert_eq!(direct.url, None);
+        assert_eq!(direct.source, "direct");
+
+        assert!(validate_tunnel_proxy_url("http://user:secret@127.0.0.1:7890").is_err());
+    }
+
+    #[test]
+    fn failed_runtime_resume_restores_the_last_published_state() {
+        let data_dir = unique_state_dir("resume-failure-reconcile");
+        let mut core = DesktopCore::new(data_dir.clone(), data_dir.join("resources"))
+            .expect("create Desktop core");
+        let mut baseline_snapshot = DesktopStateSnapshot::default();
+        baseline_snapshot.topology = Some(RuntimeTopology {
+            experience: Experience::Full,
+            server: ServerTopology::Local,
+            runner: RunnerTopology::Local,
+            exposure: Exposure::None,
+            enrollment: Enrollment::ManagedPairing,
+        });
+        baseline_snapshot.readiness = aggregate_readiness(
+            ServerReadiness::Stopped,
+            RunnerReadiness::Stopped,
+            ExposureReadiness::LocalReady,
+            ProjectReadiness::Configured,
+        );
+        let baseline = ProcessBaseline {
+            local_server: false,
+            local_runner: false,
+            quick_share: false,
+            regular_tunnel: false,
+            snapshot: baseline_snapshot.clone(),
+        };
+        core.snapshot.readiness = aggregate_readiness(
+            ServerReadiness::Starting,
+            RunnerReadiness::Connecting,
+            ExposureReadiness::LocalReady,
+            ProjectReadiness::Configured,
+        );
+
+        core.reconcile_after_operation_failure(
+            DesktopOperationKind::RuntimeResume,
+            &baseline,
+            ProcessCleanup {
+                local_server: true,
+                local_runner: true,
+                ..ProcessCleanup::default()
+            },
+            false,
+        );
+
+        assert_eq!(core.snapshot.readiness, baseline_snapshot.readiness);
+        assert_eq!(core.snapshot.topology, baseline_snapshot.topology);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn invalid_stored_identity_is_not_advertised_for_reuse() {
         let config = StoredDesktopConfig {
             topology: Some(RuntimeTopology {
@@ -2363,6 +2853,9 @@ mod tests {
                 is_git_repository: true,
                 runtime_project_id: Some("agent:desktop:repo".to_string()),
             }),
+            runtime_autostart: None,
+            preferred_connection: None,
+            tunnel_proxy: TunnelProxyConfig::default(),
             runtime: Some(StoredRuntime {
                 server_url: "https://example.test".to_string(),
                 server_env_file: None,
@@ -2630,13 +3123,15 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires current-source dogfood binaries and a temporary project"]
-    async fn windows_local_full_dogfood_reuses_enrollment_and_stops_owned_runtime() {
-        if !cfg!(windows) {
-            return;
-        }
+    async fn native_local_full_dogfood_reuses_enrollment_and_stops_owned_runtime() {
         let project = std::env::var("WEBCODEX_DESKTOP_DOGFOOD_PROJECT")
             .expect("WEBCODEX_DESKTOP_DOGFOOD_PROJECT must point to the temporary fixture");
-        let data_dir = std::env::temp_dir().join(format!(
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Resolve the fixture root, not the credential-store security checks.
+        let temporary_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve the native temporary fixture root");
+        let data_dir = temporary_root.join(format!(
             "webcodex-desktop-local-dogfood-{}",
             std::process::id()
         ));
@@ -2644,13 +3139,25 @@ mod tests {
         let mut core = DesktopCore::new(data_dir.clone(), data_dir.join("test-resources"))
             .expect("create local dogfood state");
         let cancellation = CancellationContext::never();
-        let setup = core.configure_local_setup(&project, &cancellation).await;
+        let setup = core
+            .configure_local_setup(Some(&project), &cancellation)
+            .await;
         let snapshot = match setup {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                let stages: Vec<_> = core
+                    .activity
+                    .snapshot()
+                    .into_iter()
+                    .map(|entry| entry.event_kind)
+                    .collect();
+                let readiness = core.snapshot.readiness.clone();
+                let initialized = data_dir.join("runtime/local/webcodex.env").is_file();
                 core.supervisor.lock().await.stop_all().await;
                 let _ = std::fs::remove_dir_all(&data_dir);
-                panic!("local full setup failed: {error:?}");
+                panic!(
+                    "local full setup failed: {error:?}; initialized={initialized}; readiness={readiness:?}; stages={stages:?}"
+                );
             }
         };
         assert_eq!(snapshot.readiness.server, ServerReadiness::Ready);
@@ -2688,7 +3195,7 @@ mod tests {
             .is_none());
 
         let restarted = core
-            .configure_local_setup(&project, &cancellation)
+            .configure_local_setup(Some(&project), &cancellation)
             .await
             .expect("restart local full setup without re-enrollment");
         assert_eq!(restarted.readiness.server, ServerReadiness::Ready);
