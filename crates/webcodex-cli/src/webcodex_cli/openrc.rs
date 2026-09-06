@@ -232,14 +232,16 @@ fn openrc_shell_value<'a>(field: &str, value: &'a str) -> Result<&'a str, String
 }
 
 fn openrc_shell_path<'a>(field: &str, path: &'a Path) -> Result<&'a str, String> {
-    if !path.is_absolute() {
+    let value = path
+        .to_str()
+        .ok_or_else(|| format!("invalid OpenRC {field} value: path is not valid UTF-8"))?;
+    // The rendered init script always targets Alpine (POSIX); absolute-path
+    // validation uses POSIX semantics so it never depends on the build host OS.
+    if !value.starts_with('/') {
         return Err(format!(
             "invalid OpenRC {field} value: path must be absolute"
         ));
     }
-    let value = path
-        .to_str()
-        .ok_or_else(|| format!("invalid OpenRC {field} value: path is not valid UTF-8"))?;
     openrc_shell_value(field, value)
 }
 
