@@ -60,3 +60,4 @@ data*
 /artifacts/projects-runtime/
 /artifacts/runtime-call-stream/
 /scripts/ui-smoke/node_modules/
+logs/
