@@ -1,0 +1,259 @@
+name: Release musl binaries
+
+run-name: Release musl ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v0.3.9)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-musl-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      built_at: ${{ steps.metadata.outputs.built_at }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Resolve immutable build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          workspace_version="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("Cargo.toml").open("rb") as source:
+              print(tomllib.load(source)["workspace"]["package"]["version"])
+          PY
+          )"
+          if [ "$workspace_version" != "$version" ]; then
+            echo "Tag/source version mismatch: tag=$version workspace=$workspace_version" >&2
+            exit 1
+          fi
+
+          source_sha="$(git rev-list -n 1 "$tag")"
+          if [ "$(git rev-parse HEAD)" != "$source_sha" ]; then
+            echo "Checked-out HEAD does not match $tag." >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Release checkout is not clean." >&2
+            exit 1
+          fi
+
+          # Commit time works for annotated and lightweight tags.
+          built_at="$(git log -1 --format=%ct "$source_sha")"
+          if [[ ! "$built_at" =~ ^[0-9]+$ ]]; then
+            echo "Could not resolve the source commit timestamp for $tag." >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "built_at=$built_at" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # To add arm64 later, add an ubuntu-24.04-arm row with the
+          # aarch64-unknown-linux-musl target and matching linker variable names.
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x64-musl
+            linker: musl-gcc
+            cargo_linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+            cc_env: CC_x86_64_unknown_linux_musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      WEBCODEX_BUILT_AT: ${{ needs.prepare.outputs.built_at }}
+      WEBCODEX_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      WEBCODEX_RELEASE_PLATFORM: ${{ matrix.platform }}
+      WEBCODEX_RELEASE_BIN_DIR: target/${{ matrix.target }}/release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Configure target C toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s=%s\n' '${{ matrix.cargo_linker_env }}' '${{ matrix.linker }}' >> "$GITHUB_ENV"
+          printf '%s=%s\n' '${{ matrix.cc_env }}' '${{ matrix.linker }}' >> "$GITHUB_ENV"
+
+      - name: Build static musl binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}" \
+            -p webcodex -p webcodex-cli -p webcodex-runner
+
+      - name: Verify identity and static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_commit="${SOURCE_SHA:0:12}"
+          mkdir -p dist/runtime
+          for name in webcodex webcodex-server webcodex-runner; do
+            binary="$WEBCODEX_RELEASE_BIN_DIR/$name"
+            output="$($binary --version)"
+            expected="$name $VERSION (commit $short_commit, dirty=false, built_at=$WEBCODEX_BUILT_AT)"
+            if [ "$output" != "$expected" ]; then
+              echo "Unexpected $name release identity: $output" >&2
+              echo "Expected: $expected" >&2
+              exit 1
+            fi
+
+            if readelf -d "$binary" | grep -Eq 'NEEDED|Shared library'; then
+              echo "$binary has a dynamic library dependency." >&2
+              readelf -d "$binary" >&2
+              exit 1
+            fi
+            if readelf --version-info "$binary" | grep -q 'GLIBC_'; then
+              echo "$binary has a GLIBC symbol-version dependency." >&2
+              readelf --version-info "$binary" >&2
+              exit 1
+            fi
+            if ! file "$binary" | grep -Eq 'statically linked|static-pie linked'; then
+              echo "$binary is not reported as statically linked." >&2
+              file "$binary" >&2
+              exit 1
+            fi
+            install -m 0755 "$binary" "dist/runtime/$name"
+          done
+
+      - name: Run on Alpine 3.22 without gcompat
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/dist:ro" alpine:3.22 sh -ec '
+            for name in webcodex webcodex-server webcodex-runner; do
+              /dist/runtime/$name --version
+            done
+          '
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/package_release_artifact.sh dist
+          archive="webcodex-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.tar.gz"
+          test -f "dist/$archive"
+          (
+            cd dist
+            sha256sum "$archive" > SHA256SUMS
+          )
+          rm -rf dist/runtime
+
+      - name: Upload musl release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-musl-${{ matrix.platform }}
+          path: |
+            dist/webcodex-v${{ needs.prepare.outputs.version }}-${{ matrix.platform }}.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download musl artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-musl-*
+          path: downloaded
+
+      - name: Verify and assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r checksum_file; do
+            (cd "$(dirname "$checksum_file")" && sha256sum -c SHA256SUMS)
+          done < <(find downloaded -type f -name SHA256SUMS -print)
+
+          mkdir -p dist
+          mapfile -t archives < <(find downloaded -type f -name '*.tar.gz' -print | sort)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "No musl release archives were downloaded." >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            cp "$archive" dist/
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+
+      - name: Create GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag

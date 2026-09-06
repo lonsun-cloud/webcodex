@@ -31,6 +31,7 @@ use runner_config::{
     run_runner_init, RunnerInitOptions, DEFAULT_INIT_PROJECT_REGISTRY_DIR,
     DEFAULT_POLL_INTERVAL_MS, TRANSPORT_WEBSOCKET,
 };
+use webcodex_cli::openrc::ServiceManagerSelection;
 use webcodex_cli::ops::ops_exit_code;
 use webcodex_cli::{
     base_dir_or_default, client_profile_project_registry_dir, client_profile_runner_config,
@@ -211,9 +212,11 @@ struct ServerInstallServiceOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunnerInstallServiceOptions {
     scope: ServiceScope,
+    service_manager: ServiceManagerSelection,
     config: PathBuf,
     bin: PathBuf,
     service_file: PathBuf,
+    service_file_explicit: bool,
     user: Option<String>,
     group: Option<String>,
     working_directory: PathBuf,
@@ -249,7 +252,9 @@ enum ServiceActionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceActionOptions {
     scope: ServiceScope,
+    service_manager: ServiceManagerSelection,
     service_file: PathBuf,
+    service_file_explicit: bool,
     unit: String,
     kind: ServiceActionKind,
     local_profile: Option<LocalProfileOptions>,
@@ -265,8 +270,10 @@ struct LocalProfileOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunnerStatusOptions {
     scope: ServiceScope,
+    service_manager: ServiceManagerSelection,
     config: PathBuf,
     service_file: PathBuf,
+    service_file_explicit: bool,
     local_state_dir: Option<PathBuf>,
     server_url: Option<String>,
     server_http: ServerHttpOptions,
@@ -1226,11 +1233,12 @@ fn parse_runner_subcommand(args: &[String]) -> CliAction {
             "init" => runner_init_usage(),
             "install" => runner_install_service_usage(),
             "run" => "Usage: webcodex runner run [--profile NAME|--config PATH]\n\nRun webcodex-runner directly in the foreground.\n",
-            "restart" => "Usage: webcodex runner restart [--profile NAME] [--bin PATH] [--scope user|system] [--service-file PATH]\n\nWith a profile created by `webcodex connect`, omitting --scope manages its user-level background Runner; --bin selects an explicit Runner binary for that hosted profile. An explicit scope manages the matching systemd service and does not accept --bin.\n",
-            "start" | "stop" => "Usage: webcodex runner <start|stop> [--profile NAME] [--scope user|system] [--service-file PATH]\n\nWith a profile created by `webcodex connect`, omitting --scope manages its user-level background Runner. An explicit scope manages the matching systemd service.\n",
+            "restart" => "Usage: webcodex runner restart [--profile NAME] [--bin PATH] [--scope user|system] [--service-file PATH] [--service-manager auto|systemd|openrc]\n\nWith a profile created by `webcodex connect`, omitting --scope manages its user-level background Runner; --bin selects an explicit Runner binary for that hosted profile. An explicit scope manages the matching systemd service and does not accept --bin. On OpenRC hosts the matching OpenRC service is managed instead.\n",
+            "start" | "stop" => "Usage: webcodex runner <start|stop> [--profile NAME] [--scope user|system] [--service-file PATH] [--service-manager auto|systemd|openrc]\n\nWith a profile created by `webcodex connect`, omitting --scope manages its user-level background Runner. An explicit scope manages the matching systemd service. On OpenRC hosts the matching OpenRC service is managed instead.\n",
+            "reload" => "Usage: webcodex runner reload [--profile NAME] [--scope user|system] [--service-file PATH] [--service-manager auto|systemd|openrc]\n\nReload the installed Runner service configuration (SIGHUP). Hosted connect profiles do not support reload.\n",
             "status" => runner_status_usage(),
-            "logs" => "Usage: webcodex runner logs [--profile NAME] [--scope user|system] [--service-file PATH] [--lines N] [--since VALUE] [--follow]\n",
-            "uninstall" => "Usage: webcodex runner uninstall [--profile NAME] [--scope user|system] [--service-file PATH] --confirm\n",
+            "logs" => "Usage: webcodex runner logs [--profile NAME] [--scope user|system] [--service-file PATH] [--service-manager auto|systemd|openrc] [--lines N] [--since VALUE] [--follow]\n\n--since requires systemd (journald); OpenRC logs are plain files and support only --lines/--follow.\n",
+            "uninstall" => "Usage: webcodex runner uninstall [--profile NAME] [--scope user|system] [--service-file PATH] [--service-manager auto|systemd|openrc] --confirm\n",
             "install-service" => "`webcodex runner install-service` was removed; use `webcodex runner install`.\n",
             _ => runner_usage(),
         };
@@ -1244,7 +1252,7 @@ fn parse_runner_subcommand(args: &[String]) -> CliAction {
         ),
         "run" => result_action(parse_runner_run(&args[1..]), CliAction::RunnerRun),
         "status" => result_action(parse_runner_status(&args[1..]), CliAction::RunnerStatus),
-        "start" | "stop" | "restart" | "logs" | "uninstall" => result_action(
+        "start" | "stop" | "restart" | "reload" | "logs" | "uninstall" => result_action(
             parse_runner_service_action(command, &args[1..]),
             CliAction::RunnerService,
         ),
@@ -1682,12 +1690,13 @@ fn service_control(command: &str) -> Result<ServiceControl, String> {
         "start" => Ok(ServiceControl::Start),
         "stop" => Ok(ServiceControl::Stop),
         "restart" => Ok(ServiceControl::Restart),
+        "reload" => Ok(ServiceControl::Reload),
         _ => Err(format!("unsupported service action: {command}")),
     }
 }
 
 fn parse_service_kind(command: &str, args: &[String]) -> Result<ServiceActionKind, String> {
-    if matches!(command, "start" | "stop" | "restart") {
+    if matches!(command, "start" | "stop" | "restart" | "reload") {
         if let Some(flag) = args.first() {
             if flag == "--root" || flag == "--state-dir" || flag == "--console-assets-dir" {
                 return Err(format!(
@@ -1762,7 +1771,9 @@ fn parse_server_service_action(
     let unit = service_unit_name(&service_file, SERVER_SERVICE_UNIT);
     Ok(ServiceActionOptions {
         scope: ServiceScope::System,
+        service_manager: ServiceManagerSelection::Auto,
         service_file,
+        service_file_explicit: true,
         unit,
         kind: parse_service_kind(command, &remaining)?,
         local_profile: None,
@@ -1775,7 +1786,9 @@ fn parse_runner_service_action(
 ) -> Result<ServiceActionOptions, String> {
     let mut profile: Option<String> = None;
     let mut scope: Option<ServiceScope> = None;
+    let mut service_manager: Option<ServiceManagerSelection> = None;
     let mut service_file: Option<PathBuf> = None;
+    let mut service_file_explicit = false;
     let mut runner_bin: Option<PathBuf> = None;
     let mut remaining = Vec::new();
     let mut iter = args.iter();
@@ -1788,12 +1801,28 @@ fn parse_runner_service_action(
                 }
                 scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
             }
-            "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--service-manager" => {
+                if service_manager.is_some() {
+                    return Err("--service-manager may be specified only once".to_string());
+                }
+                service_manager = Some(ServiceManagerSelection::parse(&next_value(
+                    &mut iter, arg,
+                )?)?);
+            }
+            "--service-file" => {
+                service_file_explicit = true;
+                service_file = Some(PathBuf::from(next_value(&mut iter, arg)?));
+            }
             "--bin" => runner_bin = Some(PathBuf::from(next_value(&mut iter, arg)?)),
             _ => remaining.push(arg.clone()),
         }
     }
     let scope_explicit = scope.is_some();
+    let manager_explicit = matches!(
+        service_manager,
+        Some(ServiceManagerSelection::Systemd) | Some(ServiceManagerSelection::Openrc)
+    );
+    let service_manager = service_manager.unwrap_or(ServiceManagerSelection::Auto);
     if let Some(bin) = runner_bin.as_ref() {
         if bin.as_os_str().is_empty() {
             return Err("--bin cannot be empty".to_string());
@@ -1813,6 +1842,11 @@ fn parse_runner_service_action(
         }
     }
     let scope = scope.unwrap_or_else(|| default_runner_service_scope(is_effective_root()));
+    if service_manager == ServiceManagerSelection::Openrc && scope == ServiceScope::User {
+        return Err(
+            "OpenRC supports only --scope system; rerun as root or pass --scope system".to_string(),
+        );
+    }
     let profile = profile
         .as_deref()
         .map(validate_client_profile)
@@ -1826,7 +1860,7 @@ fn parse_runner_service_action(
         .and_then(|name| name.to_str())
         .unwrap_or(RUNNER_SERVICE_UNIT)
         .to_string();
-    let local_profile = if scope_explicit {
+    let local_profile = if scope_explicit || manager_explicit {
         None
     } else {
         match profile.as_deref() {
@@ -1840,7 +1874,9 @@ fn parse_runner_service_action(
     };
     Ok(ServiceActionOptions {
         scope,
+        service_manager,
         service_file,
+        service_file_explicit,
         unit,
         kind: parse_service_kind(command, &remaining)?,
         local_profile,
@@ -1898,9 +1934,11 @@ fn parse_runner_install_service_with_identity(
 ) -> Result<RunnerInstallServiceOptions, String> {
     let mut profile: Option<String> = None;
     let mut scope: Option<ServiceScope> = None;
+    let mut service_manager: Option<ServiceManagerSelection> = None;
     let mut config: Option<PathBuf> = None;
     let mut bin: Option<PathBuf> = None;
     let mut service_file: Option<PathBuf> = None;
+    let mut service_file_explicit = false;
     let mut working_directory: Option<PathBuf> = None;
     let mut user = None;
     let mut group = None;
@@ -1920,9 +1958,20 @@ fn parse_runner_install_service_with_identity(
                 }
                 scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
             }
+            "--service-manager" => {
+                if service_manager.is_some() {
+                    return Err("--service-manager may be specified only once".to_string());
+                }
+                service_manager = Some(ServiceManagerSelection::parse(&next_value(
+                    &mut iter, arg,
+                )?)?);
+            }
             "--config" => config = Some(PathBuf::from(next_value(&mut iter, arg)?)),
             "--bin" => bin = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-            "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--service-file" => {
+                service_file_explicit = true;
+                service_file = Some(PathBuf::from(next_value(&mut iter, arg)?));
+            }
             "--working-directory" => {
                 working_directory = Some(PathBuf::from(next_value(&mut iter, arg)?))
             }
@@ -1948,6 +1997,12 @@ fn parse_runner_install_service_with_identity(
         .map(validate_client_profile)
         .transpose()?;
     let scope = scope.unwrap_or_else(|| default_runner_service_scope(effective_root));
+    let service_manager = service_manager.unwrap_or(ServiceManagerSelection::Auto);
+    if service_manager == ServiceManagerSelection::Openrc && scope == ServiceScope::User {
+        return Err(
+            "OpenRC supports only --scope system; rerun as root or pass --scope system".to_string(),
+        );
+    }
     let config = config
         .map(Ok)
         .unwrap_or_else(|| runner_config_for_scope(scope, profile.as_deref()))?;
@@ -2028,9 +2083,11 @@ fn parse_runner_install_service_with_identity(
     }
     Ok(RunnerInstallServiceOptions {
         scope,
+        service_manager,
         config,
         bin,
         service_file,
+        service_file_explicit,
         user,
         group,
         working_directory,
@@ -2054,12 +2111,16 @@ fn parse_runner_status_with_identity(
 ) -> Result<RunnerStatusOptions, String> {
     let mut profile: Option<String> = None;
     let mut scope: Option<ServiceScope> = None;
+    let mut service_manager: Option<ServiceManagerSelection> = None;
     let mut config: Option<PathBuf> = None;
     let mut service_file: Option<PathBuf> = None;
+    let mut service_file_explicit = false;
     let mut opts = RunnerStatusOptions {
         scope: ServiceScope::System,
+        service_manager: ServiceManagerSelection::Auto,
         config: PathBuf::new(),
         service_file: PathBuf::new(),
+        service_file_explicit: false,
         local_state_dir: None,
         server_url: None,
         server_http: ServerHttpOptions::default(),
@@ -2077,8 +2138,19 @@ fn parse_runner_status_with_identity(
                 }
                 scope = Some(ServiceScope::parse(&next_value(&mut iter, arg)?)?);
             }
+            "--service-manager" => {
+                if service_manager.is_some() {
+                    return Err("--service-manager may be specified only once".to_string());
+                }
+                service_manager = Some(ServiceManagerSelection::parse(&next_value(
+                    &mut iter, arg,
+                )?)?);
+            }
             "--config" => config = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-            "--service-file" => service_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--service-file" => {
+                service_file_explicit = true;
+                service_file = Some(PathBuf::from(next_value(&mut iter, arg)?));
+            }
             "--server-url" => opts.server_url = Some(next_value(&mut iter, arg)?),
             "--proxy" => opts.server_http.proxy = Some(next_value(&mut iter, arg)?),
             "--no-system-proxy" => opts.server_http.no_system_proxy = true,
@@ -2094,8 +2166,19 @@ fn parse_runner_status_with_identity(
     }
     opts.server_http.validate()?;
     let scope_explicit = scope.is_some();
+    let manager_explicit = matches!(
+        service_manager,
+        Some(ServiceManagerSelection::Systemd) | Some(ServiceManagerSelection::Openrc)
+    );
     let scope = scope.unwrap_or_else(|| default_runner_service_scope(effective_root));
+    let service_manager = service_manager.unwrap_or(ServiceManagerSelection::Auto);
+    if service_manager == ServiceManagerSelection::Openrc && scope == ServiceScope::User {
+        return Err(
+            "OpenRC supports only --scope system; rerun as root or pass --scope system".to_string(),
+        );
+    }
     opts.scope = scope;
+    opts.service_manager = service_manager;
     let profile = profile
         .as_deref()
         .map(validate_client_profile)
@@ -2108,9 +2191,10 @@ fn parse_runner_status_with_identity(
     opts.service_file = service_file
         .map(Ok)
         .unwrap_or_else(|| runner_service_file_for_scope(scope, profile.as_deref()))?;
+    opts.service_file_explicit = service_file_explicit;
     validate_service_file_scope(scope, &opts.service_file)?;
     if let Some(profile) = profile {
-        if !scope_explicit {
+        if !scope_explicit && !manager_explicit {
             opts.local_state_dir = Some(client_profile_state_dir(&profile)?);
         }
         if opts.user_token_file.is_none() {

@@ -3,6 +3,7 @@ pub(crate) mod connections;
 pub(crate) mod env;
 pub(crate) mod http;
 pub(crate) mod login;
+pub(crate) mod openrc;
 pub(crate) mod ops;
 pub(crate) mod output;
 pub(crate) mod pairing;

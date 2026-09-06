@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 
 use super::connect::profile::read_enabled_project_count;
 use super::http::{fetch_runtime_status, http_post_json_status, HttpStatusSummary};
+use super::openrc::{
+    control_openrc_service, default_openrc_init_file, install_openrc_service, openrc_service_name,
+    query_openrc_service_status, render_runner_openrc_init, resolve_service_manager,
+    run_openrc_logs, uninstall_openrc_service, ServiceManager, ServiceManagerSelection,
+};
 use super::{
     control_service_for_scope, encode_exec_argument, encode_exec_path_argument,
     encode_exec_program, encode_unit_path_value, ensure_service_file_parent,
@@ -89,6 +94,13 @@ pub(crate) fn render_runner_systemd_unit(
 pub(crate) fn run_runner_install_service(
     opts: RunnerInstallServiceOptions,
 ) -> Result<String, String> {
+    match resolve_service_manager(opts.service_manager)? {
+        ServiceManager::Systemd => run_runner_install_service_systemd(opts),
+        ServiceManager::Openrc => run_runner_install_service_openrc(opts),
+    }
+}
+
+fn run_runner_install_service_systemd(opts: RunnerInstallServiceOptions) -> Result<String, String> {
     let rendered = render_runner_systemd_unit(&opts)?;
     let unit = service_unit_name(&opts.service_file, RUNNER_SERVICE_UNIT);
     if opts.output_stdout || opts.dry_run {
@@ -159,20 +171,128 @@ pub(crate) fn run_runner_install_service(
     ))
 }
 
+fn resolve_runner_service_manager(
+    selection: ServiceManagerSelection,
+    scope: ServiceScope,
+) -> Result<ServiceManager, String> {
+    let manager = resolve_service_manager(selection)?;
+    if manager == ServiceManager::Openrc && scope != ServiceScope::System {
+        return Err(
+            "OpenRC supports only --scope system; rerun as root or pass --scope system".to_string(),
+        );
+    }
+    Ok(manager)
+}
+
+/// The OpenRC init script path: an explicit --service-file wins, otherwise the
+/// conventional /etc/init.d/webcodex-runner is used.
+fn effective_openrc_service_file(service_file: &Path, explicit: bool) -> PathBuf {
+    if explicit {
+        service_file.to_path_buf()
+    } else {
+        default_openrc_init_file()
+    }
+}
+
+fn run_runner_install_service_openrc(opts: RunnerInstallServiceOptions) -> Result<String, String> {
+    if opts.scope != ServiceScope::System {
+        return Err(
+            "OpenRC supports only --scope system; rerun as root or pass --scope system".to_string(),
+        );
+    }
+    let service_file =
+        effective_openrc_service_file(&opts.service_file, opts.service_file_explicit);
+    let service = openrc_service_name(&service_file);
+    let rendered = render_runner_openrc_init(&opts, &service_file)?;
+    if opts.output_stdout || opts.dry_run {
+        if opts.json {
+            return serde_json::to_string_pretty(&json!({
+                "service_manager": "openrc",
+                "service_file": service_file.to_string_lossy(),
+                "config": opts.config.to_string_lossy(),
+                "bin": opts.bin.to_string_lossy(),
+                "service": service,
+                "scope": opts.scope.as_str(),
+                "root_runner": opts.root_runner,
+                "dry_run": true,
+                "openrc_called": false,
+                "init_script": rendered,
+            }))
+            .map_err(|e| e.to_string());
+        }
+        return Ok(rendered);
+    }
+    let result = install_openrc_service(
+        &service_file,
+        &service,
+        &rendered,
+        opts.overwrite,
+        opts.no_start,
+    )?;
+    if opts.json {
+        return serde_json::to_string_pretty(&json!({
+            "service_manager": "openrc",
+            "service_file": service_file.to_string_lossy(),
+            "config": opts.config.to_string_lossy(),
+            "bin": opts.bin.to_string_lossy(),
+            "service": result.service,
+            "scope": opts.scope.as_str(),
+            "root_runner": opts.root_runner,
+            "enabled": result.enabled,
+            "started": result.started,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let warning = if opts.root_runner {
+        "\nWARNING: explicit --allow-root-runner accepted; this Runner executes project commands as root.\n"
+    } else {
+        ""
+    };
+    let status_command = shell_command(&[
+        "webcodex".to_string(),
+        "runner".to_string(),
+        "status".to_string(),
+        "--service-manager".to_string(),
+        "openrc".to_string(),
+        "--config".to_string(),
+        opts.config.to_string_lossy().into_owned(),
+        "--service-file".to_string(),
+        service_file.to_string_lossy().into_owned(),
+    ]);
+    Ok(format!(
+        "Runner {}.\n\nRunner configuration:\n  {}\n\nNext:\n  {status_command}\n\nDetails:\n  Service manager: openrc\n  Service: {}\n  Scope:   {}\n  Started: {}\n  Boot:    enabled (rc-update default)\n{}",
+        if result.started { "installed and started" } else { "installed" },
+        opts.config.display(),
+        result.service,
+        opts.scope.as_str(),
+        if result.started { "yes" } else { "no (--no-start)" },
+        warning,
+    ))
+}
+
 pub(crate) fn run_runner_service(opts: ServiceActionOptions) -> Result<String, String> {
     if let Some(local) = &opts.local_profile {
         if local_runner_profile_marker(&local.state_dir).is_file() {
             return match &opts.kind {
-                ServiceActionKind::Control(control) => run_local_runner_service(
-                    match control {
+                ServiceActionKind::Control(control) => {
+                    let action = match control {
                         super::ServiceControl::Start => LocalRunnerServiceAction::Start,
                         super::ServiceControl::Stop => LocalRunnerServiceAction::Stop,
                         super::ServiceControl::Restart => LocalRunnerServiceAction::Restart,
-                    },
-                    &local.config,
-                    &local.state_dir,
-                    local.runner_bin.as_deref(),
-                ),
+                        super::ServiceControl::Reload => {
+                            return Err(
+                                "hosted local Runners do not support reload; use restart instead"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    run_local_runner_service(
+                        action,
+                        &local.config,
+                        &local.state_dir,
+                        local.runner_bin.as_deref(),
+                    )
+                }
                 ServiceActionKind::Logs {
                     lines,
                     since,
@@ -200,28 +320,68 @@ pub(crate) fn run_runner_service(opts: ServiceActionOptions) -> Result<String, S
                 .to_string(),
         );
     }
+    let manager = resolve_runner_service_manager(opts.service_manager, opts.scope)?;
     match opts.kind {
-        ServiceActionKind::Control(control) => {
-            control_service_for_scope(opts.scope, &opts.unit, control)?;
-            Ok(format!(
-                "Runner service {} completed for {}.\n",
-                control.as_str(),
-                opts.unit
-            ))
-        }
+        ServiceActionKind::Control(control) => match manager {
+            ServiceManager::Systemd => {
+                control_service_for_scope(opts.scope, &opts.unit, control)?;
+                Ok(format!(
+                    "Runner service {} completed for {}.\n",
+                    control.as_str(),
+                    opts.unit
+                ))
+            }
+            ServiceManager::Openrc => {
+                let service_file =
+                    effective_openrc_service_file(&opts.service_file, opts.service_file_explicit);
+                let service = openrc_service_name(&service_file);
+                control_openrc_service(&service, control)?;
+                Ok(format!(
+                    "Runner service {} completed for {}.\n",
+                    control.as_str(),
+                    service
+                ))
+            }
+        },
         ServiceActionKind::Logs {
             lines,
             since,
             follow,
-        } => run_logs_for_scope(opts.scope, &opts.unit, lines, since.as_deref(), follow),
+        } => match manager {
+            ServiceManager::Systemd => {
+                run_logs_for_scope(opts.scope, &opts.unit, lines, since.as_deref(), follow)
+            }
+            ServiceManager::Openrc => {
+                let service_file =
+                    effective_openrc_service_file(&opts.service_file, opts.service_file_explicit);
+                run_openrc_logs(
+                    &openrc_service_name(&service_file),
+                    lines,
+                    since.as_deref(),
+                    follow,
+                )
+            }
+        },
         ServiceActionKind::Uninstall { confirm } => {
             if !confirm {
                 return Err("runner uninstall requires --confirm; no changes were made".to_string());
             }
-            let result = uninstall_unit_for_scope(opts.scope, &opts.service_file, &opts.unit)?;
+            let removed = match manager {
+                ServiceManager::Systemd => {
+                    uninstall_unit_for_scope(opts.scope, &opts.service_file, &opts.unit)?.removed
+                }
+                ServiceManager::Openrc => {
+                    let service_file = effective_openrc_service_file(
+                        &opts.service_file,
+                        opts.service_file_explicit,
+                    );
+                    uninstall_openrc_service(&service_file, &openrc_service_name(&service_file))?
+                        .removed
+                }
+            };
             Ok(format!(
                 "Runner service {}. Runner config, tokens, profile data and binaries were not deleted.\n",
-                if result.removed { "uninstalled" } else { "was already absent" }
+                if removed { "uninstalled" } else { "was already absent" }
             ))
         }
     }
@@ -457,9 +617,31 @@ pub(crate) async fn run_runner_status(opts: RunnerStatusOptions) -> Result<Strin
         .filter(|dir| local_runner_profile_marker(dir).is_file())
         .map(|dir| local_runner_state_summary(dir))
         .transpose()?;
-    let systemd = local
-        .is_none()
-        .then(|| query_systemd_service_status_for_scope(opts.scope, &service_unit));
+    let manager = if local.is_some() {
+        None
+    } else {
+        Some(resolve_runner_service_manager(
+            opts.service_manager,
+            opts.scope,
+        )?)
+    };
+    let openrc_service_file = (manager == Some(ServiceManager::Openrc))
+        .then(|| effective_openrc_service_file(&opts.service_file, opts.service_file_explicit));
+    let service_label = match &openrc_service_file {
+        Some(file) => openrc_service_name(file),
+        None => service_unit.clone(),
+    };
+    let service_state = manager.map(|manager| match manager {
+        ServiceManager::Systemd => {
+            query_systemd_service_status_for_scope(opts.scope, &service_unit)
+        }
+        ServiceManager::Openrc => {
+            let file = openrc_service_file
+                .as_ref()
+                .expect("OpenRC service file resolved above");
+            query_openrc_service_status(file, &openrc_service_name(file))
+        }
+    });
     let metadata = read_runner_config_metadata(&opts.config)?;
     let effective_server_url = opts.server_url.clone().or_else(|| {
         let url = metadata.server_url.trim().to_string();
@@ -537,11 +719,11 @@ pub(crate) async fn run_runner_status(opts: RunnerStatusOptions) -> Result<Strin
     if opts.json {
         let summary = json!({
             "service": {
-                "mode": if local.is_some() { "hosted_local" } else { "systemd" },
+                "mode": if local.is_some() { "hosted_local" } else { manager.map(ServiceManager::as_str).unwrap_or("systemd") },
                 "scope": if local.is_some() { Value::Null } else { json!(opts.scope.as_str()) },
-                "unit": service_unit,
-                "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(systemd.as_ref().expect("systemd status exists outside hosted mode").active)),
-                "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(systemd.as_ref().expect("systemd status exists outside hosted mode").enabled)),
+                "unit": service_label,
+                "active": local.as_ref().map(|state| json!(state.running)).unwrap_or_else(|| json!(service_state.as_ref().expect("service status exists outside hosted mode").active)),
+                "enabled": local.as_ref().map(|state| json!(state.managed)).unwrap_or_else(|| json!(service_state.as_ref().expect("service status exists outside hosted mode").enabled)),
                 "pid": local.as_ref().and_then(|state| state.pid),
                 "logs": local.as_ref().map(|state| state.log_path.to_string_lossy().to_string()),
             },
@@ -606,16 +788,20 @@ pub(crate) async fn run_runner_status(opts: RunnerStatusOptions) -> Result<Strin
             local.log_path.display()
         ));
     } else {
-        let systemd = systemd
+        let manager = manager.expect("service manager resolved outside hosted mode");
+        let state = service_state
             .as_ref()
-            .expect("systemd status exists outside hosted mode");
+            .expect("service status exists outside hosted mode");
+        if manager == ServiceManager::Openrc {
+            out.push_str("  service manager:      openrc\n");
+        }
         out.push_str(&format!(
             "  service scope:        {}\n",
             opts.scope.as_str()
         ));
-        out.push_str(&format!("  service unit:         {service_unit}\n"));
-        out.push_str(&format!("  service active:       {}\n", systemd.active));
-        out.push_str(&format!("  service enabled:      {}\n", systemd.enabled));
+        out.push_str(&format!("  service unit:         {service_label}\n"));
+        out.push_str(&format!("  service active:       {}\n", state.active));
+        out.push_str(&format!("  service enabled:      {}\n", state.enabled));
     }
     out.push_str(&format!(
         "  config:               {}\n",

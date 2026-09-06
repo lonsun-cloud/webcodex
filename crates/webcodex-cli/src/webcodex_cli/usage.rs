@@ -321,10 +321,12 @@ Commands:\n\
   start       Start a hosted background Runner or installed Linux service\n\
   stop        Stop a hosted background Runner or installed Linux service\n\
   restart     Restart a hosted background Runner or installed Linux service\n\
+  reload      Reload the installed Linux service configuration (SIGHUP)\n\
   status      Check Runner lifecycle, safe config metadata, and connectivity\n\
   logs        Read hosted Runner logs or the installed Linux service journal\n\
   uninstall   Remove only the Linux systemd unit; requires --confirm\n\n\
 Linux systemd service commands accept --scope user|system. Non-root users default to user; root defaults to system.\n\
+On OpenRC hosts (Alpine), --service-manager auto|openrc manages /etc/init.d/webcodex-runner instead.\n\
 Profiles created by `connect` keep their detached-process behavior when --scope is omitted.\n\n\
 `webcodex run` is the current-project runtime coordinator. `webcodex runner run` directly executes the standalone Runner.\n"
 }
@@ -358,6 +360,8 @@ pub(crate) fn runner_install_service_usage() -> &'static str {
 Options:\n\
   --profile NAME             Profile for config and unit defaults\n\
   --scope user|system        Service manager scope [default: user for non-root; system for root]\n\
+  --service-manager auto|systemd|openrc\n\
+                             Service manager backend [default: auto-detect]\n\
   --config PATH              Runner config path\n\
   --bin PATH                 webcodex-runner path; sibling then absolute PATH by default\n\
   --service-file PATH        Unit path [default: webcodex-runner[-<profile>].service]\n\
@@ -374,13 +378,18 @@ Options:\n\
 User scope uses systemctl --user, the XDG user unit directory, default.target,\n\
 and never writes User= or Group=. System scope uses /etc/systemd/system,\n\
 multi-user.target, and requires --user unless --allow-root-runner is explicit.\n\
-The unit runs webcodex-runner --config <config>. Tokens are never inlined.\n"
+The unit runs webcodex-runner --config <config>. Tokens are never inlined.\n\
+On OpenRC hosts (Alpine), the openrc backend renders /etc/init.d/webcodex-runner\n\
+(openrc-run + supervise-daemon, system scope only), enables it with\n\
+rc-update add webcodex-runner default, and logs to /var/log/webcodex-runner.log.\n"
 }
 pub(crate) fn runner_status_usage() -> &'static str {
     "Usage: webcodex runner status [OPTIONS]\n\n\
      Options:\n\
        --profile NAME             Client config profile for config/token defaults\n\
        --scope user|system        Service manager scope [default: user for non-root; system for root]\n\
+       --service-manager auto|systemd|openrc\n\
+                                  Service manager backend [default: auto-detect]\n\
        --config PATH              Runner config path [default: scope-specific runner.toml]\n\
        --service-file PATH        Override the scope-specific systemd unit path\n\
        --server-url URL           Override server URL for runtime checks\n\

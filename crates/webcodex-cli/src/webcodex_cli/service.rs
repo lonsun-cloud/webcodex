@@ -77,6 +77,7 @@ pub(crate) enum ServiceControl {
     Start,
     Stop,
     Restart,
+    Reload,
 }
 
 impl ServiceControl {
@@ -85,6 +86,7 @@ impl ServiceControl {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
+            Self::Reload => "reload",
         }
     }
 }
@@ -514,6 +516,20 @@ pub(crate) fn execute_plan<E: ProcessExecutor>(
 }
 
 fn write_text_file_atomic(path: &Path, content: &str, overwrite: bool) -> Result<(), String> {
+    write_text_file_atomic_mode(path, content, overwrite, 0o644)
+}
+
+/// Atomic file write with an explicit Unix mode. OpenRC init scripts must be
+/// executable; systemd units keep the default 0o644 via write_text_file_atomic.
+/// The mode is applied on Unix only.
+pub(crate) fn write_text_file_atomic_mode(
+    path: &Path,
+    content: &str,
+    overwrite: bool,
+    mode: u32,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = mode;
     if path.exists() && !overwrite {
         return Err(format!(
             "{} already exists; pass --overwrite to replace it",
@@ -545,7 +561,7 @@ fn write_text_file_atomic(path: &Path, content: &str, overwrite: bool) -> Result
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(0o644);
+        options.mode(mode);
         let mut file = options
             .open(&temporary)
             .map_err(|e| format!("failed to create {}: {}", temporary.display(), e))?;
@@ -570,17 +586,24 @@ fn write_text_file_atomic(path: &Path, content: &str, overwrite: bool) -> Result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExistingUnitKind {
+pub(crate) enum ExistingUnitKind {
     Absent,
     ManagedRegularFile,
 }
 
 fn preflight_unit_path(path: &Path, overwrite: bool) -> Result<ExistingUnitKind, String> {
+    preflight_service_path(path, overwrite, "systemd unit")
+}
+
+/// Symlink-safe preflight for a managed service file (a systemd unit or an
+/// OpenRC init script). `noun` names the service-file kind in error messages.
+pub(crate) fn preflight_service_path(
+    path: &Path,
+    overwrite: bool,
+    noun: &str,
+) -> Result<ExistingUnitKind, String> {
     if !path.is_absolute() {
-        return Err(format!(
-            "systemd unit path must be absolute: {}",
-            path.display()
-        ));
+        return Err(format!("{noun} path must be absolute: {}", path.display()));
     }
     let existing = match std::fs::symlink_metadata(path) {
         Ok(metadata) => Some(metadata),
@@ -602,9 +625,9 @@ fn preflight_unit_path(path: &Path, overwrite: bool) -> Result<ExistingUnitKind,
                 .map(|target| target == Path::new("/dev/null"))
                 .unwrap_or(false);
             let kind = if masked {
-                "masked systemd unit"
+                format!("masked {noun}")
             } else {
-                "systemd unit symlink"
+                format!("{noun} symlink")
             };
             return Err(format!(
                 "cannot safely overwrite {kind}: {}; replace or unmask the unit explicitly before retrying",
@@ -613,7 +636,7 @@ fn preflight_unit_path(path: &Path, overwrite: bool) -> Result<ExistingUnitKind,
         }
         if !file_type.is_file() {
             return Err(format!(
-                "cannot safely overwrite non-regular systemd unit: {}; replace it explicitly before retrying",
+                "cannot safely overwrite non-regular {noun}: {}; replace it explicitly before retrying",
                 path.display()
             ));
         }
@@ -633,7 +656,7 @@ fn preflight_unit_path(path: &Path, overwrite: bool) -> Result<ExistingUnitKind,
     })
 }
 
-fn restore_unit_file(path: &Path, previous: Option<&str>) -> Result<(), String> {
+pub(crate) fn restore_unit_file(path: &Path, previous: Option<&str>) -> Result<(), String> {
     match previous {
         Some(content) => write_text_file_atomic(path, content, true),
         None if path.exists() => std::fs::remove_file(path)
@@ -876,7 +899,7 @@ fn rollback_invocation(systemctl: &Path, operation: &str, unit: &str) -> Process
     )
 }
 
-fn push_rollback_error(errors: &mut Vec<String>, label: &str, error: String) {
+pub(crate) fn push_rollback_error(errors: &mut Vec<String>, label: &str, error: String) {
     let mut summary = format!("{label}: {error}");
     if summary.len() > 180 {
         summary.truncate(180);
@@ -885,7 +908,7 @@ fn push_rollback_error(errors: &mut Vec<String>, label: &str, error: String) {
     errors.push(summary);
 }
 
-fn best_effort_execute<E: ProcessExecutor>(
+pub(crate) fn best_effort_execute<E: ProcessExecutor>(
     executor: &mut E,
     invocation: &ProcessInvocation,
     label: &str,
@@ -971,7 +994,11 @@ fn rollback_failed_install<E: ProcessExecutor>(
     errors
 }
 
-fn install_error_with_rollback(unit: &str, error: String, rollback_errors: Vec<String>) -> String {
+pub(crate) fn install_error_with_rollback(
+    unit: &str,
+    error: String,
+    rollback_errors: Vec<String>,
+) -> String {
     let mut message = format!("installation failed for {unit}: {error}");
     if !rollback_errors.is_empty() {
         let mut summary = rollback_errors.join("; ");
@@ -1339,6 +1366,12 @@ pub(crate) fn control_server_unit_pair_with_executor<E: ProcessExecutor>(
         ],
         ServiceControl::Restart => plan_control(systemctl, service_unit, ServiceControl::Restart),
         ServiceControl::Stop => unreachable!("stop is handled above"),
+        ServiceControl::Reload => {
+            return Err(
+                "reload is not supported for the socket-activated webcodex Server unit pair"
+                    .to_string(),
+            );
+        }
     };
     execute_plan(executor, &plan)
 }
