@@ -274,7 +274,7 @@ pub(crate) fn tool_spec() -> Value {
             "required": ["action"],
             "additionalProperties": false
         },
-        "annotations": {"readOnlyHint": false}
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
     })
 }
 
