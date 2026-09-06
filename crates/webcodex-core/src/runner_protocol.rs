@@ -168,10 +168,15 @@ pub const RUNNER_CAPABILITY_APPLY_PATCH: &str = "apply_patch";
 /// current Server must reject apply_patch before dispatch rather than accepting a
 /// legacy success shape.
 pub const RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA: &str = "apply_patch_match_metadata";
+/// The Runner understands the 0.4 model-facing apply_patch matching_mode enum
+/// (`first_match`, `unique`, `exact_unique`) and returns metadata bound to the
+/// requested mode. Missing on older Runners is false; current Servers fail
+/// closed instead of silently falling back to legacy permissive positioning.
+pub const RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE: &str = "apply_patch_matching_mode";
 /// The Runner understands `strict_matching=true` for apply_patch and rejects
 /// any update chunk whose positioning is not exact and unique before writing.
-/// Missing on older Runners is false and is never inferred from apply_patch or
-/// apply_patch_match_metadata.
+/// This legacy wire capability is retained only so older Servers can roll
+/// against a current Runner; current model-facing contracts use matching_mode.
 pub const RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING: &str = "apply_patch_strict_matching";
 pub const RUNNER_CAPABILITY_GIT: &str = "git";
 pub const RUNNER_CAPABILITY_JOBS: &str = "jobs";
@@ -197,6 +202,13 @@ pub const RUNNER_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_valid
 /// whose assertion could disappear after a Server restart.
 pub const RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_COUNT_ASSERTION: &str =
     "structured_cargo_test_count_assertion";
+/// The Runner durably preserves explicit Cargo validation execution-policy
+/// metadata (`require_tests` / `no_run`) through the Job lifecycle and
+/// reconciliation. Older Runners already advertised the count-assertion
+/// capability, so this is a separate additive rolling-upgrade fence and is
+/// never inferred from protocol generation or other structured validation bits.
+pub const RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY: &str =
+    "structured_cargo_test_execution_policy";
 /// The Runner accepts the canonical machine-readable `go test -json` validation
 /// shape. Older implementations may support only the historical fixed `./...`
 /// scope; expanded caller-selected packages are fenced separately.
@@ -326,6 +338,34 @@ pub const RUNNER_CAPABILITY_CODING_AGENT_RUNS: &str = "coding_agent_runs";
 /// Runner-owned native Tool Plugin gateway and explicit dynamic reload support.
 /// Missing on older Runners is false and is never inferred from MCP inventory.
 pub const RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS: &str = "native_tool_plugins";
+/// Runner-local durable managed SSH resource registry. Missing on older Runners
+/// is false and is never inferred from one-shot or persistent SSH execution.
+pub const RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES: &str = "managed_ssh_resources";
+/// First-class read/check and fenced activation of the exact Runner process's
+/// startup-bound configuration path. Missing on older Runners is false; Servers
+/// must never fall back to PID/signal emulation for this operation.
+pub const RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL: &str = "runner_config_control";
+pub const RUNNER_CONFIG_REQUEST_KIND: &str = "runner_config";
+pub const RUNNER_CONFIG_REQUEST_MAX_BYTES: usize = 512;
+pub const RUNNER_CONFIG_RESPONSE_MAX_BYTES: usize = 4096;
+pub const RUNNER_CONFIG_RESTART_REQUIRED_FIELDS: &[&str] = &[
+    "acp",
+    "capabilities",
+    "client_id",
+    "display_name",
+    "host_context",
+    "hostname",
+    "max_concurrent_jobs",
+    "mcp_gateway",
+    "owner",
+    "poll_interval_ms",
+    "project_registry_dir",
+    "quic",
+    "server_url",
+    "token",
+    "transport",
+    "websocket_connect_timeout_secs",
+];
 /// Capabilities guaranteed by every accepted protocol-generation-2 Runner.
 /// These explicit bools remain wire facts shared by Server and Runner, but a
 /// missing/false baseline bit rejects registration. Downstream consumers may
@@ -368,6 +408,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
     RUNNER_CAPABILITY_APPLY_PATCH,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
+    RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE,
     RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING,
     RUNNER_CAPABILITY_GIT,
     RUNNER_CAPABILITY_JOBS,
@@ -378,6 +419,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_SSH_PERSISTENT_SHELL,
     RUNNER_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_COUNT_ASSERTION,
+    RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
@@ -405,6 +447,8 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_JOB_STATE_RECONCILIATION,
     RUNNER_CAPABILITY_CODING_AGENT_RUNS,
     RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS,
+    RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES,
+    RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
     RUNNER_CAPABILITY_COMPUTER_CONTROL,
     RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
     RUNNER_CAPABILITY_COMPUTER_KEY_INPUT,
@@ -488,9 +532,13 @@ pub struct RunnerCapabilities {
     /// results. Missing on older Runners is false and never follows from apply_patch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub apply_patch_match_metadata: bool,
+    /// Current enum-based apply_patch positioning semantics. Missing on older
+    /// Runners is false and must fail closed for current model-facing requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub apply_patch_matching_mode: bool,
     /// Fail-closed exact-and-unique positioning for apply_patch requests that
-    /// explicitly opt into strict_matching. Missing on older Runners is false and
-    /// requires the current match-metadata success contract.
+    /// arrive from a legacy Server as strict_matching=true. New Servers do not
+    /// use this bool as model-facing authority.
     #[serde(default, skip_serializing_if = "is_false")]
     pub apply_patch_strict_matching: bool,
     #[serde(default)]
@@ -521,6 +569,11 @@ pub struct RunnerCapabilities {
     /// Durable round-trip support for Cargo test-count postconditions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_cargo_test_count_assertion: bool,
+    /// Durable round-trip support for explicit Cargo execution-policy metadata.
+    /// Missing on older Runners is false and is never inferred from the count
+    /// assertion capability, structured validation argv, or protocol generation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_cargo_test_execution_policy: bool,
     /// Machine-readable canonical `go test -json` validation. Older Runners may
     /// support only the historical fixed `./...` scope; focused package argv is
     /// an independent additive capability.
@@ -651,10 +704,18 @@ pub struct RunnerCapabilities {
     #[serde(default, skip_serializing_if = "is_false")]
     pub coding_agent_runs: bool,
     /// Runner-owned native Tool Plugin lifecycle and typed Plugin gateway.
-    /// This remains useful even when the startup Plugin inventory is empty,
-    /// because `plugin_tool reload` can activate a dynamic provider later.
+    /// Registration carries capability only; provider/tool inventory remains
+    /// Runner-owned and is observed through the exact `plugin_tool` gateway.
     #[serde(default, skip_serializing_if = "is_false")]
     pub native_tool_plugins: bool,
+    /// Runner-local managed SSH resource list/register/remove lifecycle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed_ssh_resources: bool,
+    /// First-class bounded config check/reload implemented by this Runner
+    /// process. Missing on older Runners is false and is never inferred from OS,
+    /// transport, Plugin support, or protocol generation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runner_config_control: bool,
 }
 
 /// Bounded, non-secret status for the Runner's active configuration generation.
@@ -690,6 +751,145 @@ impl Default for RunnerConfigReloadStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerConfigAction {
+    Check,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerConfigExecutionState {
+    NotStarted,
+    Completed,
+    OutcomeUnknown,
+}
+
+/// Closed Runner config operation. No filesystem path or raw configuration is
+/// accepted: the target Runner always uses its startup-bound config path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerConfigOperationRequest {
+    pub action: RunnerConfigAction,
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+}
+
+impl RunnerConfigOperationRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.action, self.expected_generation) {
+            (RunnerConfigAction::Check, None) => Ok(()),
+            (RunnerConfigAction::Reload, Some(generation)) if generation > 0 => Ok(()),
+            (RunnerConfigAction::Check, Some(_)) => {
+                Err("check does not accept expected_generation")
+            }
+            (RunnerConfigAction::Reload, _) => {
+                Err("reload requires a positive expected_generation")
+            }
+        }
+    }
+}
+
+/// Bounded, non-secret result for one exact Runner config operation. Generation
+/// is null only when Control cannot truthfully know the current generation after
+/// a delivery failure or replacement; successful Runner responses always carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerConfigOperationResponse {
+    pub action: RunnerConfigAction,
+    pub execution_state: RunnerConfigExecutionState,
+    pub valid: Option<bool>,
+    pub current_generation: Option<u64>,
+    pub error_code: Option<String>,
+    pub error_field: Option<String>,
+    pub error_reason: Option<String>,
+    pub restart_required: bool,
+    pub restart_required_fields: Vec<String>,
+}
+
+impl RunnerConfigOperationResponse {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.current_generation == Some(0) {
+            return Err("current_generation must be positive when present");
+        }
+        if self.restart_required != !self.restart_required_fields.is_empty() {
+            return Err("restart_required does not match restart_required_fields");
+        }
+        let mut previous: Option<&str> = None;
+        for field in &self.restart_required_fields {
+            if !RUNNER_CONFIG_RESTART_REQUIRED_FIELDS.contains(&field.as_str()) {
+                return Err("unknown restart-required field");
+            }
+            if previous.is_some_and(|previous| previous >= field.as_str()) {
+                return Err("restart-required fields must be sorted and unique");
+            }
+            previous = Some(field);
+        }
+        match (self.error_field.as_deref(), self.error_reason.as_deref()) {
+            (None, None) => {}
+            (Some(field), Some("out_of_range"))
+                if matches!(
+                    field,
+                    "max_concurrent_jobs"
+                        | "shell.max_persistent_shells"
+                        | "shell.persistent_shell_idle_timeout_secs"
+                        | "acp.max_concurrent_runs"
+                        | "acp.permission_timeout_secs"
+                        | "mcp.request_timeout_secs"
+                ) => {}
+            _ => return Err("invalid config error diagnostic"),
+        }
+        if let Some(code) = self.error_code.as_deref() {
+            if !matches!(
+                code,
+                "invalid_request"
+                    | "config_read_failed"
+                    | "config_parse_failed"
+                    | "config_validation_failed"
+                    | "provider_config_invalid"
+                    | "plugin_reload_failed"
+                    | "plugin_reload_busy"
+                    | "config_generation_conflict"
+                    | "runner_unavailable"
+                    | "runner_replaced"
+                    | "capability_unavailable"
+                    | "invalid_runner_response"
+                    | "outcome_unknown"
+            ) {
+                return Err("unknown Runner config error code");
+            }
+        }
+        match self.execution_state {
+            RunnerConfigExecutionState::Completed => {
+                if self.current_generation.is_none() || self.valid.is_none() {
+                    return Err("completed config result requires validity and generation");
+                }
+                if self.valid == Some(true)
+                    && (self.error_code.is_some()
+                        || self.error_field.is_some()
+                        || self.error_reason.is_some())
+                {
+                    return Err("valid config result cannot contain an error");
+                }
+            }
+            RunnerConfigExecutionState::NotStarted => {
+                if self.valid.is_some() || self.restart_required {
+                    return Err(
+                        "not-started config result cannot claim validation or restart fields",
+                    );
+                }
+            }
+            RunnerConfigExecutionState::OutcomeUnknown => {
+                if self.valid.is_some() || self.restart_required {
+                    return Err("unknown config outcome cannot claim validation or restart fields");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for RunnerCapabilities {
     fn default() -> Self {
         Self {
@@ -703,6 +903,7 @@ impl Default for RunnerCapabilities {
             apply_text_edit_line_scope: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
+            apply_patch_matching_mode: false,
             apply_patch_strict_matching: false,
             git: false,
             jobs: false,
@@ -713,6 +914,7 @@ impl Default for RunnerCapabilities {
             ssh_persistent_shell: false,
             structured_validation_argv: false,
             structured_cargo_test_count_assertion: false,
+            structured_cargo_test_execution_policy: false,
             structured_go_test_json: false,
             structured_go_test_tool: false,
             structured_go_test_packages: false,
@@ -745,6 +947,8 @@ impl Default for RunnerCapabilities {
             job_state_reconciliation: false,
             coding_agent_runs: false,
             native_tool_plugins: false,
+            managed_ssh_resources: false,
+            runner_config_control: false,
         }
     }
 }
@@ -958,12 +1162,6 @@ pub struct RunnerPolicySummary {
     /// are never projected to the Server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_gateway_providers: Option<Vec<crate::mcp_gateway::McpGatewayProvider>>,
-    /// Frozen, bounded, sanitized startup native Tool Plugin catalog. This is
-    /// registration-time first-class inventory only; executable paths, argv,
-    /// cwd, prepared environment, PIDs, stderr, and credentials never cross
-    /// the Runner boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_providers: Option<Vec<crate::plugin::StartupPluginProvider>>,
 }
 
 impl Default for RunnerPolicySummary {
@@ -977,7 +1175,6 @@ impl Default for RunnerPolicySummary {
             shell_profiles: None,
             tool_providers: None,
             mcp_gateway_providers: None,
-            plugin_providers: None,
         }
     }
 }
@@ -2426,6 +2623,17 @@ pub struct ShellJobValidationMetadata {
     /// observation postcondition, not part of the executable argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_tests: Option<u64>,
+    /// Exact caller-provided Cargo test execution requirement. `Some(false)`
+    /// is materially different from omission: it explicitly accepts a
+    /// successful zero-test execution as validation proof when no minimum is
+    /// requested. This is bounded policy metadata, never executable text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_tests: Option<bool>,
+    /// Exact caller-provided Cargo `--no-run` intent. `Some(true)` means the
+    /// validation is compile-only and therefore does not require executed-test
+    /// count evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_run: Option<bool>,
 }
 
 impl ShellJobValidationMetadata {
@@ -2448,6 +2656,17 @@ impl ShellJobValidationMetadata {
             return false;
         }
         if self.minimum_tests.is_some() && self.tool != "cargo_test" {
+            return false;
+        }
+        if (self.require_tests.is_some() || self.no_run.is_some()) && self.tool != "cargo_test" {
+            return false;
+        }
+        if self.no_run == Some(true) && self.minimum_tests.is_some() {
+            return false;
+        }
+        if self.require_tests == Some(true)
+            && (self.minimum_tests.is_none() || self.no_run == Some(true))
+        {
             return false;
         }
         let step = &self.steps[0];
@@ -3178,6 +3397,72 @@ where
 mod envelope_tests {
     use super::*;
 
+    #[test]
+    fn runner_config_operation_contract_is_closed_bounded_and_fail_closed_by_default() {
+        assert!(!RunnerCapabilities::default().runner_config_control);
+
+        let check = RunnerConfigOperationRequest {
+            action: RunnerConfigAction::Check,
+            expected_generation: None,
+        };
+        assert!(check.validate().is_ok());
+        assert!(RunnerConfigOperationRequest {
+            action: RunnerConfigAction::Check,
+            expected_generation: Some(1),
+        }
+        .validate()
+        .is_err());
+        assert!(RunnerConfigOperationRequest {
+            action: RunnerConfigAction::Reload,
+            expected_generation: None,
+        }
+        .validate()
+        .is_err());
+        assert!(RunnerConfigOperationRequest {
+            action: RunnerConfigAction::Reload,
+            expected_generation: Some(0),
+        }
+        .validate()
+        .is_err());
+        assert!(RunnerConfigOperationRequest {
+            action: RunnerConfigAction::Reload,
+            expected_generation: Some(1),
+        }
+        .validate()
+        .is_ok());
+
+        assert!(
+            serde_json::from_value::<RunnerConfigOperationRequest>(serde_json::json!({
+                "action": "check",
+                "path": "/tmp/not-authorized"
+            }))
+            .is_err()
+        );
+
+        let valid = RunnerConfigOperationResponse {
+            action: RunnerConfigAction::Check,
+            execution_state: RunnerConfigExecutionState::Completed,
+            valid: Some(true),
+            current_generation: Some(1),
+            error_code: None,
+            error_field: None,
+            error_reason: None,
+            restart_required: false,
+            restart_required_fields: Vec::new(),
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut leaked_error = valid.clone();
+        leaked_error.error_code = Some("/private/path?token=secret".to_string());
+        leaked_error.valid = Some(false);
+        assert!(leaked_error.validate().is_err());
+
+        let mut unbounded_field = valid;
+        unbounded_field.restart_required = true;
+        unbounded_field.restart_required_fields = vec!["arbitrary.path".to_string()];
+        assert!(unbounded_field.validate().is_err());
+    }
+
     fn sample_process_request() -> RunnerRequest {
         RunnerRequest {
             request_id: "req-process-1".to_string(),
@@ -3375,6 +3660,7 @@ mod envelope_tests {
                 apply_text_edit_line_scope: false,
                 apply_patch: false,
                 apply_patch_match_metadata: false,
+                apply_patch_matching_mode: false,
                 apply_patch_strict_matching: false,
                 git: false,
                 jobs: true,
@@ -3385,6 +3671,7 @@ mod envelope_tests {
                 ssh_persistent_shell: true,
                 structured_validation_argv: true,
                 structured_cargo_test_count_assertion: true,
+                structured_cargo_test_execution_policy: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
@@ -3417,6 +3704,8 @@ mod envelope_tests {
                 job_state_reconciliation: false,
                 coding_agent_runs: false,
                 native_tool_plugins: false,
+                managed_ssh_resources: false,
+                runner_config_control: false,
             },
             policy: None,
             job_concurrency_limit: Some(4),
@@ -4548,6 +4837,7 @@ mod envelope_tests {
                 "apply_text_edit_line_scope",
                 "apply_patch",
                 "apply_patch_match_metadata",
+                "apply_patch_matching_mode",
                 "apply_patch_strict_matching",
                 "git",
                 "jobs",
@@ -4558,6 +4848,7 @@ mod envelope_tests {
                 "ssh_persistent_shell",
                 "structured_validation_argv",
                 "structured_cargo_test_count_assertion",
+                "structured_cargo_test_execution_policy",
                 "structured_go_test_json",
                 "structured_go_test_tool",
                 "structured_go_test_packages",
@@ -4585,6 +4876,8 @@ mod envelope_tests {
                 "job_state_reconciliation",
                 "coding_agent_runs",
                 "native_tool_plugins",
+                "managed_ssh_resources",
+                "runner_config_control",
                 "computer_control",
                 "computer_scroll_to_element",
                 "computer_key_input",
@@ -4935,6 +5228,8 @@ mod filter_canonical_tests {
             adapter: tool.to_string(),
             validation_target_id: None,
             minimum_tests: None,
+            require_tests: None,
+            no_run: None,
         }
     }
 

@@ -725,6 +725,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                         "enum": [
                             "passed",
                             "failed",
+                            "inconclusive",
                             "stale",
                             "not_run",
                             "not_requested",
@@ -903,12 +904,13 @@ fn attempt_activity_schema() -> Value {
         "properties": {
             "meaningful_tool_calls": schema_type("integer", "Count of meaningful (status/manifest-excluding) tool calls."),
             "successful_tool_calls": schema_type("integer", "Succeeded meaningful tool calls."),
-            "failed_tool_calls": schema_type("integer", "Failed meaningful tool calls."),
+            "failed_tool_calls": schema_type("integer", "Immutable raw failed meaningful ToolCall count, including expected/resolved/non-actionable history."),
+            "actionable_failed_tool_calls": schema_type("integer", "Failed meaningful ToolCalls that the canonical closeout projection still considers actionable for this attempt."),
             "expected_failures": schema_type("integer", "Expected failure tool calls."),
             "resolved_failures": schema_type("integer", "Validation failures resolved by the attempt."),
             "unresolved_failures": schema_type("integer", "Validation failures still unresolved.")
         },
-        "required": ["meaningful_tool_calls", "successful_tool_calls", "failed_tool_calls", "expected_failures", "resolved_failures", "unresolved_failures"]
+        "required": ["meaningful_tool_calls", "successful_tool_calls", "failed_tool_calls", "actionable_failed_tool_calls", "expected_failures", "resolved_failures", "unresolved_failures"]
     })
 }
 
@@ -968,15 +970,16 @@ fn attempt_validation_schema() -> Value {
         "properties": {
             "status": {
                 "type": "string",
-                "enum": ["passed", "failed", "stale", "not_run", "unknown"]
+                "enum": ["passed", "failed", "inconclusive", "stale", "not_run", "unknown"]
             },
             "latest_status": {
                 "type": "string",
-                "enum": ["passed", "failed", "not_run", "unknown", "unavailable"]
+                "enum": ["passed", "failed", "inconclusive", "not_run", "unknown", "unavailable"]
             },
             "latest_kind": nullable_schema("string", "Validation kind of the latest run, when present."),
             "latest_at": nullable_schema("integer", "Unix timestamp of the latest run, when present."),
             "unresolved_failure_count": schema_type("integer", "Unresolved failure event count from this attempt."),
+            "evidence_gap_event_count": schema_type("integer", "Inconclusive/request-scoped validation evidence events retained in the current post-mutation window. These are process evidence, not persistent task requirements."),
             "validation_events": schema_type("integer", "Validation event count in the current evidence window."),
             "stale_failure_count": schema_type("integer", "Failure events from this attempt that predate the latest trusted material workspace-content change."),
             "open_failures": array_schema(failure_identity_schema(), "Bounded stable identities for currently unresolved failures in this attempt."),
@@ -985,7 +988,7 @@ fn attempt_validation_schema() -> Value {
             "delta_available": schema_type("boolean", "Whether the validation delta is comparable."),
             "delta_reason_code": nullable_schema("string", "Reason code when the delta is not available; null otherwise.")
         },
-        "required": ["status", "latest_status", "unresolved_failure_count", "validation_events", "stale_failure_count", "open_failures", "total_open_failures", "failures_truncated", "delta_available"]
+        "required": ["status", "latest_status", "unresolved_failure_count", "evidence_gap_event_count", "validation_events", "stale_failure_count", "open_failures", "total_open_failures", "failures_truncated", "delta_available"]
     })
 }
 

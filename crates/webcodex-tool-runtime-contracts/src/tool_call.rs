@@ -11,9 +11,15 @@ use super::tool_inputs::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use webcodex_core::apply_patch_shared::ApplyPatchMatchingMode;
 use webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN;
 use webcodex_core::lsp_bridge::{
     CallHierarchyDirection, DEFAULT_CALL_HIERARCHY_DEPTH, DEFAULT_CALL_HIERARCHY_LIMIT,
+};
+use webcodex_core::plugin::{
+    validate_json_value as validate_plugin_json_value,
+    validate_provider_id as validate_plugin_provider_id,
+    validate_tool_name as validate_plugin_tool_name, PLUGIN_MAX_ARGUMENT_BYTES,
 };
 use webcodex_core::runner_protocol::ShellScriptLanguage;
 use webcodex_core::runtime_contract::{
@@ -30,6 +36,125 @@ use webcodex_workflow_session::{
 pub const TOOL_CALL_TOOL_FIELD: &str = "tool";
 pub const TOOL_CALL_PARAMS_FIELD: &str = "params";
 pub const TOOL_CALL_WRAPPER_FIELDS: &[&str] = &[TOOL_CALL_TOOL_FIELD, TOOL_CALL_PARAMS_FIELD];
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginToolCall {
+    pub action: String,
+    #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub binding: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<Value>,
+}
+
+impl PluginToolCall {
+    fn validate(&self) -> Result<(), String> {
+        let valid_runner = |runner: &str| {
+            !runner.trim().is_empty()
+                && runner.len() <= 128
+                && !runner.chars().any(char::is_control)
+        };
+        if self
+            .runner
+            .as_deref()
+            .is_some_and(|runner| !valid_runner(runner))
+        {
+            return Err("runner must be a bounded non-empty exact Runner client id".to_string());
+        }
+        if let Some(plugin) = self.plugin.as_deref() {
+            validate_plugin_provider_id(plugin)
+                .map_err(|_| "plugin must be a valid bounded provider id".to_string())?;
+        }
+        if let Some(tool) = self.tool.as_deref() {
+            validate_plugin_tool_name(tool)
+                .map_err(|_| "tool must be a valid bounded provider-local tool name".to_string())?;
+        }
+        if let Some(binding) = self.binding.as_deref() {
+            let Some(random) = binding.strip_prefix("wc_pbind_") else {
+                return Err("binding must be a valid opaque Plugin binding".to_string());
+            };
+            if random.len() != 32
+                || !random
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("binding must be a valid opaque Plugin binding".to_string());
+            }
+        }
+        if let Some(arguments) = self.arguments.as_ref() {
+            if !arguments.is_object() {
+                return Err("arguments must be a JSON object".to_string());
+            }
+            validate_plugin_json_value(arguments, PLUGIN_MAX_ARGUMENT_BYTES, "Plugin arguments")
+                .map_err(|_| "arguments exceed Plugin bounds".to_string())?;
+        }
+
+        match self.action.as_str() {
+            "list" => {
+                if self.tool.is_some() || self.binding.is_some() || self.arguments.is_some() {
+                    return Err("action=list accepts only optional runner and plugin".to_string());
+                }
+                if self.plugin.is_some() && self.runner.is_none() {
+                    return Err("action=list requires runner when plugin is provided".to_string());
+                }
+            }
+            "check" => {
+                if self.runner.is_none()
+                    || self.plugin.is_none()
+                    || self.tool.is_some()
+                    || self.binding.is_some()
+                    || self.arguments.is_some()
+                {
+                    return Err("action=check requires only runner and plugin".to_string());
+                }
+            }
+            "reload" => {
+                if self.runner.is_none()
+                    || self.plugin.is_some()
+                    || self.tool.is_some()
+                    || self.binding.is_some()
+                    || self.arguments.is_some()
+                {
+                    return Err("action=reload requires only runner".to_string());
+                }
+            }
+            "describe" => {
+                if self.runner.is_none()
+                    || self.plugin.is_none()
+                    || self.tool.is_none()
+                    || self.binding.is_some()
+                    || self.arguments.is_some()
+                {
+                    return Err(
+                        "action=describe requires only runner, plugin, and tool".to_string()
+                    );
+                }
+            }
+            "call" => {
+                if self.binding.is_none()
+                    || self.arguments.is_none()
+                    || self.runner.is_some()
+                    || self.plugin.is_some()
+                    || self.tool.is_some()
+                {
+                    return Err("action=call requires only binding and arguments".to_string());
+                }
+            }
+            _ => {
+                return Err(
+                    "action must be one of list, check, reload, describe, or call".to_string(),
+                )
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -699,7 +824,7 @@ pub enum ToolCall {
         #[serde(default)]
         dry_run: Option<bool>,
         #[serde(default)]
-        strict_matching: Option<bool>,
+        matching_mode: Option<ApplyPatchMatchingMode>,
         #[serde(default)]
         session_id: Option<String>,
     },
@@ -2037,6 +2162,24 @@ pub enum ToolCall {
         summary_only: bool,
     },
 
+    /// Validate the candidate at one exact Runner process's startup-bound config
+    /// path without mutating active configuration or instantiating providers.
+    RunnerConfigCheck {
+        client_id: String,
+    },
+
+    /// Activate the disk candidate on one exact Runner process with an optimistic
+    /// active-generation fence. The Runner never accepts a filesystem path here.
+    RunnerConfigReload {
+        client_id: String,
+        expected_generation: u64,
+    },
+
+    /// Stable gateway for Runner-owned native Tool Plugins. The static
+    /// ToolDefinition is a worst-case discovery contract; execution policy is
+    /// classified from `action` before scope/session/permission governance.
+    PluginTool(PluginToolCall),
+
     /// Return a structured runtime health/observability summary.
     ///
     /// This is a read-only observability tool: it never exposes tokens,
@@ -2272,6 +2415,8 @@ fn reject_unknown_targeted_inventory_fields(
             "summary_only",
         ],
         "runtime_status" => &["client_id", "compact", "summary_only"],
+        "runner_config_check" => &["client_id"],
+        "runner_config_reload" => &["client_id", "expected_generation"],
         "list_jobs" => &["limit", "status", "project", "session_id"],
         _ => return Ok(()),
     };
@@ -2386,6 +2531,16 @@ impl ToolCall {
         })?;
         validate_model_facing_assertion_name(name, &arguments)?;
         validate_model_facing_result_expectation(name, &arguments)?;
+        if name == "apply_patch"
+            && arguments
+                .as_object()
+                .is_some_and(|object| object.contains_key("strict_matching"))
+        {
+            return Err(
+                "invalid arguments for tool 'apply_patch': field 'strict_matching' is no longer supported; use matching_mode='exact_unique' for former strict_matching=true, matching_mode='first_match' for former strict_matching=false, or omit matching_mode for the current unique default"
+                    .to_string(),
+            );
+        }
         let recorder_metadata = ToolCallRecorderMetadata::from_arguments(&arguments);
         let arguments = strip_tool_call_expectation_metadata(arguments);
         if name == "read_project_artifact"
@@ -2425,7 +2580,12 @@ impl ToolCall {
         }
         if matches!(
             name,
-            "list_projects" | "list_runners" | "runtime_status" | "list_jobs"
+            "list_projects"
+                | "list_runners"
+                | "runtime_status"
+                | "list_jobs"
+                | "runner_config_check"
+                | "runner_config_reload"
         ) {
             reject_unknown_targeted_inventory_fields(name, &arguments)?;
         }
@@ -2475,8 +2635,13 @@ impl ToolCall {
             };
             wrapped.insert(TOOL_CALL_PARAMS_FIELD.to_string(), params);
         }
-        let call = serde_json::from_value(Value::Object(wrapped))
+        let call: Self = serde_json::from_value(Value::Object(wrapped))
             .map_err(|e| format!("invalid arguments for tool '{}': {}", name, e))?;
+        if let Self::PluginTool(plugin) = &call {
+            plugin
+                .validate()
+                .map_err(|error| format!("invalid arguments for tool '{}': {}", name, error))?;
+        }
         Ok((call, recorder_metadata))
     }
 
@@ -2637,6 +2802,9 @@ impl ToolCall {
             Self::UnregisterProject { .. } => "unregister_project",
             Self::CreateProject { .. } => "create_project",
             Self::ListRunners { .. } => "list_runners",
+            Self::RunnerConfigCheck { .. } => "runner_config_check",
+            Self::RunnerConfigReload { .. } => "runner_config_reload",
+            Self::PluginTool(_) => "plugin_tool",
             Self::RuntimeStatus { .. } => "runtime_status",
             Self::ReadToolTrace { .. } => "read_tool_trace",
             Self::ToolManifest { .. } => "tool_manifest",

@@ -310,6 +310,7 @@ pub fn tool_supports_model_facing_result_expectation(tool_name: &str) -> bool {
         "run_process"
             | "run_script"
             | "run_shell"
+            | "session_shell_exec"
             | "cargo_fmt"
             | "cargo_check"
             | "cargo_test"
@@ -549,7 +550,11 @@ pub(super) fn classify_failure_expectation(
     }
     let completed = output.get("command_completed").and_then(Value::as_bool) == Some(true)
         || output.get("execution_state").and_then(Value::as_str) == Some("completed");
+    // A completed nonzero command is an authoritative business result. Explicit
+    // tool/control failures remain fail-closed even if malformed output also
+    // claims completion.
     let known_business_result = completed
+        && output.get("tool_failure").and_then(Value::as_bool) != Some(true)
         && !matches!(
             actual_failure_kind,
             Some("outcome_unknown" | "timeout" | "timed_out" | "cancelled" | "execution_lost")
@@ -1543,6 +1548,12 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
         }
     }
     if tool_name == "cargo_test" {
+        if let Some(require_tests) = output.get("require_tests").and_then(Value::as_bool) {
+            summary["require_tests"] = json!(require_tests);
+        }
+        if let Some(no_run) = output.get("no_run").and_then(Value::as_bool) {
+            summary["no_run"] = json!(no_run);
+        }
         if let Some(assertion) = sanitized_test_count_assertion(output.get("test_count_assertion"))
         {
             summary["test_count_assertion"] = assertion;
@@ -1623,6 +1634,12 @@ pub(super) fn sanitize_persisted_validation_output_summary(
         }
     }
     if tool_name == "cargo_test" {
+        if let Some(require_tests) = object.get("require_tests").and_then(Value::as_bool) {
+            summary["require_tests"] = json!(require_tests);
+        }
+        if let Some(no_run) = object.get("no_run").and_then(Value::as_bool) {
+            summary["no_run"] = json!(no_run);
+        }
         if let Some(assertion) = sanitized_test_count_assertion(object.get("test_count_assertion"))
         {
             summary["test_count_assertion"] = assertion;
@@ -1740,4 +1757,78 @@ pub(super) fn persisted_cargo_test_zero_tests_run(
         .get("zero_tests_run")
         .and_then(Value::as_bool)
         .map_or(Value::Null, Value::Bool)
+}
+
+#[cfg(test)]
+mod result_expectation_tests {
+    use super::*;
+
+    #[test]
+    fn result_expectation_session_shell_exec_reuses_shared_contract_without_exit_code_list() {
+        assert!(tool_supports_model_facing_result_expectation(
+            "session_shell_exec"
+        ));
+        validate_model_facing_result_expectation(
+            "session_shell_exec",
+            &json!({"result_expectation": "observe"}),
+        )
+        .unwrap();
+        assert!(validate_model_facing_result_expectation(
+            "session_shell_exec",
+            &json!({"accepted_exit_codes": [0, 1]}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn result_expectation_observe_matches_only_completed_business_results() {
+        let expectation = ToolCallExpectation {
+            result_expectation: Some("observe".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_failure_expectation(
+                false,
+                &expectation,
+                Some("command_exit_nonzero"),
+                &json!({
+                    "command_completed": true,
+                    "execution_state": "completed",
+                    "exit_code": 1,
+                    "tool_failure": false,
+                }),
+            ),
+            TOOL_EXPECTATION_RESULT_MATCHED_RESULT
+        );
+        assert_eq!(
+            classify_failure_expectation(
+                false,
+                &expectation,
+                Some("shell_reset_required"),
+                &json!({
+                    "command_completed": true,
+                    "execution_state": "completed",
+                    "exit_code": 1,
+                    "error_code": "shell_reset_required",
+                    "tool_failure": true,
+                }),
+            ),
+            TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
+        );
+        assert_eq!(
+            classify_failure_expectation(
+                false,
+                &expectation,
+                Some("timeout"),
+                &json!({
+                    "command_completed": false,
+                    "execution_state": "timed_out",
+                    "exit_code": null,
+                    "tool_failure": true,
+                }),
+            ),
+            TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
+        );
+    }
 }

@@ -351,6 +351,8 @@ mod raw_shell;
 mod registration_projection;
 #[path = "tests/run_enqueue.rs"]
 mod run_enqueue;
+#[path = "tests/runner_config.rs"]
+mod runner_config;
 #[path = "tests/runner_liveness.rs"]
 mod runner_liveness;
 #[path = "tests/shared_key_limits.rs"]
@@ -359,5 +361,7 @@ mod shared_key_limits;
 mod shared_key_ttl;
 #[path = "tests/skill_store.rs"]
 mod skill_store;
+#[path = "tests/ssh_resource.rs"]
+mod ssh_resource;
 #[path = "tests/structured_file_delete.rs"]
 mod structured_file_delete;

@@ -76,7 +76,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "tool_failures",
-                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Compact output includes counts only."),
+                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains immutable raw failed-ToolCall evidence; non_actionable_unexpected_count identifies request-scoped validation evidence assertion failures, resolved/stale validation failures, or structurally proven not-started/non-effect attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Compact output includes counts only."),
             ),
             (
                 "hygiene",
@@ -402,12 +402,19 @@ fn startup_workspace_schema() -> Value {
 fn startup_workflow_schema() -> Value {
     json!({
         "type": "object",
-        "description": "WebCodex-owned model guidance for named coding/review pass roles. Separate from project instructions and Session authority.",
+        "description": "WebCodex-owned workflow defaults and optional named coding/review roles. Separate from project instructions and Session authority.",
         "properties": {
             "contract": {"type": "string", "const": BUILTIN_CODING_WORKFLOW_CONTRACT},
             "version": {"type": "integer", "const": BUILTIN_CODING_WORKFLOW_VERSION},
             "authority": {"type": "string", "const": "model_guidance_only"},
             "role_selection": {"type": "string", "maxLength": 240},
+            "guidance": {
+                "type": "array",
+                "description": "Default behavior for every coding/review task, including tasks without a named role. Guidance never grants authority.",
+                "minItems": 1,
+                "maxItems": BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS,
+                "items": {"type": "string", "maxLength": 320}
+            },
             "model_protocol": {
                 "type": "object",
                 "description": "Shared model-invocation guidance. It is not Session state, authority, or execution policy.",
@@ -443,7 +450,7 @@ fn startup_workflow_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["contract", "version", "authority", "role_selection", "model_protocol", "roles"],
+        "required": ["contract", "version", "authority", "role_selection", "guidance", "model_protocol", "roles"],
         "additionalProperties": false
     })
 }
@@ -688,7 +695,7 @@ fn startup_validation_schema() -> Value {
         "properties": {
             "latest_status": {
                 "type": "string",
-                "enum": ["passed", "failed", "expected", "not_run", "unknown", "unavailable"]
+                "enum": ["passed", "failed", "inconclusive", "expected", "not_run", "unknown", "unavailable"]
             },
             "open_failures": bounded_list_schema(startup_failure_schema(), 10),
             "delta": {

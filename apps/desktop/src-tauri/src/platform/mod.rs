@@ -1,26 +1,16 @@
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use tokio::process::Command;
+use webcodex_process::SpawnOptions;
 
-pub fn configure_child(command: &mut Command) {
-    #[cfg(target_os = "windows")]
-    windows::configure_child(command);
-    #[cfg(target_os = "macos")]
-    macos::configure_child(command);
-}
-
-pub async fn force_stop_owned_tree(pid: u32) -> bool {
+pub fn managed_spawn_options() -> SpawnOptions {
     #[cfg(target_os = "windows")]
     {
-        return windows::force_stop_owned_tree(pid).await;
+        return windows::managed_spawn_options();
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = pid;
-        false
+        SpawnOptions::new()
     }
 }
 

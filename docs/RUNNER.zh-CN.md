@@ -289,6 +289,23 @@ default_cwd = "/opt/webcodex-edge"
 generation；已经启动的 SSH 命令继续自己的有界生命周期，不会被重定向、replay
 或盲目重试。
 
+有权限的模型 client 也可以通过 MCP `ssh_resource` 工具登记 Runner-local SSH
+resource。`list` 只返回安全的逻辑名称、`static|managed`、active/pending-restart 状态，
+以及绑定 exact Runner 与 registry revision 的 opaque binding。`register` 接受一个用户
+明确提供的 OpenSSH destination argv 与可选 default cwd；`remove` 只删除 managed
+desired state。工具不会返回 raw target、用户名、地址、SSH option、credential 或
+identity path。静态 `[ssh.resources.*]` 名称始终 reserved，不能通过这条路径覆盖或删除。
+
+Managed mutation 修改的是 durable desired state，不是当前进程的 live config。返回
+`restart_required=true` 时，需要重启该 Runner，再次 `list` 后才能把资源绑定到
+Workflow Session。已经与 frozen startup snapshot 一致的幂等操作可以返回
+`restart_required=false`。访问还需要独立的可选 `ssh:local` permission；hosted OAuth
+client 通过 `webcodex connect ... --oauth-local-ssh` 显式 opt in。
+
+Managed target 最终仍由现有 SSH transport 消费。因此，成功登记 Windows OpenSSH
+destination 不代表一定能建立 PersistentShell：当前 remote persistent-shell contract
+仍要求远端已有 `sh`/`bash`。Remote PowerShell PersistentShell 不属于本能力。
+
 ## LSP 导航（只读）
 
 Runner 可以通过在仓库机器上运行的语言服务器提供只读语义导航：
@@ -343,8 +360,28 @@ sudo webcodex runner status --scope system --profile <profile>
 install、status、start、stop、restart、logs、uninstall 请使用相同的 `--scope`。
 User scope 使用 `systemctl --user`；system scope 使用 `/etc/systemd/system`。
 
-编辑 `runner.toml` 后，reload 对应服务以应用 policy、shell 与 SSH 资源变更。
-身份、server/auth、传输与并发变更仍需要重启。无效 reload 会保留当前生效的
-generation。对于可安全分类的 validation failure，reload status 只报告闭集、非 secret 的
+对已经运行的 Runner，修改配置时使用正式的 first-class 流程，不再查 PID 或手工发信号：
+
+1. 编辑该 Runner 启动时绑定的现有 `runner.toml`。
+2. 调用 `runner_config_check(client_id=...)`。它只读取这个绑定路径，不激活 candidate，
+   返回当前 generation 以及有界的 validation/restart 元数据。
+3. candidate 有效后调用
+   `runner_config_reload(client_id=..., expected_generation=<current_generation>)`。
+   optimistic generation fence 会在激活前拒绝 stale caller。
+4. reload 后调用 `runtime_status(client_id=...)`（或 `list_runners`）检查当前运行状态。
+
+`runner_config_reload` 不写 `runner.toml`，只激活磁盘上已经存在的 candidate。policy、
+shell、Native Plugin 与静态 SSH resource 中可热加载的字段可以立即生效；`restart_required_fields`
+报告的字段仍保持 startup-only，重启前不会假装已在线生效。无效 candidate 保留旧 active
+snapshot 与 generation。`ssh_resource` managed mutation 不同：它使用 frozen startup
+snapshot，且只在工具返回 `restart_required=true` 时要求重启 Runner。
+
+Plugin 配置通过与 `plugin_tool reload` 相同的 validated candidate admission/commit primitive
+进行 live apply，因此修改 `[plugins]` 不属于 restart-only 变更。只想 reload Plugin state 时，
+仍使用权限更窄、要求 `plugin:manage` 的 `plugin_tool reload`。
+
+Unix 上 service reload/SIGHUP 仍可作为兼容 trigger，并调用同一个 authoritative reload
+primitive。Windows 与 macOS 直接使用 first-class operation，不模拟信号，也不需要 PID
+管理。对于可安全分类的 validation failure，config operation 只报告闭集、非 secret 的
 原子信息，例如 `field=max_concurrent_jobs` 与 `reason=out_of_range`；不会投影 raw TOML、
-配置值、路径、credential 或 parser 文本。
+配置值、路径、credential、parser 文本或 shell environment value。

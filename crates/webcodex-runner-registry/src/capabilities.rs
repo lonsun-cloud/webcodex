@@ -18,6 +18,7 @@ pub enum RunnerFeature {
     ApplyTextEditLineScope,
     ApplyPatch,
     ApplyPatchMatchMetadata,
+    ApplyPatchMatchingMode,
     ApplyPatchStrictMatching,
     Git,
     Jobs,
@@ -28,6 +29,7 @@ pub enum RunnerFeature {
     SshPersistentShell,
     StructuredValidationArgv,
     StructuredCargoTestCountAssertion,
+    StructuredCargoTestExecutionPolicy,
     StructuredGoTestJson,
     StructuredGoTestTool,
     StructuredGoTestPackages,
@@ -55,6 +57,8 @@ pub enum RunnerFeature {
     JobStateReconciliation,
     CodingAgentRuns,
     NativeToolPlugins,
+    ManagedSshResources,
+    RunnerConfigControl,
     ComputerControl,
     ComputerScrollToElement,
     ComputerKeyInput,
@@ -62,7 +66,7 @@ pub enum RunnerFeature {
     ComputerTextInput,
 }
 
-const ALL_RUNNER_FEATURES: [RunnerFeature; 52] = [
+const ALL_RUNNER_FEATURES: [RunnerFeature; 56] = [
     RunnerFeature::Shell,
     RunnerFeature::FileRead,
     RunnerFeature::FileWrite,
@@ -73,6 +77,7 @@ const ALL_RUNNER_FEATURES: [RunnerFeature; 52] = [
     RunnerFeature::ApplyTextEditLineScope,
     RunnerFeature::ApplyPatch,
     RunnerFeature::ApplyPatchMatchMetadata,
+    RunnerFeature::ApplyPatchMatchingMode,
     RunnerFeature::ApplyPatchStrictMatching,
     RunnerFeature::Git,
     RunnerFeature::Jobs,
@@ -83,6 +88,7 @@ const ALL_RUNNER_FEATURES: [RunnerFeature; 52] = [
     RunnerFeature::SshPersistentShell,
     RunnerFeature::StructuredValidationArgv,
     RunnerFeature::StructuredCargoTestCountAssertion,
+    RunnerFeature::StructuredCargoTestExecutionPolicy,
     RunnerFeature::StructuredGoTestJson,
     RunnerFeature::StructuredGoTestTool,
     RunnerFeature::StructuredGoTestPackages,
@@ -110,6 +116,8 @@ const ALL_RUNNER_FEATURES: [RunnerFeature; 52] = [
     RunnerFeature::JobStateReconciliation,
     RunnerFeature::CodingAgentRuns,
     RunnerFeature::NativeToolPlugins,
+    RunnerFeature::ManagedSshResources,
+    RunnerFeature::RunnerConfigControl,
     RunnerFeature::ComputerControl,
     RunnerFeature::ComputerScrollToElement,
     RunnerFeature::ComputerKeyInput,
@@ -148,6 +156,7 @@ impl RunnerFeature {
             Self::ApplyTextEditLineScope => wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
             Self::ApplyPatch => wire::RUNNER_CAPABILITY_APPLY_PATCH,
             Self::ApplyPatchMatchMetadata => wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
+            Self::ApplyPatchMatchingMode => wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE,
             Self::ApplyPatchStrictMatching => wire::RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING,
             Self::Git => wire::RUNNER_CAPABILITY_GIT,
             Self::Jobs => wire::RUNNER_CAPABILITY_JOBS,
@@ -159,6 +168,9 @@ impl RunnerFeature {
             Self::StructuredValidationArgv => wire::RUNNER_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
             Self::StructuredCargoTestCountAssertion => {
                 wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_COUNT_ASSERTION
+            }
+            Self::StructuredCargoTestExecutionPolicy => {
+                wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY
             }
             Self::StructuredGoTestJson => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON,
             Self::StructuredGoTestTool => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
@@ -191,6 +203,8 @@ impl RunnerFeature {
             Self::JobStateReconciliation => wire::RUNNER_CAPABILITY_JOB_STATE_RECONCILIATION,
             Self::CodingAgentRuns => wire::RUNNER_CAPABILITY_CODING_AGENT_RUNS,
             Self::NativeToolPlugins => wire::RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS,
+            Self::ManagedSshResources => wire::RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES,
+            Self::RunnerConfigControl => wire::RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
             Self::ComputerControl => wire::RUNNER_CAPABILITY_COMPUTER_CONTROL,
             Self::ComputerScrollToElement => wire::RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
             Self::ComputerKeyInput => wire::RUNNER_CAPABILITY_COMPUTER_KEY_INPUT,
@@ -213,6 +227,7 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE => Self::ApplyTextEditLineScope,
             wire::RUNNER_CAPABILITY_APPLY_PATCH => Self::ApplyPatch,
             wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA => Self::ApplyPatchMatchMetadata,
+            wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE => Self::ApplyPatchMatchingMode,
             wire::RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING => Self::ApplyPatchStrictMatching,
             wire::RUNNER_CAPABILITY_GIT => Self::Git,
             wire::RUNNER_CAPABILITY_JOBS => Self::Jobs,
@@ -224,6 +239,9 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_STRUCTURED_VALIDATION_ARGV => Self::StructuredValidationArgv,
             wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_COUNT_ASSERTION => {
                 Self::StructuredCargoTestCountAssertion
+            }
+            wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY => {
+                Self::StructuredCargoTestExecutionPolicy
             }
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON => Self::StructuredGoTestJson,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL => Self::StructuredGoTestTool,
@@ -256,6 +274,8 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_JOB_STATE_RECONCILIATION => Self::JobStateReconciliation,
             wire::RUNNER_CAPABILITY_CODING_AGENT_RUNS => Self::CodingAgentRuns,
             wire::RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS => Self::NativeToolPlugins,
+            wire::RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES => Self::ManagedSshResources,
+            wire::RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL => Self::RunnerConfigControl,
             wire::RUNNER_CAPABILITY_COMPUTER_CONTROL => Self::ComputerControl,
             wire::RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT => Self::ComputerScrollToElement,
             wire::RUNNER_CAPABILITY_COMPUTER_KEY_INPUT => Self::ComputerKeyInput,
@@ -291,9 +311,11 @@ impl RunnerFeature {
             | Self::ProjectPathRegistration => RunnerFeatureInference::GenerationEligible,
             Self::Shell
             | Self::Git
+            | Self::StructuredCargoTestExecutionPolicy
             | Self::ApplyTextEditLineScope
             | Self::ApplyPatch
             | Self::ApplyPatchMatchMetadata
+            | Self::ApplyPatchMatchingMode
             | Self::ApplyPatchStrictMatching
             | Self::SshShell
             | Self::PersistentShell
@@ -314,6 +336,8 @@ impl RunnerFeature {
             | Self::JobStateReconciliation
             | Self::CodingAgentRuns
             | Self::NativeToolPlugins
+            | Self::ManagedSshResources
+            | Self::RunnerConfigControl
             | Self::ComputerControl
             | Self::ComputerScrollToElement
             | Self::ComputerKeyInput
@@ -336,6 +360,7 @@ impl RunnerFeature {
             Self::ApplyTextEditLineScope => capabilities.apply_text_edit_line_scope,
             Self::ApplyPatch => capabilities.apply_patch,
             Self::ApplyPatchMatchMetadata => capabilities.apply_patch_match_metadata,
+            Self::ApplyPatchMatchingMode => capabilities.apply_patch_matching_mode,
             Self::ApplyPatchStrictMatching => capabilities.apply_patch_strict_matching,
             Self::Git => capabilities.git,
             Self::Jobs => capabilities.jobs,
@@ -347,6 +372,9 @@ impl RunnerFeature {
             Self::StructuredValidationArgv => capabilities.structured_validation_argv,
             Self::StructuredCargoTestCountAssertion => {
                 capabilities.structured_cargo_test_count_assertion
+            }
+            Self::StructuredCargoTestExecutionPolicy => {
+                capabilities.structured_cargo_test_execution_policy
             }
             Self::StructuredGoTestJson => capabilities.structured_go_test_json,
             Self::StructuredGoTestTool => capabilities.structured_go_test_tool,
@@ -375,6 +403,8 @@ impl RunnerFeature {
             Self::JobStateReconciliation => capabilities.job_state_reconciliation,
             Self::CodingAgentRuns => capabilities.coding_agent_runs,
             Self::NativeToolPlugins => capabilities.native_tool_plugins,
+            Self::ManagedSshResources => capabilities.managed_ssh_resources,
+            Self::RunnerConfigControl => capabilities.runner_config_control,
             Self::ComputerControl => capabilities.computer_control,
             Self::ComputerScrollToElement => capabilities.computer_scroll_to_element,
             Self::ComputerKeyInput => capabilities.computer_key_input,

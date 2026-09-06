@@ -454,6 +454,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 apply_text_edit_line_scope: true,
                 apply_patch: true,
                 apply_patch_match_metadata: true,
+                apply_patch_matching_mode: true,
                 apply_patch_strict_matching: true,
                 git: true,
                 jobs: true,
@@ -464,6 +465,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 ssh_persistent_shell: true,
                 structured_validation_argv: true,
                 structured_cargo_test_count_assertion: true,
+                structured_cargo_test_execution_policy: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
@@ -496,9 +498,10 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 job_state_reconciliation: true,
                 coding_agent_runs: true,
                 native_tool_plugins: true,
+                managed_ssh_resources: true,
+                runner_config_control: true,
             },
             policy: Some(crate::runner_protocol::RunnerPolicySummary {
-                plugin_providers: Some(Vec::new()),
                 ..Default::default()
             }),
         })

@@ -501,7 +501,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "tool_failures",
-                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Never includes raw input payloads, command text, stdout/stderr, tails, or excerpts."),
+                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains immutable raw failed-ToolCall evidence; non_actionable_unexpected_count identifies request-scoped validation evidence assertion failures, resolved/stale validation failures, or structurally proven not-started/non-effect attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Never includes raw input payloads, command text, stdout/stderr, tails, or excerpts."),
             ),
             (
                 "expected_failed_tool_calls",
@@ -549,7 +549,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "validation",
-                open_object_schema("Ledger-derived validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, expected, or unknown. `expected` means a pre-declared negative/observation result matched without proving validator pass. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
+                open_object_schema("Ledger-derived validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, inconclusive, expected, or unknown. `expected` means a pre-declared negative/observation result matched without proving validator pass. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
             ),
             (
                 "review_evidence",
@@ -625,22 +625,23 @@ fn validation_evidence_schema() -> Value {
             "description": "Current workspace validation evidence for the current attempt after the latest trusted material workspace-content change. Historical ledger failures remain separately visible and are not erased by this projection.",
             "additionalProperties": false,
             "properties": {
-                "status": {"type": "string", "enum": ["passed", "failed", "expected", "stale", "not_run", "unknown"]},
+                "status": {"type": "string", "enum": ["passed", "failed", "inconclusive", "expected", "stale", "not_run", "unknown"]},
                 "reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                "latest_status": {"type": "string", "enum": ["passed", "failed", "expected", "not_run", "unknown"]},
+                "latest_status": {"type": "string", "enum": ["passed", "failed", "inconclusive", "expected", "not_run", "unknown"]},
                 "events_total": {"type": "integer", "minimum": 0},
                 "successes": {"type": "integer", "minimum": 0},
                 "failures": {"type": "integer", "minimum": 0},
                 "expected_results": {"type": "integer", "minimum": 0},
                 "resolved_failure_count": {"type": "integer", "minimum": 0},
                 "unresolved_failure_count": {"type": "integer", "minimum": 0},
+                "evidence_gap_event_count": {"type": "integer", "minimum": 0, "description": "Request-scoped/inconclusive validation evidence events in the current post-mutation window. This is historical/process evidence within the window, not a persistent task requirement."},
                 "stale_failure_count": {"type": "integer", "minimum": 0},
                 "evidence_after_latest_content_change": {"type": "boolean"},
                 "boundary_reason": {"type": "string", "enum": ["attempt_start", "workspace_content_changed", "attempt_boundary_unavailable"]}
             },
             "required": [
                 "status", "reason", "latest_status", "events_total", "successes", "failures",
-                "expected_results", "resolved_failure_count", "unresolved_failure_count", "stale_failure_count",
+                "expected_results", "resolved_failure_count", "unresolved_failure_count", "evidence_gap_event_count", "stale_failure_count",
                 "evidence_after_latest_content_change", "boundary_reason"
             ]
         })
@@ -652,14 +653,15 @@ fn validation_evidence_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "available": schema_type("boolean", "True when validation-like ledger events exist."),
-            "status": { "type": "string", "enum": ["not_run", "passed", "failed", "mixed", "expected", "unknown"] },
+            "status": { "type": "string", "enum": ["not_run", "passed", "failed", "mixed", "inconclusive", "expected", "unknown"] },
             "reason": { "anyOf": [{"type": "string"}, {"type": "null"}] },
             "latest": { "anyOf": [event.clone(), {"type": "null"}] },
-            "latest_status": { "type": "string", "enum": ["not_run", "passed", "failed", "expected", "unknown"] },
+            "latest_status": { "type": "string", "enum": ["not_run", "passed", "failed", "inconclusive", "expected", "unknown"] },
             "current_evidence": current_validation_evidence_schema(),
             "historical_failures": validation_historical_failures_schema(),
             "resolved_failures": validation_failure_set_schema(),
             "unresolved_failures": validation_failure_set_schema(),
+            "evidence_gaps": validation_failure_set_schema(),
             "source": { "type": "string", "enum": ["session_ledger"] },
             "events_total": { "type": "integer", "minimum": 0 },
             "successes": { "type": "integer", "minimum": 0 },
@@ -674,12 +676,12 @@ fn validation_evidence_schema() -> Value {
                 "description": "Bounded validation history only; never raw session events."
             },
             "parser": validation_parser_metadata_schema(),
-            "cargo_test_zero_tests_run": schema_type("boolean", "True when a successful cargo_test event explicitly reported zero tests run."),
+            "cargo_test_zero_tests_run": schema_type("boolean", "True when a completed, validator-successful cargo_test execution explicitly reported zero tests run, even if a request-scoped count assertion made the raw ToolResult fail."),
             "skipped": schema_type("boolean", "True only when validation summary generation was explicitly skipped by a closeout caller.")
         },
         "required": [
             "available", "status", "reason", "latest", "latest_status", "current_evidence",
-            "historical_failures", "resolved_failures", "unresolved_failures",
+            "historical_failures", "resolved_failures", "unresolved_failures", "evidence_gaps",
             "source", "events_total", "events", "parser",
             "cargo_test_zero_tests_run"
         ]
@@ -747,8 +749,10 @@ fn validation_event_schema() -> Value {
             "assertion_name": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS },
             "purpose": { "type": "string", "enum": ["validation", "test", "build", "format", "release"] },
             "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation"] },
-            "success": { "type": "boolean", "description": "True only when the validator/execution itself passed; pre-declared expected failures never rewrite this fact." },
-            "execution_success": { "type": "boolean" },
+            "success": { "type": "boolean", "description": "Immutable raw ToolResult success recorded by the Workflow Session. A request-scoped evidence assertion can make this false even when validator execution and correctness passed." },
+            "execution_success": { "type": "boolean", "description": "Derived execution result from authoritative completion state and exit code; independent from request-scoped evidence assertions." },
+            "validation_passed": { "type": "boolean", "description": "True when the validator/correctness execution itself passed. This can remain true while the invocation's evidence assertion is insufficient." },
+            "failure_class": { "type": "string", "enum": ["none", "execution_or_correctness", "outcome_unknown", "evidence_assertion", "evidence_insufficient", "expected_result"] },
             "expectation_satisfied": { "type": "boolean", "description": "Present for public result expectations; true when the pre-declared expectation matched. This is separate from validation success." },
             "failure_kind": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
             "failure_category": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
@@ -777,6 +781,8 @@ fn validation_event_schema() -> Value {
             "tests_detected": { "type": "boolean" },
             "tests_run_count": { "type": "integer", "minimum": 0 },
             "zero_tests_run": { "type": "boolean" },
+            "require_tests": { "type": "boolean" },
+            "no_run": { "type": "boolean" },
             "test_count_assertion": cargo_test_count_assertion_schema(),
             "stdout_lines": { "type": "integer", "minimum": 0 },
             "stderr_lines": { "type": "integer", "minimum": 0 },
@@ -787,7 +793,7 @@ fn validation_event_schema() -> Value {
         },
         "required": [
             "tool_name", "execution_source", "identity", "purpose",
-            "validation_kind", "success", "failure_kind", "failure_category",
+            "validation_kind", "success", "validation_passed", "failure_class", "failure_kind", "failure_category",
             "unresolved_failure", "summary", "cwd", "shell", "execution_state",
             "session_id", "stdout_truncated", "stderr_truncated"
         ]

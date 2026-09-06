@@ -31,7 +31,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 ),
-                "Primary model edit path for contextual/multi-file Codex patches. Transactional with SHA rechecks, rollback, dry_run, recovery. A zero-write context_mismatch may include body-free match_diagnostic plus Server-derived recovery; when recovery.action=read_files, pass recovery.items to read_files for the same project before regenerating the whole patch. outcome_unknown requires workspace inspection first. Set strict_matching=true for exact-unique positioning. Use apply_text_edits for small exact edits; unified diff for external diffs.",
+                "Primary model edit path for contextual/multi-file Codex patches. Transactional with SHA rechecks, rollback, dry_run. matching_mode=unique (default) allows bounded whitespace/Unicode drift but writes only when final target is unique; repeated `@@` is okay when old lines still identify one target, while pure additions need a unique anchor. For repetitive targets, add a stable parent/function/test/module anchor. Use matching_mode=exact_unique only after reading exact current source for a stale-context fence; never relax it after rejection. matching_mode=first_match is permissive compatibility only. Put multiple chunks for one file in one Update File; duplicate file operations are rejected. Ambiguity may return equal read_files windows. outcome_unknown requires workspace inspection before retry. Prefer apply_text_edits for small exact edits and unified diff for external diffs.",
                 apply_patch_input_schema,
             ),
             PERMISSION_RISK_PATCH,

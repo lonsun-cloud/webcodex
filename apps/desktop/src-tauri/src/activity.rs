@@ -33,6 +33,11 @@ pub enum ActivityEventKind {
     RegularTunnelReady,
     RegularTunnelStopped,
     RuntimeStopped,
+    StateRecovered,
+    OperationStarted,
+    OperationCancelRequested,
+    OperationCancelled,
+    OperationFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

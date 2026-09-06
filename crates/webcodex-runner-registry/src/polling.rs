@@ -13,8 +13,8 @@ use webcodex_core::mcp_gateway::{
     validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayResponse,
 };
 use webcodex_core::plugin::{
-    validate_response as validate_plugin_gateway_response, PluginDispatchState,
-    PluginGatewayResponse, PluginPlane,
+    validate_response_for_request as validate_plugin_gateway_response, PluginDispatchState,
+    PluginGatewayResponse,
 };
 use webcodex_core::runner_protocol::{
     RunnerPersistentShellResultRequest, RunnerPollRequest, RunnerRequest, RunnerResultPayload,
@@ -90,6 +90,136 @@ impl RunnerRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
+            let stale_runner_config_error =
+                inner.pending_by_id.get(&request_id).and_then(|pending| {
+                    match (
+                        pending.request.kind.as_str(),
+                        pending.expected_runner_config_runner_instance_id.as_deref(),
+                    ) {
+                        (
+                            webcodex_core::runner_protocol::RUNNER_CONFIG_REQUEST_KIND,
+                            Some(expected),
+                        ) => {
+                            let Some(runner) = inner.runners.get(&body.client_id) else {
+                                return Some((
+                                    "runner_replaced",
+                                    "Exact Runner disappeared before config operation dispatch"
+                                        .to_string(),
+                                ));
+                            };
+                            if runner.runner_instance_id != expected {
+                                return Some((
+                                    "runner_replaced",
+                                    "Exact Runner changed before config operation dispatch"
+                                        .to_string(),
+                                ));
+                            }
+                            (!runner
+                                .runner_features
+                                .supports(RunnerFeature::RunnerConfigControl))
+                            .then_some((
+                                "capability_unavailable",
+                                "Runner config-control capability changed before dispatch"
+                                    .to_string(),
+                            ))
+                        }
+                        (webcodex_core::runner_protocol::RUNNER_CONFIG_REQUEST_KIND, None) => {
+                            Some((
+                                "runner_replaced",
+                                "Runner config exact-process fence is missing".to_string(),
+                            ))
+                        }
+                        (_, Some(_)) => Some((
+                            "runner_replaced",
+                            "Runner config exact-process fence is inconsistent".to_string(),
+                        )),
+                        _ => None,
+                    }
+                });
+            if let Some((code, message)) = stale_runner_config_error {
+                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
+                    continue;
+                };
+                if let Some(waiter) = pending.waiter.take() {
+                    let _ = waiter.send(ShellRunResponse {
+                        success: false,
+                        request_id: request_id.clone(),
+                        client_id: body.client_id.clone(),
+                        cwd: None,
+                        command_preview: String::new(),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: None,
+                        error: Some(format!("{code}: {message}")),
+                        request_dispatched: Some(false),
+                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
+                    });
+                }
+                continue;
+            }
+            let stale_ssh_resource_error =
+                inner.pending_by_id.get(&request_id).and_then(|pending| {
+                    match (
+                        pending.request.kind.as_str(),
+                        pending.expected_ssh_resource_runner_instance_id.as_deref(),
+                    ) {
+                        ("ssh_resource", Some(expected_runner)) => {
+                            let Some(runner) = inner.runners.get(&body.client_id) else {
+                                return Some((
+                                    "runner_replaced",
+                                    "Exact Runner disappeared before SSH resource dispatch"
+                                        .to_string(),
+                                ));
+                            };
+                            if runner.runner_instance_id != expected_runner {
+                                return Some((
+                                    "runner_replaced",
+                                    "Exact Runner changed before SSH resource dispatch".to_string(),
+                                ));
+                            }
+                            (!runner
+                                .runner_features
+                                .supports(RunnerFeature::ManagedSshResources))
+                            .then_some((
+                                "ssh_resource_registry_unavailable",
+                                "Managed SSH resource capability changed before dispatch"
+                                    .to_string(),
+                            ))
+                        }
+                        ("ssh_resource", None) => Some((
+                            "runner_replaced",
+                            "SSH resource exact Runner fence is missing".to_string(),
+                        )),
+                        (_, Some(_)) => Some((
+                            "runner_replaced",
+                            "SSH resource exact Runner fence is inconsistent".to_string(),
+                        )),
+                        _ => None,
+                    }
+                });
+            if let Some((code, message)) = stale_ssh_resource_error {
+                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
+                    continue;
+                };
+                if let Some(waiter) = pending.waiter.take() {
+                    let _ = waiter.send(ShellRunResponse {
+                        success: false,
+                        request_id: request_id.clone(),
+                        client_id: body.client_id.clone(),
+                        cwd: None,
+                        command_preview: String::new(),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: None,
+                        error: Some(format!("{code}: {message}")),
+                        request_dispatched: Some(false),
+                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
+                    });
+                }
+                continue;
+            }
             let stale_bridge_error =
                 inner.pending_by_id.get(&request_id).and_then(|pending| {
                     match (
@@ -198,9 +328,10 @@ impl RunnerRegistry {
                     ));
                 };
                 let operation_binding = operation.provider_binding();
-                let fence_binding = fence.provider.as_ref().map(|(provider, instance, plane)| {
-                    (provider.as_str(), instance.as_str(), *plane)
-                });
+                let fence_binding = fence
+                    .provider
+                    .as_ref()
+                    .map(|(provider, instance)| (provider.as_str(), instance.as_str()));
                 if operation_binding != fence_binding {
                     return Some((
                         "stale_plugin_provider",
@@ -227,26 +358,6 @@ impl RunnerRegistry {
                         "plugin_capability_unavailable",
                         "native Plugin capability changed before dispatch".to_string(),
                     ));
-                }
-                if let Some((provider_id, provider_instance_id, PluginPlane::Startup)) =
-                    operation_binding
-                {
-                    let provider_is_current = runner
-                        .policy
-                        .as_ref()
-                        .and_then(|policy| policy.plugin_providers.as_ref())
-                        .is_some_and(|providers| {
-                            providers.iter().any(|provider| {
-                                provider.provider_id == provider_id
-                                    && provider.provider_instance_id == provider_instance_id
-                            })
-                        });
-                    if !provider_is_current {
-                        return Some((
-                            "stale_plugin_provider",
-                            "startup Plugin provider changed before dispatch".to_string(),
-                        ));
-                    }
                 }
                 None
             });
@@ -612,7 +723,15 @@ impl RunnerRegistry {
                         && body.stderr.is_none()
                         && body.duration_ms.is_none()
                         && body.error.is_none()
-                        && validate_plugin_gateway_response(&response).is_ok() =>
+                        && validate_plugin_gateway_response(
+                            pending
+                                .request
+                                .plugin_gateway
+                                .as_ref()
+                                .expect("checked above"),
+                            &response,
+                        )
+                        .is_ok() =>
                 {
                     response
                 }

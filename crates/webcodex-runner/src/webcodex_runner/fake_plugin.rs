@@ -6,6 +6,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -13,7 +14,18 @@ fn main() -> io::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let scenario = args.first().map(String::as_str).unwrap_or("normal");
     let marker = args.get(1).map(Path::new);
+    if scenario == "hold" {
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
     append(marker, "start\n")?;
+    if scenario.starts_with("check_") || scenario.starts_with("candidate_") {
+        append(marker, &format!("candidate-pid:{}\n", std::process::id()))?;
+    }
+    if scenario == "reload_new" {
+        append(marker, "reload-new-start\n")?;
+    }
     if scenario == "execution_context" {
         append(
             marker,
@@ -41,6 +53,16 @@ fn main() -> io::Result<()> {
     }
     if scenario == "stderr" {
         eprintln!("diagnostic-only-secret-looking-stderr");
+    } else if scenario == "stderr_flood" {
+        let mut stderr = io::stderr().lock();
+        for index in 0..256usize {
+            writeln!(
+                stderr,
+                "stderr-flood-{index:03}-{}",
+                "x".repeat(2 * 1024)
+            )?;
+        }
+        stderr.flush()?;
     }
 
     let mut reader = BufReader::new(io::stdin().lock());
@@ -57,10 +79,23 @@ fn main() -> io::Result<()> {
         match method.as_str() {
             "initialize" => {
                 append(marker, "initialize\n")?;
-                if scenario == "init_crash" {
+                if scenario == "init_crash" || scenario == "check_init_crash" {
                     return Ok(());
                 }
-                let version = if scenario == "bad_version" {
+                if scenario == "check_init_timeout" {
+                    thread::sleep(Duration::from_secs(3));
+                }
+                if scenario == "check_bad_version_tree" {
+                    let child = Command::new(env::current_exe()?)
+                        .arg("hold")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?;
+                    append(marker, &format!("descendant-pid:{}\n", child.id()))?;
+                    drop(child);
+                }
+                let version = if matches!(scenario, "bad_version" | "check_bad_version_tree") {
                     "unsupported-plugin-v0"
                 } else {
                     "webcodex-plugin-v1"
@@ -75,6 +110,42 @@ fn main() -> io::Result<()> {
             "tools/list" => {
                 lists += 1;
                 append(marker, "list\n")?;
+                if matches!(scenario, "reload_block_list" | "candidate_block_list_tree")
+                    && lists == 1
+                {
+                    append(
+                        marker,
+                        if scenario == "reload_block_list" {
+                            "reload-blocked\n"
+                        } else {
+                            "candidate-blocked\n"
+                        },
+                    )?;
+                    if scenario == "candidate_block_list_tree" {
+                        let child = Command::new(env::current_exe()?)
+                            .arg("hold")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()?;
+                        append(marker, &format!("descendant-pid:{}\n", child.id()))?;
+                        drop(child);
+                    }
+                    let release = marker
+                        .map(|path| path.with_extension("release"))
+                        .expect("blocking candidate scenario requires marker path");
+                    while !release.exists() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    append(
+                        marker,
+                        if scenario == "reload_block_list" {
+                            "reload-released\n"
+                        } else {
+                            "candidate-released\n"
+                        },
+                    )?;
+                }
                 if scenario == "split_timeout" && lists >= 2 {
                     thread::sleep(Duration::from_millis(750));
                 }
@@ -92,11 +163,57 @@ fn main() -> io::Result<()> {
                     )?;
                     continue;
                 }
-                if scenario == "invalid_tools" {
+                if scenario == "check_malformed_tools_list" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"notTools":[]}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
+                if scenario == "check_duplicate_tools" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object"}}}},{{"name":"echo","inputSchema":{{"type":"object"}}}}]}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
+                if scenario == "check_invalid_tool_name" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"bad name","inputSchema":{{"type":"object"}}}}]}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
+                if matches!(scenario, "invalid_tools" | "check_invalid_tools") {
                     send(
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","inputSchema":[]}}]}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
+                if scenario == "check_oversized_schema" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object","description":"{}"}}}}]}}}}"#,
+                            "x".repeat(70 * 1024)
+                        ),
+                    )?;
+                    continue;
+                }
+                if scenario == "check_unsupported_schema" {
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object","$ref":"https://example.invalid/secret-schema"}}}}]}}}}"#
                         ),
                     )?;
                     continue;
@@ -106,12 +223,58 @@ fn main() -> io::Result<()> {
                 } else {
                     "string"
                 };
+                let tool_name = if scenario == "check_v2" { "echo_v2" } else { "echo" };
+                let startup_padding = if scenario == "check_startup_large_schema" {
+                    "x".repeat(40 * 1024)
+                } else {
+                    String::new()
+                };
+                if scenario == "check_success_tree" {
+                    let child = Command::new(env::current_exe()?)
+                        .arg("hold")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?;
+                    append(marker, &format!("descendant-pid:{}\n", child.id()))?;
+                    drop(child);
+                }
+                let output_schema = if scenario == "output_schema_invalid" {
+                    r#","outputSchema":{"type":"object","properties":{"call":{"type":"string"}},"required":["call"],"additionalProperties":false}"#.to_string()
+                } else {
+                    String::new()
+                };
+                if scenario == "check_stderr_at_list" {
+                    let mut stderr = io::stderr().lock();
+                    writeln!(stderr, "diagnostic-written-before-list-response")?;
+                    stderr.flush()?;
+                }
                 send(
                     &mut writer,
                     &format!(
-                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","description":"Native plugin echo","inputSchema":{{"type":"object","properties":{{"value":{{"type":"{value_type}"}}}}}}}}]}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"{tool_name}","description":"Native plugin echo","inputSchema":{{"type":"object","description":"{startup_padding}","properties":{{"value":{{"type":"{value_type}"}}}}}}{output_schema}}}]}}}}"#
                     ),
                 )?;
+                if matches!(
+                    scenario,
+                    "block_after_preflight" | "block_after_preflight_tree"
+                ) && lists >= 1
+                {
+                    append(marker, "stdin-blocked\n")?;
+                    if scenario == "block_after_preflight_tree" {
+                        let child = Command::new(env::current_exe()?)
+                            .arg("hold")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()?;
+                        append(marker, &format!("descendant-pid:{}\n", child.id()))?;
+                        drop(child);
+                    }
+                    loop {
+                        thread::sleep(Duration::from_secs(60));
+                    }
+                }
             }
             "tools/call" => {
                 calls += 1;

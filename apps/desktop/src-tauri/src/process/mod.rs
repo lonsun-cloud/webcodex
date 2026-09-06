@@ -1,3 +1,7 @@
 mod supervisor;
 
-pub use supervisor::{ProcessKind, ProcessPhase, ProcessSupervisor};
+#[cfg(test)]
+mod tests;
+
+pub(crate) use supervisor::MachineEventReceiver;
+pub use supervisor::{ProcessKind, ProcessPhase, ProcessSnapshot, ProcessSupervisor};

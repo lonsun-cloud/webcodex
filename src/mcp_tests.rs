@@ -40,6 +40,27 @@ fn test_runtime_with_surface(model_surface: ModelSurface) -> ToolRuntime {
     test_runtime_with_exposure(RuntimeExposure::Runtime(model_surface))
 }
 
+fn start_authorized_test_session(
+    runtime: &ToolRuntime,
+    auth: &crate::auth::AuthContext,
+    mode: crate::tool_runtime::SessionMode,
+) -> crate::tool_runtime::SessionSummary {
+    let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(auth))
+        .expect("test authority must have a stable identity");
+    runtime
+        .sessions
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                None,
+                Some("specialized governance test".to_string()),
+                mode,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(fingerprint)),
+        )
+        .unwrap()
+}
+
 /// Run one synchronous operation with a temporary model-surface env value.
 /// The previous value is restored while the shared env lock is still held,
 /// including during unwinding. Async request tests receive an already-built
@@ -185,6 +206,8 @@ mod model_ergonomics;
 mod model_surface;
 #[path = "mcp_tests/oauth_scope.rs"]
 mod oauth_scope;
+#[path = "mcp_tests/plugin_check.rs"]
+mod plugin_check;
 #[path = "mcp_tests/plugin_tools.rs"]
 mod plugin_tools;
 #[path = "mcp_tests/project_connector.rs"]
@@ -193,6 +216,8 @@ mod project_connector;
 mod protocol;
 #[path = "mcp_tests/runtime_tools.rs"]
 mod runtime_tools;
+#[path = "mcp_tests/ssh_resource.rs"]
+mod ssh_resource;
 #[path = "mcp_tests/tools.rs"]
 mod tools;
 

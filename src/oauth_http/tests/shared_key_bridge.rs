@@ -39,6 +39,7 @@ fn bridge_computer_scopes_use_explicit_closed_ceiling_without_changing_direct_au
         bridge_oauth_computer_enabled_scopes(),
         &[
             "runtime:read",
+            "runner:manage",
             "session:collaborate",
             "project:read",
             "project:write",
@@ -106,25 +107,60 @@ fn bridge_local_mcp_scope_requires_explicit_client_ceiling_opt_in() {
 
 #[test]
 fn bridge_local_plugin_scope_requires_explicit_client_ceiling_opt_in() {
-    assert!(!bridge_oauth_scopes().contains(&crate::auth::SCOPE_PLUGIN_LOCAL));
-    assert!(!crate::auth::DIRECT_SHARED_KEY_MODEL_SCOPES.contains(&crate::auth::SCOPE_PLUGIN_LOCAL));
+    for scope in [
+        crate::auth::SCOPE_PLUGIN_INSPECT,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+        crate::auth::SCOPE_PLUGIN_MANAGE,
+    ] {
+        assert!(!bridge_oauth_scopes().contains(&scope));
+        assert!(!crate::auth::DIRECT_SHARED_KEY_MODEL_SCOPES.contains(&scope));
+    }
 
     let baseline = bridge_oauth_scopes()
         .iter()
         .map(|scope| (*scope).to_string())
         .collect::<Vec<_>>();
     let mut opted_in = baseline.clone();
-    opted_in.push(crate::auth::SCOPE_PLUGIN_LOCAL.to_string());
+    opted_in.push(crate::auth::SCOPE_PLUGIN_INSPECT.to_string());
+    opted_in.push(crate::auth::SCOPE_PLUGIN_INVOKE.to_string());
     assert!(normalize_bridge_oauth_scopes(
-        Some(crate::auth::SCOPE_PLUGIN_LOCAL),
+        Some("plugin:inspect plugin:invoke"),
         &opted_in.join(" "),
     )
     .is_ok());
     assert!(normalize_bridge_oauth_scopes(
-        Some(crate::auth::SCOPE_PLUGIN_LOCAL),
+        Some(crate::auth::SCOPE_PLUGIN_INSPECT),
         &baseline.join(" "),
     )
     .is_err());
+    let mut manage_ceiling = opted_in;
+    manage_ceiling.push(crate::auth::SCOPE_PLUGIN_MANAGE.to_string());
+    assert!(normalize_bridge_oauth_scopes(
+        Some(crate::auth::SCOPE_PLUGIN_MANAGE),
+        &manage_ceiling.join(" "),
+    )
+    .is_err());
+}
+
+#[test]
+fn bridge_local_ssh_scope_requires_explicit_client_ceiling_opt_in() {
+    assert!(!bridge_oauth_scopes().contains(&crate::auth::SCOPE_SSH_LOCAL));
+    assert!(!crate::auth::DIRECT_SHARED_KEY_MODEL_SCOPES.contains(&crate::auth::SCOPE_SSH_LOCAL));
+
+    let baseline = bridge_oauth_scopes()
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    let mut opted_in = baseline.clone();
+    opted_in.push(crate::auth::SCOPE_SSH_LOCAL.to_string());
+    assert!(
+        normalize_bridge_oauth_scopes(Some(crate::auth::SCOPE_SSH_LOCAL), &opted_in.join(" "),)
+            .is_ok()
+    );
+    assert!(
+        normalize_bridge_oauth_scopes(Some(crate::auth::SCOPE_SSH_LOCAL), &baseline.join(" "),)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -133,9 +169,10 @@ async fn bridge_authorize_local_plugin_requires_shared_key_owned_opt_in() {
     let (_tmp, db) = test_db();
     let shared_key = "local-plugin-owned-shared-key";
     let allowed_scopes = format!(
-        "{} {}",
+        "{} {} {}",
         bridge_oauth_scopes().join(" "),
-        crate::auth::SCOPE_PLUGIN_LOCAL
+        crate::auth::SCOPE_PLUGIN_INSPECT,
+        crate::auth::SCOPE_PLUGIN_INVOKE
     );
     let (owned, _) = seed_shared_key_bridge_client(
         &db,
@@ -147,12 +184,14 @@ async fn bridge_authorize_local_plugin_requires_shared_key_owned_opt_in() {
     let owned_url = valid_bridge_authorize_url(
         &owned,
         "https://local-plugin.example/callback",
-        "runtime:read plugin:local",
+        "runtime:read plugin:inspect plugin:invoke",
     );
     let mut owned_response = TestClient::get(&owned_url).send(&service).await;
     assert_eq!(owned_response.status_code, Some(StatusCode::OK));
     let owned_html = owned_response.take_string().await.unwrap_or_default();
-    assert!(owned_html.contains("plugin:local"));
+    assert!(owned_html.contains("plugin:inspect"));
+    assert!(owned_html.contains("plugin:invoke"));
+    assert!(!owned_html.contains("plugin:manage"));
 
     let user = seed_user(&db, "local-plugin-legacy-owner");
     let legacy = seed_client_with_redirects_and_scopes(
@@ -164,7 +203,59 @@ async fn bridge_authorize_local_plugin_requires_shared_key_owned_opt_in() {
     let legacy_url = valid_bridge_authorize_url(
         &legacy,
         "https://legacy-local-plugin.example/callback",
-        "runtime:read plugin:local",
+        "runtime:read plugin:inspect plugin:invoke",
+    );
+    let legacy_response = TestClient::get(&legacy_url).send(&service).await;
+    assert_eq!(legacy_response.status_code, Some(StatusCode::FOUND));
+    let location = url::Url::parse(&location_header(&legacy_response).unwrap()).unwrap();
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("invalid_scope")
+    );
+}
+
+#[tokio::test]
+async fn bridge_authorize_local_ssh_requires_shared_key_owned_opt_in() {
+    let config = test_config(oauth2_enabled_bridge());
+    let (_tmp, db) = test_db();
+    let shared_key = "local-ssh-owned-shared-key";
+    let allowed_scopes = format!(
+        "{} {}",
+        bridge_oauth_scopes().join(" "),
+        crate::auth::SCOPE_SSH_LOCAL
+    );
+    let (owned, _) = seed_shared_key_bridge_client(
+        &db,
+        shared_key,
+        "https://local-ssh.example/callback",
+        &allowed_scopes,
+    );
+    let service = Service::new(build_router(config.clone(), db.clone()));
+    let owned_url = valid_bridge_authorize_url(
+        &owned,
+        "https://local-ssh.example/callback",
+        "runtime:read ssh:local",
+    );
+    let mut owned_response = TestClient::get(&owned_url).send(&service).await;
+    assert_eq!(owned_response.status_code, Some(StatusCode::OK));
+    let owned_html = owned_response.take_string().await.unwrap_or_default();
+    assert!(owned_html.contains("ssh:local"));
+
+    let user = seed_user(&db, "local-ssh-legacy-owner");
+    let legacy = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://legacy-local-ssh.example/callback",
+        &allowed_scopes,
+    );
+    let legacy_url = valid_bridge_authorize_url(
+        &legacy,
+        "https://legacy-local-ssh.example/callback",
+        "runtime:read ssh:local",
     );
     let legacy_response = TestClient::get(&legacy_url).send(&service).await;
     assert_eq!(legacy_response.status_code, Some(StatusCode::FOUND));

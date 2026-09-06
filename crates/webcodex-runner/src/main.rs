@@ -581,6 +581,7 @@ enum RunnerCliAction {
     Run {
         config_path: PathBuf,
         once: bool,
+        stop_on_stdin_eof: bool,
     },
     Exit {
         code: i32,
@@ -590,13 +591,14 @@ enum RunnerCliAction {
 }
 
 fn usage() -> &'static str {
-    "Usage: webcodex-runner [--config PATH] [--once]\n\n\
+    "Usage: webcodex-runner [--config PATH] [--once] [--stop-on-stdin-eof]\n\n\
      Options:\n\
        -h, --help                 Print help and exit\n\
        -V, --version              Print version and exit\n\
        -c, --config PATH          Runner config path for normal runtime\n\
        --profile NAME             Client config profile for default config path\n\
-       --once                     Complete one successful poll, then exit (polling transport)\n\n\
+       --once                     Complete one successful poll, then exit (polling transport)\n\
+       --stop-on-stdin-eof        Stop when the invoking parent closes stdin\n\n\
      With --profile, the default config path is derived under\n\
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit\n\
@@ -657,6 +659,7 @@ where
     let mut config_path: Option<PathBuf> = None;
     let mut profile: Option<String> = None;
     let mut once = false;
+    let mut stop_on_stdin_eof = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -675,6 +678,7 @@ where
                 });
             }
             "--once" => once = true,
+            "--stop-on-stdin-eof" => stop_on_stdin_eof = true,
             "--config" | "-c" => {
                 let Some(path) = args.next() else {
                     return Err("--config requires a path".to_string());
@@ -713,7 +717,11 @@ where
                 .unwrap_or_else(default_config_path)?
         }
     };
-    Ok(RunnerCliAction::Run { config_path, once })
+    Ok(RunnerCliAction::Run {
+        config_path,
+        once,
+        stop_on_stdin_eof,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1895,8 +1903,10 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // patch-plan/match metadata consumed by Server validation. Older apply_patch
     // implementations omit this capability and are rejected before dispatch.
     capabilities.apply_patch_match_metadata = true;
-    // Strict patch positioning is an additive extension to apply_patch. Older
-    // Runners omit it, so Servers must not send strict_matching to them.
+    // Enum-based matching is the 0.4 model-facing authority. Older Runners omit
+    // it, so current Servers fail closed instead of falling back to old defaults.
+    capabilities.apply_patch_matching_mode = true;
+    // Retain the legacy bit only so an older Server can roll against this Runner.
     capabilities.apply_patch_strict_matching = true;
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
@@ -1914,6 +1924,10 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // This binary durably round-trips Cargo test-count assertions with
     // validation Job context and reconciliation snapshots.
     capabilities.structured_cargo_test_count_assertion = true;
+    // Explicit require_tests/no_run policy changes validation proof semantics,
+    // so advertise durable preservation independently from the older count
+    // assertion capability for rolling upgrades.
+    capabilities.structured_cargo_test_execution_policy = true;
     // This binary accepts both legacy Go validation argv from old Servers and
     // the current machine-readable JSON argv. Do not trust static config or
     // infer this from generic structured validation support.
@@ -1947,6 +1961,11 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // this explicit even when zero Plugins are configured so cross-platform
     // `plugin_tool reload` can target the exact Runner.
     capabilities.native_tool_plugins = true;
+    capabilities.managed_ssh_resources = true;
+    // Formal config check/reload is implemented directly against this process's
+    // startup-bound runner.toml path on every supported platform. Unix SIGHUP is
+    // only an additional trigger and is not part of this capability contract.
+    capabilities.runner_config_control = true;
     // MCP gateway support is fenced by the validated provider inventory in
     // registration rather than a separate capability bit. Older binaries omit
     // that inventory, so a newer Server will never target them.
@@ -2066,7 +2085,6 @@ fn build_register_request_with_provider_status(
                 prepared_cache_count,
                 tool_providers,
                 runtime.mcp_gateway().provider_inventory(),
-                runtime.plugins().startup_catalog(),
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
@@ -2195,7 +2213,6 @@ fn register_policy_summary(
     prepared_cache_count: usize,
     tool_providers: runner_protocol::ToolProvidersStatus,
     mcp_gateway_providers: Vec<crate::mcp_gateway::McpGatewayProvider>,
-    plugin_providers: Vec<webcodex_core::plugin::StartupPluginProvider>,
 ) -> RunnerPolicySummary {
     RunnerPolicySummary {
         allow_raw_shell: cfg.policy.allow_raw_shell,
@@ -2209,7 +2226,6 @@ fn register_policy_summary(
         )),
         tool_providers: Some(tool_providers),
         mcp_gateway_providers: Some(mcp_gateway_providers),
-        plugin_providers: Some(plugin_providers),
     }
 }
 
@@ -5752,8 +5768,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (config_path, once) = match action {
-        RunnerCliAction::Run { config_path, once } => (config_path, once),
+    let (config_path, once, stop_on_stdin_eof) = match action {
+        RunnerCliAction::Run {
+            config_path,
+            once,
+            stop_on_stdin_eof,
+        } => (config_path, once, stop_on_stdin_eof),
         RunnerCliAction::Exit {
             code,
             stdout,
@@ -5780,7 +5800,7 @@ fn main() {
             "webcodex-runner warning: agent token is empty; connecting without Authorization; the server must be started with --open"
         );
     }
-    if let Err(e) = run_runner(cfg, config_path, once) {
+    if let Err(e) = run_runner(cfg, config_path, once, stop_on_stdin_eof) {
         eprintln!("webcodex-runner failed: {}", e);
         std::process::exit(1);
     }

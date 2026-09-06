@@ -361,6 +361,29 @@ remain local. Configuration reloads bind future commands to the current resource
 generation; already-started SSH commands keep their own bounded lifecycle and
 are never redirected, replayed, or blindly retried.
 
+Authorized model clients can also onboard Runner-local SSH resources with the
+`ssh_resource` MCP tool. `list` returns only safe logical names plus
+`static|managed`, active/pending-restart state, and an opaque exact-Runner /
+registry-revision binding. `register` accepts one explicit OpenSSH destination
+argv and optional default cwd; `remove` deletes only managed desired state.
+Raw targets, usernames, addresses, SSH options, credentials, and identity paths
+are never returned by the tool. Static `[ssh.resources.*]` names are reserved
+and cannot be overwritten or removed through this path.
+
+Managed mutations are durable desired-state changes, not live configuration
+edits. When a mutation returns `restart_required=true`, restart that Runner,
+then `list` again before binding the resource into a Workflow Session. An
+idempotent operation already aligned with the frozen startup snapshot may
+return `restart_required=false`. Access is separately gated by the optional
+`ssh:local` permission; hosted OAuth clients opt in with
+`webcodex connect ... --oauth-local-ssh`.
+
+The managed target is still consumed by the existing SSH transport. In
+particular, registering a Windows OpenSSH destination does not imply that
+PersistentShell can start there: the current remote persistent-shell contract
+requires the existing remote `sh`/`bash` path. Remote PowerShell PersistentShell
+is not part of this capability.
+
 ## LSP navigation (read-only)
 
 The Runner can serve read-only semantic navigation through language servers
@@ -420,9 +443,35 @@ Use the same `--scope` for install, status, start, stop, restart, logs, and
 uninstall. User scope uses `systemctl --user`; system scope uses
 `/etc/systemd/system`.
 
-After editing `runner.toml`, reload the matching service to apply policy,
-shell, and SSH-resource changes. Identity, server/auth, transport, and
-concurrency changes still require a restart. Invalid reloads keep the active
-generation. When a validation failure is safely classifiable, reload status reports only
-closed non-secret atoms such as `field=max_concurrent_jobs` and `reason=out_of_range`;
-raw TOML, configured values, paths, credentials, and parser text are not projected.
+For an already-running Runner, use the first-class configuration workflow instead
+of finding its PID or sending signals manually:
+
+1. Edit the Runner's existing startup-bound `runner.toml`.
+2. Call `runner_config_check(client_id=...)`. It reads only that bound path, does
+   not activate the candidate, and returns the current generation plus bounded
+   validation/restart metadata.
+3. If valid, call
+   `runner_config_reload(client_id=..., expected_generation=<current_generation>)`.
+   The optimistic generation fence rejects stale callers before activation.
+4. Inspect `runtime_status(client_id=...)` (or `list_runners`) after reload.
+
+`runner_config_reload` never writes `runner.toml`; it only activates the candidate
+already on disk. Hot-reloadable policy, shell, Native Plugin, and static SSH-resource changes can
+become active immediately, while fields reported in `restart_required_fields`
+remain startup-only until the Runner restarts. Invalid candidates leave the active
+snapshot and generation unchanged. Managed `ssh_resource` mutations are different:
+they use a frozen startup snapshot and require a Runner restart exactly when the
+tool reports `restart_required=true`.
+
+Plugin configuration is live-applied through the same validated Plugin candidate
+admission/commit primitive used by `plugin_tool reload`; changing `[plugins]` is
+not a restart-only operation. `plugin_tool reload` remains the narrower
+`plugin:manage`-scoped entry when only Plugin state should be reloaded.
+
+On Unix, service reload/SIGHUP remains an optional compatibility trigger and calls
+the same authoritative reload primitive. Windows and macOS use the first-class
+operation directly; no signal emulation or PID management is required. When a
+validation failure is safely classifiable, config operations report only closed
+non-secret atoms such as `field=max_concurrent_jobs` and `reason=out_of_range`;
+raw TOML, configured values, paths, credentials, parser text, and shell environment
+values are not projected.

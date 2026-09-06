@@ -104,6 +104,12 @@ fn detached_process_capability_matches_supported_native_backends() {
 }
 
 #[test]
+fn runner_config_control_capability_is_platform_neutral() {
+    let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
+    assert!(capabilities.runner_config_control);
+}
+
+#[test]
 fn pointer_capability_matches_supported_native_backends() {
     let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
     assert_eq!(
@@ -391,6 +397,8 @@ fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
         adapter: "go_test".to_string(),
         validation_target_id: None,
         minimum_tests: None,
+        require_tests: None,
+        no_run: None,
     });
     let context = context.clone();
 

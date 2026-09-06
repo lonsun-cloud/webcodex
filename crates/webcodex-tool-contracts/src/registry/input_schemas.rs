@@ -16,7 +16,9 @@ mod line_edits;
 mod lsp;
 mod memory;
 mod patches;
+mod plugins;
 mod projects;
+mod runner_config;
 mod sessions;
 mod skills;
 mod text_edits;
@@ -108,9 +110,11 @@ pub(super) use memory::{
     memory_scope_purge_input_schema, memory_search_input_schema, memory_set_input_schema,
 };
 pub use patches::{apply_patch_input_schema, apply_unified_diff_input_schema};
+pub use plugins::plugin_tool_input_schema;
 pub use projects::{
     create_project_input_schema, register_project_input_schema, unregister_project_input_schema,
 };
+pub use runner_config::{runner_config_check_input_schema, runner_config_reload_input_schema};
 pub use sessions::{
     close_session_input_schema, complete_session_message_input_schema,
     get_session_assignment_input_schema, list_session_messages_input_schema,

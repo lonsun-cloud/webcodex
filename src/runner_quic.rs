@@ -573,6 +573,7 @@ mod tests {
             apply_text_edit_line_scope: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
+            apply_patch_matching_mode: false,
             apply_patch_strict_matching: false,
             git: false,
             jobs: true,
@@ -583,6 +584,7 @@ mod tests {
             ssh_persistent_shell: false,
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
             structured_go_test_json: true,
             structured_go_test_tool: true,
             structured_go_test_packages: true,
@@ -615,6 +617,8 @@ mod tests {
             job_state_reconciliation: false,
             coding_agent_runs: false,
             native_tool_plugins: false,
+            managed_ssh_resources: false,
+            runner_config_control: false,
         });
         QuicRegisterFrame::new(
             RunnerRegisterRequest {

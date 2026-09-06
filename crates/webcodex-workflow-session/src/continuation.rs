@@ -28,7 +28,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::{
     canonical_tool_call_finished_events, closeout_work_projection, current_attempt_event_view,
@@ -132,7 +132,12 @@ pub(crate) struct AttemptEventRange {
 pub(crate) struct AttemptActivity {
     pub(crate) meaningful_tool_calls: usize,
     pub(crate) successful_tool_calls: usize,
+    /// Immutable raw failed ToolCall count in the attempt.
     pub(crate) failed_tool_calls: usize,
+    /// Failed ToolCalls that the canonical runtime closeout projection still
+    /// considers actionable. Expected, resolved/stale validation, and proven
+    /// non-effect failures remain visible in failed_tool_calls but not here.
+    pub(crate) actionable_failed_tool_calls: usize,
     pub(crate) expected_failures: usize,
     pub(crate) resolved_failures: usize,
     pub(crate) unresolved_failures: usize,
@@ -163,7 +168,8 @@ pub(crate) struct AttemptExploration {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AttemptValidation {
-    /// Current workspace evidence status: `passed`, `failed`, `stale`, `not_run`, or `unknown`.
+    /// Current workspace evidence status: `passed`, `failed`, `inconclusive`,
+    /// `stale`, `not_run`, or `unknown`.
     pub(crate) status: String,
     /// Latest validation event status inside the current evidence window.
     pub(crate) latest_status: String,
@@ -172,6 +178,9 @@ pub(crate) struct AttemptValidation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) latest_at: Option<i64>,
     pub(crate) unresolved_failure_count: usize,
+    /// Inconclusive/request-scoped evidence events retained inside the current
+    /// post-mutation window. This is process history, not a durable requirement.
+    pub(crate) evidence_gap_event_count: usize,
     pub(crate) validation_events: usize,
     pub(crate) stale_failure_count: usize,
     pub(crate) open_failures: Vec<FailureIdentity>,
@@ -319,6 +328,26 @@ impl<'a> ContinuationValidationSnapshot<'a> {
     }
 }
 
+/// Canonical runtime-owned ToolFailure actionability for the same Session
+/// snapshot. Workflow Session uses only exact event-id membership and never
+/// reimplements validation/result-expectation/effect-safety classification.
+#[derive(Clone, Copy)]
+pub struct ContinuationToolFailureSnapshot<'a> {
+    actionable_event_ids: &'a HashSet<String>,
+}
+
+impl<'a> ContinuationToolFailureSnapshot<'a> {
+    pub fn new(actionable_event_ids: &'a HashSet<String>) -> Self {
+        Self {
+            actionable_event_ids,
+        }
+    }
+
+    fn is_actionable(&self, event: &SessionEvent) -> bool {
+        self.actionable_event_ids.contains(&event.event_id)
+    }
+}
+
 /// Inputs gathered up-front so the projection helpers stay pure and never
 /// touch locks, the network, or the filesystem. Callers copy bounded
 /// snapshots before constructing this.
@@ -342,6 +371,9 @@ pub struct ContinuationFeedbackInput<'a> {
     pub workspace_conflicts: bool,
     pub hooks: ContinuationProjectionHooks,
     pub current_validation: ContinuationValidationSnapshot<'a>,
+    /// Exact raw failed ToolCall event ids that the canonical runtime closeout
+    /// projection still considers actionable.
+    pub tool_failures: ContinuationToolFailureSnapshot<'a>,
 }
 
 impl ContinuationFeedback {
@@ -384,6 +416,7 @@ impl ContinuationFeedback {
             input.validation,
             input.hooks,
             input.current_validation,
+            input.tool_failures,
             input.jobs,
             input.discussion,
             input.continuation,
@@ -435,6 +468,7 @@ fn empty_attempt() -> AttemptSummary {
             meaningful_tool_calls: 0,
             successful_tool_calls: 0,
             failed_tool_calls: 0,
+            actionable_failed_tool_calls: 0,
             expected_failures: 0,
             resolved_failures: 0,
             unresolved_failures: 0,
@@ -460,6 +494,7 @@ fn empty_attempt() -> AttemptSummary {
             latest_kind: None,
             latest_at: None,
             unresolved_failure_count: 0,
+            evidence_gap_event_count: 0,
             validation_events: 0,
             stale_failure_count: 0,
             open_failures: Vec::new(),
@@ -506,6 +541,7 @@ fn build_attempt_summary(
     validation: &Value,
     hooks: ContinuationProjectionHooks,
     current_validation: ContinuationValidationSnapshot<'_>,
+    tool_failures: ContinuationToolFailureSnapshot<'_>,
     jobs: &Value,
     discussion: &SessionDiscussionSummary,
     continuation: &'static str,
@@ -553,6 +589,12 @@ fn build_attempt_summary(
     let failed_tool_calls = meaningful
         .iter()
         .filter(|event| event.status.as_deref() == Some("failed"))
+        .count();
+    let actionable_failed_tool_calls = meaningful
+        .iter()
+        .filter(|event| {
+            event.status.as_deref() == Some("failed") && tool_failures.is_actionable(event)
+        })
         .count();
     // expected failures = finished tool calls flagged as expected-failure that
     // matched (the ledger's `failure_expectation_result == matched_expected_failure`).
@@ -613,7 +655,7 @@ fn build_attempt_summary(
     // --- outcome ---
     let (outcome_status, reason_codes) = build_attempt_outcome(
         &meaningful,
-        failed_tool_calls,
+        actionable_failed_tool_calls,
         unresolved_failures,
         &jobs_block,
         &guidance_block,
@@ -644,6 +686,7 @@ fn build_attempt_summary(
             meaningful_tool_calls: meaningful.len(),
             successful_tool_calls,
             failed_tool_calls,
+            actionable_failed_tool_calls,
             expected_failures,
             resolved_failures,
             unresolved_failures,
@@ -800,6 +843,14 @@ fn build_attempt_validation(
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize
     };
+    let evidence_gap_event_count = if not_requested {
+        0
+    } else {
+        evidence
+            .get("evidence_gap_event_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
     let (open_failures, observed_open_failures, observed_truncated) = if not_requested {
         (Vec::new(), 0, false)
     } else {
@@ -862,6 +913,7 @@ fn build_attempt_validation(
         latest_kind,
         latest_at,
         unresolved_failure_count: current_unresolved,
+        evidence_gap_event_count,
         validation_events,
         stale_failure_count,
         open_failures,
@@ -963,7 +1015,7 @@ fn build_attempt_guidance(discussion: &SessionDiscussionSummary) -> AttemptGuida
 
 fn build_attempt_outcome(
     meaningful: &[&SessionEvent],
-    failed_tool_calls: usize,
+    actionable_failed_tool_calls: usize,
     unresolved_failures: usize,
     jobs: &AttemptJobs,
     guidance: &AttemptGuidance,
@@ -973,8 +1025,8 @@ fn build_attempt_outcome(
     if unresolved_failures > 0 {
         push_unique(&mut reasons, "unresolved_validation_failures");
     }
-    if failed_tool_calls > 0 && unresolved_failures == 0 {
-        push_unique(&mut reasons, "failed_tool_calls");
+    if actionable_failed_tool_calls > 0 && unresolved_failures == 0 {
+        push_unique(&mut reasons, "actionable_failed_tool_calls");
     }
     if jobs.recovering_count > 0 {
         push_unique(&mut reasons, "jobs_recovering");
@@ -990,6 +1042,9 @@ fn build_attempt_outcome(
     }
     if validation.status == "stale" {
         push_unique(&mut reasons, "validation_stale_after_changes");
+    }
+    if validation.status == "inconclusive" {
+        push_unique(&mut reasons, "validation_inconclusive");
     }
     let status = if reasons.is_empty() {
         "in_progress".to_string()
@@ -1047,7 +1102,10 @@ fn build_suggested_next_actions(
             "address open guidance on the session message board",
         );
     }
-    if matches!(validation.status.as_str(), "not_run" | "stale") {
+    if matches!(
+        validation.status.as_str(),
+        "not_run" | "stale" | "inconclusive"
+    ) {
         push_unique(
             &mut actions,
             "run validation before proceeding when the task warrants it",
@@ -1547,7 +1605,19 @@ fn current_run_did_not_execute_tests(event: &Value) -> bool {
     {
         return true;
     }
-    let (passed, failed, ignored, total) = test_counts(event);
+    // Missing count metadata is not evidence that zero tests ran. Only fall
+    // back to a parsed test summary when that summary actually exists.
+    let Some(summary) = event
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.get("test_summary"))
+        .filter(|summary| summary.is_object())
+    else {
+        return false;
+    };
+    let passed = summary.get("passed").and_then(Value::as_u64).unwrap_or(0);
+    let failed = summary.get("failed").and_then(Value::as_u64).unwrap_or(0);
+    let ignored = summary.get("ignored").and_then(Value::as_u64).unwrap_or(0);
+    let total = passed + failed + ignored;
     total == 0 && failed == 0 && passed == 0 && ignored == 0
 }
 

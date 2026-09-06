@@ -97,9 +97,11 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "sha rechecks",
         "rollback",
         "dry_run",
-        "strict_match",
-        "strict_matching=true",
-        "exact-unique positioning",
+        "matching_mode=unique",
+        "stable parent/function/test/module",
+        "matching_mode=exact_unique",
+        "stale-context",
+        "matching_mode=first_match",
         "apply_text_edits",
         "small exact edits",
         "external diffs",
@@ -211,10 +213,80 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "structured validation",
         "edit tools",
         "longer work",
+        "persistent shell",
+        "ssh_resource",
+        "runner restart",
     ] {
         assert!(
             run_shell_desc.contains(phrase),
             "run_shell description should mention {phrase}: {run_shell_desc}"
+        );
+    }
+
+    let run_process_desc = desc("run_process");
+    for phrase in [
+        "isolated one-shot native executable",
+        "literal argv",
+        "persistent shell",
+        "ssh_resource",
+        "one-shot/no-persistence ssh",
+    ] {
+        assert!(
+            run_process_desc.contains(phrase),
+            "run_process description should mention {phrase}: {run_process_desc}"
+        );
+    }
+
+    let open_shell_desc = desc("open_session_shell");
+    for phrase in [
+        "execution_context.resource",
+        "update_session_context",
+        "no per-shell host/resource parameter",
+        "does not need webcodex runner",
+        "ssh_resource",
+        "restart the runner",
+    ] {
+        assert!(
+            open_shell_desc.contains(phrase),
+            "open_session_shell description should mention {phrase}: {open_shell_desc}"
+        );
+    }
+
+    let update_context_desc = desc("update_session_context");
+    for phrase in [
+        "active runner-local named ssh resource",
+        "open_session_shell",
+        "ssh_resource",
+        "restart the runner",
+    ] {
+        assert!(
+            update_context_desc.contains(phrase),
+            "update_session_context description should mention {phrase}: {update_context_desc}"
+        );
+    }
+
+    let persistent_exec = spec_named(&specs, "session_shell_exec");
+    assert_eq!(
+        persistent_exec.input_schema["properties"]["result_expectation"]["enum"],
+        json!(["success", "failure", "observe"])
+    );
+    assert!(persistent_exec.input_schema["properties"]
+        .get("accepted_exit_codes")
+        .is_none());
+
+    let resource_desc = spec_named(&specs, "update_session_context").input_schema["properties"]
+        ["execution_context"]["properties"]["resource"]["description"]
+        .as_str()
+        .expect("update_session_context resource description")
+        .to_lowercase();
+    for phrase in [
+        "logical name",
+        "runner-owned resource",
+        "open_session_shell",
+    ] {
+        assert!(
+            resource_desc.contains(phrase),
+            "execution_context.resource should mention {phrase}: {resource_desc}"
         );
     }
 }
@@ -286,27 +358,63 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
         );
     }
     let codex_patch = &spec_named(&specs, "apply_patch").input_schema["properties"];
-    for field in ["project", "patch", "dry_run", "strict_matching"] {
+    for field in ["project", "patch", "dry_run", "matching_mode"] {
         assert!(
             codex_patch.get(field).is_some(),
             "apply_patch must keep field {field}"
         );
     }
+    assert_eq!(codex_patch["matching_mode"]["default"], "unique");
+    assert_eq!(
+        codex_patch["matching_mode"]["enum"],
+        json!(["first_match", "unique", "exact_unique"])
+    );
+    assert!(
+        codex_patch.get("strict_matching").is_none(),
+        "legacy strict_matching must not remain model-facing"
+    );
     let patch_spec = spec_named(&specs, "apply_patch");
     let patch_output = &patch_spec.output_schema["properties"]["output"]["properties"];
     assert!(
         patch_output.get("match_diagnostic").is_some(),
         "apply_patch failures must expose body-free match diagnostics"
     );
+    let match_rejection = patch_output
+        .get("match_rejection_diagnostic")
+        .expect("apply_patch matching failures must expose validated body-free diagnostics");
+    assert_eq!(match_rejection["additionalProperties"], false);
+    assert_eq!(
+        match_rejection["properties"]["classification"]["enum"],
+        json!(["unique_fuzzy_candidate", "ambiguous_candidate"])
+    );
+    assert_eq!(
+        match_rejection["properties"]["matched_start_line"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
+        match_rejection["properties"]["candidate_start_lines"]["maxItems"],
+        webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_CANDIDATE_POSITIONS
+    );
     let recovery = patch_output
         .get("recovery")
-        .expect("apply_patch must publish bounded context-mismatch recovery");
+        .expect("apply_patch must publish bounded reread recovery");
     assert_eq!(recovery["additionalProperties"], false);
     assert_eq!(
         recovery["properties"]["action"]["enum"],
         json!(["read_files"])
     );
-    assert_eq!(recovery["properties"]["items"]["maxItems"], 1);
+    assert_eq!(
+        recovery["properties"]["reason"]["enum"],
+        json!([
+            "context_mismatch",
+            "matching_mode_rejected_unique_fuzzy",
+            "matching_mode_rejected_ambiguous"
+        ])
+    );
+    assert_eq!(
+        recovery["properties"]["items"]["maxItems"],
+        webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_CANDIDATE_POSITIONS
+    );
     assert_eq!(
         recovery["properties"]["items"]["items"]["properties"]["limit"]["maximum"],
         webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_RECOVERY_READ_LINES
@@ -345,6 +453,7 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
         "match_source",
         "matched_start_line",
         "candidate_count",
+        "unique_match",
         "strict_match",
     ] {
         assert!(
@@ -352,6 +461,9 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
             "apply_patch edit summary must expose {field}"
         );
     }
+    assert!(patch_spec.description.contains("multiple chunks"));
+    assert!(patch_spec.description.contains("duplicate file operations"));
+    assert!(patch_spec.description.contains("never relax"));
     let unified_diff = &spec_named(&specs, "apply_unified_diff").input_schema["properties"];
     for field in ["project", "diff", "deny_sensitive_paths"] {
         assert!(

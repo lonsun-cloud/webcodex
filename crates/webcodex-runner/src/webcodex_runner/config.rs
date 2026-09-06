@@ -1,5 +1,6 @@
 use super::coding_agent::CodingAgentManager;
 use super::external_tools::ExternalToolRouter;
+use super::managed_ssh::ManagedSshResourceStore;
 use super::mcp_gateway::McpGatewayManager;
 use super::plugin::PluginManager;
 use super::shutdown::lock_unpoison;
@@ -9,8 +10,9 @@ use crate::runner_config::{
     TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
 };
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerConfigReloadStatus, RunnerHostContext, RUNNER_JOB_CONCURRENCY_MAX,
-    RUNNER_JOB_CONCURRENCY_MIN,
+    RunnerCapabilities, RunnerConfigAction, RunnerConfigExecutionState,
+    RunnerConfigOperationResponse, RunnerConfigReloadStatus, RunnerHostContext,
+    RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -99,9 +101,9 @@ pub(crate) struct RunnerConfig {
     /// built-in MCP gateway. The public config section is `[mcp]`.
     #[serde(default, rename = "mcp")]
     pub(crate) mcp_gateway: McpGatewayConfig,
-    /// Runner-local native stdio Tool Plugins. Startup admission is frozen for
-    /// this Runner process; explicit plugin reloads use the same section only
-    /// for the dynamic overlay.
+    /// Runner-local native stdio Tool Plugins. Startup initializes the first
+    /// committed provider set; specialized and generic reloads atomically replace
+    /// that committed state through the shared Plugin candidate gate.
     #[serde(default)]
     pub(crate) plugins: PluginConfig,
     /// Startup/restart-owned ACP coding-agent providers. This is independent
@@ -486,21 +488,32 @@ pub(crate) struct HotRunnerConfig {
     pub(crate) generation: u64,
     pub(crate) policy: RunnerPolicy,
     pub(crate) shell: ShellConfig,
+    /// Static/manual `[ssh.resources]` from the current runner.toml generation.
+    pub(crate) static_ssh: SshConfig,
+    /// Effective process-local resources: current static resources plus the
+    /// managed registry snapshot frozen when this Runner process started.
     pub(crate) ssh: SshConfig,
     pub(crate) external_tools: Arc<ExternalToolRouter>,
     reload_status: Mutex<RunnerConfigReloadStatus>,
 }
 
 impl HotRunnerConfig {
-    fn new(generation: u64, cfg: &RunnerConfig, status: RunnerConfigReloadStatus) -> Self {
-        Self {
+    fn new(
+        generation: u64,
+        cfg: &RunnerConfig,
+        startup_managed_ssh: &SshConfig,
+        status: RunnerConfigReloadStatus,
+    ) -> Result<Self, &'static str> {
+        let ssh = ManagedSshResourceStore::merge_active(&cfg.ssh, startup_managed_ssh)?;
+        Ok(Self {
             generation,
             policy: cfg.policy.clone(),
             shell: cfg.shell.clone(),
-            ssh: cfg.ssh.clone(),
+            static_ssh: cfg.ssh.clone(),
+            ssh,
             external_tools: Arc::new(ExternalToolRouter::new(&cfg.tool_providers)),
             reload_status: Mutex::new(status),
-        }
+        })
     }
 
     pub(crate) fn reload_status(&self) -> RunnerConfigReloadStatus {
@@ -510,25 +523,35 @@ impl HotRunnerConfig {
 
 pub(crate) struct ReloadableRunnerConfig {
     startup: RunnerConfig,
+    startup_managed_ssh: SshConfig,
+    managed_ssh: Arc<ManagedSshResourceStore>,
     mcp_gateway: Arc<McpGatewayManager>,
     plugins: Arc<PluginManager>,
     coding_agents: Option<Arc<CodingAgentManager>>,
-    /// Runner-owned config path. General hot reload remains Unix-only, while
-    /// native Plugin dynamic reload is explicitly cross-platform.
+    /// Runner-owned startup-bound config path. First-class check/reload uses only
+    /// this path on every platform; Unix SIGHUP is an additional trigger only.
     path: PathBuf,
     current: RwLock<Arc<HotRunnerConfig>>,
+    /// Serializes every authoritative activation path, including Unix SIGHUP and
+    /// first-class reload, so optimistic generation fences cannot race.
+    reload_lock: Mutex<()>,
     external_routers: Mutex<Vec<Weak<ExternalToolRouter>>>,
     stopping: AtomicBool,
 }
 
 impl ReloadableRunnerConfig {
     pub(crate) fn new(startup: RunnerConfig, path: PathBuf) -> Self {
-        let mut status = RunnerConfigReloadStatus::default();
-        if !cfg!(unix) {
-            status.last_reload_result = "unsupported".to_string();
-            status.last_reload_error_code = Some("reload_unsupported".to_string());
-        }
-        let current = Arc::new(HotRunnerConfig::new(1, &startup, status));
+        let status = RunnerConfigReloadStatus::default();
+        let managed_ssh = Arc::new(ManagedSshResourceStore::initialize(
+            &startup.client_id,
+            &startup.server_url,
+            &startup.ssh,
+        ));
+        let startup_managed_ssh = managed_ssh.startup_managed().clone();
+        let current = Arc::new(
+            HotRunnerConfig::new(1, &startup, &startup_managed_ssh, status)
+                .expect("startup managed SSH snapshot was collision-checked"),
+        );
         let external_routers = vec![Arc::downgrade(&current.external_tools)];
         let coding_agents = if startup.acp.agents.is_empty() {
             None
@@ -545,9 +568,12 @@ impl ReloadableRunnerConfig {
             mcp_gateway: Arc::new(McpGatewayManager::new(&startup.mcp_gateway)),
             plugins: Arc::new(PluginManager::new(&startup, path.clone())),
             coding_agents,
+            startup_managed_ssh,
+            managed_ssh,
             startup,
             path,
             current: RwLock::new(current),
+            reload_lock: Mutex::new(()),
             external_routers: Mutex::new(external_routers),
             stopping: AtomicBool::new(false),
         }
@@ -586,6 +612,10 @@ impl ReloadableRunnerConfig {
         self.coding_agents.as_ref()
     }
 
+    pub(crate) fn managed_ssh(&self) -> &ManagedSshResourceStore {
+        &self.managed_ssh
+    }
+
     pub(crate) fn client_id(&self) -> &str {
         &self.startup.client_id
     }
@@ -594,7 +624,6 @@ impl ReloadableRunnerConfig {
         &self.startup.server_url
     }
 
-    #[cfg(any(unix, test))]
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
     }
@@ -606,17 +635,95 @@ impl ReloadableRunnerConfig {
         live
     }
 
-    #[cfg(any(unix, test))]
-    pub(crate) fn reload(&self) -> RunnerConfigReloadStatus {
+    /// Read, parse, validate and classify the candidate at this Runner's exact
+    /// startup-bound config path. This never mutates active state or constructs
+    /// provider/runtime managers.
+    pub(crate) fn check_config(&self) -> RunnerConfigOperationResponse {
+        let _reload_guard = lock_unpoison(&self.reload_lock);
+        let active = self.snapshot();
         if self.is_stopping() {
-            return self.snapshot().reload_status();
+            return config_not_started(
+                RunnerConfigAction::Check,
+                Some(active.generation),
+                "runner_unavailable",
+            );
         }
-        let candidate = match load_config(&self.path) {
+        match self.load_candidate() {
+            Ok(candidate) => {
+                let mut fields = restart_required_fields(&self.startup, &candidate);
+                fields.sort();
+                RunnerConfigOperationResponse {
+                    action: RunnerConfigAction::Check,
+                    execution_state: RunnerConfigExecutionState::Completed,
+                    valid: Some(true),
+                    current_generation: Some(active.generation),
+                    error_code: None,
+                    error_field: None,
+                    error_reason: None,
+                    restart_required: !fields.is_empty(),
+                    restart_required_fields: fields,
+                }
+            }
+            Err(error) => config_candidate_error_response(
+                RunnerConfigAction::Check,
+                active.generation,
+                &error,
+            ),
+        }
+    }
+
+    fn load_candidate(&self) -> Result<RunnerConfig, String> {
+        let candidate = load_config(&self.path)?;
+        ManagedSshResourceStore::merge_active(&candidate.ssh, &self.startup_managed_ssh)
+            .map_err(str::to_string)?;
+        Ok(candidate)
+    }
+
+    /// First-class optimistic reload. A generation mismatch is rejected before
+    /// candidate validation or mutation and leaves the active reload status intact.
+    pub(crate) fn reload_config(&self, expected_generation: u64) -> RunnerConfigOperationResponse {
+        self.reload_internal(Some(expected_generation)).1
+    }
+
+    /// Authoritative reload primitive used by Unix SIGHUP. Formal first-class
+    /// reload goes through the same implementation with an optimistic fence.
+    pub(crate) fn reload(&self) -> RunnerConfigReloadStatus {
+        self.reload_internal(None).0
+    }
+
+    fn reload_internal(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> (RunnerConfigReloadStatus, RunnerConfigOperationResponse) {
+        let _reload_guard = lock_unpoison(&self.reload_lock);
+        let active = self.snapshot();
+        if self.is_stopping() {
+            let status = active.reload_status();
+            return (
+                status,
+                config_not_started(
+                    RunnerConfigAction::Reload,
+                    Some(active.generation),
+                    "runner_unavailable",
+                ),
+            );
+        }
+        if expected_generation.is_some_and(|expected| expected != active.generation) {
+            let status = active.reload_status();
+            return (
+                status,
+                config_not_started(
+                    RunnerConfigAction::Reload,
+                    Some(active.generation),
+                    "config_generation_conflict",
+                ),
+            );
+        }
+        let candidate = match self.load_candidate() {
             Ok(candidate) => candidate,
             Err(error) => {
                 let code = reload_error_code(&error);
                 let (error_field, error_reason) = reload_error_diagnostic(&error);
-                let active = self.snapshot();
                 let status = {
                     let mut status = active.reload_status.lock().unwrap();
                     status.last_reload_result = "failure".to_string();
@@ -633,10 +740,16 @@ impl ReloadableRunnerConfig {
                 } else {
                     eprintln!("webcodex-runner config reload failed: {code}");
                 }
-                return status;
+                return (
+                    status,
+                    config_candidate_error_response(
+                        RunnerConfigAction::Reload,
+                        active.generation,
+                        &error,
+                    ),
+                );
             }
         };
-        let active = self.snapshot();
         let generation = active.generation.saturating_add(1);
         let restart_required_fields = restart_required_fields(&self.startup, &candidate);
         let status = RunnerConfigReloadStatus {
@@ -653,26 +766,129 @@ impl ReloadableRunnerConfig {
             restart_required: !restart_required_fields.is_empty(),
             restart_required_fields,
         };
-        let next = Arc::new(HotRunnerConfig::new(generation, &candidate, status.clone()));
-        {
-            let mut routers = lock_unpoison(&self.external_routers);
-            routers.retain(|router| router.strong_count() > 0);
-            routers.push(Arc::downgrade(&next.external_tools));
+        let next = match HotRunnerConfig::new(
+            generation,
+            &candidate,
+            &self.startup_managed_ssh,
+            status.clone(),
+        ) {
+            Ok(next) => Arc::new(next),
+            Err(_) => {
+                let status = {
+                    let mut status = active.reload_status.lock().unwrap();
+                    status.last_reload_result = "failure".to_string();
+                    status.last_reload_error_code = Some("config_validation_failed".to_string());
+                    status.last_reload_error_field = None;
+                    status.last_reload_error_reason = None;
+                    status.clone()
+                };
+                active.external_tools.configuration_status_changed();
+                eprintln!("webcodex-runner config reload failed: config_validation_failed");
+                return (
+                    status,
+                    config_candidate_error_response(
+                        RunnerConfigAction::Reload,
+                        active.generation,
+                        "ssh_resource_static_conflict",
+                    ),
+                );
+            }
+        };
+        let next_for_commit = Arc::clone(&next);
+        match self
+            .plugins
+            .apply_config_candidate_and_then(&candidate, || {
+                {
+                    let mut routers = lock_unpoison(&self.external_routers);
+                    routers.retain(|router| router.strong_count() > 0);
+                    routers.push(Arc::downgrade(&next_for_commit.external_tools));
+                }
+                // Plugin admission is the first externally meaningful commit
+                // of this candidate. The Plugin candidate gate remains held
+                // through this Hot config swap, so a specialized Plugin reload
+                // cannot interleave and create contradictory active truths.
+                let mut current = self.current.write().unwrap();
+                *current = next_for_commit;
+            }) {
+            Ok(()) => {}
+            Err("plugin_reload_busy") => {
+                return (
+                    active.reload_status(),
+                    config_not_started(
+                        RunnerConfigAction::Reload,
+                        Some(active.generation),
+                        "plugin_reload_busy",
+                    ),
+                );
+            }
+            Err("plugin_manager_stopping") => {
+                return (
+                    active.reload_status(),
+                    config_not_started(
+                        RunnerConfigAction::Reload,
+                        Some(active.generation),
+                        "runner_unavailable",
+                    ),
+                );
+            }
+            Err("plugin_reload_state_failed") => {
+                return (
+                    active.reload_status(),
+                    config_not_started(
+                        RunnerConfigAction::Reload,
+                        Some(active.generation),
+                        "plugin_reload_failed",
+                    ),
+                );
+            }
+            Err(_) => {
+                let status = {
+                    let mut status = active.reload_status.lock().unwrap();
+                    status.last_reload_result = "failure".to_string();
+                    status.last_reload_error_code = Some("plugin_reload_failed".to_string());
+                    status.last_reload_error_field = None;
+                    status.last_reload_error_reason = None;
+                    status.clone()
+                };
+                active.external_tools.configuration_status_changed();
+                eprintln!("webcodex-runner config reload failed: plugin_reload_failed");
+                return (
+                    status,
+                    RunnerConfigOperationResponse {
+                        action: RunnerConfigAction::Reload,
+                        execution_state: RunnerConfigExecutionState::Completed,
+                        valid: Some(false),
+                        current_generation: Some(active.generation),
+                        error_code: Some("plugin_reload_failed".to_string()),
+                        error_field: None,
+                        error_reason: None,
+                        restart_required: false,
+                        restart_required_fields: Vec::new(),
+                    },
+                );
+            }
         }
-        let mut current = self.current.write().unwrap();
-        if self.is_stopping() {
-            return current.reload_status();
-        }
-        *current = next;
         eprintln!(
             "webcodex-runner config reload {}",
             status.last_reload_result
         );
-        status
+        let mut fields = status.restart_required_fields.clone();
+        fields.sort();
+        let response = RunnerConfigOperationResponse {
+            action: RunnerConfigAction::Reload,
+            execution_state: RunnerConfigExecutionState::Completed,
+            valid: Some(true),
+            current_generation: Some(status.generation),
+            error_code: None,
+            error_field: None,
+            error_reason: None,
+            restart_required: !fields.is_empty(),
+            restart_required_fields: fields,
+        };
+        (status, response)
     }
 }
 
-#[cfg(any(unix, test))]
 fn reload_error_code(error: &str) -> &'static str {
     if error.starts_with("failed to read config") {
         "config_read_failed"
@@ -685,7 +901,6 @@ fn reload_error_code(error: &str) -> &'static str {
     }
 }
 
-#[cfg(any(unix, test))]
 fn reload_error_diagnostic(error: &str) -> (Option<&'static str>, Option<&'static str>) {
     const OUT_OF_RANGE_FIELDS: &[(&str, &str)] = &[
         (
@@ -723,7 +938,43 @@ fn reload_error_diagnostic(error: &str) -> (Option<&'static str>, Option<&'stati
         .unwrap_or((None, None))
 }
 
-#[cfg(any(unix, test))]
+fn config_candidate_error_response(
+    action: RunnerConfigAction,
+    generation: u64,
+    error: &str,
+) -> RunnerConfigOperationResponse {
+    let (error_field, error_reason) = reload_error_diagnostic(error);
+    RunnerConfigOperationResponse {
+        action,
+        execution_state: RunnerConfigExecutionState::Completed,
+        valid: Some(false),
+        current_generation: Some(generation),
+        error_code: Some(reload_error_code(error).to_string()),
+        error_field: error_field.map(str::to_string),
+        error_reason: error_reason.map(str::to_string),
+        restart_required: false,
+        restart_required_fields: Vec::new(),
+    }
+}
+
+fn config_not_started(
+    action: RunnerConfigAction,
+    generation: Option<u64>,
+    error_code: &str,
+) -> RunnerConfigOperationResponse {
+    RunnerConfigOperationResponse {
+        action,
+        execution_state: RunnerConfigExecutionState::NotStarted,
+        valid: None,
+        current_generation: generation,
+        error_code: Some(error_code.to_string()),
+        error_field: None,
+        error_reason: None,
+        restart_required: false,
+        restart_required_fields: Vec::new(),
+    }
+}
+
 pub(crate) fn restart_required_fields(
     startup: &RunnerConfig,
     candidate: &RunnerConfig,
@@ -731,7 +982,7 @@ pub(crate) fn restart_required_fields(
     macro_rules! classify {
         ($($field:ident),+ $(,)?) => {{
             let RunnerConfig {
-                policy: _, shell: _, ssh: _, tool_providers: _, legacy_projects_dir: _,
+                policy: _, shell: _, ssh: _, plugins: _, tool_providers: _, legacy_projects_dir: _,
                 deprecated_temporary_projects_root: _, $($field: _),+
             } = candidate;
             [$((stringify!($field), startup.$field != candidate.$field)),+]
@@ -749,7 +1000,6 @@ pub(crate) fn restart_required_fields(
         max_concurrent_jobs,
         acp,
         mcp_gateway,
-        plugins,
         owner,
         poll_interval_ms,
         project_registry_dir,
@@ -958,53 +1208,25 @@ fn validate_shell_profile_config(name: &str, profile: &ShellProfileConfig) -> Re
 }
 
 fn validate_ssh_resource_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.len() > 80 {
-        return Err("ssh resource name must contain 1..=80 characters".to_string());
-    }
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return Err(format!(
-            "ssh.resources.{} is not a safe resource name",
-            name
-        ));
-    }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
-    {
-        return Err(format!(
-            "ssh resource name '{}' may only contain ASCII letters, digits, '_', '-', and '.'",
-            name
-        ));
-    }
-    Ok(())
+    webcodex_core::ssh_resource::validate_ssh_resource_name(name)
+        .map_err(|_| "ssh resource name is invalid".to_string())
 }
 
 fn validate_ssh_config(ssh: &mut SshConfig) -> Result<(), String> {
     for (name, resource) in &mut ssh.resources {
         validate_ssh_resource_name(name)?;
-        resource.host = resource.host.trim().to_string();
-        if resource.host.is_empty()
-            || resource.host.starts_with('-')
-            || resource.host.len() > 512
-            || resource.host.chars().any(char::is_control)
-        {
-            return Err(format!(
-                "ssh.resources.{}.host must be a non-empty safe host name",
-                name
-            ));
-        }
-        if let Some(default_cwd) = resource.default_cwd.as_mut() {
-            *default_cwd = default_cwd.trim().to_string();
-            if default_cwd.is_empty()
-                || default_cwd.len() > 4096
-                || default_cwd.chars().any(char::is_control)
-            {
-                return Err(format!(
-                    "ssh.resources.{}.default_cwd must be a non-empty remote path without control characters",
-                    name
-                ));
-            }
-        }
+        resource.host = webcodex_core::ssh_resource::normalize_ssh_resource_target(&resource.host)
+            .map_err(|_| {
+                format!("ssh.resources.{name}.host must be a non-empty safe SSH destination")
+            })?;
+        resource.default_cwd = webcodex_core::ssh_resource::normalize_ssh_resource_default_cwd(
+            resource.default_cwd.as_deref(),
+        )
+        .map_err(|_| {
+            format!(
+                "ssh.resources.{name}.default_cwd must be a non-empty remote path without control characters"
+            )
+        })?;
     }
     Ok(())
 }

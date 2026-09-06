@@ -10,6 +10,11 @@ stdout. It does **not** need to implement an MCP server or depend on an MCP SDK.
 The Plugin process runs on the Runner machine. The Server never receives its
 command, argv, cwd, prepared environment, PID, stderr, or local credentials.
 
+Native Plugins are **trusted local executables**. WebCodex does not sandbox,
+contain, sign, or otherwise make an untrusted executable safe. A Plugin has the
+same practical local-process trust implications as launching that executable
+directly with the prepared Runner environment.
+
 ## Configure a Plugin
 
 Plugins have their own `runner.toml` section; they are not MCP providers:
@@ -56,77 +61,173 @@ resolved from the prepared snapshot's `PATH`, not only from the Runner parent
 process PATH. Sensitive WebCodex process credentials are filtered from that
 environment.
 
+Plugin candidate preparation may read the complete startup-bound `runner.toml`
+because a provider can reference shell/profile inputs. The committed Plugin
+state does not retain a second generic `ShellConfig` truth: it stores Plugin
+provider config plus a derived Plugin-environment snapshot containing only the
+base program/argv/dialect/PATH/env and referenced/default profile runtime,
+environment, and init-script inputs. Unrelated persistent-shell controls do not
+replace Plugin providers. Conversely, Plugin-relevant profile/environment
+changes create a new provider instance on Plugin reload. `plugin:manage` still
+cannot activate generic Runner shell configuration.
+
 On Windows, native executables follow the Runner's normal `PATH`/`PATHEXT`
 rules. `.cmd` and `.bat` commands are rejected for this ABI because they require
 shell semantics; configure the native runtime executable instead.
 
-## Startup and Dynamic planes
+## Runner-owned gateway model
 
-There are exactly two Plugin planes.
+Native Plugins are Runner-owned capabilities. Provider tools never join the
+Server-global WebCodex tool namespace and are never appended to outer MCP
+`tools/list`. A Plugin may define `safe_delete`, `runtime_status`, or any other
+valid provider-local name without colliding with WebCodex built-ins or Plugin
+tools on another Runner/provider.
 
-### Startup
+The stable model-facing entry is the first-class WebCodex tool `plugin_tool`.
+Its ToolSpec is static and registered in the same canonical tool metadata path
+as other WebCodex tools; its schema does not depend on Runner availability or
+Plugin inventory. `tool_manifest(tool_name="plugin_tool")` therefore describes
+the exact gateway contract even when no Plugin-capable Runner is online.
 
-When the Runner process starts, it reads `[plugins]`, prepares each provider,
-starts it, performs `initialize`, calls `tools/list`, validates the bounded tool
-schemas, and freezes the successful startup catalog for that Runner instance.
-The admitted provider process remains persistent for direct calls.
+The same canonical `plugin_tool` request parser and action-aware gateway executor
+serve MCP and the generic Tool Runtime used by OpenAPI/GPT Actions. A surface
+that advertises `plugin_tool` can therefore call it; MCP does not have a separate
+Plugin implementation. For generic `callRuntimeTool`, use the canonical nested
+`params` envelope for the complete Plugin contract because the outer `tool`
+field already selects `plugin_tool` and the provider-local `tool` name belongs
+inside Plugin arguments:
 
-The startup catalog is immutable for the lifetime of that Runner process.
-Editing Plugin source or `runner.toml`, or using `plugin_tool reload`, does not
-change first-class tools. A Runner restart creates a new Runner/provider
-instance and performs startup admission again.
-
-If a startup tool name is valid, bounded, unique across the caller-visible
-startup inventory, and does not conflict with a WebCodex-reserved tool name, it
-appears directly in MCP `tools/list`. The model can call it normally, for
-example:
-
-```text
-search_symbol({"query":"RunnerRegistry"})
+```json
+{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
+{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
 ```
 
-Duplicate or reserved names are not exposed directly. They remain reachable
-through `plugin_tool` with an explicit Runner and Plugin provider.
+The static ToolDefinition is intentionally a worst-case discovery contract.
+Execution policy is classified from the validated action before Session or
+permission governance: list/describe require `plugin:inspect` and are read-only;
+call requires `plugin:invoke` and uses local-execution governance; check/reload
+require `plugin:manage` and use management governance. One shared specialized
+executor owns the authoritative Workflow Session lifecycle for both MCP and API
+transports, so one Plugin invocation records one lifecycle. A
+`recording_session_id` is always explicit provenance and is never inferred from
+transport, window, credential, Runner, or a previous call.
 
-A provider process failure does not prevent the Runner itself from registering.
-If an admitted startup provider later fails, WebCodex retires that exact
-provider instance and fails direct calls closed. It does not silently restart
-the provider under the same identity.
-
-### Dynamic
-
-After startup, Plugin development uses the dynamic plane:
+Routing always starts from the exact caller-visible Runner:
 
 ```text
-plugin_tool(action="reload", runner="my-runner")
+plugin_tool(action="list")
+    -> caller-visible Plugin-capable Runners
 plugin_tool(action="list", runner="my-runner")
+    -> current committed providers on that exact Runner
+plugin_tool(action="list", runner="my-runner", plugin="repo-tools")
+    -> bounded current tool names/titles for that exact provider
+plugin_tool(action="check", runner="my-runner", plugin="repo-tools")
+    -> disposable initialize + tools/list validation; no commit and no tools/call
+plugin_tool(action="reload", runner="my-runner")
+    -> reread runner.toml, admit candidates, atomically replace committed provider set
 plugin_tool(action="describe", runner="my-runner", plugin="repo-tools", tool="search_symbol")
-plugin_tool(action="call", runner="my-runner", plugin="repo-tools", tool="search_symbol", arguments={"query":"foo"})
+    -> { ..., "binding": "wc_pbind_..." }
+plugin_tool(action="call", binding="wc_pbind_...", arguments={"query":"foo"})
 ```
+
+The identity hierarchy is always:
+
+```text
+exact Runner instance
+    -> exact provider instance
+        -> provider-local tool + frozen schema observation
+```
+
+Same provider ids on different Runners, same tool names across Runners, and same
+tool names in different providers on one Runner are normal. Only tool names
+inside one provider catalog must be unique.
+
+At Runner startup, configured providers are eagerly prepared, initialized, and
+listed once to form the first committed provider set. Every successful provider
+instance owns a frozen validated catalog for its lifetime. Ordinary
+list/describe/call reads that frozen catalog and never asks the same instance to
+re-list. Catalog/schema changes require a new provider instance through reload.
+
+`list(runner, plugin)` observes only the currently committed provider instance.
+It does not reread `runner.toml`, start a candidate, run check/reload, create a
+binding, or call the Plugin tool. Full schemas remain exclusive to `describe`;
+list returns bounded names/titles and safe health metadata only.
+
+`check` is the recommended preflight before `reload`. The Runner rereads its
+current `runner.toml`, locates only the requested provider, prepares the same
+shell/profile environment used by the normal Plugin runtime, resolves and
+**really starts** the configured executable, performs `initialize` and
+`tools/list`, validates the normal Plugin protocol/bounds, then terminates that
+candidate process tree. It never calls provider `tools/call` and never commits
+the candidate into the current provider set. Because a Native Plugin is an arbitrary
+local executable, its own startup/initialize/list behavior can still have
+external side effects; `check` is not a purely static config linter.
+
+A successful check returns `ready=true` plus bounded tool summaries containing
+only names and optional titles. A broken candidate is normally a successful
+check operation with `ready=false`, a structured `phase`, a stable error `code`,
+and a bounded WebCodex-generated `detail`. Tool-definition validation failures
+also include a small `diagnostic` with a finite WebCodex-defined code and, when
+safe, a validated tool name and finite field label such as `inputSchema`.
+Diagnostics come only from WebCodex protocol parsing/validators; raw serde
+errors, protocol lines, schema fragments, Plugin stdout/stderr, executable
+configuration, environment, and process identities are never copied into the
+report. Plugin stderr remains Runner-local. The Runner keeps only a bounded,
+control-sanitized local stderr ring for live providers and the most recent
+disposable `check` candidate; this local projection is not part of the Plugin
+gateway response.
+
+`call` has one dispatch identity: the opaque `binding` returned by that exact
+`describe`. It does not accept `runner`, `plugin`, or `tool` as call-time
+routing fields. Each describe creates an independent binding for the exact
+Runner instance, provider instance, tool name, and schema observation seen at
+that moment. The handle does not encode or expose those internal identities.
 
 `reload` is the cross-platform authoritative reload path on Windows, macOS, and
 Linux. The Runner rereads its own `runner.toml`; the Server does not upload an
-executable, environment, or raw Plugin config.
+executable, environment, or raw Plugin config. Candidate management is
+serialized across both `check` and `reload`: a second check returns
+`plugin_check_busy`, while reload keeps the existing `plugin_reload_busy` result.
+Candidate operations are rejected with `NotStarted` instead of being queued.
+This gate does not block list/describe/call from using the currently committed
+provider while a candidate is being prepared.
 
-A changed provider is initialized and listed successfully before it replaces
-the previous dynamic instance. A failed candidate leaves the previous working
-dynamic instance intact. A removed provider is removed from the dynamic view.
-None of those operations changes the frozen startup catalog.
+A reload prepares the complete candidate provider set before commit. If any
+candidate admission fails, the previous committed set remains intact. On
+success, the committed set is replaced atomically; removed providers disappear
+immediately. Old provider instances are retired, so old bindings fail closed.
+There is no fallback to a retired or removed provider instance.
 
 This creates the normal development loop:
 
 ```text
 edit Plugin code/config
+    -> plugin_tool check
+    -> fix the bounded diagnostic until the disposable candidate is ready
     -> plugin_tool reload
-    -> describe/call the dynamic Plugin
+    -> plugin_tool list(runner, plugin)
+    -> plugin_tool describe
+    -> receive opaque binding
+    -> plugin_tool call(binding, arguments)
     -> finish debugging
-    -> restart Runner
-    -> new startup admission / first-class promotion
 ```
 
-If startup provider A is first-class and reload creates dynamic provider B,
-direct `search_symbol(...)` still calls A. `plugin_tool call` uses B. Only a
-Runner restart can replace the first-class binding.
+Running `check` before reload never replaces the current provider set and never
+creates a binding. The successful check candidate is disposed instead of being
+reused by a later reload.
+
+`runner_config_reload` and `plugin_tool reload` share the same Plugin candidate
+admission/commit primitive. Editing `[plugins]` does not require a Runner restart:
+generic Runner config reload live-applies the Plugin candidate as part of the
+same activation, while `plugin_tool reload` provides the narrower
+`plugin:manage`-scoped operation. Plugin management authority never grants
+authority to change unrelated Runner configuration.
+
+`runner_config_check` remains a structural Runner-config check: it reads/parses
+the startup-bound `runner.toml`, validates configuration bounds, and classifies
+restart-only fields without starting disposable Plugin processes. Use
+`plugin_tool check(runner, plugin)` when you need executable resolution plus the
+Plugin `initialize -> tools/list` protocol/admission preflight.
 
 ## WebCodex Plugin Protocol v1
 
@@ -174,40 +275,93 @@ Messages, schemas, arguments, JSON structure, tool counts, and results are
 bounded. Malformed or unsupported data fails closed instead of being truncated
 into a different tool contract.
 
+### Native Plugin Schema Profile v1
+
+`inputSchema` and `outputSchema` use a deliberately small WebCodex profile; they
+are **not** advertised as full JSON Schema 2020-12. Every schema node requires a
+single string `type`. Supported types are `object`, `array`, `string`, `number`,
+`integer`, `boolean`, and `null`. Supported keywords are:
+
+- all nodes: `type`, optional `title`, `description`, `enum`, `const`;
+- object: `properties`, `required`, boolean `additionalProperties`;
+- string: `minLength`, `maxLength`;
+- array: `minItems`, `maxItems`, `items`.
+
+Input/output schema roots must be `type: "object"`. Property counts, required
+entries, enum size, schema bytes/depth/nodes/strings, and declared length/item
+bounds are finite. Unknown keywords are rejected at provider admission rather
+than silently ignored. In particular v1 does not support `$ref`/remote refs,
+`$defs`, recursive refs, `pattern`, `format`, numeric `minimum`/`maximum`, schema
+forms of `additionalProperties`, union `type`, `anyOf`, `oneOf`, `allOf`, `not`,
+or arbitrary draft-specific keywords.
+
 See [`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs) for
-a complete no-dependency Node example.
+a minimal no-dependency Node example. The repository also ships
+[`plugins/safe-delete`](../plugins/safe-delete/README.md), an optional
+project-root-fenced Plugin that moves one file or directory to the operating
+system Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in
+tool surface.
 
 ## Calling and failure semantics
 
 Each provider handles one request at a time. Concurrent calls receive a
 provider-busy result instead of being silently queued without bound.
 
-`plugin_tool call` requires a preceding `describe`. WebCodex records the exact
-Runner instance, provider instance, tool name, and observed schema internally.
-If the provider or schema changes before the call, the call is `NotStarted` and
-must be described again. Those internal instance identifiers are not exposed to
-the model.
+Before `tools/call` can enter the provider connection, WebCodex resolves the
+exact frozen catalog entry, checks the caller's exact schema observation, and
+validates `arguments` against that frozen input schema. Any failure here is
+`NotStarted`; the executable sees zero `tools/call` bytes. No `tools/list` is
+performed on this path. After a provider response arrives, ordinary text/result
+bounds still apply. When an `outputSchema` exists, `structuredContent` is also
+required to match that exact frozen output schema. A mismatch is a completed
+provider contract violation and retires that provider instance fail-closed.
 
-For effectful `tools/call`, a transport/process failure after the request may
-have been sent is reported as `OutcomeUnknown`; WebCodex does not automatically
-retry or replay it. Failures known to happen before send are `NotStarted`.
+`plugin_tool call` requires an opaque binding from a preceding `describe`.
+Bindings are bounded server-side observations, not bearer authorization tokens:
+every call still requires current `plugin:invoke` authority and current access to
+the logical Runner. A binding can also be evicted. If its Runner/provider
+instance disappears, the tool is removed, or its schema changes, the stale call
+fails `NotStarted` and must be described again. WebCodex never re-resolves the
+binding to a newer same-named provider/tool, never manufactures a replacement
+binding, and never replays the call. Internal Runner/provider instance ids and
+schema revision machinery are not exposed in the handle.
 
-Plugin stdout is protocol-only. Plugin stderr is drained separately for local
-diagnostics and is never treated as protocol, inserted into a model result, or
-published in the startup registration catalog.
+After the local frozen-schema preflight succeeds, the provider timeout is one
+total RPC budget. It starts before provider-request encoding and covers bounded
+stdin queue admission, the complete frame write plus flush confirmation, and the
+response wait. A Plugin that stops reading stdin therefore cannot make
+`write_all` escape the provider timeout.
+For effectful `tools/call`, once a frame may have started writing, a write
+timeout/failure, connection loss, process death, or response timeout is
+`OutcomeUnknown`; WebCodex does not automatically retry or replay it. Failures
+proven to happen before any possible send are `NotStarted`.
+
+Plugin stdout is protocol-only. Plugin stderr is drained continuously on a
+separate worker so stderr flooding cannot backpressure stdout protocol progress.
+The local ring retains at most 64 lines, 1 KiB per line, and 32 KiB aggregate;
+control/non-UTF-8 bytes are projected safely and overlong lines are marked
+truncated. Stderr is never treated as protocol, inserted into a model ToolResult
+or Workflow Session ledger, or automatically copied into Runner registration.
 
 ## OAuth
 
-Native Plugin access is a separate authority: `plugin:local`.
+Native Plugin authority is operation-specific:
 
-- Without `plugin:local`, `plugin_tool` and first-class startup Plugin tools are
-  omitted from MCP `tools/list` and direct spoofed calls are rejected.
-- `plugin:local` is not part of the shared-key OAuth baseline.
+- `plugin:inspect` allows metadata observation such as list and describe.
+- `plugin:invoke` allows `plugin_tool call`.
+- `plugin:manage` allows development/management operations that can start or
+  change local Plugin processes, currently check and reload. It does not imply
+  `plugin:invoke`.
+- None of these scopes is part of the direct shared-key model baseline.
 - For the shared-key OAuth bridge, opt in explicitly with
-  `webcodex connect ... --auth oauth --oauth-local-plugins`.
+  `webcodex connect ... --auth oauth --oauth-local-plugins`; that opt-in grants
+  only `plugin:inspect` + `plugin:invoke`, never `plugin:manage`.
 
-`mcp:local` does not grant Plugin access, and `plugin:local` does not grant
-Runner-owned MCP provider access.
+`mcp:local` does not grant Plugin access, and Plugin scopes do not grant
+Runner-owned MCP provider access. Effectful Plugin operations also pass the
+same Workflow Session guard and authority-mode permission policy as other
+consequential WebCodex execution when an explicit `recording_session_id` is
+supplied; WebCodex never infers that Session from MCP transport identity.
 
 ## Troubleshooting
 
@@ -215,10 +369,7 @@ If a Plugin does not start, verify the configured profile, prepared `PATH`,
 absolute `cwd`, runtime executable, and that stdout contains only protocol JSON
 lines. Use stderr for local diagnostics.
 
-If a dynamic change works through `plugin_tool` but the direct MCP tool still
-uses the old behavior, that is expected: restart the Runner to create a new
-startup catalog and promote the new provider instance.
-
-If a tool is available through `plugin_tool` but not directly in MCP
-`tools/list`, check for a duplicate caller-visible Plugin tool name or a
-WebCodex-reserved name conflict.
+Provider tools are intentionally absent from outer MCP `tools/list`; use
+`plugin_tool list -> describe -> call`. If an old binding stops working after a
+Runner/provider replacement or schema change, re-list and describe again. Never
+blindly retry a call whose dispatch certainty is `outcome_unknown`.

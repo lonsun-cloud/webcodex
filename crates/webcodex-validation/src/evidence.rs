@@ -31,14 +31,22 @@ const VALIDATION_PARSER_SOURCE: &str = "bounded_validation_metadata";
 pub struct ValidationEvent {
     pub tool_name: String,
     pub execution_source: String,
+    #[serde(skip)]
+    adapter_tool_identity: Option<&'static str>,
     pub identity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertion_name: Option<String>,
     pub purpose: String,
     pub validation_kind: String,
+    /// Immutable raw ToolResult truth recorded by the Workflow Session ledger.
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_success: Option<bool>,
+    /// Semantic validator/correctness result, independent from request-scoped
+    /// evidence assertions such as cargo_test min_tests/require_tests.
+    pub validation_passed: bool,
+    /// Canonical closeout class derived from immutable execution/evidence facts.
+    pub failure_class: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expectation_satisfied: Option<bool>,
     pub failure_kind: &'static str,
@@ -78,6 +86,10 @@ pub struct ValidationEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_tests_run: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_tests: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_run: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub test_count_assertion: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout_lines: Option<u64>,
@@ -113,6 +125,7 @@ struct ValidationSummary {
     historical_failures: ValidationHistoricalFailures,
     resolved_failures: ValidationFailureSet,
     unresolved_failures: ValidationFailureSet,
+    evidence_gaps: ValidationFailureSet,
     source: &'static str,
     events_total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +168,11 @@ struct ExtractedValidationEvent {
 pub struct CurrentValidationEvidenceProjection {
     pub evidence: Value,
     pub current_validation: Value,
-    pub non_current_failure_event_ids: HashSet<String>,
+    /// Raw failed ToolCall events that validation-domain semantics prove are not
+    /// current correctness blockers. This includes resolved/stale validation
+    /// failures and request-scoped evidence assertion failures, but never
+    /// outcome_unknown.
+    pub non_actionable_tool_failure_event_ids: HashSet<String>,
 }
 
 use crate::adapters::{validation_adapter_for_tool, ValidationAdapter, ValidationFailureEvidence};
@@ -170,6 +187,7 @@ pub fn skipped_validation_summary() -> Value {
         historical_failures: no_historical_failures(),
         resolved_failures: no_failures(),
         unresolved_failures: no_failures(),
+        evidence_gaps: no_failures(),
         source: VALIDATION_SOURCE,
         events_total: 0,
         successes: None,
@@ -192,6 +210,7 @@ pub fn skipped_validation_summary() -> Value {
         "resolved_failure_count": 0,
         "expected_results": 0,
         "unresolved_failure_count": 0,
+        "evidence_gap_event_count": 0,
         "stale_failure_count": 0,
         "evidence_after_latest_content_change": false,
         "boundary_reason": "attempt_boundary_unavailable",
@@ -235,12 +254,13 @@ fn current_validation_evidence_for_events(
                 "resolved_failure_count": 0,
                 "expected_results": 0,
                 "unresolved_failure_count": 0,
+                "evidence_gap_event_count": 0,
                 "stale_failure_count": 0,
                 "evidence_after_latest_content_change": false,
                 "boundary_reason": "attempt_boundary_unavailable",
             }),
             current_validation: validation_summary_from_events(&[], limit),
-            non_current_failure_event_ids: HashSet::new(),
+            non_actionable_tool_failure_event_ids: HashSet::new(),
         };
     }
 
@@ -267,6 +287,11 @@ fn current_validation_evidence_for_events(
     let effective_boundary_index = reset_index.or(attempt.boundary_event_index);
 
     let validation_records = extract_validation_event_records(events);
+    let all_validation_events = validation_records
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    let resolved_failure_indexes = resolved_validation_failure_indexes(&all_validation_events);
     let mut current_source_event_ids = HashSet::new();
     let mut current_failure_ids = HashSet::new();
     let mut stale_failure_count = 0usize;
@@ -329,6 +354,14 @@ fn current_validation_evidence_for_events(
         .pointer("/unresolved_failures/count")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
+    let evidence_gap_event_count = current_validation
+        .pointer("/evidence_gaps/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let current_summary_status = current_validation
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let (status, reason) = if current_events_total > 0 && unresolved_failure_count > 0 {
         ("failed", Some("current_validation_failures"))
     } else if current_events_total > 0 && successes > 0 {
@@ -337,6 +370,14 @@ fn current_validation_evidence_for_events(
         (
             "expected",
             Some("declared_result_expectation_satisfied_without_validation_pass"),
+        )
+    } else if current_events_total > 0 && current_summary_status == "inconclusive" {
+        (
+            "inconclusive",
+            current_validation
+                .get("reason")
+                .and_then(Value::as_str)
+                .or(Some("validation_evidence_inconclusive")),
         )
     } else if reset_index.is_some() && stale_validation_count > 0 {
         ("stale", Some("validation_stale_after_changes"))
@@ -355,11 +396,17 @@ fn current_validation_evidence_for_events(
         "attempt_start"
     };
 
-    let non_current_failure_event_ids = validation_records
-        .into_iter()
-        .filter(|record| validation_event_is_failure(&record.event))
-        .map(|record| record.source_event_id)
-        .filter(|event_id| !current_failure_ids.contains(event_id))
+    let non_actionable_tool_failure_event_ids = validation_records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| !validation_event_is_outcome_unknown(&record.event))
+        .filter(|(index, record)| {
+            validation_event_is_inconclusive(&record.event)
+                || (validation_event_is_failure(&record.event)
+                    && (!current_failure_ids.contains(&record.source_event_id)
+                        || resolved_failure_indexes.contains(index)))
+        })
+        .map(|(_, record)| record.source_event_id.clone())
         .collect();
 
     CurrentValidationEvidenceProjection {
@@ -373,12 +420,13 @@ fn current_validation_evidence_for_events(
             "resolved_failure_count": resolved_failure_count,
             "expected_results": expected_results,
             "unresolved_failure_count": unresolved_failure_count,
+            "evidence_gap_event_count": evidence_gap_event_count,
             "stale_failure_count": stale_failure_count,
             "evidence_after_latest_content_change": reset_index.is_some() && current_events_total > 0,
             "boundary_reason": boundary_reason,
         }),
         current_validation,
-        non_current_failure_event_ids,
+        non_actionable_tool_failure_event_ids,
     }
 }
 
@@ -451,6 +499,7 @@ pub fn validation_summary_from_events(events: &[SessionEvent], limit: usize) -> 
             historical_failures: no_historical_failures(),
             resolved_failures: no_failures(),
             unresolved_failures: no_failures(),
+            evidence_gaps: no_failures(),
             source: VALIDATION_SOURCE,
             events_total,
             successes: None,
@@ -470,22 +519,37 @@ pub fn validation_summary_from_events(events: &[SessionEvent], limit: usize) -> 
         classify_validation_failures(&mut validation_events);
     let successes = validation_events
         .iter()
-        .filter(|event| event.success)
+        .filter(|event| validation_event_is_proven_success(event))
         .count();
+    let inconclusive_results = validation_events
+        .iter()
+        .filter(|event| validation_event_is_inconclusive(event))
+        .count();
+    let evidence_gaps = ValidationFailureSet {
+        count: inconclusive_results,
+        events: validation_events
+            .iter()
+            .filter(|event| validation_event_is_inconclusive(event))
+            .cloned()
+            .collect(),
+    };
     let failures = historical_failures.count;
     let expected_results = validation_events
         .iter()
         .filter(|event| validation_event_is_expected_result(event))
         .count();
-    let status = validation_status(successes, failures, expected_results);
+    let status = validation_status(successes, failures, expected_results, inconclusive_results);
     let parser = parser_summary_for_events(&validation_events);
-    let cargo_test_zero_tests_run = validation_events.iter().any(cargo_test_zero_tests_success);
     let latest = validation_events.last().cloned();
+    let cargo_test_zero_tests_run = latest.as_ref().is_some_and(cargo_test_zero_tests_success);
     let latest_status = validation_latest_status(latest.as_ref());
+    let reason = (status == "inconclusive")
+        .then(|| latest.as_ref().map(validation_inconclusive_reason))
+        .flatten();
     let latest_success = validation_events
         .iter()
         .rev()
-        .find(|event| event.success)
+        .find(|event| validation_event_is_proven_success(event))
         .cloned();
     let latest_failure = validation_events
         .iter()
@@ -498,12 +562,13 @@ pub fn validation_summary_from_events(events: &[SessionEvent], limit: usize) -> 
     to_value(ValidationSummary {
         available: true,
         status,
-        reason: None,
+        reason,
         latest,
         latest_status,
         historical_failures,
         resolved_failures,
         unresolved_failures,
+        evidence_gaps,
         source: VALIDATION_SOURCE,
         events_total,
         successes: Some(successes),
@@ -518,31 +583,73 @@ pub fn validation_summary_from_events(events: &[SessionEvent], limit: usize) -> 
     })
 }
 
-fn validation_status(successes: usize, failures: usize, expected_results: usize) -> &'static str {
-    match (successes > 0, failures > 0, expected_results > 0) {
-        (true, true, _) => "mixed",
-        (true, false, _) => "passed",
-        (false, true, _) => "failed",
-        (false, false, true) => "expected",
-        (false, false, false) => "unknown",
+fn validation_status(
+    successes: usize,
+    failures: usize,
+    expected_results: usize,
+    inconclusive_results: usize,
+) -> &'static str {
+    match (
+        successes > 0,
+        failures > 0,
+        expected_results > 0,
+        inconclusive_results > 0,
+    ) {
+        (true, true, _, _) => "mixed",
+        (true, false, _, _) => "passed",
+        (false, true, _, _) => "failed",
+        (false, false, true, _) => "expected",
+        (false, false, false, true) => "inconclusive",
+        (false, false, false, false) => "unknown",
     }
 }
 
 fn validation_latest_status(latest: Option<&ValidationEvent>) -> &'static str {
     match latest {
-        Some(event) if event.success => "passed",
+        Some(event) if validation_event_is_proven_success(event) => "passed",
         Some(event) if validation_event_is_expected_result(event) => "expected",
+        Some(event) if validation_event_is_inconclusive(event) => "inconclusive",
         Some(_) => "failed",
         None => "not_run",
     }
 }
 
 fn validation_event_is_expected_result(event: &ValidationEvent) -> bool {
-    !event.success && event.expectation_satisfied == Some(true)
+    !validation_event_is_outcome_unknown(event)
+        && !event.success
+        && event.expectation_satisfied == Some(true)
 }
 
 fn validation_event_is_failure(event: &ValidationEvent) -> bool {
-    !event.success && !validation_event_is_expected_result(event)
+    !event.validation_passed && !validation_event_is_expected_result(event)
+}
+
+fn validation_event_is_outcome_unknown(event: &ValidationEvent) -> bool {
+    event.execution_state == "outcome_unknown"
+}
+
+fn resolved_validation_failure_indexes(events: &[ValidationEvent]) -> HashSet<usize> {
+    let mut latest_success_by_identity = HashMap::<(Option<String>, String, String), usize>::new();
+    for (index, event) in events.iter().enumerate() {
+        if validation_event_is_proven_success(event)
+            && validation_event_decides_historical_failure_status(event)
+        {
+            latest_success_by_identity.insert(validation_reconciliation_key(event), index);
+        }
+    }
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            validation_event_is_failure(event) && !validation_event_is_outcome_unknown(event)
+        })
+        .filter_map(|(index, event)| {
+            latest_success_by_identity
+                .get(&validation_reconciliation_key(event))
+                .is_some_and(|success_index| *success_index > index)
+                .then_some(index)
+        })
+        .collect()
 }
 
 fn classify_validation_failures(
@@ -556,21 +663,14 @@ fn classify_validation_failures(
     // Sessions can explicitly record cross-project tool calls, so a successful
     // validation in project B must never resolve a same-shaped failure from
     // project A merely because cwd/package/filter/features match.
-    let mut latest_success_by_identity = HashMap::<(Option<String>, String, String), usize>::new();
-    for (index, event) in events.iter().enumerate() {
-        if event.success && validation_event_decides_historical_failure_status(event) {
-            latest_success_by_identity.insert(validation_reconciliation_key(event), index);
-        }
-    }
+    let resolved_indexes = resolved_validation_failure_indexes(events);
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
     for (index, event) in events.iter_mut().enumerate() {
-        if event.success || validation_event_is_expected_result(event) {
+        if !validation_event_is_failure(event) {
             continue;
         }
-        let is_resolved = latest_success_by_identity
-            .get(&validation_reconciliation_key(event))
-            .is_some_and(|success_index| *success_index > index);
+        let is_resolved = resolved_indexes.contains(&index);
         event.unresolved_failure = !is_resolved;
         if is_resolved {
             resolved.push(event.clone());
@@ -626,9 +726,7 @@ fn validation_event_decides_historical_failure_status(event: &ValidationEvent) -
     // A caller-declared expected/observed failure is useful expectation evidence,
     // but it is not proof that the validator passed and therefore can never
     // resolve an earlier real validation failure for the same identity.
-    event.execution_success != Some(false)
-        && !cargo_test_zero_tests_success(event)
-        && !cargo_test_unproven_execution_success(event)
+    validation_event_is_proven_success(event)
 }
 
 // `validation_kind = test` is only an intent/category for generic execution.
@@ -639,10 +737,90 @@ fn structured_test_requires_execution_proof(event: &ValidationEvent) -> bool {
     })
 }
 
-fn cargo_test_unproven_execution_success(event: &ValidationEvent) -> bool {
-    structured_test_requires_execution_proof(event)
-        && event.success
+fn generic_cargo_test_has_reliable_zero_test_evidence(event: &ValidationEvent) -> bool {
+    event.tool_name != "cargo_test"
+        && event.adapter_tool_identity == Some("cargo_test")
+        && event.tests_run_count == Some(0)
+        && event.zero_tests_run == Some(true)
+}
+
+fn validation_event_is_proven_success(event: &ValidationEvent) -> bool {
+    if !event.validation_passed
+        || validation_event_is_expected_result(event)
+        || request_scoped_evidence_assertion_insufficient(event)
+    {
+        return false;
+    }
+    // Generic validation preserves its historical proof behavior when count
+    // metadata is unavailable. Once the existing execution adapter positively
+    // identifies Cargo test and bounded metadata proves that zero tests ran,
+    // however, process success is not validation proof.
+    if generic_cargo_test_has_reliable_zero_test_evidence(event) {
+        return false;
+    }
+    if !structured_test_requires_execution_proof(event) {
+        return true;
+    }
+    if event.tool_name == "cargo_test" && event.no_run == Some(true) {
+        return true;
+    }
+    match (event.tests_run_count, event.zero_tests_run) {
+        (Some(count), Some(zero_tests_run)) if zero_tests_run == (count == 0) => {
+            count > 0
+                || (event.tool_name == "cargo_test"
+                    && event.require_tests == Some(false)
+                    && event.test_count_assertion.is_none())
+        }
+        _ => false,
+    }
+}
+
+fn validation_event_is_inconclusive(event: &ValidationEvent) -> bool {
+    event.validation_passed
+        && !validation_event_is_expected_result(event)
+        && !validation_event_is_proven_success(event)
+}
+
+fn validation_inconclusive_reason(event: &ValidationEvent) -> &'static str {
+    if request_scoped_evidence_assertion_insufficient(event) {
+        if event
+            .test_count_assertion
+            .as_ref()
+            .and_then(|assertion| assertion.get("reason_code"))
+            .and_then(Value::as_str)
+            == Some("test_count_unproven")
+        {
+            "test_count_assertion_unproven"
+        } else {
+            "validation_evidence_assertion_insufficient"
+        }
+    } else if event.zero_tests_run == Some(true) {
+        "zero_tests_not_validation_proof"
+    } else if structured_test_requires_execution_proof(event)
         && (event.tests_run_count.is_none() || event.zero_tests_run.is_none())
+    {
+        "test_count_metadata_unavailable"
+    } else {
+        "validation_evidence_inconclusive"
+    }
+}
+
+fn request_scoped_evidence_assertion_insufficient(event: &ValidationEvent) -> bool {
+    request_scoped_evidence_assertion_value_insufficient(event.test_count_assertion.as_ref())
+}
+
+fn request_scoped_evidence_assertion_value_insufficient(assertion: Option<&Value>) -> bool {
+    assertion
+        .and_then(Value::as_object)
+        .is_some_and(|assertion| {
+            matches!(
+                assertion.get("status").and_then(Value::as_str),
+                Some("failed" | "unproven")
+            ) && matches!(
+                assertion.get("reason_code").and_then(Value::as_str),
+                Some("minimum_not_met" | "test_count_unproven")
+            )
+        })
 }
 
 fn no_historical_failures() -> ValidationHistoricalFailures {
@@ -811,7 +989,7 @@ fn validation_event_from_finished(
         .map(|adapter| adapter.validation_kind().to_string())
         .or_else(|| validation_kind_for_tool(&finished.tool_name).map(str::to_string))
         .unwrap_or_else(|| purpose.clone());
-    let execution_success = match finished.status.as_deref() {
+    let tool_result_success = match finished.status.as_deref() {
         Some("succeeded") => true,
         Some("failed") => false,
         _ => return None,
@@ -821,7 +999,7 @@ fn validation_event_from_finished(
     // that actually entered validation execution — exit code and/or bounded
     // validation output metadata — feed the ledger summary.
     if !validation_execution_started(finished)
-        && (!execution_success || finished.tool_name == "run_job")
+        && (!tool_result_success || finished.tool_name == "run_job")
     {
         return None;
     }
@@ -845,19 +1023,20 @@ fn validation_event_from_finished(
     let diagnostics =
         adapter.and_then(|adapter| validation_diagnostics_from_summary(finished, adapter));
     let failure_kind =
-        validation_failure_kind(finished, execution_success, diagnostics.as_ref(), adapter);
+        validation_failure_kind(finished, tool_result_success, diagnostics.as_ref(), adapter);
     let public_result_expectation =
         finished.result_expectation.is_some() || !finished.accepted_exit_codes.is_empty();
     let expectation_satisfied = public_result_expectation.then_some(
         matches!(
             finished.failure_expectation_result.as_deref(),
             Some("matched_expected_failure" | "matched_expected_result")
-        ) || (execution_success && finished.failure_expectation_result.as_deref() == Some("none")),
+        ) || (tool_result_success
+            && finished.failure_expectation_result.as_deref() == Some("none")),
     );
     // Validation pass/fail remains an execution fact. A pre-declared negative
     // or observation expectation is represented separately and must never turn
     // a real validator failure into pass evidence or a historical resolver.
-    let success = execution_success;
+    let success = tool_result_success;
     let command_summary = execution_string(started, finished, "command_summary").or_else(|| {
         started
             .and_then(|event| event.input_summary.as_ref())
@@ -893,6 +1072,22 @@ fn validation_event_from_finished(
         .as_ref()
         .and_then(|summary| summary.get("test_count_assertion"))
         .cloned();
+    let require_tests = finished
+        .validation_output_summary
+        .as_ref()
+        .and_then(|summary| summary.get("require_tests"))
+        .and_then(Value::as_bool);
+    let no_run = finished
+        .validation_output_summary
+        .as_ref()
+        .and_then(|summary| summary.get("no_run"))
+        .and_then(Value::as_bool);
+    let validation_passed = validation_execution_succeeded(
+        finished,
+        success,
+        &execution_state,
+        test_count_assertion.as_ref(),
+    );
     let detected_summary = adapter.map(|adapter| {
         json!({
             "kind": adapter.validation_kind(),
@@ -906,19 +1101,22 @@ fn validation_event_from_finished(
     });
     let outcome = if success { "succeeded" } else { "failed" };
 
-    Some(ValidationEvent {
+    let mut event = ValidationEvent {
         tool_name: finished.tool_name.clone(),
         execution_source: finished.tool_name.clone(),
+        adapter_tool_identity: adapter.map(|adapter| adapter.tool_identity()),
         identity,
         assertion_name,
         purpose,
         validation_kind,
         success,
-        execution_success: public_result_expectation.then_some(execution_success),
+        execution_success: Some(validation_passed),
+        validation_passed,
+        failure_class: "none",
         expectation_satisfied,
         failure_kind,
         failure_category: failure_kind,
-        unresolved_failure: !success && expectation_satisfied != Some(true),
+        unresolved_failure: false,
         exit_code: finished.exit_code,
         summary: format!("{} {}", finished.tool_name, outcome),
         command_summary,
@@ -938,6 +1136,8 @@ fn validation_event_from_finished(
         tests_passed,
         tests_failed,
         zero_tests_run,
+        require_tests,
+        no_run,
         test_count_assertion,
         stdout_lines,
         stderr_lines,
@@ -945,7 +1145,49 @@ fn validation_event_from_finished(
         stderr_truncated,
         stdout_evidence,
         stderr_evidence,
-    })
+    };
+    event.failure_class = validation_event_failure_class(&event);
+    event.unresolved_failure = validation_event_is_failure(&event);
+    Some(event)
+}
+
+fn validation_execution_succeeded(
+    finished: &SessionEvent,
+    tool_result_success: bool,
+    execution_state: &str,
+    test_count_assertion: Option<&Value>,
+) -> bool {
+    if matches!(
+        execution_state,
+        "not_started" | "started" | "outcome_unknown" | "cancelled" | "timed_out"
+    ) {
+        return false;
+    }
+    if tool_result_success {
+        return true;
+    }
+    // A failed raw ToolResult may still carry a successful validator execution
+    // only for a recognized request-scoped evidence assertion mismatch. Never
+    // infer correctness success from exit_code=0 alone: other fail-closed tool
+    // reasons must remain real failures unless their semantic class is explicit.
+    finished.exit_code == Some(0)
+        && request_scoped_evidence_assertion_value_insufficient(test_count_assertion)
+}
+
+fn validation_event_failure_class(event: &ValidationEvent) -> &'static str {
+    if validation_event_is_expected_result(event) {
+        "expected_result"
+    } else if validation_event_is_outcome_unknown(event) {
+        "outcome_unknown"
+    } else if request_scoped_evidence_assertion_insufficient(event) {
+        "evidence_assertion"
+    } else if validation_event_is_inconclusive(event) {
+        "evidence_insufficient"
+    } else if validation_event_is_failure(event) {
+        "execution_or_correctness"
+    } else {
+        "none"
+    }
 }
 
 fn validation_adapter_for_execution(
@@ -1428,8 +1670,9 @@ fn validation_test_run_metadata(
 }
 
 fn cargo_test_zero_tests_success(event: &ValidationEvent) -> bool {
-    structured_test_requires_execution_proof(event)
-        && event.success
+    event.adapter_tool_identity == Some("cargo_test")
+        && event.validation_passed
+        && event.tests_run_count == Some(0)
         && event.zero_tests_run == Some(true)
 }
 
@@ -1448,6 +1691,7 @@ fn to_value(summary: ValidationSummary) -> Value {
             },
             "resolved_failures": {"count": 0, "events": []},
             "unresolved_failures": {"count": 0, "events": []},
+            "evidence_gaps": {"count": 0, "events": []},
             "source": VALIDATION_SOURCE,
             "events_total": 0,
             "events": [],

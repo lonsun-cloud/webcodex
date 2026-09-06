@@ -228,8 +228,11 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // The current patch success metadata contract is runtime-only and
             // must be advertised by the binary that actually implements it.
             apply_patch_match_metadata: false,
+            // Enum-based matching semantics are runtime-only and current
+            // Servers require an explicit registration capability.
+            apply_patch_matching_mode: false,
             // Strict patch matching is also runtime-only and must be explicitly
-            // advertised by a binary that enforces it before mutation.
+            // advertised for rolling compatibility with older Servers.
             apply_patch_strict_matching: false,
             git: true,
             jobs: true,
@@ -246,6 +249,10 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Durable assertion metadata is advertised by the running binary,
             // not inferred from generic validation argv support.
             structured_cargo_test_count_assertion: false,
+            // Explicit Cargo execution policy is a separate running-binary
+            // rolling-upgrade capability and is never inferred from the older
+            // count-assertion bit or protocol generation.
+            structured_cargo_test_execution_policy: false,
             // The running binary advertises this process-lifetime protocol
             // capability after installing its exact Go argv boundary.
             structured_go_test_json: false,
@@ -316,6 +323,13 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Native Tool Plugins are likewise advertised only by a Runner
             // binary that implements the typed local Plugin lifecycle.
             native_tool_plugins: false,
+            // Managed SSH resource lifecycle is likewise a running-binary
+            // capability and is never implied by generated static SSH config.
+            managed_ssh_resources: false,
+            // First-class config control is implemented by the running binary
+            // against its startup-bound path and must never be inferred from a
+            // generated static runner.toml capability block.
+            runner_config_control: false,
         },
         policy: GeneratedRunnerPolicy {
             allow_raw_shell: true,

@@ -241,35 +241,117 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_owner_prs_run_complete_linux_ci_before_merge(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release_build = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
 
         def job_block(name: str, next_name: str) -> str:
             start = workflow.index(f"  {name}:\n")
             end = workflow.index(f"  {next_name}:\n", start)
             return workflow[start:end]
 
+        changes = job_block("changes", "contract")
         linux_rust = job_block("test-linux-rust", "test-linux-tooling")
         linux_tooling = job_block("test-linux-tooling", "test-linux-arm64")
         linux_arm64 = job_block("test-linux-arm64", "test")
-        aggregate = job_block("test", "test-macos")
+        aggregate = job_block("test", "test-macos-core")
         self.assertNotIn("pull_request.user.login", linux_rust)
         self.assertNotIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_rust)
         self.assertNotIn("pull_request.user.login", linux_tooling)
         self.assertNotIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_tooling)
         self.assertIn("runs-on: ubuntu-24.04-arm", linux_arm64)
         self.assertIn("cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner", linux_arm64)
-        self.assertIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_arm64)
+        self.assertIn("needs.changes.outputs.needs_linux_arm64 == 'true'", linux_arm64)
         self.assertIn("cargo check --locked --workspace --all-targets", linux_tooling)
         self.assertIn("bash scripts/release_check.sh --static-only", linux_tooling)
-        macos = job_block("test-macos", "test-windows-core")
-        self.assertIn("platform: darwin-x64", macos)
-        self.assertIn("runner: macos-15-intel", macos)
-        self.assertIn("rust_host: x86_64-apple-darwin", macos)
-        self.assertIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", macos)
+
+        self.assertIn("ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}", changes)
+        self.assertIn("persist-credentials: false", changes)
+        self.assertIn('classifier="scripts/ci_path_risk.py"', changes)
+        self.assertIn("reason=full-native:bootstrap-base-missing", changes)
+        self.assertNotIn('git show "$HEAD_SHA:scripts/ci_path_risk.py"', changes)
+        self.assertIn('git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"', changes)
+        self.assertIn('if [ "$fetched_head" != "$HEAD_SHA" ]', changes)
+        self.assertIn("--external-contributor", changes)
+        self.assertIn("--run-ci", changes)
+        self.assertNotIn("pull_request_target", workflow)
+
+        macos_core = job_block("test-macos-core", "test-macos-desktop")
+        macos_desktop = job_block("test-macos-desktop", "test-macos")
+        macos_aggregate = job_block("test-macos", "test-windows-core")
+        self.assertIn("needs.changes.outputs.needs_macos == 'true'", macos_core)
+        self.assertIn("platform: darwin-x64", macos_core)
+        self.assertIn("runner: macos-15-intel", macos_core)
+        self.assertIn("rust_host: x86_64-apple-darwin", macos_core)
+        self.assertIn("cargo check --locked --workspace", macos_core)
+        self.assertIn("cargo test --locked -p webcodex-runner -p webcodex-computer", macos_core)
+        self.assertNotIn("--bundles dmg", macos_core)
+        self.assertIn("needs.changes.outputs.needs_macos_desktop == 'true'", macos_desktop)
+        self.assertIn("cargo build --locked --profile dogfood -p webcodex -p webcodex-cli -p webcodex-runner", macos_desktop)
+        self.assertIn("--bin-dir target/dogfood", macos_desktop)
+        self.assertIn("--bundles dmg", macos_desktop)
+
+        windows_core = job_block("test-windows-core", "test-windows-runner")
+        windows_runner = job_block("test-windows-runner", "test-windows-package")
+        windows_package = job_block("test-windows-package", "test-windows-desktop")
+        windows_desktop = job_block("test-windows-desktop", "test-windows-arm64")
+        self.assertIn("needs.changes.outputs.needs_windows_core == 'true'", windows_core)
+        self.assertIn("cargo check --locked --workspace", windows_core)
+        self.assertIn("needs.changes.outputs.needs_windows_runner == 'true'", windows_runner)
+        self.assertIn("needs.changes.outputs.needs_windows_package == 'true'", windows_package)
+        self.assertIn("needs.changes.outputs.needs_windows_desktop == 'true'", windows_desktop)
+        self.assertIn("cargo build --locked --profile dogfood -p webcodex -p webcodex-cli -p webcodex-runner", windows_desktop)
+        self.assertIn('Join-Path "target\\dogfood"', windows_desktop)
         windows_arm64 = job_block("test-windows-arm64", "test-windows")
         self.assertIn("runs-on: windows-11-arm", windows_arm64)
         self.assertIn("aarch64-pc-windows-msvc", windows_arm64)
+        self.assertIn("needs.changes.outputs.needs_windows_arm64 == 'true'", windows_arm64)
         self.assertIn("cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner", windows_arm64)
-        self.assertIn("if: always()", aggregate)
+        windows_aggregate = job_block("test-windows", "test-native")
+        native_aggregate = workflow[workflow.index("  test-native:\n"):]
+        for required_aggregate in (aggregate, macos_aggregate, windows_aggregate, native_aggregate):
+            self.assertIn("if: always()", required_aggregate)
+        self.assertIn("NEEDS_CORE: ${{ needs.changes.outputs.needs_macos }}", macos_aggregate)
+        self.assertIn("NEEDS_CORE: ${{ needs.changes.outputs.needs_windows_core }}", windows_aggregate)
+        self.assertIn("NEEDS_LINUX_ARM64: ${{ needs.changes.outputs.needs_linux_arm64 }}", native_aggregate)
+        self.assertIn("expected=skipped", windows_aggregate)
+        self.assertIn("expected_linux_arm64=skipped", native_aggregate)
+        self.assertNotIn("FULL_NATIVE_REQUESTED", workflow)
+        self.assertIn("cargo build --locked --release -p webcodex -p webcodex-cli -p webcodex-runner", release_build)
+
+    def test_ci_native_lane_conditions_are_classifier_driven(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        pairs = {
+            "test-linux-arm64": "needs_linux_arm64",
+            "test-macos-core": "needs_macos",
+            "test-macos-desktop": "needs_macos_desktop",
+            "test-windows-core": "needs_windows_core",
+            "test-windows-runner": "needs_windows_runner",
+            "test-windows-package": "needs_windows_package",
+            "test-windows-desktop": "needs_windows_desktop",
+            "test-windows-arm64": "needs_windows_arm64",
+        }
+        job_names = list(pairs)
+        job_names.extend(("test-macos", "test-windows", "test-native"))
+        for index, (job_name, output_name) in enumerate(pairs.items()):
+            start = workflow.index(f"  {job_name}:\n")
+            following = [workflow.find(f"  {name}:\n", start + 1) for name in job_names]
+            following = [position for position in following if position > start]
+            end = min(following) if following else len(workflow)
+            block = workflow[start:end]
+            with self.subTest(job=job_name):
+                self.assertIn("needs: [contract, changes]", block)
+                self.assertIn(f"if: needs.changes.outputs.{output_name} == 'true'", block)
+
+        changes = workflow[workflow.index("  changes:\n"):workflow.index("  contract:\n")]
+        for output in (
+            "needs_windows",
+            "needs_macos",
+            "needs_linux_arm64",
+            "needs_desktop_package",
+            "needs_full_native",
+            "categories",
+            "reason",
+        ):
+            self.assertIn(f"{output}: ${{{{ steps.classify.outputs.{output} }}}}", changes)
 
     def test_macos_ci_host_check_does_not_use_quiet_grep_under_pipefail(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")

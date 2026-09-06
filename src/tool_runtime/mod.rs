@@ -24,6 +24,7 @@ mod file_tools;
 pub(crate) mod files;
 mod git;
 mod runner_authorization;
+mod runner_config;
 #[cfg(test)]
 pub(crate) use git::{framed_clean_show_changes_test_stdout, framed_show_changes_test_block};
 mod git_committed;
@@ -68,6 +69,7 @@ pub(crate) mod sessions;
 mod shell;
 mod shell_tools;
 pub(crate) mod skills;
+pub(crate) mod specialized;
 pub(crate) mod startup_brief;
 mod structured_execution;
 mod surface;
@@ -98,14 +100,18 @@ pub(crate) use files::{
 };
 pub(crate) use patch::MAX_UNIFIED_DIFF_BYTES;
 #[cfg(test)]
+pub(crate) use permissions::{AuthorityMode, PermissionEvaluator};
+#[cfg(test)]
 pub(crate) use runner_authorization::required_runner_capability;
 pub use runtime::ToolRuntime;
 pub use runtime_info::RuntimeInfo;
 #[cfg(test)]
 pub(crate) use session_context::workflow_session_authority_fingerprint;
+#[cfg(test)]
+pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
 pub use tool_call::{
-    ObserveJobsItem, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery, SearchResultMode,
-    ToolCall,
+    ObserveJobsItem, PluginToolCall, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery,
+    SearchResultMode, ToolCall,
 };
 pub(crate) use tool_call::{
     TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,

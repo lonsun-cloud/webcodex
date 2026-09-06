@@ -84,8 +84,10 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
     for feature in [
         RunnerFeature::Shell,
         RunnerFeature::Git,
+        RunnerFeature::StructuredCargoTestExecutionPolicy,
         RunnerFeature::ApplyTextEditLineScope,
         RunnerFeature::ApplyPatchMatchMetadata,
+        RunnerFeature::ApplyPatchMatchingMode,
         RunnerFeature::ApplyPatchStrictMatching,
         RunnerFeature::SshShell,
         RunnerFeature::PersistentShell,
@@ -98,6 +100,7 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
         RunnerFeature::CodingAgentRuns,
         RunnerFeature::SkillStoreRead,
         RunnerFeature::SkillStoreManage,
+        RunnerFeature::ManagedSshResources,
     ] {
         assert_eq!(
             feature.inference(),
@@ -149,6 +152,19 @@ async fn patch_contract_capabilities_require_their_prerequisites() {
         error,
         "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
     );
+
+    let mut registration =
+        runner_registration("matching-mode-without-metadata", "inst-c", Vec::new());
+    registration.capabilities = with_wire_feature(
+        &with_wire_feature(&v2_baseline_capabilities(), RunnerFeature::ApplyPatch, true),
+        RunnerFeature::ApplyPatchMatchingMode,
+        true,
+    );
+    let error = registry.register(registration).await.unwrap_err();
+    assert_eq!(
+        error,
+        "apply_patch_matching_mode capability requires apply_patch_match_metadata capability"
+    );
 }
 
 #[test]
@@ -170,6 +186,7 @@ fn v2_baseline_exactly_matches_generation_eligible_classification() {
         RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len()
     );
     assert_eq!(baseline, generation_eligible);
+    assert!(!baseline.contains(RunnerFeature::StructuredCargoTestExecutionPolicy.as_wire_name()));
     for feature in RunnerFeature::all() {
         if feature.inference() == RunnerFeatureInference::RegistrationRequired {
             assert!(
@@ -237,6 +254,8 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
         RunnerFeature::ComputerTextInput,
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
+        RunnerFeature::ManagedSshResources,
+        RunnerFeature::StructuredCargoTestExecutionPolicy,
     ] {
         assert_eq!(
             feature.inference(),
@@ -530,6 +549,7 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
     for feature in [
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
+        RunnerFeature::StructuredCargoTestExecutionPolicy,
     ] {
         let registry = RunnerRegistry::default();
         let client_id = format!("sticky-{}", feature.as_wire_name());

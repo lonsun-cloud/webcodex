@@ -21,7 +21,12 @@ use webcodex_runner_config::paths::paths_equal;
 
 const PROJECT_SCAN_CACHE_MS: u64 = 5000;
 const PROJECT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
-const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+// Tree shutdown also has to let the bounded stdout/stderr readers observe EOF.
+// Darwin process-group teardown and reader scheduling can legitimately take
+// longer than 500ms on loaded native CI hosts, so keep a short but realistic
+// bounded cleanup budget rather than turning successful direct-child exit into
+// a spurious reader-timeout failure.
+const PROJECT_GIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_GIT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const EXPLICIT_REGISTRATION_SOURCE: &str = "explicit";
 const AUTO_REGISTERED_REGISTRATION_SOURCE: &str = "auto_registered";
@@ -884,11 +889,8 @@ pub(crate) fn validate_project_path_policy(
     policy: &RunnerPolicy,
     canonical_path: &Path,
 ) -> Result<(), String> {
-    let canonical_roots = policy
-        .allowed_roots
-        .iter()
-        .filter_map(|root| canonicalize_existing(root).ok())
-        .collect::<Vec<_>>();
+    let canonical_roots =
+        webcodex_runner_config::paths::canonicalize_usable_allowed_roots(&policy.allowed_roots);
     webcodex_runner_config::paths::validate_project_path_policy(
         canonical_path,
         &canonical_roots,
