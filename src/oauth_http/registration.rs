@@ -10,17 +10,6 @@ use super::{apply_oauth_no_store_headers, validate_redirect_uri};
 const MAX_REGISTRATION_BODY_BYTES: usize = 16 * 1024;
 const MAX_ACTIVE_DYNAMIC_CLIENTS: usize = 256;
 const DYNAMIC_CLIENT_NAME_PREFIX: &str = "[dynamic] ";
-/// Default scopes granted when a dynamic client omits `scope`. An explicit
-/// `scope` request may use anything advertised as `scopes_supported`.
-const DYNAMIC_CLIENT_SCOPES: &[&str] = &[
-    "runtime:read",
-    "project:read",
-    "project:write",
-    "job:run",
-    "computer:read",
-    "computer:control",
-    "offline_access",
-];
 
 #[derive(Debug, Deserialize)]
 struct RegistrationRequest {
@@ -74,8 +63,11 @@ fn validate_exact_values(
 }
 
 fn normalize_scopes(requested: Option<String>) -> Result<Vec<String>, &'static str> {
+    // Default to the full discovery set: MCP hosts such as Gemini omit `scope`
+    // at registration but request every advertised scope at authorize time, so
+    // a narrower default would make their own authorize request fail.
     let Some(requested) = requested else {
-        return Ok(DYNAMIC_CLIENT_SCOPES
+        return Ok(super::scope_registry::oauth_discovery_scopes_supported()
             .iter()
             .map(|scope| (*scope).to_string())
             .collect());

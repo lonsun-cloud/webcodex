@@ -142,13 +142,13 @@ WebCodex supports both Notion authentication choices:
   actually supported confidential-client method. Authorization uses code + PKCE
   S256, and refresh tokens rotate.
 
-Dynamically registered clients receive only this closed default ceiling:
-`runtime:read`, `project:read`, `project:write`, `job:run`, `computer:read`, and
-`computer:control`. They never receive `account:manage`, `admin`, `job:detach`,
-`agent:*`, or future scopes automatically. At least one enabled managed user must
-exist before registration; the first enabled user owns these clients. Put a
-rate limit on `/oauth/register` at the reverse proxy even though WebCodex also
-caps active dynamic registrations.
+Dynamically registered clients that omit `scope` receive the full advertised
+`scopes_supported` set (never `admin` or `agent:*`), so hosts that request every
+advertised scope at authorize time—such as Gemini—can complete authorization. An
+explicit `scope` request may still narrow the client to any supported subset. At
+least one enabled managed user must exist before registration; the first enabled
+user owns these clients. Put a rate limit on `/oauth/register` at the reverse
+proxy even though WebCodex also caps active dynamic registrations.
 
 The `/mcp` transport is POST-only JSON Streamable HTTP. `GET /mcp` returns 405
 with `Allow: POST`; notifications return 202 with an empty body and explicit

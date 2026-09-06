@@ -130,11 +130,11 @@ WebCodex 支持 Notion 的两种认证方式：
   `none`，Server 也会返回实际支持的 confidential-client 方式。授权流程使用
   authorization code + PKCE S256，refresh token 会轮换。
 
-DCR client 的默认权限是固定闭集：`runtime:read`、`project:read`、`project:write`、
-`job:run`、`computer:read`、`computer:control`；不会自动得到 `account:manage`、
-`admin`、`job:detach`、任何 `agent:*` 或未来新增 scope。注册前至少要有一个未禁用的
-managed user，DCR client 归第一个未禁用用户所有。即使 WebCodex 已限制活动 DCR client
-数量，反向代理仍应对 `/oauth/register` 限流。
+DCR client 省略 `scope` 时默认获得 discovery 广告的全部 `scopes_supported`（不含
+`admin` 与任何 `agent:*`），因此像 Gemini 这样注册时省略 `scope`、授权时请求全部已广告
+scope 的宿主也能完成授权；显式 `scope` 请求仍可将 client 收窄到任意受支持子集。注册前
+至少要有一个未禁用的 managed user，DCR client 归第一个未禁用用户所有。即使 WebCodex
+已限制活动 DCR client 数量，反向代理仍应对 `/oauth/register` 限流。
 
 `/mcp` 使用只支持 POST JSON 的 Streamable HTTP：`GET /mcp` 返回 405 并带
 `Allow: POST`；notification 返回 202、空 body，并显式设置 `application/json`。

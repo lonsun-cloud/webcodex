@@ -67,9 +67,9 @@ async fn oauth_dynamic_registration_returns_confidential_least_privilege_client(
     );
     assert_eq!(
         body["scope"],
-        "runtime:read project:read project:write job:run computer:read computer:control offline_access"
+        "runtime:read runner:manage session:collaborate communication:read communication:manage project:read project:write memory:read memory:manage job:run job:detach computer:read computer:control computer:launch computer:display_read computer:pointer_control computer:clipboard_read computer:clipboard_write mcp:local plugin:inspect plugin:invoke plugin:manage ssh:local coding_agent:run account:manage offline_access"
     );
-    assert!(!body["scope"].as_str().unwrap().contains("account:manage"));
+    assert!(body["scope"].as_str().unwrap().contains("account:manage"));
     assert!(!body["scope"].as_str().unwrap().contains("admin"));
 
     let clients = db.list_oauth_clients().unwrap();
@@ -84,7 +84,7 @@ async fn oauth_dynamic_registration_returns_confidential_least_privilege_client(
     );
     assert_eq!(
         stored.allowed_scopes,
-        "runtime:read project:read project:write job:run computer:read computer:control offline_access"
+        "runtime:read runner:manage session:collaborate communication:read communication:manage project:read project:write memory:read memory:manage job:run job:detach computer:read computer:control computer:launch computer:display_read computer:pointer_control computer:clipboard_read computer:clipboard_write mcp:local plugin:inspect plugin:invoke plugin:manage ssh:local coding_agent:run account:manage offline_access"
     );
 }
 
