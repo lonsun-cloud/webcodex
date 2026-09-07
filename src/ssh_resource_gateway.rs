@@ -5,16 +5,17 @@
 //! authentication material.
 
 use crate::auth::{AuthContext, AuthKind, SCOPE_SSH_LOCAL};
-use crate::tool_runtime::specialized::{SpecializedOperationPolicy, SpecializedSource};
-use crate::tool_runtime::ToolRuntime;
-use serde::Deserialize;
+use crate::tool_runtime::sessions::SessionTransport;
+use crate::tool_runtime::specialized::{
+    SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
+};
+use crate::tool_runtime::{SshResourceToolCall, ToolResult, ToolRuntime};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 use webcodex_core::ssh_resource::{
     validate_response_for_request, SshResourceRequest, SshResourceResponse,
-    SSH_RESOURCE_DEFAULT_CWD_MAX_BYTES, SSH_RESOURCE_NAME_MAX_BYTES, SSH_RESOURCE_TARGET_MAX_BYTES,
 };
 
 pub(crate) const SSH_RESOURCE_TOOL_NAME: &str = "ssh_resource";
@@ -113,22 +114,6 @@ impl SshResourceGatewayRuntime {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Arguments {
-    action: String,
-    #[serde(default)]
-    runner: Option<String>,
-    #[serde(default)]
-    binding: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    default_cwd: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SshResourceOperation {
     List,
@@ -189,7 +174,7 @@ struct ResolvedRunner {
     runner_instance_id: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GatewayError {
     code: &'static str,
     message: &'static str,
@@ -227,55 +212,102 @@ pub(crate) fn authorized(auth: Option<&AuthContext>) -> bool {
     auth.is_some_and(|auth| auth.has_scope(SCOPE_SSH_LOCAL))
 }
 
-pub(crate) fn tool_spec() -> Value {
-    json!({
-        "name": SSH_RESOURCE_TOOL_NAME,
-        "description": "List and durably manage Runner-local named SSH resources for PersistentShell onboarding. action=list returns safe logical names plus an opaque exact-Runner/revision binding. For an explicit new SSH target, register it with that binding; mutations change durable desired state only. When restart_required=true, restart the Runner before the desired state becomes active; an idempotent operation already aligned with the startup snapshot may return false. Then list again, bind the active logical name with update_session_context, and open_session_shell. For explicit one-shot/no-persistence SSH, run_process remains valid. Targets and authentication details are never returned.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list", "register", "remove"]},
-                "runner": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "description": "Exact caller-visible Runner client id. Required only for list."
-                },
-                "binding": {
-                    "type": "string",
-                    "pattern": "^wc_sbind_[0-9a-f]{32}$",
-                    "description": "Opaque exact Runner + registry revision observation returned by list. Required for register/remove; never grants authority by itself."
-                },
-                "name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": SSH_RESOURCE_NAME_MAX_BYTES,
-                    "pattern": "^[A-Za-z0-9_.-]+$",
-                    "description": "Logical Runner-local SSH resource name. Required for register/remove."
-                },
-                "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": SSH_RESOURCE_TARGET_MAX_BYTES,
-                    "description": "Single OpenSSH destination argv, for example 17724@w10. Required only for register. It is persisted on the Runner and never echoed. SSH options or credential material are not accepted."
-                },
-                "default_cwd": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": SSH_RESOURCE_DEFAULT_CWD_MAX_BYTES,
-                    "description": "Optional remote default cwd for register."
-                },
-                "recording_session_id": {
-                    "type": "string",
-                    "pattern": "^wc_sess_[A-Za-z0-9_]+$",
-                    "description": "Optional explicit Workflow Session used for authority, read-only/guard, permission, and audit governance. It is never inferred from MCP transport identity."
-                }
-            },
-            "required": ["action"],
-            "additionalProperties": false
+pub(crate) fn mcp_output_schema() -> Value {
+    let resource_name = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": webcodex_core::ssh_resource::SSH_RESOURCE_NAME_MAX_BYTES
+        })
+    };
+    let inventory_entry = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "name": resource_name(),
+            "source": {"type": "string", "enum": ["static", "managed"]},
+            "active": {"type": "boolean"},
+            "pending_restart": {"type": "boolean"}
         },
-        "annotations": {"readOnlyHint": false}
+        "required": ["name", "source", "active", "pending_restart"]
+    });
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "runner": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "binding": {"type": "string", "pattern": "^wc_sbind_[0-9a-f]{32}$"},
+                    "resources": {
+                        "type": "array",
+                        "maxItems": webcodex_core::ssh_resource::MANAGED_SSH_RESOURCE_MAX_COUNT,
+                        "items": inventory_entry
+                    }
+                },
+                "required": ["runner", "binding", "resources"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "resource": resource_name(),
+                    "persisted": {"type": "boolean"},
+                    "active": {"type": "boolean"},
+                    "restart_required": {"type": "boolean"}
+                },
+                "required": ["resource", "persisted", "active", "restart_required"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "error": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "code": {"type": "string", "minLength": 1},
+                            "message": {"type": "string", "minLength": 1, "maxLength": 512}
+                        },
+                        "required": ["code", "message"]
+                    },
+                    "dispatchState": {
+                        "type": "string",
+                        "enum": ["not_started", "completed", "outcome_unknown"]
+                    },
+                    "recovery": {"type": "string", "minLength": 1}
+                },
+                "required": ["error", "dispatchState"]
+            }
+        ]
     })
+}
+
+pub(crate) fn tool_spec(compact: bool) -> Value {
+    let definition = webcodex_tool_contracts::lookup_tool_definition(SSH_RESOURCE_TOOL_NAME)
+        .expect("ssh_resource ToolDefinition");
+    let model_spec = definition.model_spec.expect("ssh_resource model spec");
+    let mut input_schema = (model_spec.input_schema)();
+    if let Some(properties) = input_schema["properties"].as_object_mut() {
+        properties.insert(
+            "recording_session_id".to_string(),
+            json!({
+                "type": "string",
+                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "description": "Optional explicit Workflow Session used for authority, read-only/guard, permission, and audit governance. It is never inferred from MCP transport identity."
+            }),
+        );
+    }
+    let mut value = json!({
+        "name": SSH_RESOURCE_TOOL_NAME,
+        "description": model_spec.description,
+        "inputSchema": input_schema,
+        "annotations": webcodex_tool_contracts::tool_annotations(SSH_RESOURCE_TOOL_NAME)
+    });
+    if !compact {
+        value["outputSchema"] = mcp_output_schema();
+    }
+    value
 }
 
 /// Body-free audit projection for the MCP lifecycle. The raw target is never
@@ -292,12 +324,117 @@ pub(crate) fn audit_arguments(arguments: &Value) -> Value {
     })
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SshResourceInvocationResult {
+    operation: SshResourceOperation,
+    result: Result<Value, GatewayError>,
+}
+
+impl SshResourceInvocationResult {
+    pub(crate) fn policy(&self) -> SpecializedOperationPolicy {
+        self.operation.policy()
+    }
+
+    pub(crate) fn success(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    pub(crate) fn dispatch_certainty(&self) -> &'static str {
+        self.result
+            .as_ref()
+            .err()
+            .map(|error| error.dispatch_state)
+            .unwrap_or("completed")
+    }
+
+    pub(crate) fn failure_kind(&self) -> Option<&str> {
+        self.result.as_ref().err().map(|error| error.code)
+    }
+
+    pub(crate) fn to_mcp_result(&self) -> Value {
+        match &self.result {
+            Ok(value) => success_result(value.clone()),
+            Err(error) => error_result(error.clone()),
+        }
+    }
+
+    pub(crate) fn to_tool_result(&self) -> ToolResult {
+        match &self.result {
+            Ok(value) => ToolResult::ok(value.clone()),
+            Err(error) => {
+                let mut output = json!({
+                    "error_kind": error.code,
+                    "dispatch_state": error.dispatch_state,
+                });
+                if let Some(recovery) = error.recovery {
+                    output["recovery"] = Value::String(recovery.to_string());
+                }
+                ToolResult::err_with_output(error.message, output)
+            }
+        }
+    }
+}
+
+pub(crate) async fn invoke(
+    runtime: &ToolRuntime,
+    request: SshResourceToolCall,
+    recording_session_id: Option<&str>,
+    auth: Option<&AuthContext>,
+    transport: SessionTransport,
+) -> Result<SshResourceInvocationResult, SpecializedGovernanceDenial> {
+    let Some(operation) = SshResourceOperation::parse(&request.action) else {
+        return Err(SpecializedGovernanceDenial::Tool(
+            ToolResult::err_with_output(
+                "action must be one of list, register, or remove",
+                json!({
+                    "error_kind": "ssh_resource_invalid",
+                    "dispatch_state": "not_started",
+                }),
+            ),
+        ));
+    };
+    let policy = operation.policy();
+    let audit = audit_arguments(&serde_json::to_value(&request).unwrap_or_else(|_| json!({})));
+    let permit = runtime
+        .govern_specialized_invocation(
+            SSH_RESOURCE_TOOL_NAME,
+            policy,
+            transport,
+            recording_session_id,
+            auth,
+            &audit,
+        )
+        .await?;
+    let result = execute_business(runtime, operation, request, auth).await;
+    let invocation = SshResourceInvocationResult { operation, result };
+    runtime.finish_specialized_invocation(
+        permit,
+        invocation.success(),
+        invocation.dispatch_certainty(),
+        invocation.failure_kind(),
+    );
+    Ok(invocation)
+}
+
+async fn execute_business(
+    runtime: &ToolRuntime,
+    operation: SshResourceOperation,
+    request: SshResourceToolCall,
+    auth: Option<&AuthContext>,
+) -> Result<Value, GatewayError> {
+    match operation {
+        SshResourceOperation::List => list(runtime, request, auth).await,
+        SshResourceOperation::Register => register(runtime, request, auth).await,
+        SshResourceOperation::Remove => remove(runtime, request, auth).await,
+    }
+}
+
 pub(crate) async fn call(
     runtime: &ToolRuntime,
     arguments: Value,
     auth: Option<&AuthContext>,
 ) -> Value {
-    let parsed: Arguments = match serde_json::from_value(arguments) {
+    let parsed: SshResourceToolCall = match serde_json::from_value(arguments) {
         Ok(parsed) => parsed,
         Err(_) => {
             return error_result(GatewayError::new(
@@ -318,12 +455,7 @@ pub(crate) async fn call(
             "Runner-local SSH resource access requires the ssh:local scope",
         ));
     }
-    let result = match operation {
-        SshResourceOperation::List => list(runtime, parsed, auth).await,
-        SshResourceOperation::Register => register(runtime, parsed, auth).await,
-        SshResourceOperation::Remove => remove(runtime, parsed, auth).await,
-    };
-    match result {
+    match execute_business(runtime, operation, parsed, auth).await {
         Ok(value) => success_result(value),
         Err(error) => error_result(error),
     }
@@ -331,7 +463,7 @@ pub(crate) async fn call(
 
 async fn list(
     runtime: &ToolRuntime,
-    args: Arguments,
+    args: SshResourceToolCall,
     auth: Option<&AuthContext>,
 ) -> Result<Value, GatewayError> {
     if args.binding.is_some()
@@ -375,7 +507,7 @@ async fn list(
 
 async fn register(
     runtime: &ToolRuntime,
-    args: Arguments,
+    args: SshResourceToolCall,
     auth: Option<&AuthContext>,
 ) -> Result<Value, GatewayError> {
     if args.runner.is_some() {
@@ -416,7 +548,7 @@ async fn register(
 
 async fn remove(
     runtime: &ToolRuntime,
-    args: Arguments,
+    args: SshResourceToolCall,
     auth: Option<&AuthContext>,
 ) -> Result<Value, GatewayError> {
     if args.runner.is_some() || args.target.is_some() || args.default_cwd.is_some() {
@@ -787,6 +919,26 @@ fn error_result(error: GatewayError) -> Value {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn direct_invalid_action_fails_closed_without_panicking() {
+        let runtime = ToolRuntime::new_for_tests();
+        let request = SshResourceToolCall {
+            action: "probe".to_string(),
+            runner: None,
+            binding: None,
+            name: None,
+            target: None,
+            default_cwd: None,
+        };
+        let result = invoke(&runtime, request, None, None, SessionTransport::Mcp).await;
+        let Err(SpecializedGovernanceDenial::Tool(result)) = result else {
+            panic!("invalid direct SSH resource action must fail as a bounded tool error");
+        };
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "ssh_resource_invalid");
+        assert_eq!(result.output["dispatch_state"], "not_started");
+    }
+
     #[test]
     fn audit_projection_never_contains_target_or_default_cwd() {
         let target = "17724@w10";
@@ -804,6 +956,42 @@ mod tests {
         assert_eq!(audit["resource_name"], "w10");
         assert_eq!(audit["target_present"], true);
         assert_eq!(audit["default_cwd_present"], true);
+    }
+
+    #[test]
+    fn mcp_output_schema_accepts_action_specific_structured_results() {
+        let schema = mcp_output_schema();
+        for value in [
+            json!({
+                "runner": "runner-a",
+                "binding": "wc_sbind_0123456789abcdef0123456789abcdef",
+                "resources": [{
+                    "name": "spe",
+                    "source": "managed",
+                    "active": true,
+                    "pending_restart": false
+                }]
+            }),
+            json!({
+                "resource": "spe",
+                "persisted": true,
+                "active": false,
+                "restart_required": true
+            }),
+            json!({
+                "error": {
+                    "code": "ssh_resource_registry_stale",
+                    "message": "managed SSH resource registry changed"
+                },
+                "dispatchState": "completed",
+                "recovery": "List SSH resources again before retrying."
+            }),
+        ] {
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&value, &schema)
+                .unwrap_or_else(|error| {
+                    panic!("ssh_resource MCP schema rejected {value}: {error}")
+                });
+        }
     }
 
     #[test]
