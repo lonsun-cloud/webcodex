@@ -1215,6 +1215,98 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
 }
 
 #[tokio::test]
+async fn read_files_outer_recorder_observes_canonical_batch_before_primary_projection() {
+    use crate::tool_runtime::kernel::{
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-canonical-before-projection";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let recording_session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("canonical batch evidence".to_string()),
+    );
+    let business_session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("inner business read".to_string()),
+    );
+    let auth = auth_context(None, true);
+    let arguments = json!({
+        "project": project,
+        "items": [{"path": "a.rs"}, {"path": "b.rs"}],
+        "session_id": business_session.session_id,
+        "max_result_bytes": 8192
+    });
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let session_id = recording_session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .call_tool_with_invocation_metadata(
+                    ToolCallRequest {
+                        tool_name: "read_files".to_string(),
+                        arguments,
+                    },
+                    ToolCallContext {
+                        transport: ToolTransport::Mcp,
+                        session_id: Some(&session_id),
+                        auth: Some(&auth),
+                        window: None,
+                        record_oauth_scope_denials: false,
+                        host_file_import_trust: HostFileImportTrust::Untrusted,
+                    },
+                    ToolInvocationMetadata::default(),
+                    ToolProtocolCapabilities::default(),
+                )
+                .await
+        }
+    });
+    let content = format!("{}\n", "x".repeat(3_000));
+    for _ in 0..2 {
+        let request = next_read_request(&runtime, client_id).await;
+        complete_read(&runtime, client_id, &request, &content).await;
+    }
+
+    let result = task.await.unwrap().result.expect("model-facing result");
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["output_truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "batch_response_budget");
+    assert_eq!(result.output["returned_count"], 1);
+    assert_eq!(result.output["next_index"], 1);
+    assert_eq!(
+        result.output["continuation"]["suggested_call"]["arguments"]["session_id"],
+        business_session.session_id,
+        "model continuation must preserve the concrete business Session rather than inherit the outer recorder"
+    );
+
+    let recording_summary = runtime
+        .sessions
+        .summary(&recording_session.session_id, Some(20))
+        .unwrap();
+    let recording_event = finished_event(&recording_summary, "read_files");
+    assert_eq!(
+        recording_event.observed_paths,
+        vec!["a.rs".to_string(), "b.rs".to_string()],
+        "outer recorder must consume canonical batch evidence before the terminal model budget"
+    );
+    let business_summary = runtime
+        .sessions
+        .summary(&business_session.session_id, Some(20))
+        .unwrap();
+    let business_event = finished_event(&business_summary, "read_files");
+    assert_eq!(
+        business_event.observed_paths,
+        vec!["a.rs".to_string(), "b.rs".to_string()],
+        "concrete business Session must remain independently recorded with canonical evidence"
+    );
+}
+
+#[tokio::test]
 async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
     use crate::tool_runtime::kernel::{
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
