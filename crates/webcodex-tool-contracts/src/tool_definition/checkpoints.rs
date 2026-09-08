@@ -18,6 +18,19 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     git_like(model_spec(
         def(
             "workspace_checkpoint_create",
+            super::ToolAuditPolicy::TYPED_CANONICAL.context(
+                super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::value("checkpoint_id"),
+                    super::ToolAuditResultField::value("head"),
+                    super::ToolAuditResultField::value("branch"),
+                    super::ToolAuditResultField::value("complete"),
+                    super::ToolAuditResultField::value("tracked_diff_bytes"),
+                    super::ToolAuditResultField::value("staged_diff_bytes"),
+                    super::ToolAuditResultField::value("untracked_file_count"),
+                    super::ToolAuditResultField::value("status_summary"),
+                    super::ToolAuditResultField::value("kind"),
+                ]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_CHECKPOINT,
             Some(FileRead),
@@ -40,6 +53,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "workspace_checkpoint_list",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_CHECKPOINT,
             Some(OwnerOnly),
@@ -62,6 +76,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "workspace_checkpoint_show",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_CHECKPOINT,
             Some(OwnerOnly),
@@ -85,6 +100,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "workspace_checkpoint_restore",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_CHECKPOINT,
             Some(FileWrite),
@@ -109,6 +125,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "workspace_checkpoint_delete",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_CHECKPOINT,
             Some(OwnerOnly),

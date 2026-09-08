@@ -19,6 +19,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "project_overview",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             Some(FileRead),
@@ -41,6 +42,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "list_project_files",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(FileRead),
@@ -63,6 +65,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "list_project_tracked_files",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_FILE,
             // Runs `git ls-files` on the Runner, so the shell capability is what
@@ -87,6 +90,9 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "search_project_text",
+            super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                super::ToolAuditSessionInputPolicy::OmitTopLevel(&["pattern"]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(Shell),
@@ -110,6 +116,8 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(model_spec(
             def(
                 "search_project_texts",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .session_input(super::ToolAuditSessionInputPolicy::SearchProjectTexts),
                 ModelVisible,
                 TOOL_CATEGORY_FILE,
                 Some(Shell),
@@ -137,6 +145,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "read_file",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(FileRead),
@@ -160,6 +169,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(model_spec(
             def(
                 "read_files",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_FILE,
                 Some(FileRead),

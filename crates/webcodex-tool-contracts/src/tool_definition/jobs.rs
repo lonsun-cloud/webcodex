@@ -25,6 +25,14 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "run_process",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                        "executable",
+                        "args",
+                        "stdin",
+                        "process_summary",
+                    ]))
+                    .execution(super::ToolAuditExecutionPolicy::DIRECT_ARGV_TEST_COUNTS),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(StructuredProcess),
@@ -50,6 +58,15 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "run_detached_process",
+                super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                    super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                        "executable",
+                        "args",
+                        "stdin",
+                        "idempotency_key",
+                        "process_summary",
+                    ]),
+                ),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(DetachedProcess),
@@ -74,6 +91,14 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "run_script",
+            super::ToolAuditPolicy::TYPED_CANONICAL
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                    "script",
+                    "args",
+                    "stdin",
+                    "script_summary",
+                ]))
+                .execution(super::ToolAuditExecutionPolicy::SCRIPT_TEST_COUNTS),
             ModelVisible,
             TOOL_CATEGORY_JOB,
             Some(StructuredScript),
@@ -96,6 +121,12 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "run_shell",
+            super::ToolAuditPolicy::TYPED_CANONICAL
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                    "command",
+                    "command_summary",
+                ]))
+                .execution(super::ToolAuditExecutionPolicy::TEST_COUNTS),
             ModelVisible,
             TOOL_CATEGORY_JOB,
             Some(Shell),
@@ -118,6 +149,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
             def(
                 "open_session_shell",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(PersistentShell),
@@ -140,6 +172,12 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
             def(
                 "session_shell_exec",
+                super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                    super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                        "command",
+                        "command_summary",
+                    ]),
+                ),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(PersistentShell),
@@ -162,6 +200,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "session_shell_status",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_JOB,
             Some(PersistentShell),
@@ -185,6 +224,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "close_session_shell",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(PersistentShell),
@@ -210,6 +250,12 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "run_job",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                        "command",
+                        "command_summary",
+                    ]))
+                    .execution(super::ToolAuditExecutionPolicy::TEST_COUNTS),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 Some(AsyncJobs),
@@ -235,6 +281,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "stop_job",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 None,
@@ -259,6 +306,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "job_status",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_JOB,
             None,
@@ -281,6 +329,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "job_log",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_JOB,
             None,
@@ -304,6 +353,8 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "observe_jobs",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .session_input(super::ToolAuditSessionInputPolicy::ObserveJobs),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 None,
@@ -332,6 +383,9 @@ pub(super) const LISTING_DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "list_jobs",
+                super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                    super::ToolAuditSessionInputPolicy::OmitTopLevel(&["project", "session_id"]),
+                ),
                 ModelVisible,
                 TOOL_CATEGORY_JOB,
                 None,
@@ -355,6 +409,7 @@ pub(super) const LISTING_DEFINITIONS: &[ToolDefinition] = &[
     ),
     def(
         "job_tail",
+        super::ToolAuditPolicy::TYPED_CANONICAL,
         ModelHidden,
         TOOL_CATEGORY_JOB,
         None,

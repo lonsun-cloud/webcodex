@@ -19,6 +19,18 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(change_summary_like(git_like(model_spec(
         def(
             "git_diff_summary",
+            super::ToolAuditPolicy::TYPED_CANONICAL.context(
+                super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::value("clean"),
+                    super::ToolAuditResultField::value("branch"),
+                    super::ToolAuditResultField::value("head"),
+                    super::ToolAuditResultField::value("upstream"),
+                    super::ToolAuditResultField::value("ahead"),
+                    super::ToolAuditResultField::value("behind"),
+                    super::ToolAuditResultField::value("counts"),
+                    super::ToolAuditResultField::value("changed_files"),
+                ]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_GIT,
             Some(GitOrShell),
@@ -42,6 +54,20 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(change_summary_like(git_like(model_spec(
             def(
                 "git_review_summary",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("project"),
+                    super::ToolAuditResultField::value("scope"),
+                    super::ToolAuditResultField::value("stats"),
+                    super::ToolAuditResultField::value("coverage"),
+                    super::ToolAuditResultField::value("truncation"),
+                    super::ToolAuditResultField::value("deterministic"),
+                    super::ToolAuditResultField::value("llm_summary"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("reason_code"),
+                    super::ToolAuditResultField::array_len("signal_count", "signals"),
+                    super::ToolAuditResultField::array_len("file_count", "files"),
+                ])
+                .drop_null_request_values(),
                 ModelVisible,
                 TOOL_CATEGORY_GIT,
                 Some(GitOrShell),
@@ -67,6 +93,18 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(change_summary_like(git_like(model_spec(
             def(
                 "show_changes",
+                super::ToolAuditPolicy::TYPED_CANONICAL.context(
+                    super::ToolAuditContextPolicy::Fields(&[
+                        super::ToolAuditResultField::value("clean"),
+                        super::ToolAuditResultField::value("branch"),
+                        super::ToolAuditResultField::value("head"),
+                        super::ToolAuditResultField::value("upstream"),
+                        super::ToolAuditResultField::value("ahead"),
+                        super::ToolAuditResultField::value("behind"),
+                        super::ToolAuditResultField::value("counts"),
+                        super::ToolAuditResultField::value("changed_files"),
+                    ]),
+                ),
                 ModelVisible,
                 TOOL_CATEGORY_GIT,
                 Some(GitOrShell),
@@ -94,6 +132,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
     require_all_scopes(git_like(model_spec(
         def(
             "git_commit_paths",
+            super::ToolAuditPolicy::TYPED_CANONICAL.drop_null_request_values(),
             ModelVisible,
             TOOL_CATEGORY_GIT,
             Some(GitOrShell),
@@ -116,6 +155,8 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(git_like(model_spec(
         def(
             "git_status",
+            super::ToolAuditPolicy::TYPED_CANONICAL
+                .context(super::ToolAuditContextPolicy::WorkingTreeStatus),
             ModelVisible,
             TOOL_CATEGORY_GIT,
             Some(GitOrShell),
@@ -138,6 +179,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(git_like(model_spec(
         def(
             "git_diff",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_GIT,
             Some(GitOrShell),
@@ -161,6 +203,22 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(change_summary_like(git_like(model_spec(
             def(
                 "git_diff_hunks",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("project"),
+                    super::ToolAuditResultField::value("scope"),
+                    super::ToolAuditResultField::value("cached"),
+                    super::ToolAuditResultField::value("hunk_count"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("truncation_reasons"),
+                    super::ToolAuditResultField::value("has_more"),
+                    super::ToolAuditResultField::value("exit_code"),
+                    super::ToolAuditResultField::value("error_kind"),
+                    super::ToolAuditResultField::value("reason_code"),
+                    super::ToolAuditResultField::array_len("file_count", "files"),
+                ])
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                    "continuation",
+                ])),
                 ModelVisible,
                 TOOL_CATEGORY_GIT,
                 Some(GitOrShell),
@@ -185,6 +243,13 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(git_like(model_spec(
         def(
             "git_log",
+            super::ToolAuditPolicy::TYPED_CANONICAL.context(
+                super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::value("commits"),
+                    super::ToolAuditResultField::value("next_skip"),
+                    super::ToolAuditResultField::value("truncated"),
+                ]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_GIT,
             Some(GitOrShell),

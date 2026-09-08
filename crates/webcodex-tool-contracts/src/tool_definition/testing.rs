@@ -15,6 +15,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     captures_validation_output(model_spec(
         def(
             "cargo_fmt",
+            super::ToolAuditPolicy::TYPED_CANONICAL
+                .execution(super::ToolAuditExecutionPolicy::TEXT),
             ModelVisible,
             TOOL_CATEGORY_VALIDATION,
             Some(Shell),
@@ -38,6 +40,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         captures_validation_output(model_spec(
             def(
                 "cargo_check",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .execution(super::ToolAuditExecutionPolicy::TEXT),
                 ModelVisible,
                 TOOL_CATEGORY_VALIDATION,
                 Some(Shell),
@@ -63,6 +67,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         captures_validation_output(model_spec(
             def(
                 "cargo_test",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .execution(super::ToolAuditExecutionPolicy::TEST_ASSERTIONS),
                 ModelVisible,
                 TOOL_CATEGORY_VALIDATION,
                 Some(Shell),
@@ -87,6 +93,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     captures_validation_output(model_spec(
             def(
                 "go_test",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .execution(super::ToolAuditExecutionPolicy::TEST_COUNTS),
                 ModelVisible,
                 TOOL_CATEGORY_VALIDATION,
                 Some(OwnerOnly),
