@@ -1,13 +1,11 @@
 name: CI
 
+# Fork policy: keep the full upstream cross-platform CI available only on demand.
+# Automatic builds are limited to docker-multiarch.yml and release-musl.yml.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
 
-# Keep only the newest run for a PR. Main pushes use the commit SHA as the
-# group key, so every merged main commit still receives its own full CI run.
+# Manual full-CI runs use the selected commit SHA as their concurrency key.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -54,7 +52,9 @@ jobs:
       - name: Classify native CI risk
         id: classify
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          # The classifier supports push/pull_request; a manual run intentionally
+          # requests the same complete matrix as an upstream main push.
+          EVENT_NAME: push
           EXTERNAL_CONTRIBUTOR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login != github.repository_owner }}
           RUN_CI: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}

@@ -2,9 +2,9 @@ name: Release server image
 
 run-name: Release server image ${{ github.event.release.tag_name || inputs.tag }}
 
+# Fork policy: container images are published by docker-multiarch.yml.
+# Keep this upstream publication adapter manual-only to avoid duplicate builds.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:

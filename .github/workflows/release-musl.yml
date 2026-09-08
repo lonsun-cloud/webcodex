@@ -4,6 +4,7 @@ run-name: Release musl ${{ github.event_name == 'workflow_dispatch' && inputs.ta
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -14,7 +15,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-musl-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -39,20 +40,13 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Resolve immutable build metadata
         id: metadata
         shell: bash
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release tag: $tag" >&2
-            exit 1
-          fi
-
-          version="${tag#v}"
           workspace_version="$(python3 - <<'PY'
           import tomllib
           from pathlib import Path
@@ -61,25 +55,43 @@ jobs:
               print(tomllib.load(source)["workspace"]["package"]["version"])
           PY
           )"
-          if [ "$workspace_version" != "$version" ]; then
-            echo "Tag/source version mismatch: tag=$version workspace=$workspace_version" >&2
-            exit 1
+
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            # A main push produces a verified short-lived Actions artifact without
+            # creating a GitHub Release or triggering any other packaging workflow.
+            tag=""
+            version="$workspace_version"
+            source_sha="$GITHUB_SHA"
+            checkout_label="$source_sha"
+          else
+            tag="$RELEASE_TAG"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid release tag: $tag" >&2
+              exit 1
+            fi
+
+            version="${tag#v}"
+            if [ "$workspace_version" != "$version" ]; then
+              echo "Tag/source version mismatch: tag=$version workspace=$workspace_version" >&2
+              exit 1
+            fi
+            source_sha="$(git rev-list -n 1 "$tag")"
+            checkout_label="$tag"
           fi
 
-          source_sha="$(git rev-list -n 1 "$tag")"
           if [ "$(git rev-parse HEAD)" != "$source_sha" ]; then
-            echo "Checked-out HEAD does not match $tag." >&2
+            echo "Checked-out HEAD does not match $checkout_label." >&2
             exit 1
           fi
           if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-            echo "Release checkout is not clean." >&2
+            echo "Build checkout is not clean." >&2
             exit 1
           fi
 
-          # Commit time works for annotated and lightweight tags.
+          # Commit time is stable for branch snapshots and tagged releases.
           built_at="$(git log -1 --format=%ct "$source_sha")"
           if [[ ! "$built_at" =~ ^[0-9]+$ ]]; then
-            echo "Could not resolve the source commit timestamp for $tag." >&2
+            echo "Could not resolve the source commit timestamp for $checkout_label." >&2
             exit 1
           fi
 
@@ -216,8 +228,11 @@ jobs:
     needs:
       - prepare
       - build
+    if: needs.prepare.outputs.tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
