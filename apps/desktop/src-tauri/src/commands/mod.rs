@@ -1,6 +1,6 @@
 use crate::activity::ActivityEntry;
 use crate::error::DesktopError;
-use crate::models::{DesktopStateSnapshot, ProjectSelection};
+use crate::models::{DesktopStateSnapshot, ProjectSelection, TunnelProxyMode};
 use crate::state::AppState;
 use serde::Deserialize;
 use tauri::State;
@@ -9,6 +9,12 @@ use tauri::State;
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRequest {
     pub project_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSetupRequest {
+    pub project_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +38,13 @@ pub struct CancelDesktopOperationRequest {
     pub operation_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelProxyRequest {
+    pub mode: TunnelProxyMode,
+    pub custom_url: Option<String>,
+}
+
 #[tauri::command]
 pub async fn get_desktop_state(
     state: State<'_, AppState>,
@@ -47,6 +60,23 @@ pub async fn refresh_runtime_status(
 }
 
 #[tauri::command]
+pub async fn resume_saved_runtime(
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    state.resume_saved_runtime().await
+}
+
+#[tauri::command]
+pub async fn update_tunnel_proxy(
+    request: TunnelProxyRequest,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    state
+        .update_tunnel_proxy(request.mode, request.custom_url.as_deref())
+        .await
+}
+
+#[tauri::command]
 pub async fn inspect_project(
     request: ProjectRequest,
     state: State<'_, AppState>,
@@ -56,10 +86,12 @@ pub async fn inspect_project(
 
 #[tauri::command]
 pub async fn configure_local_setup(
-    request: ProjectRequest,
+    request: LocalSetupRequest,
     state: State<'_, AppState>,
 ) -> Result<DesktopStateSnapshot, DesktopError> {
-    state.configure_local_setup(&request.project_path).await
+    state
+        .configure_local_setup(request.project_path.as_deref())
+        .await
 }
 
 #[tauri::command]

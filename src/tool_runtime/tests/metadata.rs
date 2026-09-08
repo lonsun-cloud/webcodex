@@ -381,6 +381,7 @@ async fn register_agent_projects_for_auth(
                         lsp_call_hierarchy: false,
                         project_lifecycle: false,
                         project_path_registration: false,
+                        managed_worktree: false,
                         skill_store_read: false,
                         skill_store_manage: false,
                         computer_observe: false,
@@ -1989,7 +1990,6 @@ async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate
 
     for field in [
         "temporary_project_name",
-        "mode",
         "deny_write_tools",
         "deny_shell_tools",
         "detail",
@@ -2006,8 +2006,16 @@ async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate
             "retired start-only flattened arg {field} must not remain in ToolCallRequest"
         );
     }
-    assert!(accepted_fields.contains("execution_context"));
-    assert!(properties.contains_key("execution_context"));
+    for field in ["mode", "base_ref", "execution_context"] {
+        assert!(
+            accepted_fields.contains(field),
+            "current model-visible flattened field {field} must be owned by the manifest"
+        );
+        assert!(
+            properties.contains_key(field),
+            "current model-visible flattened field {field} must be declared by ToolCallRequest"
+        );
+    }
 
     for field in properties.keys() {
         if TOOL_CALL_WRAPPER_FIELDS.contains(&field.as_str()) {

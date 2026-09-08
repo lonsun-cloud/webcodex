@@ -12,7 +12,8 @@ use crate::model_surface::{ModelSurface, RuntimeExposure};
 use crate::tool_request_trace::ToolRequestLifecycle;
 use crate::tool_runtime::kernel::{
     check_runtime_tool_scope, HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
-    ToolCallRequest as KernelToolCallRequest, ToolProtocolCapabilities, ToolTransport,
+    ToolCallRequest as KernelToolCallRequest, ToolInvocationMetadata, ToolProtocolCapabilities,
+    ToolTransport,
 };
 use crate::tool_runtime::model_ergonomics_telemetry::{
     ModelErgonomicsRecord, ModelErgonomicsTimer,
@@ -21,9 +22,7 @@ use crate::tool_runtime::specialized::SpecializedGovernanceDenial;
 use crate::tool_runtime::tool_definition::{
     is_adaptive_runtime_direct_tool, runtime_tool_accepts_context_ack, LOCAL_CODING_TOOL_NAMES,
 };
-#[cfg(test)]
-use crate::tool_runtime::ToolResult;
-use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolRuntime, ToolSpec};
+use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolResult, ToolRuntime, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -64,45 +63,20 @@ fn full_operator_runtime_specs_for_auth(
     });
     if stateless_2026 {
         specs.extend(
-            crate::tool_runtime::skill_runtime_tool_specs()
+            crate::tool_runtime::stateless_operator_extension_tool_specs()
                 .into_iter()
                 .filter(|spec| {
-                    !oauth_scope_projection || check_runtime_tool_scope(auth, &spec.name).is_ok()
+                    if crate::tool_runtime::skills::is_skill_runtime_tool_name(&spec.name) {
+                        !oauth_scope_projection
+                            || check_runtime_tool_scope(auth, &spec.name).is_ok()
+                    } else if crate::tool_runtime::skills::is_skill_management_tool_name(&spec.name)
+                    {
+                        auth.is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
+                    } else {
+                        check_runtime_tool_scope(auth, &spec.name).is_ok()
+                    }
                 }),
         );
-        if auth.is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN)) {
-            specs.extend(crate::tool_runtime::skill_management_tool_specs());
-        }
-        specs.extend(
-            crate::tool_runtime::memory_runtime_tool_specs()
-                .into_iter()
-                .chain(crate::tool_runtime::memory_management_tool_specs())
-                .filter(|spec| check_runtime_tool_scope(auth, &spec.name).is_ok()),
-        );
-        specs.extend(
-            crate::tool_runtime::operator_diagnostic_tool_specs()
-                .into_iter()
-                .filter(|spec| check_runtime_tool_scope(auth, &spec.name).is_ok()),
-        );
-    }
-    specs
-}
-
-/// Full model-visible target universe reachable through the adaptive gateway.
-///
-/// This is intentionally independent of the current caller's OAuth scopes. The
-/// gateway decides only whether a target belongs to an admitted model surface;
-/// the selected target's existing scope/authority checks remain authoritative
-/// after routing. Stateless-only extensions are included only in the protocol
-/// era where Full Operator can model-expose them.
-fn adaptive_runtime_gateway_target_specs(stateless_2026: bool) -> Vec<ToolSpec> {
-    let mut specs = registered_tool_specs();
-    if stateless_2026 {
-        specs.extend(crate::tool_runtime::skill_runtime_tool_specs());
-        specs.extend(crate::tool_runtime::skill_management_tool_specs());
-        specs.extend(crate::tool_runtime::memory_runtime_tool_specs());
-        specs.extend(crate::tool_runtime::memory_management_tool_specs());
-        specs.extend(crate::tool_runtime::operator_diagnostic_tool_specs());
     }
     specs
 }
@@ -110,7 +84,7 @@ fn adaptive_runtime_gateway_target_specs(stateless_2026: bool) -> Vec<ToolSpec> 
 fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
     ToolSpec {
         name: ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME.to_string(),
-        description: "Call one model-visible long-tail runtime tool through the adaptive surface. Runtime argument validation, OAuth scope checks, project authority, permission gates, and tool effects remain unchanged.".to_string(),
+        description: "Call one gateway-admitted long-tail runtime tool through the adaptive surface. Tools discovered with availability=direct must be invoked directly; if the host has not loaded that callable, rediscover/load it instead of retrying through this gateway. Runtime argument validation, OAuth scope checks, project authority, permission gates, and tool effects remain unchanged.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -118,7 +92,7 @@ fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
-                    "description": "Exact model-visible runtime tool name obtained from bounded runtime discovery."
+                    "description": "Exact gateway-admitted runtime tool name obtained from bounded runtime discovery. Do not pass tools whose discovery availability is direct."
                 },
                 "arguments": {
                     "type": "object",
@@ -143,18 +117,60 @@ fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
     }
 }
 
-fn adaptive_runtime_gateway_target_allowed(target: &str, stateless_2026: bool) -> bool {
-    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME || is_adaptive_runtime_direct_tool(target) {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptiveRuntimeGatewayTargetRoute {
+    Gateway,
+    Direct,
+    Recursive,
+    Unknown,
+}
+
+fn adaptive_runtime_gateway_target_route(
+    target: &str,
+    stateless_2026: bool,
+) -> AdaptiveRuntimeGatewayTargetRoute {
+    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
+        return AdaptiveRuntimeGatewayTargetRoute::Recursive;
     }
-    if target == crate::mcp_gateway::MCP_TOOL_NAME
-        || target == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
-    {
-        return true;
+    let operator_extension_admitted = stateless_2026
+        && crate::tool_runtime::stateless_operator_extension_tool_specs()
+            .iter()
+            .any(|spec| spec.name == target);
+    let (availability, gateway_tool) = if operator_extension_admitted {
+        ModelSurface::AdaptiveRuntime
+            .runtime_tool_invocation_route_with_operator_extension(target, true)
+    } else {
+        ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(target)
+    };
+    match (availability, gateway_tool) {
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT, None) => {
+            return AdaptiveRuntimeGatewayTargetRoute::Direct;
+        }
+        (
+            crate::model_surface::TOOL_SURFACE_AVAILABILITY_GATEWAY,
+            Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+        ) => {
+            return AdaptiveRuntimeGatewayTargetRoute::Gateway;
+        }
+        _ => {}
     }
-    adaptive_runtime_gateway_target_specs(stateless_2026)
-        .iter()
-        .any(|spec| spec.name == target)
+    // The MCP adapter's own gateway remains a specialized protocol route. It is
+    // not part of the runtime ToolSpec extension universe.
+    if target == crate::mcp_gateway::MCP_TOOL_NAME {
+        return AdaptiveRuntimeGatewayTargetRoute::Gateway;
+    }
+    AdaptiveRuntimeGatewayTargetRoute::Unknown
+}
+
+#[cfg(test)]
+pub(crate) fn adaptive_runtime_gateway_target_admitted_for_test(
+    target: &str,
+    stateless_2026: bool,
+) -> bool {
+    matches!(
+        adaptive_runtime_gateway_target_route(target, stateless_2026),
+        AdaptiveRuntimeGatewayTargetRoute::Gateway
+    )
 }
 
 fn unwrap_adaptive_runtime_gateway_arguments(
@@ -172,11 +188,6 @@ fn unwrap_adaptive_runtime_gateway_arguments(
         .ok_or_else(|| {
             "adaptive runtime gateway field 'tool' must be a non-empty string".to_string()
         })?;
-    if !adaptive_runtime_gateway_target_allowed(&target, stateless_2026) {
-        return Err(format!(
-            "tool '{target}' is not available through the adaptive runtime gateway"
-        ));
-    }
     let mut target_arguments = outer.remove("arguments").unwrap_or_else(|| json!({}));
     if target_arguments.is_null() {
         target_arguments = json!({});
@@ -208,6 +219,42 @@ fn unwrap_adaptive_runtime_gateway_arguments(
         }
     }
     Ok((target, target_arguments))
+}
+
+fn adaptive_runtime_gateway_route_failure(target: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!("tool '{target}' is direct on the adaptive runtime surface; invoke its direct callable. If the host has not loaded it, rediscover/load that direct tool instead of retrying through call_runtime_tool"),
+        json!({
+            "error_kind": "wrong_invocation_route",
+            "execution_state": "not_started",
+            "state_changed": false,
+            "target_tool": target,
+            "correct_route": {
+                "mode": "direct",
+                "availability": "direct"
+            },
+            "recovery": {
+                "tool": target,
+                "route": {"mode": "direct"},
+                "rediscover_if_unloaded": true,
+                "retry_via_gateway": false
+            },
+            "recovery_kind": "fix_input"
+        }),
+    )
+}
+
+fn adaptive_runtime_gateway_unknown_target(target: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!("unknown adaptive runtime tool '{target}'"),
+        json!({
+            "error_kind": "unknown_tool",
+            "execution_state": "not_started",
+            "state_changed": false,
+            "target_tool": target,
+            "recovery_kind": "fix_input"
+        }),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,6 +570,14 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, _app_enabled: bool) -> 
         // Match ToolSpec's camelCase serde so default behavior is unchanged.
         serde_json::to_value(spec).unwrap_or_else(|_| json!({}))
     };
+    if !compact && tool_name == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "outputSchema".to_string(),
+                crate::ssh_resource_gateway::mcp_output_schema(),
+            );
+        }
+    }
     if tool_name == "import_conversation_files_to_project" {
         if let Some(object) = value.as_object_mut() {
             object.insert(
@@ -593,9 +648,11 @@ pub(super) async fn handle_list(
                     tools.push(crate::mcp_gateway::tool_spec());
                 }
             }
-            if crate::ssh_resource_gateway::authorized(auth) {
+            if model_surface == ModelSurface::LocalCoding
+                && crate::ssh_resource_gateway::authorized(auth)
+            {
                 if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
-                    tools.push(crate::ssh_resource_gateway::tool_spec());
+                    tools.push(crate::ssh_resource_gateway::tool_spec(compact_schemas));
                 }
             }
             result
@@ -1065,6 +1122,18 @@ pub(super) fn strip_stateless_ack_session_context_revision(arguments: &mut Value
         .remove(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
 }
 
+pub(super) fn session_context_revision_ack_from_wire(
+    value: Option<Value>,
+) -> crate::tool_runtime::sessions::SessionContextRevisionAck {
+    match value {
+        None => crate::tool_runtime::sessions::SessionContextRevisionAck::Unacknowledged,
+        Some(value) => value
+            .as_u64()
+            .map(crate::tool_runtime::sessions::SessionContextRevisionAck::Revision)
+            .unwrap_or(crate::tool_runtime::sessions::SessionContextRevisionAck::Invalid),
+    }
+}
+
 pub(super) async fn handle_call(
     runtime: &ToolRuntime,
     connector: Option<&ConnectorRuntime>,
@@ -1188,8 +1257,72 @@ pub(super) async fn handle_call(
                     return McpOutcome::BadRequest(rpc_error(id, -32602, message));
                 }
             };
-        params.name = target;
-        params.arguments = arguments;
+        match adaptive_runtime_gateway_target_route(&target, stateless_2026) {
+            AdaptiveRuntimeGatewayTargetRoute::Gateway => {
+                params.name = target;
+                params.arguments = arguments;
+            }
+            AdaptiveRuntimeGatewayTargetRoute::Direct => {
+                if let Err(ToolCallErrorStatus::InsufficientScope {
+                    required_scope,
+                    description,
+                }) = check_runtime_tool_scope(auth, &target)
+                {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("forbidden");
+                        lc.dispatch_finished(false, Some(false), "forbidden");
+                    }
+                    return scope_forbidden(auth, required_scope, description);
+                }
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("wrong_invocation_route");
+                    lc.dispatch_finished(false, Some(false), "wrong_invocation_route");
+                }
+                let completion = ModelErgonomicsTimer::start(&target).map(|timer| timer.finish());
+                let rendered = mcp_runtime_tool_result_fallback(
+                    adaptive_runtime_gateway_route_failure(&target),
+                );
+                if let (Some(slot), Some(completion)) =
+                    (model_ergonomics_out.as_deref_mut(), completion.as_ref())
+                {
+                    *slot = rendered.get("structuredContent").and_then(|structured| {
+                        completion.record_for_structured_content(structured)
+                    });
+                }
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    if stateless_2026 {
+                        mcp_stateless_result(rendered, false)
+                    } else {
+                        rendered
+                    },
+                ));
+            }
+            AdaptiveRuntimeGatewayTargetRoute::Unknown => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("unknown_tool");
+                    lc.dispatch_finished(false, Some(false), "unknown_tool");
+                }
+                let rendered = mcp_runtime_tool_result_fallback(
+                    adaptive_runtime_gateway_unknown_target(&target),
+                );
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    if stateless_2026 {
+                        mcp_stateless_result(rendered, false)
+                    } else {
+                        rendered
+                    },
+                ));
+            }
+            AdaptiveRuntimeGatewayTargetRoute::Recursive => {
+                return McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    "call_runtime_tool cannot target itself through the adaptive runtime gateway",
+                ));
+            }
+        }
     }
     if let Some(lc) = lifecycle.as_deref() {
         let audit = if params.name == crate::plugin_gateway::PLUGIN_TOOL_NAME {
@@ -1318,7 +1451,9 @@ pub(super) async fn handle_call(
             },
         ));
     }
-    if params.name == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME {
+    if params.name == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
+        && (model_surface != ModelSurface::AdaptiveRuntime || via_adaptive_runtime_gateway)
+    {
         let recording_session_id = match strip_recording_session_id(&mut params.arguments) {
             Ok(session_id) => session_id,
             Err(message) => {
@@ -1355,18 +1490,40 @@ pub(super) async fn handle_call(
             }
         };
         let audit = crate::ssh_resource_gateway::audit_arguments(&params.arguments);
-        let permit = match runtime
-            .govern_specialized_invocation(
-                &params.name,
-                policy,
-                crate::tool_runtime::sessions::SessionTransport::Mcp,
-                recording_session_id.as_deref(),
-                auth,
-                &audit,
-            )
-            .await
+        let request = match serde_json::from_value::<crate::tool_runtime::SshResourceToolCall>(
+            params.arguments.clone(),
+        ) {
+            Ok(request) if request.validate().is_ok() => request,
+            _ => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.capture_payload("effective_arguments", &audit);
+                }
+                let result =
+                    crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
+                let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_finished(true, Some(ok), if ok { "success" } else { "tool_error" });
+                }
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    if stateless_2026 {
+                        mcp_stateless_result(result, false)
+                    } else {
+                        result
+                    },
+                ));
+            }
+        };
+        let invocation = match crate::ssh_resource_gateway::invoke(
+            runtime,
+            request,
+            recording_session_id.as_deref(),
+            auth,
+            crate::tool_runtime::sessions::SessionTransport::Mcp,
+        )
+        .await
         {
-            Ok(permit) => permit,
+            Ok(invocation) => invocation,
             Err(SpecializedGovernanceDenial::Scope {
                 required_scope,
                 description,
@@ -1395,23 +1552,16 @@ pub(super) async fn handle_call(
                 ));
             }
         };
+        let ok = invocation.success();
         if let Some(lc) = lifecycle.as_deref() {
             lc.capture_payload("effective_arguments", &audit);
-            lc.capture_payload("specialized_governance", &permit.audit_projection());
-        }
-        let result = crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
-        let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
-        let failure_kind = result
-            .pointer("/structuredContent/error/code")
-            .and_then(Value::as_str);
-        let dispatch_certainty = result
-            .pointer("/structuredContent/dispatchState")
-            .and_then(Value::as_str)
-            .unwrap_or("completed");
-        runtime.finish_specialized_invocation(permit, ok, dispatch_certainty, failure_kind);
-        if let Some(lc) = lifecycle.as_deref() {
+            lc.capture_payload(
+                "specialized_governance",
+                &invocation.policy().audit_projection(),
+            );
             lc.dispatch_finished(true, Some(ok), if ok { "success" } else { "tool_error" });
         }
+        let result = invocation.to_mcp_result();
         return McpOutcome::Ok(rpc_result(
             id,
             if stateless_2026 {
@@ -1518,11 +1668,6 @@ pub(super) async fn handle_call(
         Vec::new()
     };
     let session_message_resolution = if stateless_2026 {
-        if let Some(arguments) = params.arguments.as_object_mut() {
-            arguments.remove(
-                crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD,
-            );
-        }
         match strip_stateless_session_message_resolution(&mut params.arguments) {
             Ok(value) => value,
             Err(message) => {
@@ -1558,28 +1703,8 @@ pub(super) async fn handle_call(
         }
         return McpOutcome::BadRequest(rpc_error(id, -32602, message));
     }
-    if let (Some(arguments), Some(resolution)) =
-        (params.arguments.as_object_mut(), session_message_resolution)
-    {
-        arguments.insert(
-            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD
-                .to_string(),
-            json!(resolution),
-        );
-    }
-    if !ack_session_message_ids.is_empty() {
-        if let Some(arguments) = params.arguments.as_object_mut() {
-            arguments.insert(
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD
-                    .to_string(),
-                json!(ack_session_message_ids),
-            );
-        }
-    }
     let context_continuity_surface_capable =
         stateless_2026 && model_surface.supports_operator_extensions();
-    let context_continuity_capable =
-        context_continuity_surface_capable && runtime_tool_accepts_context_ack(&params.name);
     // context_request remains surface-scoped and independent from ACK policy.
     let context_sidecar_capable = stateless_2026 && model_surface.supports_operator_extensions();
     let skill_runtime_capable = stateless_2026 && model_surface.supports_operator_extensions();
@@ -1610,43 +1735,25 @@ pub(super) async fn handle_call(
     } else {
         Vec::new()
     };
-    if !context_request.is_empty() {
-        if let Some(arguments) = params.arguments.as_object_mut() {
-            arguments.insert(
-                crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD
-                    .to_string(),
-                json!(context_request),
-            );
-        }
-    }
-    if context_continuity_surface_capable {
-        if let Some(arguments) = params.arguments.as_object_mut() {
-            arguments.remove(
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD,
-            );
-        }
-        // Tolerate cached old schemas: strip the public wrapper from every
-        // operator request, but preserve it as proof only for ACK-capable tools.
-        let context_revision = strip_stateless_ack_session_context_revision(&mut params.arguments);
-        if context_continuity_capable {
-            if let (Some(arguments), Some(context_revision)) =
-                (params.arguments.as_object_mut(), context_revision)
-            {
-                arguments.insert(
-                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD
-                        .to_string(),
-                    context_revision,
-                );
-            }
-        }
-    }
+    // Tolerate cached old schemas: strip the public wrapper from every operator
+    // request. The adapter preserves only the normalized wire shape; whether the
+    // concrete tool may consume it as continuity proof is decided by the kernel
+    // from the trusted surface capability plus canonical ToolDefinition policy.
+    let context_revision = context_continuity_surface_capable
+        .then(|| strip_stateless_ack_session_context_revision(&mut params.arguments))
+        .flatten();
+    let ack_session_context_revision = if context_continuity_surface_capable {
+        session_context_revision_ack_from_wire(context_revision)
+    } else {
+        crate::tool_runtime::sessions::SessionContextRevisionAck::Unacknowledged
+    };
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload("effective_arguments", &params.arguments);
     }
     let as_image_requested = params.name == "read_project_artifact"
         && params.arguments.get("as_image").and_then(Value::as_bool) == Some(true);
     let outcome = runtime
-        .call_tool_with_protocol_capabilities(
+        .call_tool_with_invocation_metadata(
             KernelToolCallRequest {
                 tool_name: params.name.clone(),
                 arguments: params.arguments,
@@ -1659,8 +1766,14 @@ pub(super) async fn handle_call(
                 record_oauth_scope_denials: false,
                 host_file_import_trust,
             },
+            ToolInvocationMetadata {
+                ack_session_message_ids,
+                session_message_resolution,
+                context_request,
+                ack_session_context_revision,
+            },
             ToolProtocolCapabilities {
-                context_continuity: context_continuity_capable,
+                context_continuity: context_continuity_surface_capable,
                 context_sidecar: context_sidecar_capable,
                 skill_runtime: skill_runtime_capable,
                 skill_management: skill_management_capable,

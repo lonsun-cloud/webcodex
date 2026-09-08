@@ -44,6 +44,10 @@ data*
 # Local scratch material and reports that must not be committed.
 /ignore/
 
+# Local Trellis workflow state, planning artifacts, and project-only skills.
+/.trellis/
+/.agents/skills/trellis-*/
+
 # Watched frontend development output.
 /frontend/.dev-dist/
 logs/

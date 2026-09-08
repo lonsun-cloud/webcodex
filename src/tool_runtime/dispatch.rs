@@ -11,7 +11,7 @@ use super::{
 };
 use crate::auth::AuthContext;
 use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Add the Phase A lifecycle tuple to a definite pre-execution structured
 /// execution denial without changing generic denial helpers used by unrelated
@@ -153,10 +153,11 @@ fn sparsify_terminal_structured_execution_success(tool_name: &str, result: &mut 
 /// recorder that needs them has consumed the canonical ToolResult.
 /// Failure projection is handled separately and preserves every fact required
 /// for retry, escalation, uncertainty, Job handoff, and reconciliation.
-pub(super) fn sparsify_success_model_result_metadata(result: &mut ToolResult) {
+pub(super) fn sparsify_success_model_result_metadata(tool_name: &str, result: &mut ToolResult) {
     if !result.success {
         return;
     }
+    super::git::sparsify_complete_git_review_success(tool_name, result);
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
@@ -204,72 +205,32 @@ pub(super) fn sparsify_failure_model_result_metadata(tool_name: &str, result: &m
     }
 }
 
-pub(super) enum SearchModelProjection {
+enum SearchModelProjection {
     None,
-    SingleDefault,
-    Batch { default_queries: Vec<bool> },
+    Single {
+        default_timeout: bool,
+    },
+    Batch {
+        default_timeouts: Vec<bool>,
+        max_result_bytes: Option<usize>,
+    },
 }
 
 impl SearchModelProjection {
-    pub(super) fn capture(call: &ToolCall) -> Self {
-        match call {
-            ToolCall::SearchProjectText {
-                pattern_mode,
-                result_mode,
-                timeout_secs,
-                context_before,
-                context_after,
-                ..
-            } if caller_uses_default_search_controls(
-                pattern_mode,
-                result_mode,
-                timeout_secs,
-                context_before,
-                context_after,
-            ) =>
-            {
-                Self::SingleDefault
-            }
-            ToolCall::SearchProjectTexts { queries, .. } => Self::Batch {
-                default_queries: queries
-                    .iter()
-                    .map(|query| {
-                        caller_uses_default_search_controls(
-                            &query.pattern_mode,
-                            &query.result_mode,
-                            &query.timeout_secs,
-                            &query.context_before,
-                            &query.context_after,
-                        )
-                    })
-                    .collect(),
-            },
-            _ => Self::None,
-        }
-    }
-}
-
-/// Batch response-budget inputs captured before the ToolCall is moved into
-/// canonical execution. Budgeting is intentionally deferred until after
-/// Session recording/decorations so the recorder keeps seeing the canonical
-/// result while the model-facing projection can account for sparse semantics.
-enum BatchResponseBudgetProjection {
-    None,
-    ReadFiles { max_result_bytes: Option<usize> },
-    SearchProjectTexts { max_result_bytes: Option<usize> },
-}
-
-impl BatchResponseBudgetProjection {
     fn capture(call: &ToolCall) -> Self {
         match call {
-            ToolCall::ReadFiles {
-                max_result_bytes, ..
-            } => Self::ReadFiles {
-                max_result_bytes: *max_result_bytes,
+            ToolCall::SearchProjectText { timeout_secs, .. } => Self::Single {
+                default_timeout: caller_uses_default_search_timeout(timeout_secs),
             },
             ToolCall::SearchProjectTexts {
-                max_result_bytes, ..
-            } => Self::SearchProjectTexts {
+                queries,
+                max_result_bytes,
+                ..
+            } => Self::Batch {
+                default_timeouts: queries
+                    .iter()
+                    .map(|query| caller_uses_default_search_timeout(&query.timeout_secs))
+                    .collect(),
                 max_result_bytes: *max_result_bytes,
             },
             _ => Self::None,
@@ -277,64 +238,199 @@ impl BatchResponseBudgetProjection {
     }
 }
 
-fn caller_uses_default_search_controls(
-    pattern_mode: &Option<super::SearchPatternMode>,
-    result_mode: &Option<super::SearchResultMode>,
-    timeout_secs: &Option<i64>,
-    context_before: &Option<usize>,
-    context_after: &Option<usize>,
-) -> bool {
-    pattern_mode
-        .as_ref()
-        .is_none_or(|mode| matches!(mode, super::SearchPatternMode::Regex))
-        && result_mode
-            .as_ref()
-            .is_none_or(|mode| matches!(mode, super::SearchResultMode::Matches))
-        && timeout_secs
-            .as_ref()
-            .copied()
-            .unwrap_or(super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64)
-            == super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64
-        && context_before.as_ref().copied().unwrap_or(0) == 0
-        && context_after.as_ref().copied().unwrap_or(0) == 0
+enum ModelFacingProjection {
+    None,
+    Read(super::read_files::ReadModelProjection),
+    Search(SearchModelProjection),
 }
 
-/// Project an ordinary complete default text search down to its actual records.
-/// Session/event extraction sees the complete result before this model-facing
-/// pass. Fallbacks, partial results, non-default modes, timeouts, and context
-/// requests stay explicit. Batch defaults may inherit a smaller remaining
-/// timeout from the shared outer deadline without making that derived value
-/// model-relevant.
-pub(crate) fn sparsify_complete_default_search_output(
+/// Request facts needed only after canonical execution/recording has finished.
+/// Captured once before the ToolCall is moved, then consumed exactly once by the
+/// terminal model-facing projection stage. The concrete projection stays private
+/// so callers cannot branch on tool-specific result policy.
+pub(super) struct ModelFacingProjectionPlan {
+    projection: ModelFacingProjection,
+}
+
+impl ModelFacingProjectionPlan {
+    pub(super) fn capture(call: &ToolCall) -> Self {
+        let projection = match call {
+            ToolCall::ReadFile { .. } | ToolCall::ReadFiles { .. } => {
+                ModelFacingProjection::Read(super::read_files::ReadModelProjection::capture(call))
+            }
+            ToolCall::SearchProjectText { .. } | ToolCall::SearchProjectTexts { .. } => {
+                ModelFacingProjection::Search(SearchModelProjection::capture(call))
+            }
+            _ => ModelFacingProjection::None,
+        };
+        Self { projection }
+    }
+
+    pub(super) fn bind_resolved_project(&mut self, resolved: Option<&ResolvedProject>) {
+        if let ModelFacingProjection::Read(projection) = &mut self.projection {
+            projection.bind_resolved_project(resolved);
+        }
+    }
+
+    /// Consume the plan at the only stage allowed to turn canonical execution
+    /// output into the final model-facing read/search shape. Session/audit
+    /// recorders must run before this method.
+    pub(super) fn project(self, result: &mut ToolResult) {
+        match self.projection {
+            ModelFacingProjection::None => {}
+            ModelFacingProjection::Read(projection) => {
+                let tool_name = match &projection {
+                    super::read_files::ReadModelProjection::Single { .. } => "read_file",
+                    super::read_files::ReadModelProjection::Batch {
+                        max_result_bytes, ..
+                    } => {
+                        super::read_files::apply_model_facing_output_budget(
+                            result,
+                            *max_result_bytes,
+                            &projection,
+                        );
+                        super::read_files::enforce_final_model_facing_hard_cap(result, &projection);
+                        "read_files"
+                    }
+                    super::read_files::ReadModelProjection::None => return,
+                };
+                super::read_files::add_actionable_read_continuations(&projection, result);
+                sparsify_complete_read_success(tool_name, result);
+            }
+            ModelFacingProjection::Search(projection) => {
+                if let SearchModelProjection::Batch {
+                    default_timeouts,
+                    max_result_bytes,
+                } = &projection
+                {
+                    super::search_project_texts::apply_model_facing_output_budget(
+                        result,
+                        default_timeouts,
+                        *max_result_bytes,
+                    );
+                    super::search_project_texts::enforce_final_model_facing_hard_cap(
+                        result,
+                        default_timeouts,
+                    );
+                }
+                sparsify_search_success_for_model(&projection, result);
+            }
+        }
+    }
+}
+
+fn caller_uses_default_search_timeout(timeout_secs: &Option<i64>) -> bool {
+    timeout_secs
+        .as_ref()
+        .copied()
+        .unwrap_or(super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64)
+        == super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64
+}
+
+fn sparsify_search_match_items(output: &mut serde_json::Map<String, Value>) {
+    let Some(matches) = output.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in matches {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        for key in ["context_before", "context_after"] {
+            if item
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                item.remove(key);
+            }
+        }
+        let path = item.get("path").and_then(Value::as_str).map(str::to_string);
+        let Some(read_hint) = item.get_mut("read_hint").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if path
+            .as_deref()
+            .is_some_and(|path| read_hint.get("path").and_then(Value::as_str) == Some(path))
+        {
+            read_hint.remove("path");
+        }
+    }
+}
+
+fn add_search_refinement_continuation(output: &mut serde_json::Map<String, Value>) {
+    if output.get("truncated").and_then(Value::as_bool) != Some(true)
+        || !matches!(
+            output.get("truncation_reason").and_then(Value::as_str),
+            Some("limit" | "output_bytes")
+        )
+    {
+        return;
+    }
+    output.entry("continuation".to_string()).or_insert_with(|| {
+        json!({
+            "kind": "refine_query",
+            "safe_cursor": false,
+            "refine_with": ["path", "include_globs", "pattern", "result_mode", "limit"]
+        })
+    });
+}
+
+/// Project successful text-search presentation after Session/event consumers
+/// have seen canonical evidence. Complete rg results keep only mode-relevant
+/// records and explicit non-default controls. Fallback/truncated successes retain
+/// diagnostic metadata; match items still drop only empty context and duplicate
+/// read-hint paths. A default batch timeout may shrink under the shared absolute
+/// deadline without making that derived value model-relevant.
+pub(crate) fn sparsify_search_output_for_model(
     output: &mut serde_json::Map<String, Value>,
+    default_timeout: bool,
     allow_batch_deadline_reduction: bool,
 ) -> bool {
-    let Some(matches_len) = output
-        .get("matches")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-    else {
-        return false;
-    };
+    sparsify_search_match_items(output);
+    add_search_refinement_continuation(output);
+
     let exit_code = output.get("exit_code").and_then(Value::as_i64);
-    let effective_timeout = output.get("effective_timeout_secs").and_then(Value::as_u64);
-    let default_timeout = if allow_batch_deadline_reduction {
-        effective_timeout.is_some_and(|timeout| {
-            (1..=super::files::DEFAULT_SEARCH_TIMEOUT_SECS).contains(&timeout)
-        })
-    } else {
-        effective_timeout == Some(super::files::DEFAULT_SEARCH_TIMEOUT_SECS)
+    let result_mode = output
+        .get("result_mode")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mode_consistent = match result_mode.as_deref() {
+        Some("matches") => output
+            .get("matches")
+            .and_then(Value::as_array)
+            .is_some_and(|matches| {
+                output.get("count").and_then(Value::as_u64) == Some(matches.len() as u64)
+            }),
+        Some("files_with_matches") => {
+            output
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| {
+                    output.get("returned_file_count").and_then(Value::as_u64)
+                        == Some(files.len() as u64)
+                })
+        }
+        Some("count") => output
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| {
+                output.get("returned_file_count").and_then(Value::as_u64)
+                    == Some(files.len() as u64)
+                    && output.get("count_complete").and_then(Value::as_bool) == Some(true)
+                    && output.get("returned_match_count").and_then(Value::as_u64)
+                        == output.get("total_matches").and_then(Value::as_u64)
+            }),
+        _ => false,
     };
     let ordinary_complete = output.get("backend").and_then(Value::as_str) == Some("rg")
-        && output.get("pattern_mode").and_then(Value::as_str) == Some("regex")
-        && output.get("result_mode").and_then(Value::as_str) == Some("matches")
-        && default_timeout
-        && output.get("context_before").and_then(Value::as_u64) == Some(0)
-        && output.get("context_after").and_then(Value::as_u64) == Some(0)
+        && matches!(
+            output.get("pattern_mode").and_then(Value::as_str),
+            Some("regex" | "literal")
+        )
+        && mode_consistent
         && output.get("truncated").and_then(Value::as_bool) == Some(false)
         && output.get("truncation_reason").is_some_and(Value::is_null)
-        && matches!(exit_code, Some(0 | 1))
-        && output.get("count").and_then(Value::as_u64) == Some(matches_len as u64);
+        && matches!(exit_code, Some(0 | 1));
     if !ordinary_complete {
         return false;
     }
@@ -343,17 +439,53 @@ pub(crate) fn sparsify_complete_default_search_output(
         "project",
         "pattern",
         "backend",
-        "result_mode",
-        "pattern_mode",
-        "effective_timeout_secs",
         "exit_code",
-        "context_before",
-        "context_after",
-        "count",
         "truncated",
         "truncation_reason",
     ] {
         output.remove(key);
+    }
+    if output.get("pattern_mode").and_then(Value::as_str) == Some("regex") {
+        output.remove("pattern_mode");
+    }
+    match result_mode.as_deref() {
+        Some("matches") => {
+            output.remove("result_mode");
+            output.remove("count");
+        }
+        Some("files_with_matches") => {
+            output.remove("returned_file_count");
+        }
+        Some("count") => {
+            output.remove("returned_file_count");
+            output.remove("returned_match_count");
+            output.remove("count_complete");
+            if output
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                output.remove("files");
+            }
+        }
+        _ => {}
+    }
+    for key in ["context_before", "context_after"] {
+        if output.get(key).and_then(Value::as_u64) == Some(0) {
+            output.remove(key);
+        }
+    }
+    let effective_timeout = output.get("effective_timeout_secs").and_then(Value::as_u64);
+    let timeout_is_boring_default = default_timeout
+        && if allow_batch_deadline_reduction {
+            effective_timeout.is_some_and(|timeout| {
+                (1..=super::files::DEFAULT_SEARCH_TIMEOUT_SECS).contains(&timeout)
+            })
+        } else {
+            effective_timeout == Some(super::files::DEFAULT_SEARCH_TIMEOUT_SECS)
+        };
+    if timeout_is_boring_default {
+        output.remove("effective_timeout_secs");
     }
     if output.get("path").and_then(Value::as_str) == Some(".") {
         output.remove("path");
@@ -361,10 +493,7 @@ pub(crate) fn sparsify_complete_default_search_output(
     true
 }
 
-pub(super) fn sparsify_complete_default_search_success(
-    projection: &SearchModelProjection,
-    result: &mut ToolResult,
-) {
+fn sparsify_search_success_for_model(projection: &SearchModelProjection, result: &mut ToolResult) {
     if !result.success {
         return;
     }
@@ -372,10 +501,12 @@ pub(super) fn sparsify_complete_default_search_success(
         return;
     };
     match projection {
-        SearchModelProjection::SingleDefault => {
-            sparsify_complete_default_search_output(output, false);
+        SearchModelProjection::Single { default_timeout } => {
+            sparsify_search_output_for_model(output, *default_timeout, false);
         }
-        SearchModelProjection::Batch { default_queries } => {
+        SearchModelProjection::Batch {
+            default_timeouts, ..
+        } => {
             let complete_batch =
                 output
                     .get("items")
@@ -413,14 +544,18 @@ pub(super) fn sparsify_complete_default_search_success(
                 let Some(index) = item.get("index").and_then(Value::as_u64) else {
                     continue;
                 };
-                if default_queries.get(index as usize).copied() != Some(true) {
-                    continue;
-                }
                 let Some(search_output) = item.get_mut("output").and_then(Value::as_object_mut)
                 else {
                     continue;
                 };
-                sparsify_complete_default_search_output(search_output, true);
+                sparsify_search_output_for_model(
+                    search_output,
+                    default_timeouts
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(false),
+                    true,
+                );
             }
             if complete_batch {
                 for key in [
@@ -440,13 +575,14 @@ pub(super) fn sparsify_complete_default_search_success(
     }
 }
 
-pub(crate) fn sparsify_complete_default_search_batch_success(
-    default_queries: &[bool],
+pub(crate) fn sparsify_search_batch_success_for_model(
+    default_timeouts: &[bool],
     result: &mut ToolResult,
 ) {
-    sparsify_complete_default_search_success(
+    sparsify_search_success_for_model(
         &SearchModelProjection::Batch {
-            default_queries: default_queries.to_vec(),
+            default_timeouts: default_timeouts.to_vec(),
+            max_result_bytes: None,
         },
         result,
     );
@@ -726,6 +862,41 @@ impl ToolRuntime {
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
     ) -> ToolResult {
+        let (mut result, projection) = self
+            .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+            call,
+            auth,
+            transport,
+            recorder_metadata,
+            window,
+            inner_model_facing_recording,
+            context_request,
+            material_capabilities,
+            super::kernel::ToolProtocolCapabilities::default(),
+        )
+        .await;
+        projection.project(&mut result);
+        result
+    }
+
+    /// Kernel-only companion that returns the terminal model-facing projection
+    /// plan after the same authoritative Project resolution used for execution.
+    /// The returned ToolResult is still canonical with respect to read/search
+    /// budgeting and sparse projection so an outer recorder can consume it first.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+        &self,
+        call: ToolCall,
+        auth: Option<&AuthContext>,
+        transport: sessions::SessionTransport,
+        recorder_metadata: sessions::ToolCallRecorderMetadata,
+        window: Option<&crate::client_window::ClientWindow>,
+        inner_model_facing_recording: bool,
+        context_request: Vec<String>,
+        material_capabilities: super::context_projection::ContextMaterialCapabilities,
+        protocol_capabilities: super::kernel::ToolProtocolCapabilities,
+    ) -> (ToolResult, ModelFacingProjectionPlan) {
+        let mut result_projection = ModelFacingProjectionPlan::capture(&call);
         // Edit usage telemetry retains only fixed safe classifications. For
         // apply_patch it captures the requested matching enum before the call is
         // moved, never the patch/path/content arguments.
@@ -740,6 +911,8 @@ impl ToolRuntime {
                 inner_model_facing_recording,
                 context_request.clone(),
                 material_capabilities,
+                protocol_capabilities,
+                &mut result_projection,
             )
             .await;
         // Early project/session/auth failures can return before the normal
@@ -759,7 +932,7 @@ impl ToolRuntime {
         if let Some(guard) = edit_usage.as_mut() {
             guard.finish_with_result(&result);
         }
-        result
+        (result, result_projection)
     }
 
     /// Everything the activity ledger needs from a call, captured before the
@@ -871,6 +1044,8 @@ impl ToolRuntime {
         inner_model_facing_recording: bool,
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
+        protocol_capabilities: super::kernel::ToolProtocolCapabilities,
+        result_projection: &mut ModelFacingProjectionPlan,
     ) -> ToolResult {
         call = call
             .with_coding_agent_recording_session_id(recorder_metadata.recording_session_id.clone());
@@ -878,6 +1053,33 @@ impl ToolRuntime {
             return match crate::plugin_gateway::invoke(
                 self,
                 plugin,
+                recorder_metadata.recording_session_id.as_deref(),
+                auth,
+                transport,
+            )
+            .await
+            {
+                Ok(invocation) => invocation.to_tool_result(),
+                Err(crate::tool_runtime::specialized::SpecializedGovernanceDenial::Scope {
+                    required_scope,
+                    description,
+                }) => ToolResult::err_with_output(
+                    description,
+                    serde_json::json!({
+                        "failure_kind": "insufficient_scope",
+                        "required_scope": required_scope,
+                        "dispatch_certainty": "not_started",
+                    }),
+                ),
+                Err(crate::tool_runtime::specialized::SpecializedGovernanceDenial::Tool(
+                    result,
+                )) => result,
+            };
+        }
+        if let ToolCall::SshResource(ssh_resource) = call {
+            return match crate::ssh_resource_gateway::invoke(
+                self,
+                ssh_resource,
                 recorder_metadata.recording_session_id.as_deref(),
                 auth,
                 transport,
@@ -913,6 +1115,7 @@ impl ToolRuntime {
         let resolved_project = project_resolution
             .as_ref()
             .and_then(|resolution| resolution.as_ref().ok());
+        result_projection.bind_resolved_project(resolved_project);
         // Preserve the canonical project for activity attribution before the
         // session recorder consumes the resolved value below. Short aliases
         // must not turn a real Runner execution into a client-less row.
@@ -1238,8 +1441,6 @@ impl ToolRuntime {
         }
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
-        let search_projection = SearchModelProjection::capture(&call);
-        let batch_budget_projection = BatchResponseBudgetProjection::capture(&call);
         let validation_assertion_name = recorder_metadata.expectation.assertion_name.as_deref();
         let tool_name = call.tool_name();
         let trusted_recording_session_id = recorder_metadata
@@ -1260,6 +1461,7 @@ impl ToolRuntime {
                 project_resolution,
                 trusted_recording_session_id,
                 trusted_recording_session_project,
+                protocol_capabilities,
             )
             .await;
         let permission = permission.filter(|_| {
@@ -1327,43 +1529,7 @@ impl ToolRuntime {
             material_capabilities,
         )
         .await;
-        let defer_batch_sparsification = !inner_model_facing_recording
-            && !matches!(
-                &batch_budget_projection,
-                BatchResponseBudgetProjection::None
-            );
-        match &batch_budget_projection {
-            BatchResponseBudgetProjection::None => {}
-            BatchResponseBudgetProjection::ReadFiles { max_result_bytes } => {
-                super::read_files::apply_model_facing_output_budget(&mut result, *max_result_bytes);
-                // Direct/business-Session dispatch has already added every
-                // model-facing Session overlay. Enforce the true final ceiling
-                // against that decorated result before sparse projection. Outer
-                // kernel recording defers sparsification and repeats this exact
-                // hard-cap pass after its own overlays are attached.
-                super::read_files::enforce_final_model_facing_hard_cap(&mut result);
-            }
-            BatchResponseBudgetProjection::SearchProjectTexts { max_result_bytes } => {
-                let default_queries = match &search_projection {
-                    SearchModelProjection::Batch { default_queries } => default_queries.as_slice(),
-                    _ => &[],
-                };
-                super::search_project_texts::apply_model_facing_output_budget(
-                    &mut result,
-                    default_queries,
-                    *max_result_bytes,
-                );
-                super::search_project_texts::enforce_final_model_facing_hard_cap(
-                    &mut result,
-                    default_queries,
-                );
-            }
-        }
         sparsify_terminal_structured_execution_success(tool_name, &mut result);
-        if !defer_batch_sparsification {
-            sparsify_complete_default_search_success(&search_projection, &mut result);
-            sparsify_complete_read_success(tool_name, &mut result);
-        }
         result
     }
 
@@ -1377,13 +1543,17 @@ impl ToolRuntime {
         project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
+        protocol_capabilities: super::kernel::ToolProtocolCapabilities,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
             | ToolCall::ListRunners { .. }
             | ToolCall::RuntimeStatus { .. }
             | ToolCall::ReadToolTrace { .. }
-            | ToolCall::ToolManifest { .. }) => self.dispatch_discovery_tool(call, auth).await,
+            | ToolCall::ToolManifest { .. }) => {
+                self.dispatch_discovery_tool(call, auth, protocol_capabilities)
+                    .await
+            }
 
             call @ (ToolCall::RunnerConfigCheck { .. } | ToolCall::RunnerConfigReload { .. }) => {
                 self.dispatch_runner_config_tool(call, auth).await
@@ -1392,6 +1562,12 @@ impl ToolRuntime {
             ToolCall::PluginTool(_) => {
                 unreachable!(
                     "plugin_tool is dispatched before generic static ToolDefinition policy"
+                )
+            }
+
+            ToolCall::SshResource(_) => {
+                unreachable!(
+                    "ssh_resource is dispatched before generic static ToolDefinition policy"
                 )
             }
 

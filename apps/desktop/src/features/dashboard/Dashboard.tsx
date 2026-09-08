@@ -12,6 +12,10 @@ interface DashboardProps {
   state: DesktopState;
   refreshing: boolean;
   onRefresh: () => void;
+  onResumeRuntime: () => void;
+  onConnectChatGpt: () => void;
+  onChangeSetup: () => void;
+  onNavigate: (page: "projects" | "connection" | "activity") => void;
   onStopQuickShare: () => void;
   onStopRuntime: () => void;
 }
@@ -20,12 +24,22 @@ export function Dashboard({
   state,
   refreshing,
   onRefresh,
+  onResumeRuntime,
+  onConnectChatGpt,
+  onChangeSetup,
+  onNavigate,
   onStopQuickShare,
   onStopRuntime,
 }: DashboardProps) {
   const { t } = useLocale();
   const isQuickShare = state.topology?.experience === "quick_share";
   const operationBusy = Boolean(state.current_operation);
+  const canResumeRuntime = !isQuickShare && Boolean(state.topology) && !state.readiness.runtime_ready;
+  const canConnectChatGpt = !isQuickShare &&
+    state.topology?.server.kind === "local" &&
+    state.readiness.runtime_ready &&
+    state.openai_tunnel_configured &&
+    !state.regular_tunnel;
   const summary = readinessSummary(state.readiness.summary_kind, state.readiness.summary, t);
   const nextAction = readinessNextAction(
     state.readiness.next_action_kind,
@@ -34,7 +48,7 @@ export function Dashboard({
   );
   return (
     <section
-      className="page-section"
+      className="page-section dashboard-page"
       aria-labelledby="home-title"
       aria-busy={refreshing}
       data-webcodex-page="home"
@@ -55,7 +69,32 @@ export function Dashboard({
         </button>
       </div>
 
-      <div className="status-grid">
+      <div
+        className={`readiness-banner ${state.readiness.ready_for_chatgpt ? "ready" : "pending"}`}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <div>
+          <span className="section-kicker">{t("home.overall")}</span>
+          <strong>{state.readiness.ready_for_chatgpt ? t("home.readyToUse") : summary}</strong>
+        </div>
+        <div className="readiness-actions">
+          {canResumeRuntime && (
+            <button className="primary-button" onClick={onResumeRuntime} disabled={operationBusy || refreshing} data-webcodex-action="resume-runtime">
+              {t("home.resumeRuntime")}
+            </button>
+          )}
+          {canConnectChatGpt && (
+            <button className="primary-button" onClick={onConnectChatGpt} disabled={operationBusy} data-webcodex-action="connect-chatgpt">
+              {t("home.connectChatGpt")}
+            </button>
+          )}
+          {nextAction && !canResumeRuntime && !canConnectChatGpt && <span>{nextAction}</span>}
+        </div>
+      </div>
+
+      <div className="status-grid" aria-label={t("home.components")}>
         <StatusCard
           title={t("home.service")}
           value={serviceLabel(state, t)}
@@ -82,18 +121,21 @@ export function Dashboard({
         />
       </div>
 
-      <div
-        className={`readiness-banner ${state.readiness.ready_for_chatgpt ? "ready" : "pending"}`}
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        <div>
-          <span className="section-kicker">{t("home.overall")}</span>
-          <strong>{state.readiness.ready_for_chatgpt ? t("home.readyToUse") : summary}</strong>
+      <section className="dashboard-shortcuts" aria-labelledby="home-shortcuts-title">
+        <div className="section-heading">
+          <h2 id="home-shortcuts-title">{t("home.shortcuts")}</h2>
         </div>
-        {nextAction && <span>{nextAction}</span>}
-      </div>
+        <div className="shortcut-grid">
+          {(["projects", "connection", "activity"] as const).map((page) => (
+            <button className="shortcut-card" key={page} onClick={() => onNavigate(page)}>
+              <span className={`nav-icon nav-${page}`} aria-hidden="true" />
+              <strong>{t(`home.open.${page}`)}</strong>
+              <span>{t(`home.hint.${page}`)}</span>
+              <span className="shortcut-arrow" aria-hidden="true">↗</span>
+            </button>
+          ))}
+        </div>
+      </section>
 
       {state.quick_share && (
         <div className="handoff-card">
@@ -110,7 +152,12 @@ export function Dashboard({
       {!isQuickShare && state.topology && (
         <div className="runtime-actions">
           <span>{t("home.runtimeOwnership")}</span>
-          <button className="secondary-button" onClick={onStopRuntime} disabled={operationBusy} data-webcodex-action="stop-runtime">{t("home.stopRuntime")}</button>
+          <div className="runtime-action-buttons">
+            <button className="secondary-button" onClick={onChangeSetup} disabled={operationBusy} data-webcodex-action="change-runtime-setup">{t("home.changeSetup")}</button>
+            {state.readiness.runtime_ready && (
+              <button className="secondary-button" onClick={onStopRuntime} disabled={operationBusy} data-webcodex-action="stop-runtime">{t("home.stopRuntime")}</button>
+            )}
+          </div>
         </div>
       )}
     </section>
@@ -160,7 +207,7 @@ function quickShareClipboardLabel(state: string, contains: string, t: Translate)
 
 function connectionLabel(state: DesktopState, t: Translate) {
   const exposure = state.topology?.exposure;
-  if (!exposure || exposure.kind === "none") return t("common.localOnly");
+  if (!exposure || exposure.kind === "none") return t("common.noChatGpt");
   if (exposure.kind === "cloudflare") return "Cloudflare";
   if (exposure.kind === "open_ai_tunnel") return "OpenAI Secure Tunnel";
   return "Existing HTTPS";
@@ -171,4 +218,3 @@ function connectionExplanation(state: DesktopState, t: Translate) {
   if (state.readiness.exposure === "local_ready") return t("home.connectionLocalReady");
   return t("home.connectionUnverified");
 }
-

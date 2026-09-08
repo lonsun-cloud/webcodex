@@ -17,16 +17,19 @@ type SetupMode = "local" | "remote" | "share";
 interface FirstRunProps {
   state: DesktopState;
   onState: (state: DesktopState) => void;
+  chooseModeFirst?: boolean;
+  onComplete?: () => void;
 }
 
-export function FirstRun({ state, onState }: FirstRunProps) {
+export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }: FirstRunProps) {
   const { t } = useLocale();
   const initialMode = useMemo<SetupMode | null>(() => {
+    if (chooseModeFirst) return null;
     if (state.topology?.experience === "quick_share") return "share";
     if (state.topology?.server.kind === "local") return "local";
     if (state.topology?.server.kind === "remote") return "remote";
     return null;
-  }, [state.topology]);
+  }, [chooseModeFirst, state.topology]);
   const [mode, setMode] = useState<SetupMode | null>(initialMode);
   const [project, setProject] = useState<ProjectSelection | null>(
     state.project ?? null,
@@ -36,6 +39,7 @@ export function FirstRun({ state, onState }: FirstRunProps) {
   );
   const [pairingCode, setPairingCode] = useState("");
   const [provider, setProvider] = useState<QuickShareProvider>("cloudflare");
+  const [connectAfterSetup, setConnectAfterSetup] = useState(state.openai_tunnel_configured);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
   const mutationBusy = busy || Boolean(state.current_operation);
@@ -63,13 +67,21 @@ export function FirstRun({ state, onState }: FirstRunProps) {
   };
 
   const run = async () => {
-    if (!mode || !project || state.current_operation) return;
+    if (!mode || state.current_operation) return;
+    if ((mode === "remote" || mode === "share") && !project) return;
     setBusy(true);
     setError(null);
     try {
       if (mode === "local") {
-        onState(await desktopApi.configureLocal(project.path));
+        let next = await desktopApi.configureLocal(project?.path ?? null);
+        onState(next);
+        if (connectAfterSetup && next.openai_tunnel_configured && next.readiness.runtime_ready) {
+          next = await desktopApi.startRegularTunnel();
+          onState(next);
+        }
+        onComplete?.();
       } else if (mode === "remote") {
+        if (!project) return;
         const oneTimeCode = pairingCode;
         setPairingCode("");
         const next = await desktopApi.configureRemote(
@@ -78,8 +90,11 @@ export function FirstRun({ state, onState }: FirstRunProps) {
           project.path,
         );
         onState(next);
+        onComplete?.();
       } else {
+        if (!project) return;
         onState(await desktopApi.startQuickShare(project.path, provider));
+        onComplete?.();
       }
     } catch (value) {
       setError(normalizeDesktopError(value));
@@ -208,10 +223,29 @@ export function FirstRun({ state, onState }: FirstRunProps) {
         </fieldset>
       )}
 
+      {mode === "local" && state.openai_tunnel_configured && (
+        <label className="setup-choice-card" htmlFor="setup-connect-chatgpt">
+          <input
+            id="setup-connect-chatgpt"
+            type="checkbox"
+            checked={connectAfterSetup}
+            onChange={(event) => setConnectAfterSetup(event.target.checked)}
+            disabled={mutationBusy}
+          />
+          <span>
+            <strong>{t("setup.connectChatGptAfterSetup")}</strong>
+            <small>{t("setup.connectChatGptAfterSetupHelp")}</small>
+          </span>
+        </label>
+      )}
+
       <div className="project-picker-card">
         <div>
           <span className="section-kicker">{t("setup.project")}</span>
           <strong>{project ? project.path : t("setup.chooseProject")}</strong>
+          {mode === "local" && !project && (
+            <span className="project-meta">{t("setup.projectOptional")}</span>
+          )}
           {project && (
             <span className="project-meta">
               {t("setup.allowedRoot", {
@@ -251,7 +285,7 @@ export function FirstRun({ state, onState }: FirstRunProps) {
           className="primary-button"
           disabled={
             mutationBusy ||
-            !project ||
+            ((mode === "remote" || mode === "share") && !project) ||
             (mode === "remote" &&
               (!serverUrl.trim() || (!canReuseRemoteEnrollment && !pairingCode.trim())))
           }
@@ -300,7 +334,7 @@ function sameServerOrigin(left: string, right: string) {
 function providerLabel(provider: QuickShareProvider, t: Translate) {
   if (provider === "cloudflare") return "Cloudflare";
   if (provider === "openai") return "OpenAI Secure Tunnel";
-  return t("common.localOnly");
+  return t("common.noChatGpt");
 }
 
 function providerDescription(provider: QuickShareProvider, t: Translate) {

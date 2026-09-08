@@ -15,6 +15,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const TUNNEL_CLIENT_VERSION: &str = "0.0.12";
 const TUNNEL_CLIENT_RELEASE_BASE: &str =
     "https://github.com/openai/tunnel-client/releases/download/v0.0.12";
@@ -22,9 +25,12 @@ const TUNNEL_CLIENT_MAX_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
 const TUNNEL_CLIENT_MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const TUNNEL_CLIENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_CLIENT_DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
+const TUNNEL_CLIENT_CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const TUNNEL_CLIENT_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const TUNNEL_CLIENT_HEALTH_URL_BYTES: usize = 512;
 const TUNNEL_CLIENT_OVERRIDE: &str = "WEBCODEX_TUNNEL_CLIENT_BIN";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TunnelClientAsset {
@@ -80,10 +86,12 @@ pub(super) async fn start_openai_tunnel(
     deadline: Instant,
 ) -> Result<OpenAiTunnel, ProductError> {
     run_doctor(prerequisites, mcp_url, authorization_file, deadline).await?;
+    run_control_plane_probe(prerequisites, deadline).await?;
 
     let health_url_file = session_dir.join("openai-tunnel-health-url");
     let log_file = session_dir.join("openai-tunnel.log");
     let mut command = Command::new(&prerequisites.binary);
+    suppress_windows_console(&mut command);
     command.arg("run");
     configure_runtime_command(&mut command, prerequisites, mcp_url, authorization_file);
     command
@@ -126,6 +134,10 @@ fn configure_runtime_command(
         // broader OpenAI authority out of the long-lived tunnel daemon.
         .env_remove("OPENAI_ADMIN_KEY")
         .env_remove("OPENAI_API_KEY")
+        // The local Server bootstrap key may be a process-environment override.
+        // The daemon receives only the generated Authorization file, never the
+        // bootstrap credential as inherited environment state.
+        .env_remove("WEBCODEX_TOKEN")
         .arg("--mcp.server-url")
         .arg(format!("url={mcp_url},channel=main"))
         .arg("--mcp.extra-headers")
@@ -142,6 +154,7 @@ async fn run_doctor(
     deadline: Instant,
 ) -> Result<(), ProductError> {
     let mut command = Command::new(&prerequisites.binary);
+    suppress_windows_console(&mut command);
     command.arg("doctor");
     configure_runtime_command(&mut command, prerequisites, mcp_url, authorization_file);
     command
@@ -186,6 +199,68 @@ async fn run_doctor(
             "tunnel_unavailable",
             "OpenAI tunnel-client doctor rejected the Secure MCP Tunnel configuration",
             Some("Check CONTROL_PLANE_TUNNEL_ID, CONTROL_PLANE_API_KEY, Tunnel workspace scope, and network access, then retry."),
+        ));
+    }
+    Ok(())
+}
+
+async fn run_control_plane_probe(
+    prerequisites: &OpenAiTunnelPrerequisites,
+    deadline: Instant,
+) -> Result<(), ProductError> {
+    let mut command = Command::new(&prerequisites.binary);
+    suppress_windows_console(&mut command);
+    remove_npm_wrapper_network_environment(&mut command);
+    command
+        .arg("admin")
+        .arg("tunnels")
+        .arg("get")
+        .arg(&prerequisites.tunnel_id)
+        .env("CONTROL_PLANE_TUNNEL_ID", &prerequisites.tunnel_id)
+        // Exercise the exact Runtime Key inherited by the daemon rather than
+        // accidentally succeeding through broader operator credentials.
+        .env_remove("OPENAI_ADMIN_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| {
+        tunnel_runtime_error("OpenAI tunnel-client control-plane probe could not start")
+    })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(tunnel_runtime_error(
+            "OpenAI tunnel-client control-plane probe had no startup budget remaining",
+        ));
+    }
+    let budget = remaining.min(TUNNEL_CLIENT_CONTROL_PLANE_PROBE_TIMEOUT);
+    let status = match tokio::time::timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(tunnel_runtime_error(
+                "OpenAI tunnel-client control-plane probe could not be supervised",
+            ));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(ProductError::new(
+                "tunnel_unavailable",
+                "OpenAI Secure MCP Tunnel could not reach the OpenAI control plane before the startup timeout",
+                Some("Check the Tunnel proxy, api.openai.com network access, Tunnel ID, and Runtime Key permissions, then retry."),
+            ));
+        }
+    };
+    if !status.success() {
+        return Err(ProductError::new(
+            "tunnel_unavailable",
+            "OpenAI Secure MCP Tunnel could not verify the selected Tunnel with the Runtime Key",
+            Some("Check the Tunnel proxy, Tunnel workspace, and Tunnels Read + Use permissions, then retry."),
         ));
     }
     Ok(())
@@ -670,13 +745,13 @@ fn verify_sha256(path: &Path, expected: &str, label: &str) -> Result<(), Product
 }
 
 async fn verify_tunnel_client_version(path: &Path) -> Result<(), ProductError> {
-    let output = tokio::time::timeout(
-        TUNNEL_CLIENT_VERIFY_TIMEOUT,
-        Command::new(path).arg("--version").output(),
-    )
-    .await
-    .map_err(|_| verification_error())?
-    .map_err(|_| verification_error())?;
+    let mut command = Command::new(path);
+    suppress_windows_console(&mut command);
+    command.arg("--version");
+    let output = tokio::time::timeout(TUNNEL_CLIENT_VERIFY_TIMEOUT, command.output())
+        .await
+        .map_err(|_| verification_error())?
+        .map_err(|_| verification_error())?;
     let version_text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -686,6 +761,13 @@ async fn verify_tunnel_client_version(path: &Path) -> Result<(), ProductError> {
         return Err(verification_error());
     }
     Ok(())
+}
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn missing_tunnel_configuration(message: &'static str) -> ProductError {

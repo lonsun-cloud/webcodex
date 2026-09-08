@@ -15,6 +15,7 @@ tests with different cost profiles sharing the same default lane.
 | fast unit | Pure parsing, validation, helpers, local state machines, small fixtures. | No network, no global env mutation, no long sleeps. | `cargo test -p webcodex --lib tool_call` |
 | contract/schema | Keep metadata, registry, MCP `tools/list`, OpenAPI, and runtime tool names synchronized. | No external network; in-process services are preferred. | `cargo test -p webcodex --lib metadata`; `cargo test -p webcodex --lib mcp`; `cargo test -p webcodex --lib openapi` |
 | local integration | Exercise HTTP handlers, runtime dispatch, sessions, local agent registry, temp dirs, loopback listeners, and database fixtures. | Loopback only, isolated temp dirs, bounded waits, no shared mutable state without a lock. | `cargo test -p webcodex --lib runtime_http -- --nocapture`; `cargo test -p webcodex --lib session -- --nocapture` |
+| Runner real-process | Process-tree ownership, real shell timeout/stop, validation/Git `ManagedChild`, and JobManager descendant cleanup. These tests are ignored by the ordinary Runner suite and share the `runner_real_process_` name prefix. | Real local child processes only; no external network. Keep concurrency bounded because the assertions intentionally exercise OS scheduling and process teardown. | `cargo test --locked -p webcodex-runner runner_real_process -- --ignored --test-threads=2` |
 | slow/manual ignored | Valuable coverage that is local but slow, serial, large-input, or global-state-sensitive. | Explicit operator opt-in; often `--ignored` and `--test-threads=1`. | Run the specific ignored test/filter documented by its subsystem. |
 | e2e/deployment smoke | Prove that binaries, local services, GPT Actions schema, MCP, artifact transfer, and an agent can work together. | Temporary local services and loopback ports; real deployment only when explicitly requested. | `bash scripts/e2e_zero_config_ws.sh`; `bash scripts/smoke_deployment.sh`; `bash scripts/smoke_artifact_transfer.sh` |
 | reconnect continuity | Runner disconnect/reconnect layer independence, stale-not-ready observations, reconciliation-aware recovering/lost transitions, server-restart durable Session plus explicit-session continuity, meaningful-activity scoping, and version-mismatch diagnostics. | In-process fixtures, no external network. | `cargo test -p webcodex --lib reconnect` |
@@ -31,66 +32,71 @@ The lanes above define test semantics; workflows decide when to run them.
 
 - `.github/workflows/ci.yml` is the ordinary repository gate. Its cheap `changes`
   job classifies the exact PR base...head path set before native scheduling, while
-  the lightweight `contract` job remains mandatory for every configured pull
-  request and every push to `main`. The classifier is deterministic and local to
-  Git: it does not use commit messages or PR titles, and it emits per-platform and
-  per-package-lane requirements. The contract lane owns frontend
-  install/type/test/dist validation, workspace-boundary self-test/checks,
-  formatting, the heuristic test-inventory self-test/report (without count
-  thresholds), and focused registry/OpenAPI/MCP schema and metadata parity.
+  the `contract` job remains mandatory for every configured pull request and every
+  push to `main`. The classifier is deterministic and local to Git: it does not use
+  commit messages or PR titles, and it emits per-platform and per-package-lane
+  requirements. For changed Rust/Cargo files it searches only bounded platform-marker
+  lines from both the base and head file versions, so body-only changes inside an
+  existing platform cfg remain visible without serializing near-complete file diffs.
+  If that marker scan exceeds its bound, CI fails closed to native core plus
+  architecture compilation while preserving path-derived package/Desktop decisions;
+  only an untrustworthy changed-path inventory falls back to the complete native
+  matrix. The contract lane owns frontend install/type/test/dist validation,
+  workspace-boundary self-test/checks, formatting, the heuristic test-inventory
+  self-test/report (without count thresholds), and focused registry/OpenAPI/MCP
+  schema and metadata parity.
 - The heavy Linux Rust matrix `test-linux-rust` and Linux tooling lane
-  `test-linux-tooling` both depend on a successful `contract` job and now run for
-  every pull request as well as every push to `main`, including owner-authored PRs.
-  Release readiness must not be the first place complete Linux package suites or
-  release-tooling tests execute. The historical `test` job id remains the aggregate
-  Linux status check and always evaluates `contract` plus both Linux lanes, failing
-  unless every required result is `success`. Pushes to `main`, external-contributor
-  PRs, and owner PRs carrying `run-ci` still force the complete native matrix. Other
-  owner PRs are upgraded automatically according to changed-path risk: native
-  process-owning Runner surfaces, shell, Plugin, Computer, platform-specific, and
-  Desktop Rust ownership selects Windows and/or macOS lanes; `npm/webcodex/**`
-  selects the native Windows package lane; packaging/signing/release and workflow
-  policy surfaces select the corresponding package lanes or the full matrix.
-  For changed Rust files and Cargo manifests, classification inspects bounded full
-  diff context so a body-only edit inside an existing platform `cfg`/target section
-  cannot silently look platform-neutral; an over-bound context falls back to full
-  native. Ordinary Rust domain/control changes remain on the mandatory Linux gates.
+  `test-linux-tooling` run for every pull request as well as every push to `main`,
+  including owner-authored PRs. They start in parallel with `contract` rather than
+  waiting for unrelated frontend/static work. The ordinary Runner package run now
+  excludes the explicitly ignored `runner_real_process_` group; `changes` selects a
+  separate Linux real-process lane for Runner/process-ownership surfaces, and the
+  historical `test` aggregate requires that lane to be `success` when selected or
+  `skipped` otherwise. Native child lanes likewise wait only for the cheap `changes`
+  classifier, while the stable macOS/Windows/native aggregates retain the mandatory
+  `contract` gate. Pushes to `main`, external-contributor PRs, and owner PRs carrying
+  `run-ci` still force the complete native matrix **and** the Runner real-process
+  lanes. Other owner PRs are upgraded automatically according to changed-path risk:
+  native process-owning Runner surfaces select the real-process lane in addition to
+  Windows/macOS native Runner coverage; Computer, platform-specific, Desktop, npm,
+  packaging, signing, and release surfaces retain their existing independent lanes.
+  Ordinary Rust domain/control changes remain on the mandatory Linux gates; native
+  package/install or real-process lanes are selected only by their own path risks or
+  an explicit full-native policy override, not merely because a broad Rust diff is
+  large.
   The stable `test-macos`,
   `test-windows`, and `test-native` aggregates always resolve and verify each child
   lane is `success` when required or `skipped` when not required, avoiding a skipped
   required-check context that could leave branch protection pending.
-- Linux Rust execution is package-sharded without test-name filters: the server
-  package `webcodex`, the integration-rich Runner package `webcodex-runner`, and
-  the remaining workspace crates run as three complete package groups in
-  parallel. The remainder shard uses the workspace selector
+- Linux Rust execution remains package-sharded: the server package `webcodex`, the
+  Runner package `webcodex-runner`, and the remaining workspace crates run in
+  parallel. The Runner shard uses ordinary libtest semantics, so the named
+  real-process group is compiled but not executed there; the separate filtered
+  `--ignored` lane is its only ordinary-CI execution owner. The remainder shard uses
   `--workspace --exclude webcodex --exclude webcodex-runner`, so newly added
-  workspace members enter CI automatically rather than depending on a
-  hand-maintained package list. Each
-  workspace package therefore executes in exactly one Linux Rust group; sharding
-  is an execution optimization rather than a semantic coverage reduction. Package
-  boundaries do not imply that every test inside a shard has the same cost or
-  integration characteristics.
+  workspace members enter CI automatically rather than depending on a hand-maintained
+  package list. The split changes scheduling, not process-ownership coverage.
 - Linux tooling runs in parallel with the Rust shards and retains
   release-verification tooling, Markdown-link validation, and npm package-smoke
-  tooling; within the Linux heavy split, only this tooling lane installs Node
-  because those smoke scripts invoke Node/npm directly. macOS native coverage is
-  split into a core two-architecture Runner/Computer lane and a separately selected
-  two-architecture Desktop DMG/package lane, so process/Plugin changes do not
-  mechanically rebuild Desktop packages. macOS still owns release-surface
-  compilation and the native Runner suite on both published architectures,
-  including detached ownership/restart recovery. The local-`sshd`
+  tooling. macOS native coverage has core Runner/Computer, Runner real-process, and
+  Desktop package jobs; the first two run on both published architectures while the
+  Desktop job remains independently selected. Windows likewise separates the default
+  Runner/Computer suite from the real-process Runner group. That group now owns the
+  explicit shell/JobManager/Git/validation process-tree fixtures, detached-supervisor
+  lifecycle tests, Windows fake-SSH stop/timeout/tree fixtures, selected Plugin
+  provider/check shutdown and process-tree fixtures, and LSP child shutdown/reap/
+  idle-cleanup fixtures. Ordinary Plugin protocol/catalog and LSP navigation/restart
+  coverage stays in the default Runner suite. The real-process jobs themselves use two
+  libtest threads. The local-`sshd`
   SSH integration fixture remains Linux-only because it depends on Linux daemon
-  account/auth configuration; Windows still owns its native library, CLI, Runner,
-  npm, and artifact-to-install coverage. The Windows Runner + Computer lane caps
-  libtest at two concurrent test functions so process startup remains bounded
-  without serializing the whole Runner suite.
+  account/auth configuration.
 - Exact-source release acceptance is a separate trust boundary from ordinary CI.
-  Its Stage 1 runs the canonical release contract, the complete locked Rust
-  workspace suite as package shards without test-name filters, frontend, E2E, and
-  eval in parallel. Stage 2 is blocked until every test-gate job succeeds, then
-  fans out only native release-profile and Server-image evidence in parallel. Follow [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)
-  and `.github/workflows/release-readiness.yml`; sharding changes scheduling, not
-  semantic Rust test coverage or `scripts/release_check.sh`.
+  Release readiness first binds the exact source to a successful `main`-push CI run;
+  main pushes force full-native classification, so that proof includes the explicit
+  Runner real-process lanes on Linux, Windows, and both macOS architectures. Readiness
+  then runs its release-specific E2E/eval and disposable Server-image checks instead
+  of duplicating the same real-child-process lifecycle suite. Follow [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)
+  and `.github/workflows/release-readiness.yml`.
 - Slow/manual and real-process lanes remain explicit targeted evidence unless
   a workflow names them. Do not infer that one lane ran merely because another CI
   job passed.
@@ -123,8 +129,13 @@ The lanes above define test semantics; workflows decide when to run them.
   progress; prefer channels, notifications, or direct state inspection. Short
   negative probes, semantic grace windows, and exact count/protocol iterations
   may remain when they are the contract.
+  Async Runner shutdown waits are notification-driven by `ShutdownCoordinator`;
+  tests should signal that state directly rather than sleep for a presumed polling interval.
 - Ignored tests are not dead tests. Each ignored test should have a reason and a
   documented lane for running it intentionally.
+  The `runner_real_process_` ignored tests belong to ordinary CI through their explicit
+  real-process jobs; the separate real Codex/LSP ignored dogfood tests remain opt-in
+  and are intentionally excluded by the real-process name filter.
 
 ## `import_http` Coverage
 

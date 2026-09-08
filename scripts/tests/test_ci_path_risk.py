@@ -28,6 +28,7 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows"], "false")
         self.assertEqual(result["needs_macos"], "false")
         self.assertEqual(result["needs_linux_arm64"], "false")
+        self.assertEqual(result["needs_runner_real_process"], "false")
 
     def test_desktop_rust_requires_windows_macos_and_desktop_packages(self) -> None:
         result = classify("apps/desktop/src-tauri/src/process/supervisor.rs")
@@ -40,12 +41,14 @@ class PathRiskFixtureTests(unittest.TestCase):
         result = classify("crates/webcodex-process/src/lib.rs")
         self.assertEqual(result["needs_windows_core"], "true")
         self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_runner_real_process"], "true")
         self.assertEqual(result["needs_desktop_package"], "false")
 
     def test_runner_plugin_requires_windows_runner_and_macos(self) -> None:
         result = classify("crates/webcodex-runner/src/webcodex_runner/plugin.rs")
         self.assertEqual(result["needs_windows_runner"], "true")
         self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_npm_installer_change_requires_native_windows_package_lane(self) -> None:
         result = classify("npm/webcodex/install.js")
@@ -54,27 +57,36 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_macos"], "false")
 
     def test_runner_shell_and_persistent_shell_require_windows_and_macos(self) -> None:
-        for path in (
-            "crates/webcodex-runner/src/webcodex_runner/shell.rs",
-            "crates/webcodex-persistent-shell/src/lib.rs",
-        ):
-            with self.subTest(path=path):
-                result = classify(path)
-                self.assertEqual(result["needs_windows"], "true")
-                self.assertEqual(result["needs_macos"], "true")
+        runner = classify("crates/webcodex-runner/src/webcodex_runner/shell.rs")
+        self.assertEqual(runner["needs_windows"], "true")
+        self.assertEqual(runner["needs_macos"], "true")
+        self.assertEqual(runner["needs_runner_real_process"], "true")
 
-    def test_runner_process_owners_require_native_runner_lane(self) -> None:
+        persistent = classify("crates/webcodex-persistent-shell/src/lib.rs")
+        self.assertEqual(persistent["needs_windows"], "true")
+        self.assertEqual(persistent["needs_macos"], "true")
+        self.assertEqual(persistent["needs_runner_real_process"], "false")
+
+    def test_runner_process_owners_require_native_runner_and_real_process_lanes(self) -> None:
         for path in (
             "crates/webcodex-runner/src/webcodex_runner/coding_agent.rs",
+            "crates/webcodex-runner/src/webcodex_runner/detached_job/tests.rs",
             "crates/webcodex-runner/src/webcodex_runner/external_tools.rs",
+            "crates/webcodex-runner/src/webcodex_runner/job_manager.rs",
+            "crates/webcodex-runner/src/webcodex_runner/lsp/tests.rs",
             "crates/webcodex-runner/src/webcodex_runner/mcp_gateway.rs",
             "crates/webcodex-runner/src/webcodex_runner/projects.rs",
+            "crates/webcodex-runner/src/webcodex_runner/ssh.rs",
             "crates/webcodex-runner/src/webcodex_runner/validation/execute.rs",
         ):
             with self.subTest(path=path):
                 result = classify(path)
                 self.assertEqual(result["needs_windows_runner"], "true")
                 self.assertEqual(result["needs_macos"], "true")
+                self.assertEqual(result["needs_runner_real_process"], "true")
+
+        test_helpers = classify("crates/webcodex-runner/src/main_tests.rs")
+        self.assertEqual(test_helpers["needs_runner_real_process"], "true")
 
     def test_windows_installer_and_npm_package_choose_windows_package_lanes(self) -> None:
         desktop = classify("scripts/desktop_install_windows_smoke.ps1")
@@ -111,6 +123,7 @@ class PathRiskFixtureTests(unittest.TestCase):
             with self.subTest(path=path):
                 result = classify(path)
                 self.assertEqual(result["needs_full_native"], "true")
+                self.assertEqual(result["needs_runner_real_process"], "true")
                 self.assertEqual(result["needs_windows_arm64"], "true")
                 self.assertEqual(result["needs_linux_arm64"], "true")
                 self.assertEqual(result["needs_macos_desktop"], "true")
@@ -119,11 +132,13 @@ class PathRiskFixtureTests(unittest.TestCase):
         result = classify(".github/workflows/future-native-policy.yml")
         self.assertEqual(result["needs_full_native"], "true")
         self.assertIn("ci-policy", result["categories"])
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_mixed_docs_and_process_uses_highest_risk(self) -> None:
         result = classify("docs/README.md", "crates/webcodex-process/src/windows.rs")
         self.assertEqual(result["needs_windows_core"], "true")
         self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_rename_into_risky_path_classifies_destination(self) -> None:
         result = classify(
@@ -133,11 +148,13 @@ class PathRiskFixtureTests(unittest.TestCase):
         )
         self.assertEqual(result["needs_windows_core"], "true")
         self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_deleted_risky_file_still_requires_native(self) -> None:
         result = classify("crates/webcodex-process/src/windows.rs", statuses=("D",))
         self.assertEqual(result["needs_windows_core"], "true")
         self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_platform_cfg_change_upgrades_native_even_from_normal_rust_path(self) -> None:
         result = classify(
@@ -147,6 +164,7 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows_core"], "true")
         self.assertEqual(result["needs_macos"], "true")
         self.assertIn("platform-cfg", result["categories"])
+        self.assertEqual(result["needs_runner_real_process"], "false")
 
     def test_aarch64_cfg_requests_all_architecture_native_lanes(self) -> None:
         result = classify(
@@ -157,6 +175,7 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows_arm64"], "true")
         self.assertEqual(result["needs_macos"], "true")
         self.assertIn("aarch64-cfg", result["categories"])
+        self.assertEqual(result["needs_runner_real_process"], "false")
 
     def test_changed_paths_are_repository_relative_and_bounded(self) -> None:
         with self.assertRaises(risk.DiffLimitExceeded):
@@ -175,6 +194,7 @@ class InvocationOverrideFixtureTests(unittest.TestCase):
         result = forced.outputs()
         self.assertEqual(result["needs_full_native"], "true")
         self.assertIn("override-run-ci", result["reason"])
+        self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_push_main_forces_full_native(self) -> None:
         forced = risk.forced_risk_for_invocation(
@@ -183,6 +203,7 @@ class InvocationOverrideFixtureTests(unittest.TestCase):
         self.assertIsNotNone(forced)
         assert forced is not None
         self.assertEqual(forced.outputs()["needs_full_native"], "true")
+        self.assertEqual(forced.outputs()["needs_runner_real_process"], "true")
 
     def test_external_contributor_preserves_full_native_policy(self) -> None:
         forced = risk.forced_risk_for_invocation(
@@ -191,6 +212,7 @@ class InvocationOverrideFixtureTests(unittest.TestCase):
         self.assertIsNotNone(forced)
         assert forced is not None
         self.assertEqual(forced.outputs()["needs_full_native"], "true")
+        self.assertEqual(forced.outputs()["needs_runner_real_process"], "true")
 
     def test_owner_pr_without_override_uses_path_classifier(self) -> None:
         self.assertIsNone(
@@ -221,19 +243,78 @@ class GitRangeIntegrationTests(unittest.TestCase):
             ["git", "rev-parse", "HEAD"], cwd=root, text=True
         ).strip()
 
-    def test_platform_diff_bound_falls_back_to_full_native(self) -> None:
+    def test_platform_context_bound_falls_back_to_native_core_without_packaging(self) -> None:
         change = risk.Change(status="M", path="src/runtime.rs")
         with (
             mock.patch.object(risk, "_git_changes", return_value=[change]),
             mock.patch.object(
                 risk,
-                "_git_platform_diff",
+                "_git_platform_context",
                 side_effect=risk.DiffLimitExceeded("fixture bound"),
             ),
         ):
             result = risk.classify_git_range("0" * 40, "1" * 40).outputs()
+        self.assertEqual(result["needs_full_native"], "false")
+        self.assertEqual(result["needs_windows_core"], "true")
+        self.assertEqual(result["needs_macos"], "true")
+        self.assertEqual(result["needs_linux_arm64"], "true")
+        self.assertEqual(result["needs_windows_arm64"], "true")
+        self.assertEqual(result["needs_windows_package"], "false")
+        self.assertEqual(result["needs_windows_desktop"], "false")
+        self.assertEqual(result["needs_macos_desktop"], "false")
+        self.assertIn("platform-context-bounded", result["categories"])
+        self.assertEqual(result["needs_runner_real_process"], "false")
+
+    def test_changed_path_bound_still_falls_back_to_full_native(self) -> None:
+        with mock.patch.object(
+            risk,
+            "_git_changes",
+            side_effect=risk.DiffLimitExceeded("fixture path bound"),
+        ):
+            result = risk.classify_git_range("0" * 40, "1" * 40).outputs()
         self.assertEqual(result["needs_full_native"], "true")
-        self.assertIn("bounded-fallback", result["categories"])
+        self.assertIn("changed-path-bounded-fallback", result["categories"])
+        self.assertEqual(result["needs_runner_real_process"], "true")
+
+    def test_broad_rust_change_does_not_escalate_to_packaging_or_arm64(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            sources = []
+            for index in range(14):
+                source = root / "src" / f"wide_{index:02}.rs"
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(
+                    f"pub const VALUE_{index}: usize = {index};\n" + "// filler\n" * 18000,
+                    encoding="utf-8",
+                )
+                sources.append(source)
+            runner = root / "crates" / "webcodex-runner" / "src" / "webcodex_runner" / "projects.rs"
+            runner.parent.mkdir(parents=True, exist_ok=True)
+            runner.write_text("pub fn managed() -> usize { 1 }\n" + "// runner filler\n" * 12000, encoding="utf-8")
+            sources.append(runner)
+            base = self.commit(root, "broad base")
+
+            for source in sources:
+                source.write_text(source.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+            head = self.commit(root, "broad rust change")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                result = risk.classify_git_range(base, head).outputs()
+            finally:
+                os.chdir(previous)
+
+            self.assertEqual(result["needs_full_native"], "false")
+            self.assertEqual(result["needs_windows_runner"], "true")
+            self.assertEqual(result["needs_macos"], "true")
+            self.assertEqual(result["needs_windows_package"], "false")
+            self.assertEqual(result["needs_windows_desktop"], "false")
+            self.assertEqual(result["needs_macos_desktop"], "false")
+            self.assertEqual(result["needs_linux_arm64"], "false")
+            self.assertEqual(result["needs_windows_arm64"], "false")
+            self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_real_git_rename_is_observed_as_delete_plus_add_and_upgrades_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -268,6 +349,7 @@ class GitRangeIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(result["needs_windows_core"], "true")
             self.assertEqual(result["needs_macos"], "true")
+            self.assertEqual(result["needs_runner_real_process"], "true")
 
     def test_body_only_edit_inside_existing_windows_cfg_upgrades_native(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -296,6 +378,7 @@ class GitRangeIntegrationTests(unittest.TestCase):
             self.assertEqual(result["needs_windows_core"], "true")
             self.assertEqual(result["needs_macos"], "true")
             self.assertIn("platform-cfg", result["categories"])
+            self.assertEqual(result["needs_runner_real_process"], "false")
 
     def test_body_only_edit_inside_existing_target_cargo_section_upgrades_native(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -326,6 +409,7 @@ class GitRangeIntegrationTests(unittest.TestCase):
             self.assertEqual(result["needs_windows_core"], "true")
             self.assertEqual(result["needs_macos"], "true")
             self.assertIn("platform-cfg", result["categories"])
+            self.assertEqual(result["needs_runner_real_process"], "false")
 
 
 if __name__ == "__main__":

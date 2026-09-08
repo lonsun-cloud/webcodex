@@ -28,10 +28,23 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
   const [cancelSubmittingId, setCancelSubmittingId] = useState<string | null>(null);
+  const [showSetup, setShowSetup] = useState(false);
+  const [startupAttempt, setStartupAttempt] = useState(0);
   const stateVersionRef = useRef(0);
+  const mainRef = useRef<HTMLElement>(null);
   const hasRegularTunnel = Boolean(state?.regular_tunnel);
   const hasCurrentOperation = Boolean(state?.current_operation);
   const hasLoadedState = Boolean(state);
+
+  useEffect(() => {
+    mainRef.current?.focus({ preventScroll: true });
+    mainRef.current?.scrollTo?.({ top: 0 });
+  }, [navigation, showSetup]);
+
+  const openSetup = () => {
+    setShowSetup(true);
+    setNavigation("home");
+  };
 
   const commitState = useCallback((next: DesktopState) => {
     stateVersionRef.current += 1;
@@ -45,18 +58,28 @@ export default function App() {
         const initial = await desktopApi.getState();
         if (cancelled) return;
         commitState(initial);
-        if (!initial.topology || initial.current_operation) return;
+        if (initial.current_operation) return;
+        const bootstrapLocal = !initial.topology;
+        const resumeExisting = Boolean(
+          initial.topology
+          && initial.runtime_autostart
+          && initial.topology.experience === "full",
+        );
+        if (!bootstrapLocal && !resumeExisting) return;
 
-        const observedVersion = stateVersionRef.current;
         setRefreshing(true);
         try {
-          const next = await desktopApi.refresh();
-          if (!cancelled && stateVersionRef.current === observedVersion) {
-            commitState(next);
+          let next = bootstrapLocal
+            ? await desktopApi.configureLocal(null)
+            : await desktopApi.resumeSavedRuntime();
+          if (cancelled) return;
+          commitState(next);
+          if (shouldStartPreferredTunnel(next)) {
+            next = await desktopApi.startRegularTunnel();
+            if (!cancelled) commitState(next);
           }
-        } catch {
-          // Startup probing is best-effort. The fast published snapshot remains
-          // usable while an external status probe is slow or unavailable.
+        } catch (value) {
+          if (!cancelled) setError(normalizeDesktopError(value));
         } finally {
           if (!cancelled) setRefreshing(false);
         }
@@ -67,7 +90,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [commitState]);
+  }, [commitState, startupAttempt]);
 
   useEffect(() => {
     if (!hasLoadedState) return;
@@ -128,6 +151,23 @@ export default function App() {
     }
   };
 
+  const resumeRuntime = async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      let next = await desktopApi.resumeSavedRuntime();
+      commitState(next);
+      if (shouldStartPreferredTunnel(next)) {
+        next = await desktopApi.startRegularTunnel();
+        commitState(next);
+      }
+    } catch (value) {
+      setError(normalizeDesktopError(value));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const cancelCurrentOperation = async () => {
     const observed = state?.current_operation;
     if (!observed || !observed.cancellable || observed.phase === "cancelling") return;
@@ -143,12 +183,32 @@ export default function App() {
   };
 
   if (!state) {
-    return <div className="splash" role="status"><div className="brand-mark" aria-hidden="true">W</div><span>{t("app.loading")}</span></div>;
+    return (
+      <main className="splash">
+        <div className="brand-mark" aria-hidden="true">W</div>
+        {error ? (
+          <section className="startup-error" aria-label="WebCodex">
+            <AppError error={error} />
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => {
+                setError(null);
+                setStartupAttempt((attempt) => attempt + 1);
+              }}
+              data-webcodex-action="retry-desktop-startup"
+            >
+              {t("common.retry")}
+            </button>
+          </section>
+        ) : (
+          <span role="status">{t("app.loading")}</span>
+        )}
+      </main>
+    );
   }
 
-  const needsSetup =
-    !state.topology ||
-    (!state.readiness.runtime_ready && state.topology.experience === "full");
+  const needsSetup = !state.topology || showSetup;
 
   return (
     <div className="app-shell">
@@ -172,6 +232,7 @@ export default function App() {
           <label htmlFor="desktop-sidebar-locale">{t("locale.label")}</label>
           <select
             id="desktop-sidebar-locale"
+            aria-label={t("locale.label")}
             value={locale}
             onChange={(event) => setLocale(event.target.value as typeof locale)}
             data-webcodex-control="locale"
@@ -182,11 +243,16 @@ export default function App() {
         </div>
         <div className="sidebar-status">
           <i className={`status-dot ${state.readiness.runtime_ready ? "ready" : "unknown"}`} aria-hidden="true" />
-          <div><strong>{state.readiness.runtime_ready ? t("sidebar.runtimeReady") : t("sidebar.needsSetup")}</strong><span>{state.readiness.ready_for_chatgpt ? t("sidebar.chatgptReady") : t("sidebar.connectionIncomplete")}</span></div>
+          <div><strong>{state.readiness.runtime_ready ? t("sidebar.runtimeReady") : state.topology ? t("common.stopped") : t("sidebar.needsSetup")}</strong><span>{state.readiness.ready_for_chatgpt ? t("sidebar.chatgptReady") : t("sidebar.connectionIncomplete")}</span></div>
         </div>
       </aside>
 
-      <main className="main-content">
+      <main className="main-content" ref={mainRef} tabIndex={-1}>
+        {navigation === "home" && showSetup && state.topology && (
+          <button className="back-button" onClick={() => setShowSetup(false)}>
+            <span aria-hidden="true">← </span>{t("home.backToOverview")}
+          </button>
+        )}
         {state.current_operation && (
           <section
             className={`operation-status ${state.current_operation.phase}`}
@@ -224,23 +290,43 @@ export default function App() {
         )}
         {error && <AppError error={error} />}
         {navigation === "home" && (needsSetup ? (
-          <FirstRun state={state} onState={commitState} />
+          <FirstRun
+            state={state}
+            onState={commitState}
+            chooseModeFirst={showSetup}
+            onComplete={() => setShowSetup(false)}
+          />
         ) : (
           <Dashboard
             state={state}
             refreshing={refreshing}
             onRefresh={() => void refresh()}
+            onResumeRuntime={() => void resumeRuntime()}
+            onConnectChatGpt={() => void runStateOperation(desktopApi.startRegularTunnel)}
+            onChangeSetup={openSetup}
+            onNavigate={setNavigation}
             onStopQuickShare={() => void runStateOperation(desktopApi.stopQuickShare)}
             onStopRuntime={() => void runStateOperation(desktopApi.stopLocalRuntime)}
           />
         ))}
-        {navigation === "projects" && <ProjectsPanel state={state} />}
+        {navigation === "projects" && (
+          <ProjectsPanel state={state} onConfigure={openSetup} />
+        )}
         {navigation === "connection" && <ConnectionPanel state={state} onState={commitState} />}
         {navigation === "activity" && <ActivityPanel activity={activity} />}
-        {navigation === "settings" && <SettingsPanel state={state} />}
+        {navigation === "settings" && <SettingsPanel state={state} onState={commitState} />}
       </main>
     </div>
   );
+}
+
+function shouldStartPreferredTunnel(state: DesktopState) {
+  return state.preferred_connection === "open_ai_tunnel" &&
+    state.topology?.experience === "full" &&
+    state.topology.server.kind === "local" &&
+    state.readiness.runtime_ready &&
+    state.openai_tunnel_configured &&
+    !state.regular_tunnel;
 }
 
 function operationLabel(
@@ -256,6 +342,8 @@ function operationLabel(
     case "regular_tunnel_stop": return t("operation.regularTunnelStop");
     case "local_runtime_stop": return t("operation.localRuntimeStop");
     case "runtime_refresh": return t("operation.runtimeRefresh");
+    case "runtime_resume": return t("operation.runtimeResume");
+    case "tunnel_proxy_update": return t("operation.tunnelProxyUpdate");
   }
 }
 
@@ -274,4 +362,3 @@ function AppError({ error }: { error: DesktopError }) {
     </div>
   );
 }
-

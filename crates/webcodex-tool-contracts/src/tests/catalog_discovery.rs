@@ -87,6 +87,15 @@ fn tool_manifest_schema_exposes_compact_discovery_fields() {
         "tool_manifest input schema",
         present: ["category", "intent", "include_recommended_flows", "include_risk_summary"]
     );
+    let risk_summary_description = props["include_risk_summary"]["description"]
+        .as_str()
+        .expect("include_risk_summary description");
+    assert!(risk_summary_description.contains("where the selected projection exposes it"));
+    assert!(risk_summary_description.contains("Unfiltered/full discovery can return the aggregate"));
+    assert!(risk_summary_description.contains("sparse filtered discovery omits it"));
+    assert!(risk_summary_description
+        .contains("does not change authority, permission, or tool behavior"));
+    assert!(!risk_summary_description.contains("Include risk_summary in the output"));
     let output = spec.output_schema["properties"]["output"]["properties"]
         .as_object()
         .unwrap();
@@ -128,14 +137,48 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
 }
 
 #[test]
-fn edit_recommended_flow_prefers_apply_patch_before_exact_edits() {
+fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
     let flow = TOOL_RECOMMENDED_FLOWS
         .iter()
         .find(|flow| flow.name == "edit")
         .expect("edit recommended flow");
-    assert_eq!(flow.tools.first().copied(), Some("apply_patch"));
+    assert_eq!(flow.tools.first().copied(), Some("read_files"));
     assert_eq!(flow.tools.get(1).copied(), Some("apply_text_edits"));
-    assert!(flow.summary.starts_with("Edit: prefer apply_patch"));
+    assert_eq!(flow.tools.get(2).copied(), Some("apply_patch"));
+    assert!(flow
+        .summary
+        .starts_with("Edit: after read_file/read_files, prefer apply_text_edits"));
+}
+
+#[test]
+fn execution_lifetime_flow_routes_runner_owned_and_supervisor_owned_work() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "execution_lifetime")
+        .expect("execution_lifetime recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "run_process",
+            "run_job",
+            "run_detached_process",
+            "observe_jobs",
+            "stop_job",
+        ]
+    );
+    let text = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_ascii_lowercase();
+    for phrase in [
+        "runner-owned",
+        "outlive the current runner process",
+        "run_detached_process",
+        "supervisor-owned",
+        "replacement runner",
+    ] {
+        assert!(
+            text.contains(phrase),
+            "execution_lifetime flow should mention {phrase}: {text}"
+        );
+    }
 }
 
 #[test]
@@ -203,8 +246,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     assert_eq!(
         edit_prefix,
         vec![
-            "apply_patch",
             "apply_text_edits",
+            "apply_patch",
             "apply_unified_diff",
             "write_project_file",
             "save_project_artifact"
@@ -224,10 +267,15 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "restart runner, list again",
         "bind with update_session_context",
         "explicit one-shot/no-persistence ssh",
+        "execution lifetime: run_process/run_job stay runner-owned",
+        "outlive the current runner process",
+        "discover run_detached_process",
+        "supervisor-owned job",
         "inspect: use search_project_text and read_file before editing",
         "run_shell with rg or git grep is the diagnostic escape hatch",
-        "edit: prefer apply_patch for model-generated contextual",
-        "use apply_text_edits for small exact guarded edits",
+        "edit: after read_file/read_files, prefer apply_text_edits",
+        "using the returned current sha",
+        "use apply_patch for contextual or large multi-hunk changes",
         "apply_unified_diff only for external raw diffs",
         "write_project_file only for intentional whole-file rewrites",
         "validate: use cargo_check / cargo_test / go_test",
@@ -273,12 +321,13 @@ fn discovery_and_persistent_shell_flows_route_high_value_adaptive_tools() {
         .iter()
         .find(|flow| flow.name == "persistent_shell")
         .expect("persistent shell recommended flow");
+    assert_eq!(persistent.tools.first().copied(), Some("ssh_resource"));
     assert_eq!(
-        persistent.tools.first().copied(),
+        persistent.tools.get(1).copied(),
         Some("update_session_context")
     );
-    assert_eq!(persistent.tools.get(1).copied(), Some("open_session_shell"));
-    assert_eq!(persistent.tools.get(2).copied(), Some("session_shell_exec"));
+    assert_eq!(persistent.tools.get(2).copied(), Some("open_session_shell"));
+    assert_eq!(persistent.tools.get(3).copied(), Some("session_shell_exec"));
     assert!(persistent.tools.contains(&"session_shell_status"));
     assert!(persistent.tools.contains(&"close_session_shell"));
     assert!(persistent.tools.contains(&"run_process"));
@@ -296,6 +345,7 @@ fn discovery_and_persistent_shell_flows_route_high_value_adaptive_tools() {
         .manifest_purpose
         .contains("ssh_resource register"));
     for tool in [
+        "ssh_resource",
         "update_session_context",
         "open_session_shell",
         "session_shell_exec",
@@ -406,7 +456,7 @@ fn coding_intent_matches_local_coding_canonical_tools() {
         .iter()
         .position(|tool| *tool == "apply_text_edits")
         .unwrap();
-    assert!(apply_patch_position < apply_text_edits_position);
+    assert!(apply_text_edits_position < apply_patch_position);
     for middle in [
         "project_overview",
         "apply_patch",

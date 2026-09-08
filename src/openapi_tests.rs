@@ -24,7 +24,6 @@ fn openapi_hidden_start_only_fields_do_not_enter_model_facing_flattened_schema()
         .unwrap();
     for field in [
         "temporary_project_name",
-        "mode",
         "deny_write_tools",
         "deny_shell_tools",
         "detail",
@@ -41,6 +40,9 @@ fn openapi_hidden_start_only_fields_do_not_enter_model_facing_flattened_schema()
         properties.contains_key("execution_context"),
         "execution_context stays model-facing because update_session_context uses it"
     );
+    assert!(properties.contains_key("mode"));
+    assert!(properties.contains_key("base_ref"));
+    assert_eq!(properties["mode"]["enum"], json!(["checkout", "worktree"]));
 }
 
 #[test]
@@ -437,17 +439,18 @@ fn openapi_rejects_legacy_codex_paths_from_model_facing_spec() {
         !serialized.contains("CodexRunRequest"),
         "legacy CodexRunRequest schema must stay absent from OpenAPI"
     );
-    // callRuntimeTool is generic, but it is the formal GPT Actions route for
-    // model-generated apply_patch edits because no dedicated apply_patch Action exists.
+    // callRuntimeTool is the GPT Actions route for both canonical guarded edits
+    // and the contextual patch alternative; the description must preserve that ordering.
     let call_tool = &spec["paths"]["/api/tools/call"]["post"]["description"]
         .as_str()
         .unwrap();
     assert!(
-        call_tool.contains("Prefer dedicated actions")
-            && call_tool.contains("model-generated patch edits")
+        call_tool.contains("ordinary model-generated file edits")
+            && call_tool.contains("tool=apply_text_edits")
+            && call_tool.contains("current expected_sha256")
             && call_tool.contains("tool=apply_patch")
-            && call_tool.contains("formal apply_patch route"),
-        "callRuntimeTool description should document the apply_patch exception: {call_tool}"
+            && call_tool.contains("contextual or large patch-shaped change"),
+        "callRuntimeTool description should prefer guarded text edits before contextual patching: {call_tool}"
     );
     // getRuntimeJobStatus / getRuntimeJobLog should mention job_id polling.
     let status_desc = &spec["paths"]["/api/jobs/status"]["post"]["description"]
@@ -480,6 +483,12 @@ fn openapi_call_runtime_tool_lists_accepted_tool_names() {
     assert!(tool_desc.contains("document_diagnostics"));
     assert!(tool_desc.contains("hover"));
     assert!(tool_desc.contains("workspace_symbols"));
+    for hidden_extension in ["skill_list", "memory_search", "read_tool_trace"] {
+        assert!(
+            !tool_desc.contains(hidden_extension),
+            "generic OpenAPI callRuntimeTool must not advertise Stateless operator extension {hidden_extension}"
+        );
+    }
     let properties = spec["components"]["schemas"]["ToolCallRequest"]["properties"]
         .as_object()
         .unwrap();
@@ -1022,6 +1031,11 @@ fn openapi_call_runtime_tool_params_is_explicit_object() {
     assert_eq!(work_example["tool"], "work_on_project");
     assert_eq!(work_example["client_id"], "special");
     assert_eq!(work_example["instruction"], "Complete the development task");
+    let managed_example = &spec["paths"]["/api/tools/call"]["post"]["requestBody"]["content"]
+        ["application/json"]["examples"]["workOnManagedWorktree"]["value"];
+    assert_eq!(managed_example["tool"], "work_on_project");
+    assert_eq!(managed_example["mode"], "worktree");
+    assert_eq!(managed_example["base_ref"], "origin/main");
     // `tool` remains required; `params` is optional (advanced callers may
     // omit it for argument-less tools).
     let required = tool_call["required"].as_array().unwrap();
@@ -1621,33 +1635,46 @@ fn openapi_call_runtime_tool_examples_cover_params_and_no_params_without_retired
     );
     assert!(
         values.iter().any(|value| {
+            value["tool"].as_str() == Some("apply_text_edits")
+                && value["project"].as_str() == Some("webcodex")
+                && value["changes"]
+                    .as_array()
+                    .is_some_and(|changes| !changes.is_empty())
+        }),
+        "callRuntimeTool examples should document the default SHA-guarded apply_text_edits route"
+    );
+    assert!(
+        values.iter().any(|value| {
             value["tool"].as_str() == Some("apply_patch")
                 && value["project"].as_str() == Some("webcodex")
                 && value["patch"]
                     .as_str()
                     .is_some_and(|patch| patch.contains("*** Begin Patch"))
         }),
-        "callRuntimeTool examples should document the formal model-generated apply_patch route"
+        "callRuntimeTool examples should retain the contextual apply_patch route"
     );
 }
 
 #[test]
-fn openapi_edit_routes_keep_apply_patch_primary_for_model_generated_changes() {
+fn openapi_edit_routes_prefer_guarded_text_edits_for_model_generated_changes() {
     let spec = build_openapi_spec();
     let unified = spec["paths"]["/api/projects/apply_unified_diff"]["post"]["description"]
         .as_str()
         .expect("applyUnifiedDiff description");
     assert!(unified.contains("External/raw unified-diff mutation only"));
-    assert!(unified.contains("callRuntimeTool with tool=apply_patch"));
+    assert!(unified.contains("tool=apply_text_edits"));
+    assert!(unified.contains("tool=apply_patch"));
+    assert!(unified.contains("contextual or large patch-shaped changes"));
     assert!(!unified.contains("Canonical complex or multi-file"));
-    assert!(!unified.contains("Prefer apply_text_edits"));
 
     let call = spec["paths"]["/api/tools/call"]["post"]["description"]
         .as_str()
         .expect("callRuntimeTool description");
-    assert!(call.contains("model-generated patch edits"));
+    assert!(call.contains("ordinary model-generated file edits"));
+    assert!(call.contains("tool=apply_text_edits"));
+    assert!(call.contains("current expected_sha256"));
     assert!(call.contains("tool=apply_patch"));
-    assert!(call.contains("formal apply_patch route"));
+    assert!(call.contains("contextual or large patch-shaped change"));
 
     assert!(
         spec["paths"].get("/api/projects/apply_patch").is_none(),

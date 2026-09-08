@@ -718,6 +718,83 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
 }
 
 #[tokio::test]
+async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let auth = plugin_auth_with_scopes(&[crate::auth::SCOPE_PLUGIN_INSPECT]);
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools",
+        "provider-instance-a",
+        vec![],
+    )
+    .await;
+
+    for (id, arguments) in [
+        (
+            694,
+            json!({
+                "action":"list",
+                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_cached"]
+            }),
+        ),
+        (
+            695,
+            json!({
+                "action":"list",
+                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 7
+            }),
+        ),
+        (
+            696,
+            json!({
+                "action":"list",
+                crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"]
+            }),
+        ),
+        (
+            697,
+            json!({
+                "action":"list",
+                crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
+                    "message_id": "wc_msg_cached",
+                    "resolution": "handled"
+                }
+            }),
+        ),
+    ] {
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(id)),
+                mcp_2026_params(json!({
+                    "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                    "arguments": arguments
+                })),
+            ),
+            Some(&auth),
+        )
+        .await;
+        let McpOutcome::BadRequest(value) = outcome else {
+            panic!("specialized plugin_tool must reject generic continuity wrappers");
+        };
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(encoded.contains("unknown field"), "{encoded}");
+        assert!(runtime
+            .runner_registry
+            .poll(RunnerPollRequest {
+                client_id: "runner-a".to_string(),
+                runner_instance_id: "runner-instance-a".to_string(),
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn restricted_permission_denies_plugin_call_and_outer_direct_name_never_dispatches() {
     let runtime = test_runtime().with_permission_evaluator(
         crate::tool_runtime::PermissionEvaluator::with_mode(
@@ -1818,7 +1895,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
 }
 
 #[tokio::test]
-async fn tool_manifest_returns_canonical_static_plugin_tool_contract_without_runner_inventory() {
+async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner_inventory() {
     let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
     let auth = plugin_auth_with_scopes(&[
         crate::auth::SCOPE_PLUGIN_INSPECT,
@@ -1845,18 +1922,15 @@ async fn tool_manifest_returns_canonical_static_plugin_tool_contract_without_run
         panic!("tool_manifest(plugin_tool) must succeed without any Runner inventory");
     };
     let output = &value["result"]["structuredContent"]["output"];
-    assert_eq!(output["tool_name"], crate::plugin_gateway::PLUGIN_TOOL_NAME);
+    assert_eq!(output["name"], crate::plugin_gateway::PLUGIN_TOOL_NAME);
+    assert_eq!(output["route"]["mode"], "direct");
+    assert!(output["route"].get("via").is_none());
     assert_eq!(
-        output["contract"]["name"],
-        crate::plugin_gateway::PLUGIN_TOOL_NAME
-    );
-    assert_eq!(output["contract"]["availability"], "direct");
-    assert_eq!(
-        output["contract"]["input_schema"]["properties"]["binding"]["pattern"],
+        output["input_schema"]["properties"]["binding"]["pattern"],
         "^wc_pbind_[0-9a-f]{32}$"
     );
-    assert_eq!(output["tools"][0]["authority"]["policy"], "require_any");
-    let scopes = output["tools"][0]["authority"]["scopes"]
+    assert_eq!(output["authority"]["policy"], "require_any");
+    let scopes = output["authority"]["scopes"]
         .as_array()
         .expect("Plugin gateway authority scopes");
     for scope in [
@@ -1883,7 +1957,7 @@ async fn tool_manifest_returns_canonical_static_plugin_tool_contract_without_run
         .iter()
         .find(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME)
         .expect("plugin_tool after Runner registration");
-    assert_eq!(gateway["inputSchema"], output["contract"]["input_schema"]);
+    assert_eq!(gateway["inputSchema"], output["input_schema"]);
     assert!(!listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -1900,7 +1974,7 @@ async fn tool_manifest_returns_canonical_static_plugin_tool_contract_without_run
     for field in ["action", "runner", "plugin", "tool", "binding", "arguments"] {
         assert_eq!(
             stateless_gateway["inputSchema"]["properties"][field],
-            output["contract"]["input_schema"]["properties"][field],
+            output["input_schema"]["properties"][field],
             "Stateless MCP must preserve canonical Plugin business schema for {field}"
         );
     }

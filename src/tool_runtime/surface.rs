@@ -4,8 +4,12 @@
 //! manifests, and bounded `list_tools` filtering close together while leaving
 //! dispatch and authorization flow in `mod.rs`.
 
+use super::kernel::ToolProtocolCapabilities;
 use super::metadata::ToolAuthorityPolicy;
-use super::registry::{accepted_flattened_args_for_spec, registered_tool_specs};
+use super::registry::{
+    accepted_flattened_args_for_spec, operator_diagnostic_tool_specs, registered_tool_specs,
+    stateless_operator_extension_tool_specs,
+};
 use super::runtime::ToolRuntime;
 use super::tool_definition::{
     available_tool_manifest_intent_names, is_model_visible_tool_name, resolve_tool_manifest_intent,
@@ -18,6 +22,32 @@ use super::tool_result::ToolResult;
 use super::tool_spec::ToolSpec;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+
+const TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS: usize = 180;
+const TOOL_MANIFEST_CANONICAL_KEYS: &[&str] = &[
+    "schema_version",
+    "tool_count",
+    "count",
+    "returned_count",
+    "total_count",
+    "filtered_count",
+    "tool_name",
+    "contract",
+    "category",
+    "intent",
+    "available_intents",
+    "filtered",
+    "categories_requested",
+    "limit",
+    "truncated",
+    "truncation_reason",
+    "limit_applied",
+    "requested_limit",
+    "categories",
+    "tools",
+    "risk_summary",
+    "recommended_flows",
+];
 
 pub(crate) fn registered_tool_categories() -> Value {
     let mut categories = serde_json::Map::new();
@@ -40,6 +70,57 @@ pub(crate) fn recommended_flows() -> Vec<&'static str> {
         .iter()
         .map(|flow| flow.summary)
         .collect()
+}
+
+fn tool_manifest_specs(
+    capabilities: ToolProtocolCapabilities,
+    model_surface: crate::model_surface::ModelSurface,
+) -> Vec<ToolSpec> {
+    let mut specs = registered_tool_specs();
+    if model_surface.supports_operator_extensions() {
+        specs.extend(
+            stateless_operator_extension_tool_specs()
+                .into_iter()
+                .filter(|spec| tool_manifest_extension_capability_allows(&spec.name, capabilities)),
+        );
+    }
+    specs
+}
+
+fn tool_manifest_extension_capability_allows(
+    tool_name: &str,
+    capabilities: ToolProtocolCapabilities,
+) -> bool {
+    if super::skills::is_skill_runtime_tool_name(tool_name) {
+        capabilities.skill_runtime
+    } else if super::skills::is_skill_management_tool_name(tool_name) {
+        capabilities.skill_management
+    } else if super::memory::is_memory_runtime_tool_name(tool_name)
+        || super::memory::is_memory_management_tool_name(tool_name)
+    {
+        capabilities.memory_surface
+    } else if operator_diagnostic_tool_specs()
+        .iter()
+        .any(|spec| spec.name == tool_name)
+    {
+        capabilities.trace_diagnostics
+    } else {
+        // New extension families must declare an explicit server-owned protocol
+        // capability before discovery can expose them.
+        false
+    }
+}
+
+fn tool_manifest_route(
+    spec: &ToolSpec,
+    model_surface: crate::model_surface::ModelSurface,
+) -> (&'static str, Option<&'static str>) {
+    if is_model_visible_tool_name(spec.name.as_str()) {
+        model_surface.runtime_tool_invocation_route(spec.name.as_str())
+    } else {
+        model_surface
+            .runtime_tool_invocation_route_with_operator_extension(spec.name.as_str(), true)
+    }
 }
 
 impl ToolRuntime {
@@ -138,6 +219,7 @@ impl ToolRuntime {
         intent: Option<String>,
         include_recommended_flows: bool,
         include_risk_summary: bool,
+        protocol_capabilities: ToolProtocolCapabilities,
     ) -> ToolResult {
         if let Some(tool_name) = tool_name {
             if category.is_some() || intent.is_some() {
@@ -147,6 +229,7 @@ impl ToolRuntime {
                 &tool_name,
                 include_recommended_flows,
                 include_risk_summary,
+                protocol_capabilities,
             ) {
                 Ok(payload) => ToolResult::ok(payload),
                 Err(result) => result,
@@ -157,6 +240,7 @@ impl ToolRuntime {
             intent,
             include_recommended_flows,
             include_risk_summary,
+            protocol_capabilities,
         ) {
             Ok(payload) => ToolResult::ok(payload),
             Err(result) => result,
@@ -168,6 +252,7 @@ impl ToolRuntime {
         raw_tool_name: &str,
         include_recommended_flows: bool,
         include_risk_summary: bool,
+        protocol_capabilities: ToolProtocolCapabilities,
     ) -> Result<Value, ToolResult> {
         let tool_name = raw_tool_name.trim();
         let model_surface = self.model_surface().ok_or_else(|| {
@@ -179,15 +264,14 @@ impl ToolRuntime {
         if tool_name.is_empty() {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         }
-        let specs = registered_tool_specs();
+        let specs = tool_manifest_specs(protocol_capabilities, model_surface);
         let tool_count = specs.len();
         let Some(spec) = specs.iter().find(|spec| spec.name == tool_name) else {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         };
         let category = runtime_tool_category(spec.name.as_str());
         let metadata = runtime_tool_metadata(spec.name.as_str());
-        let (availability, gateway_tool) =
-            model_surface.runtime_tool_invocation_route(spec.name.as_str());
+        let (availability, gateway_tool) = tool_manifest_route(spec, model_surface);
         let mut exact_categories = serde_json::Map::new();
         exact_categories.insert(category.to_string(), json!([spec.name]));
         let mut output = json!({
@@ -236,7 +320,7 @@ impl ToolRuntime {
     }
 
     pub(crate) fn compact_tool_manifest_payload(&self) -> Value {
-        self.tool_manifest_payload(None, None, true, true)
+        self.tool_manifest_payload(None, None, true, true, ToolProtocolCapabilities::default())
             .expect("default tool_manifest payload without intent must succeed")
     }
 
@@ -249,7 +333,14 @@ impl ToolRuntime {
         if categories.is_none() && intent.is_none() && limit.is_none() {
             return Ok(self.compact_tool_manifest_payload());
         }
-        self.tool_manifest_payload_for_categories(categories, intent, limit, true, true)
+        self.tool_manifest_payload_for_categories(
+            categories,
+            intent,
+            limit,
+            true,
+            true,
+            ToolProtocolCapabilities::default(),
+        )
     }
 
     fn tool_manifest_payload(
@@ -258,6 +349,7 @@ impl ToolRuntime {
         intent: Option<String>,
         include_recommended_flows: bool,
         include_risk_summary: bool,
+        protocol_capabilities: ToolProtocolCapabilities,
     ) -> Result<Value, ToolResult> {
         self.tool_manifest_payload_for_categories(
             category.map(|category| vec![category]),
@@ -265,6 +357,7 @@ impl ToolRuntime {
             None,
             include_recommended_flows,
             include_risk_summary,
+            protocol_capabilities,
         )
     }
 
@@ -275,6 +368,7 @@ impl ToolRuntime {
         limit: Option<usize>,
         include_recommended_flows: bool,
         include_risk_summary: bool,
+        protocol_capabilities: ToolProtocolCapabilities,
     ) -> Result<Value, ToolResult> {
         let resolved_intent = match intent {
             None => None,
@@ -285,8 +379,14 @@ impl ToolRuntime {
                 }
             },
         };
+        let model_surface = self.model_surface().ok_or_else(|| {
+            ToolResult::err(
+                "tool_manifest is unavailable under the project_connector runtime exposure"
+                    .to_string(),
+            )
+        })?;
 
-        let specs = registered_tool_specs();
+        let specs = tool_manifest_specs(protocol_capabilities, model_surface);
         let tool_count = specs.len();
         let categories_requested = normalize_tool_manifest_categories(categories);
         let category = categories_requested
@@ -314,12 +414,6 @@ impl ToolRuntime {
             None => filtered_specs,
         };
         let risk_summary = include_risk_summary.then(|| build_risk_summary(&returned_specs));
-        let model_surface = self.model_surface().ok_or_else(|| {
-            ToolResult::err(
-                "tool_manifest is unavailable under the project_connector runtime exposure"
-                    .to_string(),
-            )
-        })?;
         let tools: Vec<Value> = returned_specs
             .iter()
             .map(|spec| compact_manifest_tool_entry(spec, model_surface))
@@ -520,13 +614,264 @@ fn manifest_authority(policy: ToolAuthorityPolicy) -> Value {
     }
 }
 
+fn manifest_route_projection(availability: Option<&str>, gateway_tool: Option<&Value>) -> Value {
+    let mode = availability.unwrap_or("unavailable");
+    let mut route = serde_json::Map::new();
+    route.insert("mode".to_string(), Value::String(mode.to_string()));
+    if mode == "gateway" {
+        if let Some(via) = gateway_tool.and_then(Value::as_str) {
+            route.insert("via".to_string(), Value::String(via.to_string()));
+        }
+    }
+    Value::Object(route)
+}
+
+fn selection_description(description: &str) -> String {
+    let description = description.trim();
+    if let Some(end) = description.char_indices().find_map(|(index, ch)| {
+        let end = index + ch.len_utf8();
+        if !matches!(ch, '.' | '!' | '?')
+            || description[..end].chars().count() > TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS
+        {
+            return None;
+        }
+        description[end..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+            .then_some(end)
+    }) {
+        return description[..end].trim().to_string();
+    }
+
+    if description.chars().count() <= TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS {
+        return description.to_string();
+    }
+
+    let content_limit = TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS - 1;
+    let byte_end = description
+        .char_indices()
+        .nth(content_limit - 1)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(description.len());
+    let prefix = &description[..byte_end];
+    let cut = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .filter(|index| *index > TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS / 2)
+        .unwrap_or(byte_end);
+    format!("{}…", description[..cut].trim_end())
+}
+
+#[cfg(test)]
+mod selection_description_tests {
+    use super::*;
+
+    #[test]
+    fn selection_description_ignores_periods_inside_technical_tokens() {
+        assert_eq!(
+            selection_description(
+                "Inspect startup-bound runner.toml path. This never changes authority."
+            ),
+            "Inspect startup-bound runner.toml path."
+        );
+        assert_eq!(
+            selection_description("Read foo.rs safely. Then continue."),
+            "Read foo.rs safely."
+        );
+        assert_eq!(
+            selection_description("Supports v0.4.0 clients. Newer versions are also accepted."),
+            "Supports v0.4.0 clients."
+        );
+    }
+
+    #[test]
+    fn selection_description_prefers_real_sentence_boundary() {
+        assert_eq!(
+            selection_description("First sentence. Second sentence."),
+            "First sentence."
+        );
+    }
+
+    #[test]
+    fn selection_description_fallback_is_bounded_and_unicode_safe() {
+        let ascii = "selection token ".repeat(30);
+        let ascii_summary = selection_description(&ascii);
+        assert!(ascii_summary.ends_with('…'));
+        assert!(
+            ascii_summary.chars().count() <= TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS,
+            "{ascii_summary}"
+        );
+
+        let unicode = "界".repeat(240);
+        let unicode_summary = selection_description(&unicode);
+        assert!(unicode_summary.ends_with('…'));
+        assert!(
+            unicode_summary.chars().count() <= TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS,
+            "{unicode_summary}"
+        );
+        assert!(unicode_summary
+            .trim_end_matches('…')
+            .chars()
+            .all(|ch| ch == '界'));
+    }
+}
+
+/// Project the canonical manifest only after Session/audit consumers have seen
+/// it. This preserves the compatibility/full diagnostic result internally while
+/// making ordinary model discovery answer only the next selection/call decision.
+/// Unknown output sidecars are preserved verbatim.
+pub(super) fn sparsify_tool_manifest_model_result(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object() else {
+        return;
+    };
+    let canonical = output.clone();
+    let mut projected = serde_json::Map::new();
+
+    if let Some(contract) = canonical.get("contract").and_then(Value::as_object) {
+        for key in [
+            "name",
+            "description",
+            "input_schema",
+            "effect",
+            "risk",
+            "approval",
+            "idempotency",
+            "annotations",
+        ] {
+            if let Some(value) = contract.get(key) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        projected.insert(
+            "route".to_string(),
+            manifest_route_projection(
+                contract.get("availability").and_then(Value::as_str),
+                contract.get("gateway_tool"),
+            ),
+        );
+        if let Some(authority) = canonical
+            .get("tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| tools.first())
+            .and_then(|tool| tool.get("authority"))
+        {
+            projected.insert("authority".to_string(), authority.clone());
+        }
+        if let Some(flows) = canonical
+            .get("recommended_flows")
+            .and_then(Value::as_array)
+            .filter(|flows| !flows.is_empty())
+        {
+            projected.insert("recommended_flows".to_string(), Value::Array(flows.clone()));
+        }
+    } else if canonical.get("filtered").and_then(Value::as_bool) == Some(true) {
+        let specs = registered_tool_specs();
+        let descriptions: HashMap<&str, &str> = specs
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.description.as_str()))
+            .collect();
+        let tools = canonical
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(|tool| {
+                        let mut entry = serde_json::Map::new();
+                        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                            entry.insert("name".to_string(), Value::String(name.to_string()));
+                            if let Some(description) = descriptions.get(name) {
+                                entry.insert(
+                                    "description".to_string(),
+                                    Value::String(selection_description(description)),
+                                );
+                            }
+                        }
+                        entry.insert(
+                            "route".to_string(),
+                            manifest_route_projection(
+                                tool.get("availability").and_then(Value::as_str),
+                                tool.get("gateway_tool"),
+                            ),
+                        );
+                        if let Some(requires_project) = tool.get("requires_project") {
+                            entry.insert("requires_project".to_string(), requires_project.clone());
+                        }
+                        if let Some(effect) = tool.get("effect") {
+                            entry.insert("effect".to_string(), effect.clone());
+                        }
+                        if tool.get("effect").and_then(Value::as_str) != Some("observe") {
+                            if let Some(risk) = tool.get("risk") {
+                                entry.insert("risk".to_string(), risk.clone());
+                            }
+                        }
+                        Value::Object(entry)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        projected.insert("tools".to_string(), Value::Array(tools));
+        for key in ["intent", "category"] {
+            if let Some(value) = canonical.get(key).filter(|value| !value.is_null()) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        if canonical.get("truncated").and_then(Value::as_bool) == Some(true) {
+            for key in [
+                "truncated",
+                "truncation_reason",
+                "returned_count",
+                "filtered_count",
+                "limit",
+            ] {
+                if let Some(value) = canonical.get(key) {
+                    projected.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        if let Some(flows) = canonical
+            .get("recommended_flows")
+            .and_then(Value::as_array)
+            .filter(|flows| !flows.is_empty())
+        {
+            projected.insert("recommended_flows".to_string(), Value::Array(flows.clone()));
+        }
+    } else {
+        for key in [
+            "schema_version",
+            "tool_count",
+            "categories",
+            "available_intents",
+            "risk_summary",
+            "recommended_flows",
+        ] {
+            if let Some(value) = canonical.get(key) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    for (key, value) in canonical {
+        if !TOOL_MANIFEST_CANONICAL_KEYS.contains(&key.as_str()) {
+            projected.insert(key, value);
+        }
+    }
+    result.output = Value::Object(projected);
+}
+
 pub(super) fn compact_manifest_tool_entry(
     spec: &ToolSpec,
     model_surface: crate::model_surface::ModelSurface,
 ) -> Value {
     let name = spec.name.as_str();
     let m = runtime_tool_metadata(name);
-    let (availability, gateway_tool) = model_surface.runtime_tool_invocation_route(name);
+    let (availability, gateway_tool) = tool_manifest_route(spec, model_surface);
     json!({
         "name": name,
         "category": runtime_tool_category(name),

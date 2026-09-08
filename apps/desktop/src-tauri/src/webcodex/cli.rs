@@ -352,16 +352,15 @@ async fn run_bounded_until(
         command.stdin(Stdio::null());
     }
     let mut child =
-        ManagedChild::spawn_with_options(&mut command, platform::managed_spawn_options()).map_err(
-            |error| {
+        ManagedChild::spawn_with_options(&mut command, platform::managed_spawn_options(false))
+            .map_err(|error| {
                 DesktopError::new(
                     "webcodex_command_start_failed",
                     "Could not start a safely owned WebCodex command",
                     "Check the Desktop binary directory and execution permissions.",
                 )
                 .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
-            },
-        )?;
+            })?;
 
     let stdout = match child.child_mut().stdout.take() {
         Some(stdout) => stdout,
@@ -854,18 +853,59 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn process_exists(pid: u32) -> bool {
-        let Ok(pid) = i32::try_from(pid) else {
+    fn process_can_execute(pid: u32) -> bool {
+        // Match ManagedChild's tree-liveness contract: an unreaped zombie still
+        // occupies a PID, but it cannot execute code and must not make cleanup
+        // look incomplete. Keep unknown probe failures conservative.
+        #[cfg(target_os = "linux")]
+        let raw_pid = pid;
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
             return false;
         };
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == 0 {
-            return true;
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return !matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
         }
-        !matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        )
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{raw_pid}/stat")) else {
+                return true;
+            };
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                return true;
+            };
+            let state = rest.split_whitespace().next().unwrap_or("");
+            state != "Z" && state != "X"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>();
+            let bytes = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size as libc::c_int,
+                )
+            };
+            if bytes == size as libc::c_int {
+                return unsafe { info.assume_init() }.pbi_status != libc::SZOMB;
+            }
+            if bytes == 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return false;
+            }
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            true
+        }
     }
 
     #[cfg(unix)]
@@ -916,7 +956,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         for pid in read_fixture_pids(&marker) {
             assert!(
-                !process_exists(pid),
+                !process_can_execute(pid),
                 "owned PID {pid} survived timeout cleanup"
             );
         }
@@ -949,7 +989,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         for pid in read_fixture_pids(&marker) {
             assert!(
-                !process_exists(pid),
+                !process_can_execute(pid),
                 "pipe-holding PID {pid} survived cleanup"
             );
         }
@@ -994,7 +1034,7 @@ mod tests {
         assert_eq!(error.code, "desktop_operation_cancelled");
         for pid in read_fixture_pids(&marker) {
             assert!(
-                !process_exists(pid),
+                !process_can_execute(pid),
                 "owned PID {pid} survived cancellation"
             );
         }
@@ -1089,7 +1129,7 @@ mod tests {
         assert_eq!(error.code, "desktop_operation_cancelled");
         for pid in read_fixture_pids(&marker) {
             assert!(
-                !process_exists(pid),
+                !process_can_execute(pid),
                 "pipe-holding PID {pid} survived output-drain cancellation"
             );
         }
@@ -1121,7 +1161,7 @@ mod tests {
         ));
         let escaped_marker = marker.to_string_lossy().replace('\'', "''");
         let script = format!(
-            "$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath '{escaped_marker}' -Value \"$PID $($child.Id)\" -NoNewline; Start-Sleep -Seconds 30"
+            "$child = Start-Process ping.exe -ArgumentList '-n','31','127.0.0.1' -PassThru; Set-Content -LiteralPath '{escaped_marker}' -Value \"$PID $($child.Id)\" -NoNewline; Start-Sleep -Seconds 30"
         );
         let args = vec![
             "-NoProfile".to_string(),
@@ -1144,13 +1184,24 @@ mod tests {
             .await
         });
         let marker_deadline = Instant::now() + Duration::from_secs(6);
-        while !marker.is_file() {
+        let pids = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                let parsed = contents
+                    .split_whitespace()
+                    .map(str::parse::<u32>)
+                    .collect::<Result<Vec<_>, _>>();
+                if let Ok(pids) = parsed {
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+            }
             assert!(
                 Instant::now() < marker_deadline,
                 "blocked-stdin fixture must publish owned pids before timeout"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
         let error = tokio::time::timeout(Duration::from_secs(12), command)
             .await
             .expect("blocked-stdin command must finish within its bounded cleanup")
@@ -1158,11 +1209,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "webcodex_command_timeout");
         assert!(started.elapsed() < Duration::from_secs(12));
-        let pids = std::fs::read_to_string(&marker)
-            .expect("fixture must publish owned pids")
-            .split_whitespace()
-            .map(|value| value.parse::<u32>().expect("fixture pid"))
-            .collect::<Vec<_>>();
         for pid in pids {
             assert!(
                 !windows_process_exists(pid),

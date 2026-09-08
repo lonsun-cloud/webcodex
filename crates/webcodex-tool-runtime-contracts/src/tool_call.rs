@@ -156,6 +156,36 @@ impl PluginToolCall {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshResourceToolCall {
+    pub action: String,
+    #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
+    pub binding: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub default_cwd: Option<String>,
+}
+
+impl SshResourceToolCall {
+    pub fn validate(&self) -> Result<(), String> {
+        // Only classify the closed action vocabulary before specialized
+        // governance. Action-specific identity/value validation remains in the
+        // SSH gateway after scope/session/permission checks so an unauthorized
+        // caller cannot learn whether a binding, Runner, name, or target is valid.
+        if matches!(self.action.as_str(), "list" | "register" | "remove") {
+            Ok(())
+        } else {
+            Err("action must be one of list, register, or remove".to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchResultMode {
@@ -447,6 +477,10 @@ pub enum ToolCall {
         client_id: Option<String>,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        base_ref: Option<String>,
         instruction: String,
         #[serde(default = "default_true")]
         include_project_instructions: bool,
@@ -2180,6 +2214,11 @@ pub enum ToolCall {
     /// classified from `action` before scope/session/permission governance.
     PluginTool(PluginToolCall),
 
+    /// Stable gateway for Runner-local managed SSH resources. The static
+    /// ToolDefinition is a worst-case discovery contract; exact execution
+    /// policy is classified from `action` before specialized governance.
+    SshResource(SshResourceToolCall),
+
     /// Return a structured runtime health/observability summary.
     ///
     /// This is a read-only observability tool: it never exposes tokens,
@@ -2541,7 +2580,7 @@ impl ToolCall {
                     .to_string(),
             );
         }
-        let recorder_metadata = ToolCallRecorderMetadata::from_arguments(&arguments);
+        let recorder_metadata = ToolCallRecorderMetadata::from_business_arguments(&arguments);
         let arguments = strip_tool_call_expectation_metadata(arguments);
         if name == "read_project_artifact"
             && arguments
@@ -2639,6 +2678,11 @@ impl ToolCall {
             .map_err(|e| format!("invalid arguments for tool '{}': {}", name, e))?;
         if let Self::PluginTool(plugin) = &call {
             plugin
+                .validate()
+                .map_err(|error| format!("invalid arguments for tool '{}': {}", name, error))?;
+        }
+        if let Self::SshResource(ssh_resource) = &call {
+            ssh_resource
                 .validate()
                 .map_err(|error| format!("invalid arguments for tool '{}': {}", name, error))?;
         }
@@ -2805,6 +2849,7 @@ impl ToolCall {
             Self::RunnerConfigCheck { .. } => "runner_config_check",
             Self::RunnerConfigReload { .. } => "runner_config_reload",
             Self::PluginTool(_) => "plugin_tool",
+            Self::SshResource(_) => "ssh_resource",
             Self::RuntimeStatus { .. } => "runtime_status",
             Self::ReadToolTrace { .. } => "read_tool_trace",
             Self::ToolManifest { .. } => "tool_manifest",

@@ -68,10 +68,11 @@ use tools::{
     add_stateless_workflow_recorder_metadata, mcp_host_file_import_trust_decision_from_state,
     mcp_host_file_import_trust_from_state, mcp_tools_list_payload_with_compact,
     mcp_tools_list_payload_with_compact_and_app, mcp_tools_list_payload_with_features_for_auth,
-    project_connector_tools_list_payload_with_compact,
-    strip_stateless_ack_session_context_revision, strip_stateless_ack_session_message_ids,
-    strip_stateless_context_request, strip_stateless_session_message_resolution,
-    take_last_mcp_host_file_import_trust_decision, HostFileImportTrustReason, McpToolCallParams,
+    project_connector_tools_list_payload_with_compact, session_context_revision_ack_from_wire,
+    strip_recording_session_id, strip_stateless_ack_session_context_revision,
+    strip_stateless_ack_session_message_ids, strip_stateless_context_request,
+    strip_stateless_session_message_resolution, take_last_mcp_host_file_import_trust_decision,
+    HostFileImportTrustReason, McpToolCallParams,
 };
 
 /// Hard upper bound on a single MCP JSON-RPC dispatch, applied in `mcp_post`.
@@ -375,16 +376,16 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             return;
         }
     };
-    guard.parsed("ok");
     let window = match protocol_era {
         McpProtocolEra::Legacy => {
             crate::client_window::mcp_window(req, request.method == "initialize")
         }
-        McpProtocolEra::Stateless2026 => crate::client_window::McpWindow {
-            identity: None,
-            issued_session_id: None,
-        },
+        McpProtocolEra::Stateless2026 => {
+            crate::client_window::stateless_mcp_window(&request.params)
+        }
     };
+    guard.set_client_window(window.identity.as_ref());
+    guard.parsed("ok");
 
     // Chat-window MCP tool calls must land in the action audit exactly like
     // the REST surface (they were previously invisible there). Summary-level

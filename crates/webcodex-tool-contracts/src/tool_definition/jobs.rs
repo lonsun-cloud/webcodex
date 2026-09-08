@@ -41,7 +41,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 true,
             ),
-            "Run one isolated one-shot native executable with literal argv and no shell parsing. For repeated shared state, prefer the persistent shell route; for an explicit new SSH target that should persist, use ssh_resource onboarding before persistent shell use. Explicit one-shot/no-persistence SSH remains valid here. Long work continues as the same execution.",
+            "Run one isolated one-shot native executable with literal argv and no shell parsing. For repeated shared state, prefer the persistent shell route; for an explicit new SSH target that should persist, use ssh_resource onboarding before persistent shell use. Explicit one-shot/no-persistence SSH remains valid here. Long work continues as the same execution, owned by the current Runner, including Job handoff. If accepted native work must outlive the current Runner process across exit, restart, upgrade, or replacement, discover run_detached_process instead.",
             run_process_input_schema,
         ),
         70,
@@ -66,7 +66,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 true,
             ),
-            "Start a detached process as a durable Job with literal argv and explicit detached authority. A bounded replay key blocks duplicate dispatch while the Job is active or retained; expired keys are not retry tokens. Observe or stop with Job tools. No shell, script, SSH-resource, or retry fallback.",
+            "Start a supervisor-owned detached native process as a durable Job when accepted work must outlive the initiating Runner process, such as across Runner exit, restart, upgrade, or replacement. Ownership is handed off before payload start; a replacement Runner can recover the same logical Job only when the durable supervisor/native identity and lifetime fence reconcile. A bounded replay key blocks duplicate dispatch while the Job is active or retained; expired keys are not retry tokens. Observe or stop with Job tools. No shell, script, SSH-resource, or retry fallback.",
             run_detached_process_input_schema,
         ),
         &[JOB_RUN, SCOPE_JOB_DETACH],
@@ -90,7 +90,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             true,
             true,
         ),
-        "Run bounded sh, bash, or PowerShell content as typed script data from a Runner-owned file. Long work continues as the same execution; the script body never becomes shell command text.",
+        "Run bounded sh, bash, or PowerShell content as typed script data from a Runner-owned file. Long work continues as the same execution, owned by the current Runner; the script body never becomes shell command text. If work must outlive the current Runner process, use a native executable and discover run_detached_process instead.",
         run_script_input_schema,
     ),
     model_spec(
@@ -112,11 +112,10 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             true,
             true,
         ),
-        "Run one bounded shell command as an escape hatch for real shell syntax. For persistent cwd/exports/functions, use the persistent shell route; an explicit new SSH target that should persist first goes through ssh_resource onboarding and Runner restart. Prefer structured validation, process, and edit tools when they fit; use asynchronous execution for longer work.",
+        "Run one bounded shell command as an escape hatch for real shell syntax. For persistent cwd/exports/functions, use the persistent shell route; an explicit new SSH target that should persist first goes through ssh_resource onboarding and Runner restart. Prefer structured validation, process, and edit tools when they fit. For longer work, asynchronous shell execution remains Runner-owned. If work must outlive the current Runner process, discover run_detached_process instead (native argv, no shell).",
         run_shell_input_schema,
     ),
-    adaptive_runtime_direct(
-        requires_explicit_business_session(model_spec(
+    requires_explicit_business_session(model_spec(
             def(
                 "open_session_shell",
                 ModelVisible,
@@ -137,11 +136,8 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Open one bounded long-lived shell for an explicit Workflow Session: local sh/bash, Windows PowerShell, or sh/bash through the active named SSH resource already bound in execution_context.resource. For an explicit new target, use ssh_resource list/register, restart the Runner, list again, then bind with update_session_context; there is no per-shell host/resource parameter. The SSH target does not need WebCodex Runner.",
             open_session_shell_input_schema,
-        )),
-        71,
-    ),
-    adaptive_runtime_direct(
-        requires_explicit_business_session(model_spec(
+    )),
+    requires_explicit_business_session(model_spec(
             def(
                 "session_shell_exec",
                 ModelVisible,
@@ -162,9 +158,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Execute one framed command in an existing Session persistent shell. Reuse it for sequences that need shared cwd, variables, exports, functions, or umask; commands are serialized in the same shell process.",
             session_shell_exec_input_schema,
-        )),
-        72,
-    ),
+    )),
     requires_explicit_business_session(model_spec(
         def(
             "session_shell_status",
@@ -232,7 +226,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 true,
             ),
-            "Start one asynchronous shell Job and return its stable job_id. Queued execution keeps that identity; observe the existing Job before considering any retry.",
+            "Start one Runner-owned asynchronous shell Job and return its stable job_id. Queued execution keeps that identity; observe the existing Job before considering any retry. Server disconnect/restart can reconcile the same Job while the owning Runner process remains, but a replacement Runner does not inherit ordinary Jobs. If work must outlive the current Runner process, discover run_detached_process instead.",
             run_job_input_schema,
         ),
         TOOL_CATEGORY_JOB,
@@ -326,7 +320,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
             ),
-            "Observe 1 to 8 existing Jobs with bounded baseline/delta logs and isolated item errors. Optionally performs one shared wait for the batch and returns when any relevant Job changes; final items are non-waiting snapshots. Return each opaque observation token unchanged on follow-up. unknown_job exposes recovery_tool=list_jobs for direct caller-visible Job re-observation. Never launches, retries, stops, or subscribes.",
+            "Observe 1 to 8 existing Jobs with bounded baseline/delta logs and isolated item errors. Optionally performs one shared wait for the batch and returns when any relevant Job changes; final items are non-waiting snapshots. Ordinary all-success observations may use a compact result projection; each opaque observation token is returned unchanged. reset remains explicit bounded recovery rather than exact delta. unknown_job exposes recovery_tool=list_jobs for direct caller-visible Job re-observation. Never launches, retries, stops, or subscribes.",
             observe_jobs_input_schema,
         ),
         80,

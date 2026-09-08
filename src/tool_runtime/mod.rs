@@ -111,7 +111,7 @@ pub(crate) use session_context::workflow_session_authority_fingerprint;
 pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
 pub use tool_call::{
     ObserveJobsItem, PluginToolCall, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery,
-    SearchResultMode, ToolCall,
+    SearchResultMode, SshResourceToolCall, ToolCall,
 };
 pub(crate) use tool_call::{
     TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,
@@ -143,9 +143,12 @@ pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverEr
 #[cfg(test)]
 pub(crate) use registry::accepted_flattened_args_for_spec;
 pub(crate) use registry::{
-    generic_tool_call_flattened_args_for_spec, memory_management_tool_specs,
-    memory_runtime_tool_specs, operator_diagnostic_tool_specs, registered_tool_specs,
-    skill_management_tool_specs, skill_runtime_tool_specs,
+    generic_tool_call_flattened_args_for_spec, registered_tool_specs,
+    stateless_operator_extension_tool_specs,
+};
+#[cfg(test)]
+pub(crate) use registry::{
+    memory_management_tool_specs, memory_runtime_tool_specs, skill_management_tool_specs,
 };
 pub(crate) use session_context::{add_session_hint, unknown_session_result};
 pub(crate) use session_shell::SessionShellRegistry;

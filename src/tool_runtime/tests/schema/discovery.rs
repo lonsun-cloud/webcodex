@@ -80,6 +80,26 @@ fn tool_manifest_and_list_tools_limit_truncation_reports_limit_reason() {
         .contains("ResponseTooLarge"));
 }
 
+#[test]
+fn tool_manifest_sparse_filtered_projection_only_keeps_truncation_metadata_when_needed() {
+    let runtime = test_runtime();
+    let canonical = runtime
+        .compact_tool_manifest_payload_bounded(None, Some("coding".to_string()), Some(3))
+        .expect("limited coding manifest");
+    let mut result = crate::tool_runtime::ToolResult::ok(canonical);
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut result);
+
+    assert_eq!(result.output["truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "limit");
+    assert_eq!(result.output["returned_count"], 3);
+    assert!(result.output["filtered_count"].as_u64().unwrap() > 3);
+    assert_eq!(result.output["limit"], 3);
+    assert!(result.output.get("categories").is_none());
+    assert!(result.output.get("tool_count").is_none());
+    assert!(result.output.get("count").is_none());
+    assert!(result.output.get("total_count").is_none());
+}
+
 fn output_schema_properties(spec: &ToolSpec) -> &serde_json::Map<String, Value> {
     spec.output_schema["properties"]["output"]["properties"]
         .as_object()
@@ -1195,23 +1215,25 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
     assert_eq!(no_patch["filtered"], true);
     assert_recommended_flows_subset_of_manifest_tools(&no_patch, "startup no-patch");
     let no_patch_tools = serde_json::to_string(&no_patch["tools"]).unwrap();
-    let no_patch_flows = serde_json::to_string(&no_patch["recommended_flows"]).unwrap();
     assert!(
         !no_patch_tools.contains("apply_patch"),
         "without patch category, tools must not include apply_patch"
     );
     assert!(
-        !no_patch_flows.contains("apply_patch"),
-        "without patch category, recommended_flows must not include apply_patch"
-    );
-    assert!(
         !no_patch_tools.contains("apply_unified_diff"),
         "without patch category, tools must not include apply_unified_diff"
     );
-    assert!(
-        !no_patch_flows.contains("apply_unified_diff"),
-        "without patch category, recommended_flows must not include apply_unified_diff"
-    );
+    for forbidden in ["apply_patch", "apply_unified_diff"] {
+        assert!(
+            no_patch["recommended_flows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|flow| flow["tools"].as_array().into_iter().flatten())
+                .all(|tool| tool.as_str() != Some(forbidden)),
+            "without patch category, recommended flow tool references must not include {forbidden}"
+        );
+    }
 
     // same filter with patch
     let with_patch = runtime
@@ -1522,6 +1544,90 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
             gateway_tool.map_or(Value::Null, |name| json!(name))
         );
     }
+}
+
+#[tokio::test]
+async fn tool_manifest_operator_extensions_require_explicit_family_capabilities() {
+    use crate::model_surface::ModelSurface;
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+
+    let runtime = test_runtime().with_model_surface(ModelSurface::AdaptiveRuntime);
+    let manifest = |tool_name: &'static str, capabilities: ToolProtocolCapabilities| {
+        runtime.tool_manifest(
+            Some(tool_name.to_string()),
+            None,
+            None,
+            false,
+            false,
+            capabilities,
+        )
+    };
+
+    let no_capability = manifest("skill_list", ToolProtocolCapabilities::default()).await;
+    assert!(!no_capability.success);
+    assert_eq!(no_capability.output["code"], "unknown_tool_manifest_tool");
+
+    let skill_only = ToolProtocolCapabilities {
+        skill_runtime: true,
+        ..Default::default()
+    };
+    let skill = manifest("skill_list", skill_only).await;
+    assert!(skill.success, "{:?}", skill.error);
+    assert_eq!(skill.output["contract"]["availability"], "gateway");
+    assert_eq!(
+        skill.output["contract"]["gateway_tool"],
+        "call_runtime_tool"
+    );
+    for hidden_without_skill_cap in ["skill_install", "memory_search", "read_tool_trace"] {
+        let hidden = manifest(hidden_without_skill_cap, skill_only).await;
+        assert!(
+            !hidden.success,
+            "{hidden_without_skill_cap} leaked via skill runtime capability"
+        );
+        assert_eq!(hidden.output["code"], "unknown_tool_manifest_tool");
+    }
+
+    let memory_only = ToolProtocolCapabilities {
+        memory_surface: true,
+        ..Default::default()
+    };
+    assert!(manifest("memory_search", memory_only).await.success);
+    assert!(!manifest("skill_list", memory_only).await.success);
+    assert!(!manifest("read_tool_trace", memory_only).await.success);
+
+    let diagnostic_only = ToolProtocolCapabilities {
+        trace_diagnostics: true,
+        ..Default::default()
+    };
+    assert!(manifest("read_tool_trace", diagnostic_only).await.success);
+    assert!(!manifest("memory_search", diagnostic_only).await.success);
+
+    let local = test_runtime().with_model_surface(ModelSurface::LocalCoding);
+    let local_with_capability = local
+        .tool_manifest(
+            Some("skill_list".to_string()),
+            None,
+            None,
+            false,
+            false,
+            skill_only,
+        )
+        .await;
+    assert!(
+        !local_with_capability.success,
+        "unsupported Local Coding surface must not expose operator extensions even with inconsistent internal capability input"
+    );
+    assert_eq!(
+        local_with_capability.output["code"],
+        "unknown_tool_manifest_tool"
+    );
+
+    let management_only = ToolProtocolCapabilities {
+        skill_management: true,
+        ..Default::default()
+    };
+    assert!(manifest("skill_install", management_only).await.success);
+    assert!(!manifest("skill_list", management_only).await.success);
 }
 
 #[tokio::test]
