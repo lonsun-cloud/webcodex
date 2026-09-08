@@ -3025,23 +3025,24 @@ async fn work_on_project_sizes_and_runner_request_reduction_are_stable() {
     assert!(reused_bytes < standard_bytes);
     assert!(workflow_omitted_bytes < fresh_bytes);
     // With the same repository observations and instruction body retained, the
-    // static workflow-only omission is 757 bytes in this fixture. Keep enough
+    // workflow-omitted projection stays below 1 KiB in this fixture. Keep enough
     // headroom for small projection growth while preserving the context win.
     assert!(
         workflow_omitted_bytes <= 1000,
         "workflow-omitted projection regressed above the context budget: {workflow_omitted_bytes} bytes"
     );
     // The sparse projection itself remains below 1 KiB when static workflow
-    // guidance is omitted. With Session ACK/recording/sidecar guidance included,
-    // the canonical default is about 4.0 KiB fresh and 4.1 KiB on unchanged
-    // continuation. Keep that default tightly bounded and still far below the
-    // standard startup hard cap while leaving modest protocol headroom.
+    // guidance is omitted. With Session ACK/recording/sidecar guidance plus the
+    // v9 early-validation-handoff rule included, this fixture is about 4.5 KiB
+    // fresh and 4.6 KiB on unchanged continuation. Keep the default tightly
+    // bounded and still far below the standard startup hard cap while leaving
+    // only modest protocol headroom.
     assert!(
-        fresh_bytes <= 4300,
+        fresh_bytes <= 4800,
         "fresh work_on_project projection regressed above the sparse context budget: {fresh_bytes} bytes"
     );
     assert!(
-        reused_bytes <= 4400,
+        reused_bytes <= 4900,
         "unchanged work_on_project projection regressed above the sparse continuation budget: {reused_bytes} bytes"
     );
 }
