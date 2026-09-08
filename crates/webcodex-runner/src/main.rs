@@ -16,9 +16,12 @@ use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker, BackgroundThread
 mod job_manager_tests;
 mod webcodex_runner;
 
+#[cfg(test)]
+use runner_operation::RunnerOperation;
+use runner_operation::{RunnerFileOperation, RunnerInvocationMetadata, RunnerJobOperation};
 use webcodex_core::{
     apply_edits_shared, apply_patch_shared, artifact_policy, build_info, lsp_bridge, mcp_gateway,
-    runner_protocol, validation_bridge,
+    runner_operation, runner_protocol, validation_bridge,
 };
 use webcodex_runner_config as runner_config;
 use webcodex_workspace::{project_overview, workspace_checkpoint};
@@ -66,16 +69,20 @@ use webcodex_runner::{
 use webcodex_runner::{
     client_profile_runner_config, configured_prepared_shell_job_command,
     configured_shell_job_command, configured_validation_job_command, cwd_allowed,
-    default_config_path, dispatch_request, err_cmd, handle_apply_patch_file_request,
-    handle_apply_text_edits_file_request, handle_artifact_file_request, handle_basic_file_request,
-    handle_checkpoint_file_request, handle_write_project_file_request, hostname,
-    is_artifact_request_kind, is_basic_file_request_kind, is_checkpoint_request_kind,
-    is_project_op, is_structured_edit_request_kind, load_config, max_concurrent_jobs, ok_cmd,
-    prepare_detached_process_launch, project_registry_dir, resolve_prepared_shell_profile,
-    resolve_requested_path, run_runner, validate_client_profile,
-    validate_structured_edit_runner_path, CommandResult, HotRunnerConfig, HttpSendConfig,
-    PreparedShellProfile, PreparedShellProfileCache, ReloadableRunnerConfig, RunnerConfig,
-    RunnerPolicy, RunnerProjectCache, RunnerSink, ShellConfig, SubmitResultError,
+    default_config_path, dispatch_request_with_outcome, err_cmd, handle_apply_patch_file_request,
+    handle_apply_text_edits_file_request, handle_artifact_file_operation,
+    handle_basic_file_request, handle_checkpoint_file_request, handle_write_project_file_request,
+    hostname, load_config, max_concurrent_jobs, ok_cmd, prepare_detached_process_launch,
+    project_registry_dir, resolve_prepared_shell_profile, resolve_requested_path, run_runner,
+    validate_client_profile, validate_structured_edit_runner_path, CommandResult, HotRunnerConfig,
+    HttpSendConfig, PreparedShellProfile, PreparedShellProfileCache, ReloadableRunnerConfig,
+    RunnerConfig, RunnerDispatchOutcome, RunnerPolicy, RunnerProjectCache, RunnerSink, ShellConfig,
+    SubmitResultError,
+};
+#[cfg(test)]
+use webcodex_runner::{
+    dispatch_request, is_artifact_request_kind, is_basic_file_request_kind,
+    is_checkpoint_request_kind, is_structured_edit_request_kind,
 };
 use webcodex_runner::{is_transport_failure, SshConfig, SshConnectionPool};
 use webcodex_runner::{
@@ -210,7 +217,40 @@ struct PendingJobStart {
     shell: ShellConfig,
     ssh: SshConfig,
     project_registry_dir: PathBuf,
-    request: RunnerRequest,
+    metadata: RunnerInvocationMetadata,
+    operation: RunnerJobOperation,
+}
+
+#[cfg(test)]
+impl PendingJobStart {
+    fn from_wire(
+        generation: u64,
+        policy: RunnerPolicy,
+        shell: ShellConfig,
+        ssh: SshConfig,
+        project_registry_dir: PathBuf,
+        request: RunnerRequest,
+    ) -> Self {
+        let invocation = request
+            .decode_invocation()
+            .expect("test Job wire request must decode to a canonical invocation");
+        let RunnerOperation::Job(operation) = invocation.operation else {
+            panic!("test PendingJobStart requires a Job operation");
+        };
+        assert!(
+            operation.is_start(),
+            "test PendingJobStart requires a start operation"
+        );
+        Self {
+            generation,
+            policy,
+            shell,
+            ssh,
+            project_registry_dir,
+            metadata: invocation.metadata,
+            operation,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1185,7 +1225,6 @@ pub(crate) const POLLING_DISPATCH_MAX_IN_FLIGHT: usize = 2;
 
 struct PollingDispatch {
     request_id: String,
-    project_cache_invalidation_required: bool,
     sink: RunnerSink,
     config: Arc<HotRunnerConfig>,
     runtime: Arc<ReloadableRunnerConfig>,
@@ -1197,8 +1236,8 @@ struct PollingDispatch {
 }
 
 impl PollingDispatch {
-    fn run(self) -> Result<bool, SubmitResultError> {
-        dispatch_request(
+    fn run(self) -> Result<RunnerDispatchOutcome, SubmitResultError> {
+        dispatch_request_with_outcome(
             &self.sink,
             &self.config,
             &self.runtime,
@@ -1213,8 +1252,7 @@ impl PollingDispatch {
 
 struct PollingDispatchCompletion {
     request_id: String,
-    project_cache_invalidation_required: bool,
-    dispatch_result: Result<bool, SubmitResultError>,
+    dispatch_result: Result<RunnerDispatchOutcome, SubmitResultError>,
 }
 
 /// Sends a completion even if a worker unwinds. It is declared before the
@@ -1223,25 +1261,19 @@ struct PollingDispatchCompletion {
 struct PollingDispatchCompletionOnDrop {
     completion_tx: mpsc::SyncSender<PollingDispatchCompletion>,
     request_id: String,
-    project_cache_invalidation_required: bool,
-    dispatch_result: Option<Result<bool, SubmitResultError>>,
+    dispatch_result: Option<Result<RunnerDispatchOutcome, SubmitResultError>>,
 }
 
 impl PollingDispatchCompletionOnDrop {
-    fn new(
-        completion_tx: mpsc::SyncSender<PollingDispatchCompletion>,
-        request_id: String,
-        project_cache_invalidation_required: bool,
-    ) -> Self {
+    fn new(completion_tx: mpsc::SyncSender<PollingDispatchCompletion>, request_id: String) -> Self {
         Self {
             completion_tx,
             request_id,
-            project_cache_invalidation_required,
             dispatch_result: None,
         }
     }
 
-    fn complete(&mut self, result: Result<bool, SubmitResultError>) {
+    fn complete(&mut self, result: Result<RunnerDispatchOutcome, SubmitResultError>) {
         self.dispatch_result = Some(result);
     }
 }
@@ -1255,7 +1287,6 @@ impl Drop for PollingDispatchCompletionOnDrop {
         });
         let _ = self.completion_tx.send(PollingDispatchCompletion {
             request_id: std::mem::take(&mut self.request_id),
-            project_cache_invalidation_required: self.project_cache_invalidation_required,
             dispatch_result,
         });
     }
@@ -1302,15 +1333,11 @@ impl PollingDispatchSupervisor {
         let completion_tx = self.completion_tx.clone();
         let dispatch_guard = self.dispatches.enter();
         let request_id = dispatch.request_id.clone();
-        let project_cache_invalidation_required = dispatch.project_cache_invalidation_required;
         let handle = std::thread::Builder::new()
             .name("webcodex-poll-dispatch".to_string())
             .spawn(move || {
-                let mut completion = PollingDispatchCompletionOnDrop::new(
-                    completion_tx,
-                    request_id,
-                    project_cache_invalidation_required,
-                );
+                let mut completion =
+                    PollingDispatchCompletionOnDrop::new(completion_tx, request_id);
                 let _dispatch_guard = dispatch_guard;
                 completion.complete(dispatch.run());
             })
@@ -1335,10 +1362,15 @@ impl PollingDispatchSupervisor {
             0
         });
         let _request_id = completion.request_id;
-        if completion.project_cache_invalidation_required && completion.dispatch_result.is_ok() {
-            project_cache.invalidate();
+        match completion.dispatch_result {
+            Ok(outcome) => {
+                if outcome.project_cache_invalidation_required {
+                    project_cache.invalidate();
+                }
+                Ok(outcome.handled)
+            }
+            Err(error) => Err(error),
         }
-        completion.dispatch_result
     }
 
     /// Inspect every completion currently available. This is called before
@@ -2302,6 +2334,7 @@ fn register(
     }
 }
 
+#[cfg(test)]
 fn is_file_request_kind(kind: &str) -> bool {
     is_basic_file_request_kind(kind)
         || is_structured_edit_request_kind(kind)
@@ -2309,18 +2342,16 @@ fn is_file_request_kind(kind: &str) -> bool {
         || is_checkpoint_request_kind(kind)
 }
 
-fn handle_file_request(policy: &RunnerPolicy, request: &RunnerRequest) -> CommandResult {
-    let Some(path) = request.path.as_deref() else {
-        return CommandResult {
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            duration_ms: Some(0),
-            error: Some("file request missing path".to_string()),
-        };
-    };
+fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation) -> CommandResult {
+    let request = operation.payload();
+    let path = request.path.as_str();
     let start = Instant::now();
-    if is_structured_edit_request_kind(&request.kind) {
+    if matches!(
+        operation,
+        RunnerFileOperation::WriteProjectFile(_)
+            | RunnerFileOperation::ApplyTextEdits(_)
+            | RunnerFileOperation::ApplyPatch(_)
+    ) {
         if let Err(e) = validate_structured_edit_runner_path(path) {
             return CommandResult {
                 exit_code: None,
@@ -2343,34 +2374,51 @@ fn handle_file_request(policy: &RunnerPolicy, request: &RunnerRequest) -> Comman
             }
         }
     };
-    match request.kind.as_str() {
-        "file_write_project_file" => handle_write_project_file_request(request, &resolved, start),
-        "file_apply_text_edits" => handle_apply_text_edits_file_request(policy, request, start),
-        "file_apply_patch" => handle_apply_patch_file_request(policy, request, start),
-        "file_save_project_artifact"
-        | "file_read_project_artifact_metadata"
-        | "file_read_project_artifact"
-        | "file_read_project_artifact_export_chunk"
-        | "file_artifact_upload_begin"
-        | "file_artifact_upload_chunk"
-        | "file_artifact_upload_finish"
-        | "file_artifact_upload_abort" => handle_artifact_file_request(request, &resolved, start),
-        "file_checkpoint_create" | "file_checkpoint_restore" => {
-            handle_checkpoint_file_request(request, &resolved, start)
+    match operation {
+        RunnerFileOperation::WriteProjectFile(_) => {
+            handle_write_project_file_request(request, &resolved, start)
         }
-        "file_read"
-        | "file_write"
-        | "file_list"
-        | "file_project_overview"
-        | "file_delete_project_files"
-        | "file_skill_list_packages"
-        | "file_skill_read_file" => handle_basic_file_request(policy, request, &resolved, start),
+        RunnerFileOperation::ApplyTextEdits(_) => {
+            handle_apply_text_edits_file_request(policy, request, start)
+        }
+        RunnerFileOperation::ApplyPatch(_) => {
+            handle_apply_patch_file_request(policy, request, start)
+        }
+        RunnerFileOperation::SaveProjectArtifact(_)
+        | RunnerFileOperation::ReadProjectArtifactMetadata(_)
+        | RunnerFileOperation::ReadProjectArtifact(_)
+        | RunnerFileOperation::ReadProjectArtifactExportChunk(_)
+        | RunnerFileOperation::ArtifactUploadBegin(_)
+        | RunnerFileOperation::ArtifactUploadChunk(_)
+        | RunnerFileOperation::ArtifactUploadFinish(_)
+        | RunnerFileOperation::ArtifactUploadAbort(_) => {
+            handle_artifact_file_operation(operation, &resolved, start)
+        }
+        RunnerFileOperation::CheckpointCreate(_) | RunnerFileOperation::CheckpointRestore(_) => {
+            handle_checkpoint_file_request(operation, &resolved, start)
+        }
+        RunnerFileOperation::Read(_)
+        | RunnerFileOperation::Write(_)
+        | RunnerFileOperation::List(_)
+        | RunnerFileOperation::ProjectOverview(_)
+        | RunnerFileOperation::DeleteProjectFiles(_)
+        | RunnerFileOperation::SkillListPackages(_)
+        | RunnerFileOperation::SkillReadFile(_) => {
+            handle_basic_file_request(policy, operation, &resolved, start)
+        }
+    }
+}
+
+#[cfg(test)]
+fn handle_file_request(policy: &RunnerPolicy, request: &RunnerRequest) -> CommandResult {
+    match request.decode_operation() {
+        Ok(RunnerOperation::File(operation)) => handle_file_operation(policy, &operation),
         _ => CommandResult {
             exit_code: None,
             stdout: None,
             stderr: None,
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(format!("unknown file request kind: {}", request.kind)),
+            duration_ms: Some(0),
+            error: Some("invalid file request".to_string()),
         },
     }
 }
@@ -2813,20 +2861,34 @@ fn runner_job_is_active(status: &str) -> bool {
     matches!(status, "agent_queued" | "running" | "stop_requested")
 }
 
-fn job_prestart_lifecycle_for_kind(kind: &str) -> Option<ShellCommandExecutionState> {
+fn job_prestart_lifecycle(operation: &RunnerJobOperation) -> Option<ShellCommandExecutionState> {
+    match operation {
+        RunnerJobOperation::StartShell(_)
+        | RunnerJobOperation::StartProcess(_)
+        | RunnerJobOperation::StartDetachedProcess(_)
+        | RunnerJobOperation::StartScript(_) => Some(ShellCommandExecutionState::NotStarted),
+        RunnerJobOperation::StartValidation(_) | RunnerJobOperation::Stop { .. } => None,
+    }
+}
+
+/// Compatibility-only lifecycle projection for malformed V2 Job requests that
+/// fail before a canonical operation can be constructed. Production Job
+/// execution never uses this string registry.
+pub(crate) fn decode_failure_prestart_lifecycle(
+    request: &RunnerRequest,
+) -> Option<ShellCommandExecutionState> {
     matches!(
-        kind,
+        request.kind.as_str(),
         "start_job" | "start_process_job" | "start_detached_process_job" | "start_script_job"
     )
     .then_some(ShellCommandExecutionState::NotStarted)
 }
 
-fn structured_prestart_lifecycle(request: &RunnerRequest) -> Option<ShellCommandExecutionState> {
-    job_prestart_lifecycle_for_kind(request.kind.as_str())
-}
-
-fn post_spawn_interruption_lifecycle_for_kind(kind: &str) -> Option<ShellCommandExecutionState> {
-    (kind == "start_job").then_some(ShellCommandExecutionState::OutcomeUnknown)
+fn post_spawn_interruption_lifecycle(
+    operation: &RunnerJobOperation,
+) -> Option<ShellCommandExecutionState> {
+    matches!(operation, RunnerJobOperation::StartShell(_))
+        .then_some(ShellCommandExecutionState::OutcomeUnknown)
 }
 
 fn post_spawn_interruption_reason(
@@ -2845,13 +2907,17 @@ fn post_spawn_interruption_reason(
     }
 }
 
-fn post_spawn_interruption_delta(kind: &str, duration_ms: u64, error: &str) -> RunnerJobDelta {
+fn post_spawn_interruption_delta(
+    operation: &RunnerJobOperation,
+    duration_ms: u64,
+    error: &str,
+) -> RunnerJobDelta {
     RunnerJobDelta {
         status: "failed".to_string(),
         exit_code: None,
         duration_ms: Some(duration_ms),
         error: Some(error.to_string()),
-        command_execution_state: post_spawn_interruption_lifecycle_for_kind(kind),
+        command_execution_state: post_spawn_interruption_lifecycle(operation),
         finished: true,
         ..Default::default()
     }
@@ -3109,15 +3175,21 @@ fn validate_detached_recovery_context(
     Ok(())
 }
 
-fn validate_runner_job_context(
+fn validate_runner_job_context_operation(
     context: &ShellJobContext,
-    request: &RunnerRequest,
+    operation: &RunnerJobOperation,
     client_id: &str,
 ) -> Result<(), String> {
     const MAX_CONTEXT_FIELD_CHARS: usize = 1_024;
     const MAX_COMMAND_PREVIEW_CHARS: usize = 121;
     let bounded =
         |value: &str, max_chars: usize| !value.contains('\0') && value.chars().count() <= max_chars;
+    if !operation.is_start() {
+        return Err("stop_job is not a Job start operation".to_string());
+    }
+    if operation.context() != Some(context) {
+        return Err("job recovery context does not match the typed Job operation".to_string());
+    }
     if !bounded(&context.command_preview, MAX_COMMAND_PREVIEW_CHARS)
         || context.command_preview.contains(['\r', '\n'])
     {
@@ -3136,7 +3208,7 @@ fn validate_runner_job_context(
             ));
         }
     }
-    if context.cwd != request.cwd {
+    if context.cwd.as_deref() != operation.cwd() {
         return Err("job recovery context cwd does not match the execution request".to_string());
     }
     if context.ssh_resource.is_some() && context.workflow_session_id.is_none() {
@@ -3165,12 +3237,29 @@ fn validate_runner_job_context(
     }) {
         return Err("job recovery context shell is invalid".to_string());
     }
-    if request.kind == "start_job" {
-        runner_protocol::validate_raw_shell_wire_command(&request.command)?;
-    }
-    let validation_context = request.kind == "start_validation_job";
-    if (validation_context && !(1..=3).contains(&context.validation_steps.len()))
-        || (!validation_context && !context.validation_steps.is_empty())
+
+    let validation_steps = match operation {
+        RunnerJobOperation::StartValidation(operation) => {
+            let names = operation
+                .steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            if !(1..=3).contains(&operation.steps.len())
+                || operation.steps.iter().any(|step| !step.is_canonical())
+                || operation.steps.iter().enumerate().any(|(index, step)| {
+                    operation.steps[..index]
+                        .iter()
+                        .any(|earlier| earlier.name == step.name)
+                })
+            {
+                return Err("invalid structured validation plan".to_string());
+            }
+            names
+        }
+        _ => Vec::new(),
+    };
+    if context.validation_steps != validation_steps
         || context
             .validation_steps
             .iter()
@@ -3184,6 +3273,7 @@ fn validate_runner_job_context(
     {
         return Err("job recovery context validation_steps are invalid".to_string());
     }
+    let validation_context = matches!(operation, RunnerJobOperation::StartValidation(_));
     if context.validation.as_ref().is_some_and(|metadata| {
         !validation_context
             || !metadata.is_valid()
@@ -3203,98 +3293,39 @@ fn validate_runner_job_context(
     {
         return Err("job recovery context structured execution metadata is invalid".to_string());
     }
-    // validation_identity / validation_tool / assertion_name are server-admission-derived
-    // validation correlation metadata. The Runner validates their closed shape above,
-    // then preserves them while checking the execution fields it can authoritatively
-    // derive from the typed request. None of them grant execution authority.
-    let (validation_identity, validation_tool, assertion_name) = context
-        .structured_execution
-        .as_ref()
-        .map(|metadata| {
-            (
-                metadata.validation_identity.clone(),
-                metadata.validation_tool.clone(),
-                metadata.assertion_name.clone(),
-            )
-        })
-        .unwrap_or((None, None, None));
-    let expected_structured = match request.kind.as_str() {
-        "start_process_job" => {
-            if !request.command.is_empty()
-                || request.script.is_some()
-                || request.process.is_none()
-                || context.ssh_resource.is_some()
-            {
+
+    match operation {
+        RunnerJobOperation::StartShell(operation) => {
+            runner_protocol::validate_raw_shell_wire_command(&operation.command)?;
+        }
+        RunnerJobOperation::StartProcess(operation)
+        | RunnerJobOperation::StartDetachedProcess(operation) => {
+            if context.ssh_resource.is_some() {
                 return Err("typed process Job request shape is invalid".to_string());
             }
-            let process = request.process.as_ref().expect("checked process payload");
-            runner_protocol::validate_process_argv(process)?;
-            validate_runner_structured_common(request)?;
-            Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-                execution_source: "run_process".to_string(),
-                language: None,
-                script_bytes: None,
-                arg_count: process.args.len(),
-                stdin_present: request.stdin.is_some(),
-                validation_identity: validation_identity.clone(),
-                validation_tool: validation_tool.clone(),
-                assertion_name: assertion_name.clone(),
-            })
+            runner_protocol::validate_process_argv(&operation.process)?;
+            validate_runner_structured_common(
+                operation.cwd.as_deref(),
+                operation.stdin.as_deref(),
+                operation.timeout_secs,
+            )?;
         }
-        "start_detached_process_job" => {
-            if !request.command.is_empty()
-                || request.script.is_some()
-                || request.process.is_none()
-                || context.ssh_resource.is_some()
-            {
-                return Err("typed detached process Job request shape is invalid".to_string());
-            }
-            let process = request
-                .process
-                .as_ref()
-                .expect("checked detached process payload");
-            runner_protocol::validate_process_argv(process)?;
-            validate_runner_structured_common(request)?;
-            Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-                execution_source: "run_detached_process".to_string(),
-                language: None,
-                script_bytes: None,
-                arg_count: process.args.len(),
-                stdin_present: request.stdin.is_some(),
-                validation_identity: validation_identity.clone(),
-                validation_tool: validation_tool.clone(),
-                assertion_name: None,
-            })
-        }
-        "start_script_job" => {
-            if !request.command.is_empty()
-                || request.process.is_some()
-                || request.script.is_none()
-                || context.ssh_resource.is_some()
-            {
+        RunnerJobOperation::StartScript(operation) => {
+            if context.ssh_resource.is_some() {
                 return Err("typed script Job request shape is invalid".to_string());
             }
-            let script = request.script.as_ref().expect("checked script payload");
             runner_protocol::validate_script_request(
-                script,
-                request.stdin.as_deref(),
-                request.cwd.as_deref(),
-                request.timeout_secs,
+                &operation.script,
+                operation.stdin.as_deref(),
+                operation.cwd.as_deref(),
+                operation.timeout_secs,
             )?;
-            Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-                execution_source: "run_script".to_string(),
-                language: Some(script.language),
-                script_bytes: Some(script.script.len()),
-                arg_count: script.args.len(),
-                stdin_present: request.stdin.is_some(),
-                validation_identity: validation_identity.clone(),
-                validation_tool: validation_tool.clone(),
-                assertion_name: assertion_name.clone(),
-            })
         }
-        _ => None,
-    };
-    if context.structured_execution != expected_structured {
+        RunnerJobOperation::StartValidation(_) => {}
+        RunnerJobOperation::Stop { .. } => unreachable!("stop rejected above"),
+    }
+
+    if context.structured_execution != operation.expected_structured_execution() {
         return Err(
             "job recovery context structured execution metadata does not match request".to_string(),
         );
@@ -3325,8 +3356,28 @@ fn validate_runner_job_context(
     Ok(())
 }
 
-fn validate_runner_structured_common(request: &RunnerRequest) -> Result<(), String> {
-    if let Some(stdin) = request.stdin.as_deref() {
+#[cfg(test)]
+fn validate_runner_job_context(
+    context: &ShellJobContext,
+    request: &RunnerRequest,
+    client_id: &str,
+) -> Result<(), String> {
+    let mut request = request.clone();
+    request.job_context = Some(context.clone());
+    match request.decode_operation()? {
+        runner_operation::RunnerOperation::Job(operation) => {
+            validate_runner_job_context_operation(context, &operation, client_id)
+        }
+        _ => Err("request is not a Runner Job operation".to_string()),
+    }
+}
+
+fn validate_runner_structured_common(
+    cwd: Option<&str>,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    if let Some(stdin) = stdin {
         if stdin.len() > runner_protocol::PROCESS_STDIN_MAX_BYTES {
             return Err(format!(
                 "stdin is too large; maximum is {} bytes",
@@ -3337,7 +3388,7 @@ fn validate_runner_structured_common(request: &RunnerRequest) -> Result<(), Stri
             return Err("stdin cannot contain NUL bytes".to_string());
         }
     }
-    if let Some(cwd) = request.cwd.as_deref() {
+    if let Some(cwd) = cwd {
         if cwd.len() > runner_protocol::PROCESS_CWD_MAX_BYTES {
             return Err(format!(
                 "cwd is too long; maximum is {} bytes",
@@ -3350,7 +3401,7 @@ fn validate_runner_structured_common(request: &RunnerRequest) -> Result<(), Stri
     }
     if !(runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS
         ..=runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
-        .contains(&request.timeout_secs)
+        .contains(&timeout_secs)
     {
         return Err(format!(
             "timeout_secs must be between {} and {}",
@@ -3573,20 +3624,18 @@ impl JobManager {
 
     fn fail_job(
         &self,
-        request: &RunnerRequest,
+        operation: &RunnerJobOperation,
         error: String,
         validation_progress: Option<ShellJobValidationProgress>,
     ) {
-        let Some(job_id) = request.job_id.as_deref() else {
-            return;
-        };
+        let job_id = operation.job_id();
         self.update_and_send(
             job_id,
             RunnerJobDelta {
                 status: "failed".to_string(),
                 duration_ms: Some(0),
                 error: Some(error),
-                command_execution_state: structured_prestart_lifecycle(request),
+                command_execution_state: job_prestart_lifecycle(operation),
                 validation_progress,
                 finished: true,
                 ..Default::default()
@@ -4039,46 +4088,27 @@ impl JobManager {
         self.workers.active()
     }
 
-    fn shutdown_rejection(&self, request: &RunnerRequest) {
-        self.fail_job(request, "runner is shutting down".to_string(), None);
+    fn shutdown_rejection(&self, operation: &RunnerJobOperation) {
+        self.fail_job(operation, "runner is shutting down".to_string(), None);
     }
 
     fn enqueue(&self, sink: RunnerSink, start: PendingJobStart) {
-        let Some(job_id) = start.request.job_id.clone() else {
+        if !start.operation.is_start() {
+            return;
+        }
+        let job_id = start.operation.job_id().to_string();
+        let Some(context) = start.operation.context().cloned() else {
             return;
         };
-        let Some(context) = start.request.job_context.clone() else {
-            let command_execution_state = structured_prestart_lifecycle(&start.request);
-            let _ = sink.send_job_update(&RunnerJobUpdateRequest {
-                client_id: sink.client_id().to_string(),
-                runner_instance_id: sink.runner_instance_id().to_string(),
-                job_id,
-                request_id: Some(start.request.request_id),
-                update_seq: Some(1),
-                status: "failed".to_string(),
-                stdout_chunk: None,
-                stderr_chunk: None,
-                stdout_tail: None,
-                stderr_tail: None,
-                log_snapshot: None,
-                exit_code: None,
-                duration_ms: Some(0),
-                error: Some("job start request is missing recovery context".to_string()),
-                command_execution_state,
-                validation_progress: None,
-                activity: None,
-                finished: true,
-            });
-            return;
-        };
-        if let Err(error) = validate_runner_job_context(&context, &start.request, sink.client_id())
+        if let Err(error) =
+            validate_runner_job_context_operation(&context, &start.operation, sink.client_id())
         {
-            let command_execution_state = structured_prestart_lifecycle(&start.request);
+            let command_execution_state = job_prestart_lifecycle(&start.operation);
             let _ = sink.send_job_update(&RunnerJobUpdateRequest {
                 client_id: sink.client_id().to_string(),
                 runner_instance_id: sink.runner_instance_id().to_string(),
                 job_id,
-                request_id: Some(start.request.request_id),
+                request_id: Some(start.metadata.request_id.clone()),
                 update_seq: Some(1),
                 status: "failed".to_string(),
                 stdout_chunk: None,
@@ -4140,21 +4170,21 @@ impl JobManager {
                     runner_instance_id,
                     snapshot: ShellJobSnapshot {
                         job_id: job_id.clone(),
-                        request_id: start.request.request_id.clone(),
+                        request_id: start.metadata.request_id.clone(),
                         status: if terminal {
                             "failed".to_string()
                         } else {
                             "agent_queued".to_string()
                         },
                         update_seq: u64::from(terminal),
-                        created_at: start.request.created_at,
+                        created_at: start.metadata.created_at,
                         started_at: None,
                         ended_at: terminal.then_some(now),
                         exit_code: None,
                         duration_ms: terminal.then_some(0),
                         error: immediate_failure.clone(),
                         command_execution_state: terminal
-                            .then(|| structured_prestart_lifecycle(&start.request))
+                            .then(|| job_prestart_lifecycle(&start.operation))
                             .flatten(),
                         context,
                         stdout: ShellJobStreamSnapshot::default(),
@@ -4194,40 +4224,20 @@ impl JobManager {
 
     fn start_now(&self, start: PendingJobStart) {
         if self.shutting_down.load(Ordering::SeqCst) {
-            self.shutdown_rejection(&start.request);
+            self.shutdown_rejection(&start.operation);
             return;
         }
-        if start.request.kind == "start_detached_process_job" {
-            let PendingJobStart {
-                generation,
-                policy,
-                shell,
-                project_registry_dir,
-                request,
-                ..
-            } = start;
-            self.start_detached_process_job(
-                generation,
-                policy,
-                shell,
-                project_registry_dir,
-                request,
-            );
-        } else if matches!(
-            start.request.kind.as_str(),
-            "start_process_job" | "start_script_job"
-        ) {
-            let PendingJobStart {
-                generation,
-                policy,
-                shell,
-                project_registry_dir,
-                request,
-                ..
-            } = start;
-            self.start_structured_job(generation, policy, shell, project_registry_dir, request);
-        } else {
-            self.start_shell_job(start);
+        match &start.operation {
+            RunnerJobOperation::StartDetachedProcess(_) => self.start_detached_process_job(start),
+            RunnerJobOperation::StartProcess(_) | RunnerJobOperation::StartScript(_) => {
+                self.start_structured_job(start)
+            }
+            RunnerJobOperation::StartShell(_) | RunnerJobOperation::StartValidation(_) => {
+                self.start_shell_job(start)
+            }
+            RunnerJobOperation::Stop { .. } => {
+                unreachable!("stop Job operation cannot enter the start queue")
+            }
         }
     }
 
@@ -4250,7 +4260,7 @@ impl JobManager {
                     let reserved = jobs
                         .values()
                         .filter(|job| {
-                            job.client_id == queued_start.request.client_id
+                            job.client_id == queued_start.metadata.client_id
                                 && job.slot_reserved
                                 && runner_job_is_active(&job.snapshot.status)
                         })
@@ -4261,10 +4271,9 @@ impl JobManager {
                     }
                 }
                 if let Some(idx) = selected {
-                    if let Some(job_id) = queued[idx].request.job_id.as_deref() {
-                        if let Some(job) = jobs.get_mut(job_id) {
-                            job.slot_reserved = true;
-                        }
+                    let job_id = queued[idx].operation.job_id();
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.slot_reserved = true;
                     }
                     queued.remove(idx)
                 } else {
@@ -4278,17 +4287,20 @@ impl JobManager {
         }
     }
 
-    fn start_detached_process_job(
-        &self,
-        generation: u64,
-        policy: RunnerPolicy,
-        shell: ShellConfig,
-        project_registry_dir: PathBuf,
-        request: RunnerRequest,
-    ) {
-        let Some(job_id) = request.job_id.clone() else {
-            return;
-        };
+    fn start_detached_process_job(&self, start: PendingJobStart) {
+        let PendingJobStart {
+            generation,
+            policy,
+            shell,
+            project_registry_dir,
+            metadata,
+            operation,
+            ..
+        } = start;
+        let job_id = operation.job_id().to_string();
+        if !matches!(operation, RunnerJobOperation::StartDetachedProcess(_)) {
+            unreachable!("detached Job starter received non-detached operation");
+        }
         let (stop_requested, runner_instance_id) = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -4307,29 +4319,16 @@ impl JobManager {
         };
         let (Some(stop_requested), Some(runner_instance_id)) = (stop_requested, runner_instance_id)
         else {
-            self.shutdown_rejection(&request);
-            return;
-        };
-        let Some(process) = request.process.clone() else {
-            self.fail_job(
-                &request,
-                "typed detached process Job request is missing its payload".to_string(),
-                None,
-            );
-            return;
-        };
-        let Some(context) = request.job_context.clone() else {
-            self.fail_job(
-                &request,
-                "detached process Job request is missing recovery context".to_string(),
-                None,
-            );
+            self.shutdown_rejection(&operation);
             return;
         };
         let manager = self.clone_for_worker();
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
             let _worker_guard = worker_guard;
+            let RunnerJobOperation::StartDetachedProcess(request) = &operation else {
+                unreachable!("detached Job starter received non-detached operation");
+            };
             let prepared = match prepare_detached_process_launch(
                 generation,
                 &policy,
@@ -4337,14 +4336,14 @@ impl JobManager {
                 &project_registry_dir,
                 &manager.prepared_profiles,
                 request.cwd.as_deref(),
-                &process.executable,
-                &process.args,
+                &request.process.executable,
+                &request.process.args,
                 request.timeout_secs,
                 Some(stop_requested.as_ref()),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    manager.fail_job(&request, error, None);
+                    manager.fail_job(&operation, error, None);
                     manager.start_available_queued();
                     return;
                 }
@@ -4367,20 +4366,20 @@ impl JobManager {
                 manager.start_available_queued();
                 return;
             }
-            let store = match manager.detached_store_for_start(&request.client_id) {
+            let store = match manager.detached_store_for_start(&metadata.client_id) {
                 Ok(store) => store,
                 Err(error) => {
-                    manager.fail_job(&request, error, None);
+                    manager.fail_job(&operation, error, None);
                     manager.start_available_queued();
                     return;
                 }
             };
             let detached_request = DetachedStartRequest {
                 job_id: job_id.clone(),
-                request_id: request.request_id.clone(),
-                client_id: request.client_id.clone(),
+                request_id: metadata.request_id.clone(),
+                client_id: metadata.client_id.clone(),
                 runner_instance_id,
-                context,
+                context: request.context.clone(),
                 launch: DetachedLaunchSpec {
                     process: prepared.process,
                     cwd: Some(prepared.cwd),
@@ -4399,7 +4398,7 @@ impl JobManager {
                                 tracing::error!(job_id = %job_id, error = %sync_error, "detached Job failed-start durable sync failed closed");
                             }
                         }
-                        Err(_) => manager.fail_job(&request, error, None),
+                        Err(_) => manager.fail_job(&operation, error, None),
                     }
                     manager.start_available_queued();
                     return;
@@ -4446,17 +4445,22 @@ impl JobManager {
         });
     }
 
-    fn start_structured_job(
-        &self,
-        generation: u64,
-        policy: RunnerPolicy,
-        shell: ShellConfig,
-        project_registry_dir: PathBuf,
-        request: RunnerRequest,
-    ) {
-        let Some(job_id) = request.job_id.clone() else {
-            return;
-        };
+    fn start_structured_job(&self, start: PendingJobStart) {
+        let PendingJobStart {
+            generation,
+            policy,
+            shell,
+            project_registry_dir,
+            operation,
+            ..
+        } = start;
+        let job_id = operation.job_id().to_string();
+        if !matches!(
+            operation,
+            RunnerJobOperation::StartProcess(_) | RunnerJobOperation::StartScript(_)
+        ) {
+            unreachable!("structured Job starter received non process/script operation");
+        }
         let stop_requested = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -4471,19 +4475,9 @@ impl JobManager {
             }
         };
         let Some(stop_requested) = stop_requested else {
-            self.shutdown_rejection(&request);
+            self.shutdown_rejection(&operation);
             return;
         };
-        if (request.kind == "start_process_job" && request.process.is_none())
-            || (request.kind == "start_script_job" && request.script.is_none())
-        {
-            self.fail_job(
-                &request,
-                "typed structured Job request is missing its payload".to_string(),
-                None,
-            );
-            return;
-        }
         let manager = self.clone_for_worker();
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
@@ -4500,9 +4494,8 @@ impl JobManager {
                     },
                 );
             };
-            let result = match request.kind.as_str() {
-                "start_process_job" => {
-                    let process = request.process.as_ref().expect("validated process payload");
+            let result = match &operation {
+                RunnerJobOperation::StartProcess(request) => {
                     run_process_with_profiles_and_execution_state_with_start_hook(
                         generation,
                         &policy,
@@ -4510,16 +4503,15 @@ impl JobManager {
                         &project_registry_dir,
                         &manager.prepared_profiles,
                         request.cwd.as_deref(),
-                        &process.executable,
-                        &process.args,
+                        &request.process.executable,
+                        &request.process.args,
                         request.stdin.as_deref(),
                         request.timeout_secs,
                         Some(stop_requested.as_ref()),
                         Some(&on_started),
                     )
                 }
-                "start_script_job" => {
-                    let script = request.script.as_ref().expect("validated script payload");
+                RunnerJobOperation::StartScript(request) => {
                     run_script_with_profiles_and_execution_state_with_start_hook(
                         generation,
                         &policy,
@@ -4527,14 +4519,14 @@ impl JobManager {
                         &project_registry_dir,
                         &manager.prepared_profiles,
                         request.cwd.as_deref(),
-                        script,
+                        &request.script,
                         request.stdin.as_deref(),
                         request.timeout_secs,
                         Some(stop_requested.as_ref()),
                         Some(&on_started),
                     )
                 }
-                _ => unreachable!("structured Job dispatcher received legacy request"),
+                _ => unreachable!("structured Job starter received non process/script operation"),
             };
             let execution_state = result.execution_state;
             let stopped = stop_requested.load(Ordering::SeqCst)
@@ -4576,80 +4568,49 @@ impl JobManager {
             shell,
             ssh,
             project_registry_dir,
-            request,
+            metadata: _,
+            operation,
         } = start;
-        let Some(job_id) = request.job_id.clone() else {
-            return;
+        let (job_id, cwd, raw_command, steps, timeout_secs, context, validation) = match &operation
+        {
+            RunnerJobOperation::StartShell(request) => (
+                request.job_id.clone(),
+                request.cwd.clone(),
+                Some(request.command.clone()),
+                Vec::new(),
+                request.timeout_secs,
+                request.context.clone(),
+                false,
+            ),
+            RunnerJobOperation::StartValidation(request) => (
+                request.job_id.clone(),
+                request.cwd.clone(),
+                None,
+                request.steps.clone(),
+                request.timeout_secs,
+                request.context.clone(),
+                true,
+            ),
+            _ => unreachable!("shell Job starter received non shell/validation operation"),
         };
         if !policy.allow_raw_shell {
             self.fail_job(
-                &request,
+                &operation,
                 "raw shell is disabled by local Runner policy".to_string(),
                 None,
             );
             return;
         }
-        if request
-            .job_context
-            .as_ref()
-            .is_some_and(|context| context.ssh_resource.is_some())
-        {
-            self.start_ssh_shell_job(generation, policy, ssh, request);
+        if context.ssh_resource.is_some() {
+            self.start_ssh_shell_job(generation, policy, ssh, operation);
             return;
         }
-        let cwd_path = request
-            .cwd
+        let cwd_path = cwd
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
         if let Err(e) = cwd_allowed(&policy, &cwd_path) {
-            self.fail_job(&request, e, None);
-            return;
-        }
-        let validation = request.kind == "start_validation_job";
-        let steps = if validation {
-            match serde_json::from_str::<Vec<ShellJobValidationStep>>(&request.command) {
-                Ok(steps)
-                    if (1..=3).contains(&steps.len())
-                        && steps.iter().all(ShellJobValidationStep::is_canonical)
-                        && steps.iter().enumerate().all(|(index, step)| {
-                            !steps[..index]
-                                .iter()
-                                .any(|earlier| earlier.name == step.name)
-                        }) =>
-                {
-                    steps
-                }
-                _ => {
-                    self.fail_job(
-                        &request,
-                        "invalid structured validation plan".to_string(),
-                        None,
-                    );
-                    return;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        if validation
-            && request.job_context.as_ref().is_none_or(|context| {
-                context.validation_steps
-                    != steps
-                        .iter()
-                        .map(|step| step.name.clone())
-                        .collect::<Vec<_>>()
-            })
-        {
-            self.fail_job(
-                &request,
-                "structured validation plan does not match recovery context".to_string(),
-                Some(ShellJobValidationProgress {
-                    completed: 0,
-                    current_step: None,
-                    failed_step: None,
-                }),
-            );
+            self.fail_job(&operation, e, None);
             return;
         }
         let prepared_profile = match resolve_prepared_shell_profile(
@@ -4657,13 +4618,13 @@ impl JobManager {
             &shell,
             &project_registry_dir,
             &cwd_path,
-            request.cwd.is_some(),
+            cwd.is_some(),
             &self.prepared_profiles,
             Some(self.shutting_down.as_ref()),
         ) {
             Ok(profile) => profile,
             Err(e) => {
-                self.fail_job(&request, e, None);
+                self.fail_job(&operation, e, None);
                 return;
             }
         };
@@ -4679,7 +4640,7 @@ impl JobManager {
             })
         {
             self.fail_job(
-                &request,
+                &operation,
                 VALIDATION_TOOL_UNAVAILABLE_CODE.to_string(),
                 Some(ShellJobValidationProgress {
                     completed: 0,
@@ -4700,17 +4661,18 @@ impl JobManager {
                     &steps[index].args,
                 )
             } else {
+                let raw_command = raw_command
+                    .as_deref()
+                    .expect("typed raw shell Job carries command text");
                 match prepared_profile.as_deref() {
-                    Some(profile) => {
-                        configured_prepared_shell_job_command(profile, &request.command)
-                    }
-                    None => configured_shell_job_command(&shell, &request.command),
+                    Some(profile) => configured_prepared_shell_job_command(profile, raw_command),
+                    None => configured_shell_job_command(&shell, raw_command),
                 }
             };
             let mut command = match configured {
                 Ok(command) => command,
                 Err(error) => {
-                    self.fail_job(&request, error, None);
+                    self.fail_job(&operation, error, None);
                     return;
                 }
             };
@@ -4742,7 +4704,7 @@ impl JobManager {
             }
         };
         let Some(stop_requested) = stop_requested else {
-            self.shutdown_rejection(&request);
+            self.shutdown_rejection(&operation);
             return;
         };
         // Preserve the pre-start proof boundary explicitly. A stop/shutdown
@@ -4750,11 +4712,11 @@ impl JobManager {
         // fence below is intentionally repeated after spawn because that later
         // race can no longer claim NotStarted.
         if stop_requested.load(Ordering::SeqCst) {
-            self.fail_job(&request, "job stopped before start".to_string(), None);
+            self.fail_job(&operation, "job stopped before start".to_string(), None);
             return;
         }
         if self.shutting_down.load(Ordering::SeqCst) {
-            self.shutdown_rejection(&request);
+            self.shutdown_rejection(&operation);
             return;
         }
         let start = Instant::now();
@@ -4765,7 +4727,7 @@ impl JobManager {
             Err(e) => {
                 if validation {
                     self.fail_job(
-                        &request,
+                        &operation,
                         VALIDATION_STEP_SPAWN_FAILED_CODE.to_string(),
                         Some(ShellJobValidationProgress {
                             completed: 0,
@@ -4783,7 +4745,7 @@ impl JobManager {
                             )
                         })
                         .unwrap_or_else(|| format!("failed to spawn command: {}", e));
-                    self.fail_job(&request, error, None);
+                    self.fail_job(&operation, error, None);
                 }
                 return;
             }
@@ -4818,7 +4780,7 @@ impl JobManager {
             self.update_and_send(
                 &job_id,
                 post_spawn_interruption_delta(
-                    request.kind.as_str(),
+                    &operation,
                     start.elapsed().as_millis() as u64,
                     error,
                 ),
@@ -4850,7 +4812,7 @@ impl JobManager {
         let worker_guard = self.workers.enter();
         std::thread::spawn(move || {
             let _worker_guard = worker_guard;
-            let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
+            let timeout_secs = timeout_secs.min(policy.max_timeout_secs).max(1);
             let mut step_index = 0;
             let (final_status, out, err, final_progress) = loop {
                 const OUTPUT_CHANNEL_CAPACITY: usize = 64;
@@ -5143,38 +5105,32 @@ impl JobManager {
         generation: u64,
         policy: RunnerPolicy,
         ssh: SshConfig,
-        request: RunnerRequest,
+        operation: RunnerJobOperation,
     ) {
-        let Some(job_id) = request.job_id.clone() else {
+        let request = match &operation {
+            RunnerJobOperation::StartShell(request) => request,
+            RunnerJobOperation::StartValidation(_) => {
+                self.fail_job(
+                    &operation,
+                    "ssh_resource_unsupported_for_request: SSH resources do not support structured validation jobs; command was not started".to_string(),
+                    None,
+                );
+                return;
+            }
+            _ => unreachable!("SSH Job starter received non shell/validation operation"),
+        };
+        let job_id = request.job_id.clone();
+        let Some(resource_name) = request.context.ssh_resource.as_deref() else {
             return;
         };
-        let Some(resource_name) = request
-            .job_context
-            .as_ref()
-            .and_then(|context| context.ssh_resource.as_deref())
-        else {
-            return;
-        };
-        let Some(session_id) = request
-            .job_context
-            .as_ref()
-            .and_then(|context| context.workflow_session_id.as_deref())
-        else {
+        let Some(session_id) = request.context.workflow_session_id.as_deref() else {
             self.fail_job(
-                &request,
+                &operation,
                 "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started".to_string(),
                 None,
             );
             return;
         };
-        if request.kind != "start_job" {
-            self.fail_job(
-                &request,
-                "ssh_resource_unsupported_for_request: SSH resources do not support structured validation jobs; command was not started".to_string(),
-                None,
-            );
-            return;
-        }
         let prepared = match self.ssh_pool.prepare_job_command(
             generation,
             &ssh,
@@ -5185,14 +5141,14 @@ impl JobManager {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.fail_job(&request, error, None);
+                self.fail_job(&operation, error, None);
                 return;
             }
         };
         let transport = prepared.transport.clone();
         let program_delivery = prepared.program_delivery;
         let mut command = prepared.command;
-        if program_delivery.requires_stdin() || request.stdin.is_some() {
+        if program_delivery.requires_stdin() {
             command.stdin(Stdio::piped());
         } else {
             command.stdin(Stdio::null());
@@ -5213,7 +5169,7 @@ impl JobManager {
             }
         };
         let Some(stop_requested) = stop_requested else {
-            self.shutdown_rejection(&request);
+            self.shutdown_rejection(&operation);
             return;
         };
         let start = Instant::now();
@@ -5222,7 +5178,7 @@ impl JobManager {
             Ok(child) => child,
             Err(error) => {
                 self.fail_job(
-                    &request,
+                    &operation,
                     format!(
                         "ssh_command_spawn_failed: could not start local ssh client: {error}; command was not started"
                     ),
@@ -5259,7 +5215,7 @@ impl JobManager {
             self.update_and_send(
                 &job_id,
                 post_spawn_interruption_delta(
-                    request.kind.as_str(),
+                    &operation,
                     start.elapsed().as_millis() as u64,
                     error,
                 ),
@@ -5278,6 +5234,7 @@ impl JobManager {
         let ssh_pool = self.ssh_pool.clone();
         let output_limit_bytes = policy.max_output_bytes;
         let worker_guard = self.workers.enter();
+        let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
         std::thread::spawn(move || {
             let _worker_guard = worker_guard;
             const OUTPUT_CHANNEL_CAPACITY: usize = 64;
@@ -5303,13 +5260,7 @@ impl JobManager {
             // Readers must already be draining before program/caller stdin can
             // block. The writer is tracked and polled by this same Job worker.
             let mut writer_start_error = None;
-            let mut stdin_writer = match program_delivery.spawn_writer(
-                child_stdin.take(),
-                request
-                    .stdin
-                    .as_deref()
-                    .map(|input| input.as_bytes().to_vec()),
-            ) {
+            let mut stdin_writer = match program_delivery.spawn_writer(child_stdin.take(), None) {
                 Ok(writer) => writer,
                 Err(error) => {
                     writer_start_error = Some(error);
@@ -5317,7 +5268,6 @@ impl JobManager {
                     None
                 }
             };
-            let timeout_secs = request.timeout_secs.min(policy.max_timeout_secs).max(1);
             let mut transport_stderr = String::new();
             let (mut status, mut exit_code, mut error, interrupted_after_dispatch) = loop {
                 let mut out = String::new();
@@ -5502,7 +5452,7 @@ impl JobManager {
             let mut queued = lock_unpoison(&self.queued);
             if let Some(pos) = queued
                 .iter()
-                .position(|queued_start| queued_start.request.job_id.as_deref() == Some(job_id))
+                .position(|queued_start| queued_start.operation.job_id() == job_id)
             {
                 queued.remove(pos)
             } else {
@@ -5510,7 +5460,7 @@ impl JobManager {
             }
         };
         if let Some(queued_start) = queued_job {
-            let PendingJobStart { request, .. } = queued_start;
+            let operation = queued_start.operation;
             self.update_and_send(
                 job_id,
                 RunnerJobDelta {
@@ -5519,7 +5469,7 @@ impl JobManager {
                     exit_code: Some(-1),
                     duration_ms: Some(0),
                     error: Some("job stopped before start".to_string()),
-                    command_execution_state: structured_prestart_lifecycle(&request),
+                    command_execution_state: job_prestart_lifecycle(&operation),
                     finished: true,
                     ..Default::default()
                 },
@@ -5687,7 +5637,6 @@ fn handle_one_poll(
     let Some(request) = response.request else {
         return Ok((false, inventory_status));
     };
-    let project_op = is_project_op(&request.kind);
     let hot = runtime.snapshot();
     let runtime = Arc::clone(runtime);
     let jobs = jobs.clone();
@@ -5699,7 +5648,6 @@ fn handle_one_poll(
     let lsp = lsp.clone();
     let dispatch = PollingDispatch {
         request_id: request.request_id.clone(),
-        project_cache_invalidation_required: project_op,
         sink,
         config: hot,
         runtime,
@@ -5760,12 +5708,14 @@ fn handle_one_poll(
             }
         }
     };
-    if project_op && result.is_ok() {
-        project_cache.invalidate();
+    if let Ok(outcome) = &result {
+        if outcome.project_cache_invalidation_required {
+            project_cache.invalidate();
+        }
     }
     let _ = polling_dispatches.background_threads.reap_finished();
     result
-        .map(|_| (true, inventory_status))
+        .map(|outcome| (outcome.handled, inventory_status))
         .map_err(PollError::from_submit)
 }
 
