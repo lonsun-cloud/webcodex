@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
 import { useLocale } from "../../i18n/locale";
 import { TunnelConfigDiagnostics } from "../connection/TunnelConfigDiagnostics";
+import { PowerShellInstallGuidance } from "../settings/PowerShellInstallGuidance";
 import {
   desktopErrorPresentation,
   normalizeDesktopError,
@@ -39,6 +40,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
     state.topology?.server.kind === "remote" ? state.topology.server.url : "",
   );
   const [pairingCode, setPairingCode] = useState("");
+  const [remoteEnrollmentNeedsRefresh, setRemoteEnrollmentNeedsRefresh] = useState(false);
   const [provider, setProvider] = useState<QuickShareProvider>("cloudflare");
   const [connectAfterSetup, setConnectAfterSetup] = useState(state.openai_tunnel_configured);
   const [busy, setBusy] = useState(false);
@@ -46,7 +48,8 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
   const mutationBusy = busy || Boolean(state.current_operation);
   const canReuseRemoteEnrollment = Boolean(
     mode === "remote" &&
-      project?.runtime_project_id &&
+      !remoteEnrollmentNeedsRefresh &&
+      state.project?.runtime_project_id &&
       state.topology?.experience === "full" &&
       state.topology.server.kind === "remote" &&
       sameServerOrigin(serverUrl, state.topology.server.url),
@@ -89,6 +92,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
           oneTimeCode,
           project.path,
         );
+        setRemoteEnrollmentNeedsRefresh(false);
         onState(next);
         onComplete?.();
       } else {
@@ -97,7 +101,15 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
         onComplete?.();
       }
     } catch (value) {
-      setError(normalizeDesktopError(value));
+      const normalized = normalizeDesktopError(value);
+      if (mode === "remote" && normalized.code === "pairing_code_invalid") {
+        // The optimistic reuse hint is based on saved Desktop state. If the
+        // backend proves that connection identity is no longer reusable, expose
+        // the one-shot recovery field instead of trapping the user behind the
+        // stale reuse hint.
+        setRemoteEnrollmentNeedsRefresh(true);
+      }
+      setError(normalized);
     } finally {
       setBusy(false);
     }
@@ -149,6 +161,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
       <div className="eyebrow">{modeLabel(mode, t)}</div>
       <h1 id="setup-title">{setupTitle(mode, t)}</h1>
       <p className="lede">{setupDescription(mode, t)}</p>
+      <PowerShellInstallGuidance state={state} onState={onState} />
 
       {mode === "local" && <TunnelConfigDiagnostics state={state} onState={onState} />}
 
@@ -285,7 +298,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
                 className="secondary-button"
                 onClick={() => void run()}
                 disabled={mutationBusy}
-                data-webcodex-action="reload-project"
+                data-webcodex-action="activate-project"
               >
                 {t("setup.reloadProject")}
               </button>
