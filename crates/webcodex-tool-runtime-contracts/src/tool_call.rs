@@ -2567,19 +2567,6 @@ impl ToolCall {
         name: &str,
         arguments: Value,
     ) -> Result<(Self, ToolCallRecorderMetadata), String> {
-        // `list_agents` was the pre-0.4 model-facing name for execution Runners.
-        // Keep one ingress-only compatibility alias without registering a second
-        // ToolDefinition or allowing new discovery surfaces to teach that name.
-        let name = match name {
-            "list_agents" => "list_runners",
-            _ => name,
-        };
-        if name == "start_coding_task" {
-            return Err(
-                "tool 'start_coding_task' is no longer supported; use 'work_on_project'"
-                    .to_string(),
-            );
-        }
         if name == "create_project"
             && arguments
                 .as_object()

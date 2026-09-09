@@ -62,11 +62,6 @@ pub(crate) struct RunnerConfig {
     /// field so runtime comparisons operate on one effective registry path.
     #[serde(default, rename = "projects_dir")]
     pub(crate) legacy_projects_dir: Option<PathBuf>,
-    /// Pre-0.4 managed-temporary-project setting retained only so old configs
-    /// are parsed explicitly. The feature is retired; load_config validates the
-    /// former path shape, reports the deprecation, and clears this inert field.
-    #[serde(default, rename = "temporary_projects_root")]
-    pub(crate) deprecated_temporary_projects_root: Option<PathBuf>,
     /// Minimum delay after an empty polling response. Repeated idle polls back
     /// off through the built-in schedule while never going below this value.
     #[serde(default = "default_poll_interval_ms")]
@@ -983,7 +978,7 @@ pub(crate) fn restart_required_fields(
         ($($field:ident),+ $(,)?) => {{
             let RunnerConfig {
                 policy: _, shell: _, ssh: _, plugins: _, tool_providers: _, legacy_projects_dir: _,
-                deprecated_temporary_projects_root: _, $($field: _),+
+                $($field: _),+
             } = candidate;
             [$((stringify!($field), startup.$field != candidate.$field)),+]
                 .into_iter()
@@ -1421,15 +1416,6 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
     validate_max_concurrent_jobs(cfg.max_concurrent_jobs)?;
     if let Some(host_context) = cfg.host_context.take() {
         cfg.host_context = Some(host_context.normalized()?);
-    }
-    if let Some(root) = cfg.deprecated_temporary_projects_root.as_ref() {
-        if root.as_os_str().is_empty() || !root.is_absolute() {
-            return Err("temporary_projects_root must be a non-empty absolute path".to_string());
-        }
-        eprintln!(
-            "webcodex-runner config warning: temporary_projects_root is deprecated and ignored"
-        );
-        cfg.deprecated_temporary_projects_root = None;
     }
     if let Some(transport) = cfg.transport.as_deref().map(str::trim) {
         if !transport.is_empty()
