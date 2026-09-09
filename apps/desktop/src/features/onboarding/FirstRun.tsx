@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
 import { useLocale } from "../../i18n/locale";
+import { TunnelConfigDiagnostics } from "../connection/TunnelConfigDiagnostics";
 import {
   desktopErrorPresentation,
   normalizeDesktopError,
@@ -67,13 +68,12 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
   };
 
   const run = async () => {
-    if (!mode || state.current_operation) return;
-    if ((mode === "remote" || mode === "share") && !project) return;
+    if (!mode || !project || mutationBusy) return;
     setBusy(true);
     setError(null);
     try {
       if (mode === "local") {
-        let next = await desktopApi.configureLocal(project?.path ?? null);
+        let next = await desktopApi.configureLocal(project.path);
         onState(next);
         if (connectAfterSetup && next.openai_tunnel_configured && next.readiness.runtime_ready) {
           next = await desktopApi.startRegularTunnel();
@@ -149,6 +149,8 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
       <div className="eyebrow">{modeLabel(mode, t)}</div>
       <h1 id="setup-title">{setupTitle(mode, t)}</h1>
       <p className="lede">{setupDescription(mode, t)}</p>
+
+      {mode === "local" && <TunnelConfigDiagnostics state={state} onState={onState} />}
 
       {mode === "remote" && (
         <div className="form-card">
@@ -244,7 +246,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
           <span className="section-kicker">{t("setup.project")}</span>
           <strong>{project ? project.path : t("setup.chooseProject")}</strong>
           {mode === "local" && !project && (
-            <span className="project-meta">{t("setup.projectOptional")}</span>
+            <span className="project-meta">{t("setup.projectRequired")}</span>
           )}
           {project && (
             <span className="project-meta">
@@ -276,6 +278,20 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
             <code>{error.code}</code>
             <p>{error.message}</p>
           </details>
+          {error.code === "project_not_loaded" && (
+            <div className="setup-recovery-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void run()}
+                disabled={mutationBusy}
+                data-webcodex-action="reload-project"
+              >
+                {t("setup.reloadProject")}
+              </button>
+              <span>{t("setup.reloadProjectHelp")}</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -285,7 +301,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
           className="primary-button"
           disabled={
             mutationBusy ||
-            ((mode === "remote" || mode === "share") && !project) ||
+            !project ||
             (mode === "remote" &&
               (!serverUrl.trim() || (!canReuseRemoteEnrollment && !pairingCode.trim())))
           }
@@ -342,4 +358,3 @@ function providerDescription(provider: QuickShareProvider, t: Translate) {
   if (provider === "openai") return t("provider.openaiDescription");
   return t("provider.localDescription");
 }
-

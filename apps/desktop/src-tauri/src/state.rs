@@ -3,11 +3,11 @@ use crate::deadline::Deadline;
 use crate::error::{DesktopError, DesktopResult};
 use crate::models::{
     aggregate_readiness, DesktopOperationKind, DesktopStateSnapshot, Enrollment, Experience,
-    Exposure, ExposureReadiness, ProjectReadiness, ProjectSelection, QuickShareState,
-    ReadinessNextActionKind, ReadinessSummaryKind, RegularConnectionPreference, RegularTunnelState,
-    RegularTunnelStatus, RunnerReadiness, RunnerTopology, RuntimeTopology, ServerReadiness,
-    ServerTopology, StoredDesktopConfig, StoredRuntime, TunnelProxyConfig, TunnelProxyMode,
-    TunnelProxySnapshot,
+    Exposure, ExposureReadiness, OpenAiTunnelConfigSnapshot, ProjectReadiness, ProjectSelection,
+    QuickShareState, ReadinessNextActionKind, ReadinessSummaryKind, RegularConnectionPreference,
+    RegularTunnelState, RegularTunnelStatus, RunnerReadiness, RunnerTopology, RuntimeTopology,
+    ServerReadiness, ServerTopology, StoredDesktopConfig, StoredRuntime, TunnelProxyConfig,
+    TunnelProxyMode, TunnelProxySnapshot,
 };
 use crate::operation::{
     cancelled_error, CancellationContext, CancellationSignal, OperationAdmission,
@@ -106,7 +106,7 @@ impl AppState {
         }
         snapshot.current_operation = self.operations.current();
         snapshot.activity_sequence = self.activity.latest_sequence();
-        snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
+        apply_openai_tunnel_configuration(&mut snapshot);
         snapshot.regular_tunnel_available = true;
         snapshot
     }
@@ -419,6 +419,14 @@ impl ProcessCleanup {
     }
 }
 
+fn project_not_loaded_error() -> DesktopError {
+    readiness_timeout_error(
+        "project_not_loaded",
+        "The selected project did not become ready in the Desktop-owned Runner",
+        "Retry project setup to restart Desktop's Runner and load this project again.",
+    )
+}
+
 fn process_is_active(snapshot: Option<crate::process::ProcessSnapshot>) -> bool {
     snapshot.is_some_and(|process| {
         matches!(
@@ -426,6 +434,27 @@ fn process_is_active(snapshot: Option<crate::process::ProcessSnapshot>) -> bool 
             ProcessPhase::Starting | ProcessPhase::Running | ProcessPhase::Stopping
         )
     })
+}
+
+fn project_recovery_owns_runner(started_this_operation: bool, owned_runner_active: bool) -> bool {
+    started_this_operation || owned_runner_active
+}
+
+fn project_recovery_readiness(
+    current: &crate::models::ReadinessSnapshot,
+    project_selected: bool,
+    runner: RunnerReadiness,
+) -> crate::models::ReadinessSnapshot {
+    aggregate_readiness(
+        current.server.clone(),
+        runner,
+        current.exposure.clone(),
+        if project_selected {
+            ProjectReadiness::Configured
+        } else {
+            ProjectReadiness::None
+        },
+    )
 }
 
 pub struct DesktopCore {
@@ -449,7 +478,7 @@ impl DesktopCore {
         let mut snapshot = DesktopStateSnapshot::default();
         snapshot.topology = config.topology.clone();
         snapshot.project = project_snapshot(&config);
-        snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
+        apply_openai_tunnel_configuration(&mut snapshot);
         snapshot.regular_tunnel_available = true;
         apply_config_projection(&mut snapshot, &config);
         let published = Arc::new(RwLock::new(snapshot.clone()));
@@ -468,7 +497,7 @@ impl DesktopCore {
     }
 
     pub async fn get_state(&mut self) -> DesktopResult<DesktopStateSnapshot> {
-        self.snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
+        apply_openai_tunnel_configuration(&mut self.snapshot);
         self.snapshot.regular_tunnel_available = true;
         apply_config_projection(&mut self.snapshot, &self.config);
         if self.snapshot.regular_tunnel.is_some() {
@@ -606,7 +635,7 @@ impl DesktopCore {
     fn publish_snapshot(&mut self) -> DesktopStateSnapshot {
         self.snapshot.current_operation = None;
         self.snapshot.activity_sequence = self.activity.latest_sequence();
-        self.snapshot.openai_tunnel_configured = openai_tunnel_is_configured();
+        apply_openai_tunnel_configuration(&mut self.snapshot);
         self.snapshot.regular_tunnel_available = true;
         apply_config_projection(&mut self.snapshot, &self.config);
         let snapshot = self.snapshot.clone();
@@ -851,28 +880,6 @@ impl DesktopCore {
             same_server(&identity.server_url, &server_url)
                 && same_project(&identity.project_path, &project.path)
         });
-        self.config.topology = self.snapshot.topology.clone();
-        self.config.project = Some(project.clone());
-        self.config.runtime_autostart = Some(true);
-        self.config.runtime = Some(match reusable_identity.as_ref() {
-            Some(identity) => StoredRuntime {
-                server_url: server_url.clone(),
-                server_env_file: Some(env_file.clone()),
-                runner_config: Some(identity.runner_config.clone()),
-                user_token_file: Some(identity.user_token_file.clone()),
-                project_id: Some(identity.project_id.clone()),
-                runtime_project_id: Some(identity.runtime_project_id.clone()),
-            },
-            None => StoredRuntime {
-                server_url: server_url.clone(),
-                server_env_file: Some(env_file.clone()),
-                runner_config: None,
-                user_token_file: None,
-                project_id: None,
-                runtime_project_id: None,
-            },
-        });
-        self.save_config().await?;
         cancellation.check()?;
 
         let server_deadline = Deadline::after(SERVER_READY_TIMEOUT);
@@ -918,6 +925,9 @@ impl DesktopCore {
         let (identity, identity_replaced) = match reusable_identity {
             Some(identity) => (identity, false),
             None => {
+                // Login publishes with --overwrite. Keep the saved connection's
+                // files intact until activation and config persistence succeed.
+                let connections_dir = local_enrollment_directory(&self.data_dir, &self.config);
                 let pairing_code = self
                     .adapter
                     .create_local_pairing(&server_url, &env_file, cancellation)
@@ -927,58 +937,164 @@ impl DesktopCore {
                     .login_with_pairing(
                         &server_url,
                         &pairing_code,
-                        &self.data_dir.join("connections"),
+                        &connections_dir,
                         &project,
                         cancellation,
                     )
                     .await?;
                 drop(pairing_code);
-                self.store_identity(&project, &identity, Some(env_file.clone()))
-                    .await?;
                 cancellation.check()?;
                 (identity, true)
             }
         };
 
+        let replacing_owned_runner = identity_replaced
+            && process_is_active(self.process_snapshot(ProcessKind::LocalRunner).await);
         let runner_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-        let runner_ready = if identity_replaced {
-            // A fresh Desktop enrollment may reuse the same client_id while
-            // changing the Runner token or project registry. An older owned
-            // Runner with that client_id is not proof that this exact config is
-            // active, so force replacement instead of accepting stale online
-            // status.
-            false
-        } else {
-            self.adapter
-                .runner_ready_until(&identity, cancellation, runner_deadline)
-                .await
-                .unwrap_or(false)
-        };
-        cancellation.check()?;
-        let runner_started = if !runner_ready {
-            if runner_deadline.is_elapsed() {
-                return Err(readiness_timeout_error(
-                    "runner_offline",
-                    "Runner did not become connected",
-                    "Check Server reachability and Runner diagnostics, then retry.",
-                ));
+        let activation: DesktopResult<bool> = async {
+            if replacing_owned_runner {
+                // A Desktop-owned Runner can only serve the exact config it was
+                // started with. Replace that owned process transactionally while
+                // keeping the local Server alive; never broad-kill unrelated Runners.
+                self.stop_process_until(ProcessKind::LocalRunner, runner_deadline)
+                    .await;
+                if runner_deadline.is_elapsed() {
+                    return Err(readiness_timeout_error(
+                        "runner_offline",
+                        "Desktop could not stop its previous Runner before changing projects",
+                        "Retry project setup. Desktop will only replace the Runner it owns.",
+                    ));
+                }
+                cancellation.check()?;
             }
-            self.snapshot.readiness.runner = RunnerReadiness::Connecting;
-            self.publish_snapshot();
-            let command = self.adapter.local_runner_command(&identity.runner_config)?;
-            self.spawn_owned(ProcessKind::LocalRunner, command, false, cancellation)
+
+            let runner_ready = if identity_replaced {
+                // A fresh Desktop enrollment may reuse the same client_id while
+                // changing the Runner token or project registry. An older Runner
+                // with that client_id is not proof that this exact config is active.
+                false
+            } else {
+                self.adapter
+                    .runner_ready_until(&identity, cancellation, runner_deadline)
+                    .await
+                    .unwrap_or(false)
+            };
+            cancellation.check()?;
+            let runner_started = if !runner_ready {
+                if runner_deadline.is_elapsed() {
+                    return Err(readiness_timeout_error(
+                        "runner_offline",
+                        "Runner did not become connected",
+                        "Retry project setup to restart Desktop's Runner.",
+                    ));
+                }
+                self.snapshot.readiness.runner = RunnerReadiness::Connecting;
+                self.publish_snapshot();
+                let command = self.adapter.local_runner_command(&identity.runner_config)?;
+                self.spawn_owned(ProcessKind::LocalRunner, command, false, cancellation)
+                    .await?;
+                true
+            } else {
+                false
+            };
+            self.wait_for_runner(&identity, cancellation, runner_deadline, runner_started)
                 .await?;
-            true
-        } else {
-            false
+            self.snapshot.readiness.runner = RunnerReadiness::Ready;
+            self.publish_snapshot();
+            let project_recovery_owns_runner = project_recovery_owns_runner(
+                runner_started,
+                process_is_active(self.process_snapshot(ProcessKind::LocalRunner).await),
+            );
+            self.wait_for_project(&identity, cancellation, project_recovery_owns_runner)
+                .await?;
+            cancellation.check()?;
+            Ok(runner_started)
+        }
+        .await;
+        let runner_started = match activation {
+            Ok(runner_started) => runner_started,
+            Err(error) => {
+                if replacing_owned_runner {
+                    self.stop_process_until(
+                        ProcessKind::LocalRunner,
+                        Deadline::after(READINESS_CLEANUP_SLACK),
+                    )
+                    .await;
+                    self.snapshot.topology = self.config.topology.clone();
+                    self.snapshot.project = project_snapshot(&self.config);
+                    self.snapshot.readiness = aggregate_readiness(
+                        ServerReadiness::Ready,
+                        RunnerReadiness::Stopped,
+                        exposure_readiness(self.config.topology.as_ref()),
+                        self.config
+                            .project
+                            .as_ref()
+                            .map(|_| ProjectReadiness::Configured)
+                            .unwrap_or(ProjectReadiness::None),
+                    );
+                    self.publish_snapshot();
+                }
+                return Err(error);
+            }
         };
-        self.wait_for_runner(&identity, cancellation, runner_deadline, runner_started)
-            .await?;
-        self.snapshot.readiness.runner = RunnerReadiness::Ready;
-        self.publish_snapshot();
-        self.wait_for_project(&identity, cancellation, runner_started)
-            .await?;
-        cancellation.check()?;
+
+        // Commit the visible/saved project only after the new Runner and exact
+        // project have both reached readiness. Until this point the previous
+        // stored project remains the recovery authority.
+        let previous_config = self.config.clone();
+        let mut committed_project = project.clone();
+        committed_project.runtime_project_id = Some(identity.runtime_project_id.clone());
+        self.config.topology = self.snapshot.topology.clone();
+        self.config.project = Some(committed_project.clone());
+        self.config.runtime_autostart = Some(true);
+        self.config.runtime = Some(StoredRuntime {
+            server_url: identity.server_url.clone(),
+            server_env_file: Some(env_file.clone()),
+            runner_config: Some(identity.runner_config.clone()),
+            user_token_file: Some(identity.user_token_file.clone()),
+            project_id: Some(identity.project_id.clone()),
+            runtime_project_id: Some(identity.runtime_project_id.clone()),
+        });
+        if let Err(error) = self.save_config().await {
+            self.config = previous_config;
+            self.snapshot.topology = self.config.topology.clone();
+            self.snapshot.project = project_snapshot(&self.config);
+            if runner_started || replacing_owned_runner {
+                self.stop_process_until(
+                    ProcessKind::LocalRunner,
+                    Deadline::after(READINESS_CLEANUP_SLACK),
+                )
+                .await;
+            }
+            if server_started {
+                self.stop_process_until(
+                    ProcessKind::LocalServer,
+                    Deadline::after(READINESS_CLEANUP_SLACK),
+                )
+                .await;
+            }
+            self.snapshot.readiness = aggregate_readiness(
+                if server_started {
+                    ServerReadiness::Stopped
+                } else {
+                    ServerReadiness::Ready
+                },
+                if runner_started || replacing_owned_runner {
+                    RunnerReadiness::Stopped
+                } else {
+                    RunnerReadiness::Ready
+                },
+                ExposureReadiness::Disabled,
+                self.config
+                    .project
+                    .as_ref()
+                    .map(|_| ProjectReadiness::Configured)
+                    .unwrap_or(ProjectReadiness::None),
+            );
+            self.publish_snapshot();
+            return Err(error);
+        }
+        self.snapshot.project = Some(committed_project);
         self.snapshot.readiness = aggregate_readiness(
             ServerReadiness::Ready,
             RunnerReadiness::Ready,
@@ -1137,7 +1253,11 @@ impl DesktopCore {
         };
         self.wait_for_runner(&identity, cancellation, runner_deadline, runner_started)
             .await?;
-        self.wait_for_project(&identity, cancellation, runner_started)
+        let project_recovery_owns_runner = project_recovery_owns_runner(
+            runner_started,
+            process_is_active(self.process_snapshot(ProcessKind::LocalRunner).await),
+        );
+        self.wait_for_project(&identity, cancellation, project_recovery_owns_runner)
             .await?;
         cancellation.check()?;
         self.config.topology = Some(topology);
@@ -1400,7 +1520,7 @@ impl DesktopCore {
                 "Manage external exposure on the remote Server instead.",
             ));
         }
-        if !openai_tunnel_is_configured() {
+        if !openai_tunnel_configuration().is_configured() {
             return Err(DesktopError::new(
                 "tunnel_unavailable",
                 "OpenAI Secure Tunnel is not configured",
@@ -1589,8 +1709,12 @@ impl DesktopCore {
         });
         self.config.preferred_connection = Some(RegularConnectionPreference::OpenAiTunnel);
         self.save_config().await?;
+        // The daemon and clipboard handoff prove that the Tunnel is ready FOR
+        // ChatGPT. They do not prove that ChatGPT has actually connected or
+        // invoked the authenticated MCP endpoint, so keep aggregate external
+        // readiness conservative until a canonical external-observation signal exists.
         let exposure = if handoff_available {
-            ExposureReadiness::RemoteReady
+            ExposureReadiness::LocalReady
         } else {
             ExposureReadiness::Degraded
         };
@@ -1607,7 +1731,7 @@ impl DesktopCore {
             ActivityEventKind::RegularTunnelReady,
             "regular_tunnel",
             ActivityLevel::Info,
-            "Regular OpenAI Secure Tunnel reached verified readiness",
+            "Regular OpenAI Secure Tunnel reached local handoff readiness",
         );
         self.get_state().await
     }
@@ -1839,20 +1963,14 @@ impl DesktopCore {
         cleanup_owned_runner: bool,
     ) -> DesktopResult<()> {
         let deadline = Deadline::after(PROJECT_READY_TIMEOUT);
+        let recovery_at = tokio::time::Instant::now() + PROJECT_READY_TIMEOUT / 2;
+        let mut recovery_attempted = false;
         loop {
             cancellation.check()?;
             if deadline.is_elapsed() {
-                self.cleanup_readiness_process(
-                    ProcessKind::LocalRunner,
-                    deadline,
-                    cleanup_owned_runner,
-                )
-                .await;
-                return Err(readiness_timeout_error(
-                    "project_not_loaded",
-                    "The selected project is registered but not loaded by the Runner",
-                    "Restart the Runner or check the project registry, then retry.",
-                ));
+                self.cleanup_project_readiness_runner(deadline, cleanup_owned_runner)
+                    .await;
+                return Err(project_not_loaded_error());
             }
             if self
                 .adapter
@@ -1863,20 +1981,60 @@ impl DesktopCore {
                 return Ok(());
             }
             cancellation.check()?;
-            if deadline.is_elapsed() {
-                self.cleanup_readiness_process(
-                    ProcessKind::LocalRunner,
-                    deadline,
-                    cleanup_owned_runner,
-                )
+            if cleanup_owned_runner
+                && !recovery_attempted
+                && tokio::time::Instant::now() >= recovery_at
+            {
+                recovery_attempted = true;
+                let recovery: DesktopResult<()> = async {
+                    self.stop_process_until(ProcessKind::LocalRunner, deadline)
+                        .await;
+                    if deadline.is_elapsed() {
+                        return Err(project_not_loaded_error());
+                    }
+                    cancellation.check()?;
+                    self.publish_project_recovery_readiness(RunnerReadiness::Connecting);
+                    let command = self.adapter.local_runner_command(&identity.runner_config)?;
+                    self.spawn_owned(ProcessKind::LocalRunner, command, false, cancellation)
+                        .await?;
+                    self.wait_for_runner(identity, cancellation, deadline, true)
+                        .await
+                }
                 .await;
-                return Err(readiness_timeout_error(
-                    "project_not_loaded",
-                    "The selected project is registered but not loaded by the Runner",
-                    "Restart the Runner or check the project registry, then retry.",
-                ));
+                if let Err(error) = recovery {
+                    self.cleanup_project_readiness_runner(deadline, true).await;
+                    return Err(error);
+                }
+                self.publish_project_recovery_readiness(RunnerReadiness::Ready);
+                continue;
+            }
+            if deadline.is_elapsed() {
+                self.cleanup_project_readiness_runner(deadline, cleanup_owned_runner)
+                    .await;
+                return Err(project_not_loaded_error());
             }
             sleep_or_cancel_until(POLL_INTERVAL, cancellation, deadline).await?;
+        }
+    }
+
+    fn publish_project_recovery_readiness(&mut self, runner: RunnerReadiness) {
+        self.snapshot.readiness = project_recovery_readiness(
+            &self.snapshot.readiness,
+            self.snapshot.project.is_some(),
+            runner,
+        );
+        self.publish_snapshot();
+    }
+
+    async fn cleanup_project_readiness_runner(
+        &mut self,
+        deadline: Deadline,
+        cleanup_owned_runner: bool,
+    ) {
+        self.cleanup_readiness_process(ProcessKind::LocalRunner, deadline, cleanup_owned_runner)
+            .await;
+        if cleanup_owned_runner {
+            self.publish_project_recovery_readiness(RunnerReadiness::Stopped);
         }
     }
 
@@ -2046,6 +2204,30 @@ fn machine_event_overflow_error(event: &Value) -> DesktopError {
             .and_then(Value::as_u64)
             .unwrap_or(1),
     }))
+}
+
+fn local_enrollment_directory(data_dir: &Path, config: &StoredDesktopConfig) -> PathBuf {
+    // Two reusable slots bound local credential storage while keeping login's
+    // --overwrite away from the currently committed recovery identity. Resolve
+    // native path aliases (notably /var on macOS) before comparing paths.
+    let root = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf())
+        .join("local-connections");
+    let first = root.join("a");
+    let saved_runner = config
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runner_config.as_ref());
+    if saved_runner.is_some_and(|path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .starts_with(&first)
+    }) {
+        root.join("b")
+    } else {
+        first
+    }
 }
 
 fn project_snapshot(config: &StoredDesktopConfig) -> Option<ProjectSelection> {
@@ -2344,7 +2526,7 @@ fn regular_tunnel_exposure(
     }
     Some(match state.status {
         RegularTunnelStatus::Starting => ExposureReadiness::Starting,
-        RegularTunnelStatus::Ready if state.ready_for_chatgpt => ExposureReadiness::RemoteReady,
+        RegularTunnelStatus::Ready if state.ready_for_chatgpt => ExposureReadiness::LocalReady,
         RegularTunnelStatus::Ready => ExposureReadiness::Degraded,
         RegularTunnelStatus::Error => ExposureReadiness::Error,
     })
@@ -2362,6 +2544,16 @@ fn apply_regular_tunnel_next_action(
             snapshot.readiness.next_action_kind =
                 Some(ReadinessNextActionKind::RestartSecureTunnel);
             snapshot.readiness.next_action = Some("Restart the secure tunnel.".to_string());
+        }
+        ExposureReadiness::LocalReady => {
+            snapshot.readiness.summary_kind = ReadinessSummaryKind::TunnelReadyWaitingForChatGpt;
+            snapshot.readiness.summary =
+                "OpenAI Secure Tunnel is ready; waiting for ChatGPT to connect".to_string();
+            snapshot.readiness.next_action_kind = Some(ReadinessNextActionKind::CheckConnection);
+            snapshot.readiness.next_action = Some(
+                "Connect the Tunnel in ChatGPT, then verify it with one real project read."
+                    .to_string(),
+            );
         }
         ExposureReadiness::Degraded => {
             snapshot.readiness.next_action_kind =
@@ -2530,10 +2722,31 @@ fn apply_config_projection(snapshot: &mut DesktopStateSnapshot, config: &StoredD
     };
 }
 
-fn openai_tunnel_is_configured() -> bool {
-    ["CONTROL_PLANE_TUNNEL_ID", "CONTROL_PLANE_API_KEY"]
-        .iter()
-        .all(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+fn openai_tunnel_configuration() -> OpenAiTunnelConfigSnapshot {
+    openai_tunnel_configuration_from_presence(
+        environment_variable_present("CONTROL_PLANE_TUNNEL_ID"),
+        environment_variable_present("CONTROL_PLANE_API_KEY"),
+    )
+}
+
+fn openai_tunnel_configuration_from_presence(
+    tunnel_id_present: bool,
+    api_key_present: bool,
+) -> OpenAiTunnelConfigSnapshot {
+    OpenAiTunnelConfigSnapshot {
+        tunnel_id_present,
+        api_key_present,
+    }
+}
+
+fn environment_variable_present(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+fn apply_openai_tunnel_configuration(snapshot: &mut DesktopStateSnapshot) {
+    let configuration = openai_tunnel_configuration();
+    snapshot.openai_tunnel_configured = configuration.is_configured();
+    snapshot.openai_tunnel_config = configuration;
 }
 
 fn same_server(left: &str, right: &str) -> bool {
@@ -2627,6 +2840,74 @@ mod tests {
             tunnel_proxy: TunnelProxyConfig::default(),
             runtime: None,
         }
+    }
+
+    #[test]
+    fn project_recovery_accepts_existing_desktop_runner_ownership() {
+        assert!(project_recovery_owns_runner(true, false));
+        assert!(project_recovery_owns_runner(false, true));
+        assert!(project_recovery_owns_runner(true, true));
+        assert!(!project_recovery_owns_runner(false, false));
+    }
+
+    #[test]
+    fn project_recovery_cleanup_invalidates_derived_ready_state() {
+        let ready = aggregate_readiness(
+            ServerReadiness::Ready,
+            RunnerReadiness::Ready,
+            ExposureReadiness::RemoteReady,
+            ProjectReadiness::Ready,
+        );
+        assert!(ready.runtime_ready);
+        assert!(ready.ready_for_chatgpt);
+
+        let stopped = project_recovery_readiness(&ready, true, RunnerReadiness::Stopped);
+        assert_eq!(stopped.runner, RunnerReadiness::Stopped);
+        assert_eq!(stopped.project, ProjectReadiness::Configured);
+        assert!(!stopped.runtime_ready);
+        assert!(!stopped.ready_for_chatgpt);
+        assert_eq!(
+            stopped.summary_kind,
+            ReadinessSummaryKind::RunnerDisconnected
+        );
+        assert_eq!(
+            stopped.next_action_kind,
+            Some(ReadinessNextActionKind::StartRunner)
+        );
+    }
+
+    #[test]
+    fn local_enrollment_preserves_saved_files_and_reuses_only_the_inactive_slot() {
+        let dir = unique_state_dir("enrollment-slots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_stored_config("previous");
+        let first = local_enrollment_directory(&dir, &config);
+        let saved_runner = first.join("server").join("runner.toml");
+        std::fs::create_dir_all(saved_runner.parent().unwrap()).unwrap();
+        std::fs::write(&saved_runner, "previous project fixture").unwrap();
+        config.runtime = Some(StoredRuntime {
+            server_url: "http://127.0.0.1:7890".into(),
+            server_env_file: None,
+            runner_config: Some(saved_runner.clone()),
+            user_token_file: None,
+            project_id: None,
+            runtime_project_id: None,
+        });
+
+        let candidate = local_enrollment_directory(&dir, &config);
+        assert_ne!(candidate, first);
+        let candidate_runner = candidate.join("server").join("runner.toml");
+        std::fs::create_dir_all(candidate_runner.parent().unwrap()).unwrap();
+        std::fs::write(&candidate_runner, "replacement project fixture").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(saved_runner).unwrap(),
+            "previous project fixture"
+        );
+        // A failed activation retries the candidate, never the saved connection.
+        assert_eq!(local_enrollment_directory(&dir, &config), candidate);
+        config.runtime.as_mut().unwrap().runner_config = Some(candidate_runner);
+        assert_eq!(local_enrollment_directory(&dir, &config), first);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3227,6 +3508,8 @@ mod tests {
             .expect("local setup stores managed user token path");
         let first_user_token =
             std::fs::read(&first_user_token_file).expect("read managed user token before restart");
+        let first_runner_config = first_runtime.runner_config.clone().unwrap();
+        let first_runner_bytes = std::fs::read(&first_runner_config).unwrap();
 
         let stopped = core
             .stop_local_runtime(&cancellation)
@@ -3263,13 +3546,19 @@ mod tests {
             first_user_token == second_user_token,
             "local restart must reuse enrollment instead of rotating the managed user token"
         );
-        // The supervisor refuses to spawn while an owned runtime process is
-        // still active, and the saved identity only matches an unchanged
-        // project, so switching projects stops the runtime first and pairs
-        // again through the same username path as first setup.
-        core.stop_local_runtime(&cancellation)
+        let server_before_switch = core
+            .process_snapshot(ProcessKind::LocalServer)
             .await
-            .expect("stop runtime before switching project");
+            .expect("Desktop owns local Server before project switch");
+        let runner_before_switch = core
+            .process_snapshot(ProcessKind::LocalRunner)
+            .await
+            .expect("Desktop owns local Runner before project switch");
+        assert!(server_before_switch.owned_by_desktop);
+        assert!(runner_before_switch.owned_by_desktop);
+        // Switch projects while the Desktop-owned Server and Runner are still
+        // running. Production setup must replace only its owned Runner and keep
+        // the Server alive; callers must not need to stop the runtime first.
         let second_project = data_dir.join("second-project");
         std::fs::create_dir_all(&second_project).expect("create second project fixture");
         let expected_project = core
@@ -3296,6 +3585,32 @@ mod tests {
             &core.config.project.as_ref().expect("selected project").path,
             &expected_project.path,
         ));
+        let server_after_switch = core
+            .process_snapshot(ProcessKind::LocalServer)
+            .await
+            .expect("Desktop still owns local Server after project switch");
+        let runner_after_switch = core
+            .process_snapshot(ProcessKind::LocalRunner)
+            .await
+            .expect("Desktop owns exactly one replacement Runner after project switch");
+        assert_eq!(
+            server_after_switch.pid, server_before_switch.pid,
+            "project switch must keep the existing Desktop-owned Server"
+        );
+        assert_ne!(
+            runner_after_switch.pid, runner_before_switch.pid,
+            "project switch must replace the Desktop-owned Runner generation"
+        );
+        assert!(server_after_switch.owned_by_desktop);
+        assert!(runner_after_switch.owned_by_desktop);
+        assert!(
+            std::fs::read(&first_runner_config).unwrap() == first_runner_bytes,
+            "switching projects must preserve the previous Runner config for recovery"
+        );
+        assert!(
+            std::fs::read(&first_user_token_file).unwrap() == first_user_token,
+            "switching projects must preserve the previous managed user token for recovery"
+        );
         core.stop_local_runtime(&cancellation)
             .await
             .expect("stop restarted local runtime");
@@ -3492,7 +3807,7 @@ mod tests {
         });
         assert_eq!(
             regular_tunnel_exposure(&mut state, true),
-            Some(ExposureReadiness::RemoteReady)
+            Some(ExposureReadiness::LocalReady)
         );
         assert_eq!(
             regular_tunnel_exposure(&mut state, false),
@@ -3509,6 +3824,47 @@ mod tests {
         );
         assert!(readiness.runtime_ready);
         assert!(!readiness.ready_for_chatgpt);
+    }
+
+    #[test]
+    fn regular_tunnel_local_handoff_waits_for_external_chatgpt_evidence() {
+        let mut snapshot = DesktopStateSnapshot::default();
+        snapshot.readiness = aggregate_readiness(
+            ServerReadiness::Ready,
+            RunnerReadiness::Ready,
+            ExposureReadiness::LocalReady,
+            ProjectReadiness::Ready,
+        );
+        apply_regular_tunnel_next_action(&mut snapshot, &ExposureReadiness::LocalReady);
+        assert!(snapshot.readiness.runtime_ready);
+        assert!(!snapshot.readiness.ready_for_chatgpt);
+        assert_eq!(
+            snapshot.readiness.summary_kind,
+            ReadinessSummaryKind::TunnelReadyWaitingForChatGpt
+        );
+        assert_eq!(
+            snapshot.readiness.next_action_kind,
+            Some(ReadinessNextActionKind::CheckConnection)
+        );
+    }
+
+    #[test]
+    fn tunnel_configuration_presence_matrix_is_value_free() {
+        for (tunnel_id_present, api_key_present, configured) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let observation =
+                openai_tunnel_configuration_from_presence(tunnel_id_present, api_key_present);
+            assert_eq!(observation.tunnel_id_present, tunnel_id_present);
+            assert_eq!(observation.api_key_present, api_key_present);
+            assert_eq!(observation.is_configured(), configured);
+            let encoded =
+                serde_json::to_value(&observation).expect("serialize presence observation");
+            assert_eq!(encoded.as_object().map(|object| object.len()), Some(2));
+        }
     }
 
     #[cfg(windows)]
@@ -3536,7 +3892,7 @@ mod tests {
         core.snapshot.readiness = aggregate_readiness(
             ServerReadiness::Ready,
             RunnerReadiness::Ready,
-            ExposureReadiness::RemoteReady,
+            ExposureReadiness::LocalReady,
             ProjectReadiness::Ready,
         );
         core.snapshot.regular_tunnel = Some(RegularTunnelState {
