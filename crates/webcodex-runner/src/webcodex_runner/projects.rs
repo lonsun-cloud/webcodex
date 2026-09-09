@@ -778,19 +778,63 @@ impl RunnerProjectCache {
     }
 }
 
-/// Windows-only fail-closed rule: project roots must be on a local disk drive
-/// (`C:\repo`, `D:\repo`, or the canonicalized `\\?\C:\repo` form). UNC
-/// (`\\server\share\repo`), verbatim-UNC (`\\?\UNC\...`), device-namespace
-/// (`\\.\...`) and every other non-disk Windows path prefix is rejected with
-/// the stable `unc_project_path_unsupported` error before any filesystem
-/// access happens.
+/// Windows-only raw/canonical namespace fence. Local disks plus UNC and
+/// verbatim-UNC shares may proceed; device namespaces and generic verbatim
+/// namespaces fail closed with a stable error before filesystem access.
 ///
 /// The shared `webcodex_runner_config::paths::validate_project_path_ingress`
 /// owns the grammar-based prefix rule; it never falls back to a string
 /// `starts_with` check.
 fn validate_windows_project_root(path: &Path) -> Result<(), &'static str> {
     webcodex_runner_config::paths::validate_project_path_ingress(path)
-        .map_err(|_| "unc_project_path_unsupported")
+        .map_err(|_| "windows_project_path_unsupported")
+}
+
+/// Before a model-facing request dereferences a raw Windows network path, require
+/// it to fall under Runner authority that was already configured by the user.
+/// This prevents an untrusted `\\server\share` spelling from triggering SMB I/O
+/// (and possible OS authentication) merely to discover that policy rejects it.
+fn validate_model_network_project_ingress_authority(
+    policy: &RunnerPolicy,
+    path: &Path,
+) -> Result<(), &'static str> {
+    #[cfg(windows)]
+    {
+        if !webcodex_runner_config::paths::is_windows_network_share_path(path) {
+            return Ok(());
+        }
+        // Containment below is lexical: a parent component could escape an
+        // authorized directory before the canonical policy gets a chance to run.
+        if path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err("path_outside_allowed_roots");
+        }
+        if policy.allowed_roots.iter().any(|root| {
+            root.is_absolute() && webcodex_runner_config::paths::path_is_within(path, root)
+        }) {
+            return Ok(());
+        }
+        // A configured mapped drive may canonicalize to the same UNC share. It is
+        // safe to resolve configured roots here because those roots are already
+        // user-authorized; never canonicalize the untrusted target before this gate.
+        let canonical_roots =
+            webcodex_runner_config::paths::canonicalize_usable_allowed_roots(&policy.allowed_roots);
+        if canonical_roots
+            .iter()
+            .any(|root| webcodex_runner_config::paths::path_is_within(path, root))
+        {
+            return Ok(());
+        }
+        return Err("path_outside_allowed_roots");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (policy, path);
+        Ok(())
+    }
 }
 
 /// Escape a string for use as a TOML basic string (double-quoted). NUL is
@@ -1330,10 +1374,20 @@ pub(crate) fn handle_resolve_or_register_project_operation(
             )
         }
     };
-    // The raw input path is checked before any filesystem access so a UNC
-    // path is rejected as `unc_project_path_unsupported` even when the share
-    // is unreachable (which would otherwise surface as `project_path_not_found`).
+    // Reject unsupported namespaces before filesystem access. Raw UNC/VerbatimUNC
+    // inputs must also be covered by pre-existing Runner authority before they may
+    // trigger SMB I/O; local CLI/Desktop onboarding owns any authority extension.
     if let Err(error_kind) = validate_windows_project_root(Path::new(path)) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
+    if let Err(error_kind) =
+        validate_model_network_project_ingress_authority(policy, Path::new(path))
+    {
         return structured_project_error_cmd(
             start,
             error_kind,
@@ -1352,9 +1406,8 @@ pub(crate) fn handle_resolve_or_register_project_operation(
             )
         }
     };
-    // The canonical form is checked too: Windows canonicalization rewrites
-    // reachable UNC paths into `\\?\UNC\...`, which the raw check may not
-    // have seen verbatim.
+    // Re-check the canonical form so canonicalization cannot introduce a device
+    // or other unsupported Windows namespace. VerbatimUNC remains supported.
     if let Err(error_kind) = validate_windows_project_root(&canonical_path) {
         return structured_project_error_cmd(
             start,
@@ -1930,6 +1983,11 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             None,
             None,
         );
+    }
+    if let Err(error_kind) =
+        validate_model_network_project_ingress_authority(policy, Path::new(path))
+    {
+        return managed_worktree_error(start, error_kind, false, Some(&base_ref), None, None);
     }
     let source = match canonicalize_existing(Path::new(path)) {
         Ok(source) if source.is_dir() && source.to_str().is_some() => source,
@@ -2770,11 +2828,23 @@ pub(crate) fn handle_project_operation(
     if path.is_empty() || path.contains('\0') || !Path::new(&path).is_absolute() {
         return err_cmd(start, "path must be a non-empty absolute path".to_string());
     }
-    // Windows supports local-drive project roots only; UNC and other
-    // non-disk prefixes fail closed here, before the directory is touched,
-    // so an unreachable share cannot masquerade as a missing directory.
+    // Existing project registration accepts local disks and network shares;
+    // special Windows namespaces still fail before filesystem access.
     if let Err(error_kind) = validate_windows_project_root(Path::new(&path)) {
         return project_error_cmd(start, error_kind);
+    }
+    if !create {
+        if let Err(error_kind) =
+            validate_model_network_project_ingress_authority(policy, Path::new(&path))
+        {
+            return project_error_cmd(start, error_kind);
+        }
+    }
+    #[cfg(windows)]
+    if create && webcodex_runner_config::paths::is_windows_network_share_path(Path::new(&path)) {
+        // Network project creation is deliberately outside this phase. Existing
+        // network directories can be registered when RunnerPolicy already grants them.
+        return project_error_cmd(start, "windows_project_path_unsupported");
     }
 
     let client_id = client_id.to_string();
@@ -2920,6 +2990,12 @@ pub(crate) fn handle_project_operation(
     };
     if let Err(error_kind) = validate_windows_project_root(&canonical_for_policy) {
         return project_error_cmd(start, error_kind);
+    }
+    #[cfg(windows)]
+    if webcodex_runner_config::paths::is_windows_network_share_path(&canonical_for_policy) {
+        // A mapped drive may canonicalize to VerbatimUNC. Keep create_project
+        // local-only even when the raw spelling looked like a drive letter.
+        return project_error_cmd(start, "windows_project_path_unsupported");
     }
     if validate_project_path_policy(policy, &canonical_for_policy).is_err() {
         return project_error_cmd(start, "path_outside_allowed_roots");

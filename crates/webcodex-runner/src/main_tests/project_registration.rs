@@ -358,16 +358,101 @@ fn resolve_or_register_project_rejects_invalid_non_directory_and_disallowed_path
 
 #[cfg(windows)]
 #[test]
-fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
+fn resolve_or_register_project_authorized_network_paths_reach_filesystem_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_registry_dir = tmp.path().join("project-registry");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: vec![PathBuf::from(r"\\server\share")],
+        ..RunnerPolicy::default()
+    };
+
+    for network_path in [
+        r"\\server\share\webcodex-unreachable-repo",
+        r"\\?\UNC\server\share\webcodex-unreachable-repo",
+    ] {
+        let error = project_error_value(handle_resolve_or_register_project(
+            &policy,
+            &project_registry_dir,
+            &project_request(
+                "resolve_or_register_project",
+                serde_json::json!({"path": network_path}),
+            ),
+        ));
+        assert_eq!(
+            error["error_kind"], "project_path_not_found",
+            "authorized network path {network_path} must reach filesystem resolution"
+        );
+        assert_eq!(error["state_changed"], false);
+    }
+    assert!(!project_registry_dir.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn model_facing_network_ingress_requires_authority_before_filesystem_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_registry_dir = tmp.path().join("project-registry");
+    let denied = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
+        ..RunnerPolicy::default()
+    };
+    let raw = Path::new(r"\\untrusted-host\share\webcodex-unreachable-repo");
+    let error = project_error_value(handle_resolve_or_register_project(
+        &denied,
+        &project_registry_dir,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": raw.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(error["error_kind"], "path_outside_allowed_roots");
+    assert_eq!(error["state_changed"], false);
+    assert!(!project_registry_dir.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn model_facing_network_ingress_rejects_parent_traversal_and_empty_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("project-registry");
+    for (root, path) in [
+        (r"\\server\share\repo", r"\\server\share\repo\..\private"),
+        (
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo\..\private",
+        ),
+        ("", r"\\untrusted-host\share\repo"),
+    ] {
+        let policy = RunnerPolicy {
+            allow_cwd_anywhere: true,
+            allowed_roots: vec![PathBuf::from(root)],
+            ..RunnerPolicy::default()
+        };
+        let error = project_error_value(handle_resolve_or_register_project(
+            &policy,
+            &registry,
+            &project_request(
+                "resolve_or_register_project",
+                serde_json::json!({"path": path}),
+            ),
+        ));
+        assert_eq!(
+            error["error_kind"], "path_outside_allowed_roots",
+            "raw network ingress must reject {path:?} under {root:?} before target I/O"
+        );
+    }
+    assert!(!registry.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_or_register_project_rejects_unsupported_windows_namespaces() {
     let tmp = tempfile::tempdir().unwrap();
     let project_registry_dir = tmp.path().join("project-registry");
     let policy = project_policy(tmp.path());
-
-    // The raw path check must fire before canonicalization: these shares do
-    // not exist, but the error is the platform rule, not "path not found".
-    for unc_path in [
-        r"\\server\share\repo",
-        r"\\?\UNC\server\share\repo",
+    for unsupported in [
         r"\\.\device\repo",
         r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
     ] {
@@ -376,38 +461,26 @@ fn resolve_or_register_project_rejects_unc_and_non_local_disk_paths() {
             &project_registry_dir,
             &project_request(
                 "resolve_or_register_project",
-                serde_json::json!({"path": unc_path}),
+                serde_json::json!({"path": unsupported}),
             ),
         ));
-        assert_eq!(
-            error["error_kind"], "unc_project_path_unsupported",
-            "{unc_path} must fail closed as an unsupported non-local-disk path"
-        );
+        assert_eq!(error["error_kind"], "windows_project_path_unsupported");
         assert_eq!(error["state_changed"], false);
     }
-    assert!(
-        !project_registry_dir.exists(),
-        "no registration may be attempted"
-    );
+    assert!(!project_registry_dir.exists());
+}
 
-    // An allowed_roots entry naming a UNC share must not bypass the rule.
-    let unc_allowed = RunnerPolicy {
-        allow_cwd_anywhere: false,
-        allowed_roots: vec![PathBuf::from(r"\\server\share\repo")],
+#[cfg(windows)]
+#[test]
+fn model_facing_policy_does_not_auto_authorize_network_share_with_allow_anywhere() {
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
         ..RunnerPolicy::default()
     };
-    let error = project_error_value(handle_resolve_or_register_project(
-        &unc_allowed,
-        &project_registry_dir,
-        &project_request(
-            "resolve_or_register_project",
-            serde_json::json!({"path": r"\\server\share\repo"}),
-        ),
-    ));
-    assert_eq!(
-        error["error_kind"], "unc_project_path_unsupported",
-        "a UNC allowed_root must not make a UNC project root acceptable"
-    );
+    let error = validate_project_path_policy(&policy, Path::new(r"\\server\share\repo"))
+        .expect_err("model-facing RunnerPolicy must not auto-authorize a network share");
+    assert!(error.contains("outside allowed_roots"), "{error}");
 }
 
 #[cfg(windows)]
@@ -464,26 +537,44 @@ fn resolve_or_register_project_accepts_local_drive_and_verbatim_disk_identity() 
 
 #[cfg(windows)]
 #[test]
-fn register_project_rejects_unc_paths() {
+fn register_project_network_path_requires_authority_before_filesystem_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let project_registry_dir = tmp.path().join("project-registry");
-    let policy = project_policy(tmp.path());
+    let path = r"\\server\share\webcodex-unreachable-repo";
+    let request = project_request(
+        "register_project",
+        serde_json::json!({
+            "id": "demo",
+            "name": "Demo",
+            "path": path,
+            "description": "UNC project",
+            "allow_patch": false
+        }),
+    );
 
-    let error = project_error_value(handle_project_op(
-        &policy,
-        &project_registry_dir,
-        &project_request(
-            "register_project",
-            serde_json::json!({
-                "id": "demo",
-                "name": "Demo",
-                "path": r"\\server\share\repo",
-                "description": "UNC project",
-                "allow_patch": false
-            }),
-        ),
-    ));
-    assert_eq!(error["error_code"], "unc_project_path_unsupported");
+    let denied = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
+        ..RunnerPolicy::default()
+    };
+    let denied_error =
+        project_error_value(handle_project_op(&denied, &project_registry_dir, &request));
+    assert_eq!(denied_error["error_code"], "path_outside_allowed_roots");
+
+    let allowed = RunnerPolicy {
+        allowed_roots: vec![PathBuf::from(r"\\server\share")],
+        ..RunnerPolicy::default()
+    };
+    let result = handle_project_op(&allowed, &project_registry_dir, &request);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("does not exist or cannot be canonicalized"),
+        "authorized UNC registration must reach filesystem resolution: {error}"
+    );
+    assert!(
+        !error.contains("windows_project_path_unsupported"),
+        "{error}"
+    );
     assert!(!project_registry_dir.exists());
 }
 
