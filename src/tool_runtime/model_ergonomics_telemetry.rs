@@ -74,6 +74,20 @@ pub(crate) struct ModelErgonomicsRecord {
     pub(crate) edit_conflict_kind: Option<String>,
 }
 
+impl ModelErgonomicsRecord {
+    pub(crate) fn outcome_class(&self) -> &'static str {
+        if self.execution_state.as_deref() == Some("outcome_unknown")
+            || self.error_kind.as_deref() == Some("dispatch_hard_timeout")
+        {
+            "unknown"
+        } else if self.success {
+            "success"
+        } else {
+            "failure"
+        }
+    }
+}
+
 impl ModelErgonomicsTimer {
     pub(crate) fn start(tool_name: &str) -> Option<Self> {
         Self::start_with_protocol(
@@ -549,6 +563,7 @@ mod tests {
             let record = completion(tool, 0).record_for_pre_result_failure("dispatch_hard_timeout");
             assert!(!record.success);
             assert_eq!(record.error_kind.as_deref(), Some("dispatch_hard_timeout"));
+            assert_eq!(record.outcome_class(), "unknown");
             assert_eq!(record.serialized_result_bytes, None);
             assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
             assert_eq!(record.edit_outcome.as_deref(), Some("uncertain"));
@@ -560,6 +575,7 @@ mod tests {
                 completion("apply_text_edits", 0).record_for_pre_result_failure(error_kind);
             assert!(!record.success);
             assert_eq!(record.error_kind.as_deref(), Some(error_kind));
+            assert_eq!(record.outcome_class(), "failure");
             assert_eq!(record.serialized_result_bytes, None);
             assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
             assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
