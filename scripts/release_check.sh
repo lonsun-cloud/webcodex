@@ -45,13 +45,14 @@ fi
 # Final pre-tag acceptance is orchestrated by .github/workflows/release-readiness.yml.
 # The release operator first binds one successful exact-source main-push CI run;
 # that CI already owns the deterministic release/static contract, complete Linux
-# Rust coverage, frontend checks, both native macOS Runner suites, Windows x64
-# runtime/package/Desktop coverage, and lightweight Linux/Windows arm64
-# production-target compilation. Readiness revalidates that exact CI run attempt, then runs only:
+# Rust coverage and path-aware frontend, macOS Apple-Silicon, Windows x64,
+# Desktop, and amd64 Server-image checks. Readiness revalidates that exact CI
+# run attempt, then runs:
+#   - extended native Linux ARM64, macOS Intel/Desktop, and Windows ARM64/Desktop checks
 #   - WebSocket + polling zero-config E2E
 #   - EVAL_MODE=compare bash scripts/eval_coding_loop.sh with prebuilt debug fixtures
 #   - disposable linux/amd64 + linux/arm64 Server-image/runtime/bootstrap validation
-# Six-platform release-profile/ABI/package candidates plus the Windows x64 and
+# Six-platform release-profile/ABI/package candidates plus the Windows x64/ARM64 and
 # both native macOS Desktop artifacts are built exactly once after immutable tagging
 # by release-build.yml.
 #
@@ -84,7 +85,7 @@ die() {
 }
 
 # Sanity: cargo is needed only for the full local release check. Main CI uses
-# --static-only after its separate exact workspace all-targets check.
+# --static-only alongside its complete Linux Rust package test shards.
 if [ "$MODE" = full ] && ! command -v cargo >/dev/null 2>&1; then
     printf '[release] cargo is required\n' >&2
     exit 2
@@ -206,8 +207,15 @@ if bash scripts/test_python_tooling.sh \
     && grep -Fq 'DESKTOP_RESULT' .github/workflows/ci.yml \
     && grep -Fq 'prepare_desktop_bundle_macos.py' .github/workflows/ci.yml \
     && grep -Fq 'desktop_install_macos_smoke.sh' .github/workflows/ci.yml \
+    && grep -Fq 'test-docker-server:' .github/workflows/ci.yml \
+    && grep -Fq 'workflow_dispatch:' .github/workflows/extended-native.yml \
+    && grep -Fq 'macos-15-intel' .github/workflows/extended-native.yml \
+    && grep -Fq 'windows-11-arm' .github/workflows/extended-native.yml \
+    && ! grep -Fq 'macos-15-intel' .github/workflows/ci.yml \
+    && ! grep -Fq 'windows-11-arm' .github/workflows/ci.yml \
     && grep -Fq 'desktop_artifacts' .github/workflows/release-build.yml \
     && grep -Fq 'prepare_desktop_bundle.ps1' .github/workflows/release-build.yml \
+    && grep -Fq 'win32-arm64-setup.exe' .github/workflows/release-build.yml \
     && grep -Fq 'prepare_desktop_bundle_macos.py' .github/workflows/release-build.yml \
     && python3 scripts/check_markdown_links.py \
     && bash scripts/tests/test_npm_package_smoke_existing_binaries.sh; then
