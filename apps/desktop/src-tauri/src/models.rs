@@ -94,6 +94,8 @@ pub enum ProjectReadiness {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessSummaryKind {
     ReadyForChatGpt,
+    RuntimeStopped,
+    RuntimeStarting,
     ServiceNeedsAttention,
     RunnerDisconnected,
     ProjectNotReady,
@@ -156,6 +158,22 @@ pub fn aggregate_readiness(
             ReadinessSummaryKind::ReadyForChatGpt,
             None,
             "Ready to use with ChatGPT".to_string(),
+            None,
+        )
+    } else if server == ServerReadiness::Stopped && runner == RunnerReadiness::Stopped {
+        (
+            ReadinessSummaryKind::RuntimeStopped,
+            Some(ReadinessNextActionKind::StartOrReconnectService),
+            "Runtime stopped".to_string(),
+            Some("Start the runtime to continue.".to_string()),
+        )
+    } else if server == ServerReadiness::Starting
+        || (server == ServerReadiness::Ready && runner == RunnerReadiness::Connecting)
+    {
+        (
+            ReadinessSummaryKind::RuntimeStarting,
+            None,
+            "Runtime starting".to_string(),
             None,
         )
     } else if !matches!(server, ServerReadiness::Ready) {
@@ -255,6 +273,7 @@ pub struct RegularTunnelState {
 #[serde(rename_all = "snake_case")]
 pub enum DesktopOperationKind {
     LocalSetup,
+    LocalProjectActivate,
     RemoteSetup,
     QuickShareStart,
     QuickShareStop,
@@ -264,12 +283,14 @@ pub enum DesktopOperationKind {
     RuntimeRefresh,
     RuntimeResume,
     TunnelProxyUpdate,
+    TunnelConfigUpdate,
 }
 
 impl DesktopOperationKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalSetup => "local_setup",
+            Self::LocalProjectActivate => "local_project_activate",
             Self::RemoteSetup => "remote_setup",
             Self::QuickShareStart => "quick_share_start",
             Self::QuickShareStop => "quick_share_stop",
@@ -279,6 +300,7 @@ impl DesktopOperationKind {
             Self::RuntimeRefresh => "runtime_refresh",
             Self::RuntimeResume => "runtime_resume",
             Self::TunnelProxyUpdate => "tunnel_proxy_update",
+            Self::TunnelConfigUpdate => "tunnel_config_update",
         }
     }
 }
@@ -333,10 +355,25 @@ pub struct TunnelProxySnapshot {
     pub detected_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelConfigSource {
+    #[default]
+    Environment,
+    File,
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct OpenAiTunnelConfigSnapshot {
     pub tunnel_id_present: bool,
     pub api_key_present: bool,
+    #[serde(default)]
+    pub source: TunnelConfigSource,
+    #[serde(default)]
+    pub saved_tunnel_id: Option<String>,
+    #[serde(default)]
+    pub effective_tunnel_id: Option<String>,
 }
 
 impl OpenAiTunnelConfigSnapshot {
@@ -461,6 +498,37 @@ mod tests {
         assert_eq!(local.runner, remote.runner);
         assert_ne!(local.server, remote.server);
         assert_ne!(local.exposure, remote.exposure);
+    }
+
+    #[test]
+    fn stopped_starting_and_failed_readiness_are_distinct() {
+        for (server, runner, expected) in [
+            (
+                ServerReadiness::Stopped,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStopped,
+            ),
+            (
+                ServerReadiness::Starting,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStarting,
+            ),
+            (
+                ServerReadiness::Error,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::ServiceNeedsAttention,
+            ),
+        ] {
+            let state = aggregate_readiness(
+                server,
+                runner,
+                ExposureReadiness::LocalReady,
+                ProjectReadiness::Configured,
+            );
+            assert_eq!(state.summary_kind, expected);
+            assert!(!state.runtime_ready);
+            assert!(!state.ready_for_chatgpt);
+        }
     }
 
     #[test]

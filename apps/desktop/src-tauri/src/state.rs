@@ -3,8 +3,7 @@ use crate::deadline::Deadline;
 use crate::error::{DesktopError, DesktopResult};
 use crate::models::{
     aggregate_readiness, ChatGptActivitySnapshot, DesktopOperationKind, DesktopStateSnapshot,
-    Enrollment, Experience, Exposure, ExposureReadiness, OpenAiTunnelConfigSnapshot,
-    ProjectReadiness, ProjectSelection,
+    Enrollment, Experience, Exposure, ExposureReadiness, ProjectReadiness, ProjectSelection,
     QuickShareState, ReadinessNextActionKind, ReadinessSummaryKind, RegularConnectionPreference,
     RegularTunnelState, RegularTunnelStatus, RunnerReadiness, RunnerTopology, RuntimeTopology,
     ServerReadiness, ServerTopology, StoredDesktopConfig, StoredRuntime, TunnelProxyConfig,
@@ -15,6 +14,7 @@ use crate::operation::{
     OperationController,
 };
 use crate::process::{MachineEventReceiver, ProcessKind, ProcessPhase, ProcessSupervisor};
+use crate::tunnel_config::{TunnelConfig, TunnelConfigRequest};
 use crate::webcodex::{
     inspect_project_path, ProjectRuntimeIdentity, QuickShareReadyEvent, RegularTunnelReadyEvent,
     WebCodexAdapter,
@@ -113,7 +113,10 @@ impl AppState {
         }
         snapshot.current_operation = self.operations.current();
         snapshot.activity_sequence = self.activity.latest_sequence();
-        apply_openai_tunnel_configuration(&mut snapshot);
+        if snapshot.openai_tunnel_config.source == crate::models::TunnelConfigSource::Environment {
+            snapshot.openai_tunnel_config = crate::tunnel_config::environment_snapshot();
+            snapshot.openai_tunnel_configured = snapshot.openai_tunnel_config.is_configured();
+        }
         snapshot.regular_tunnel_available = true;
         snapshot.powershell_runtime = crate::platform::powershell_runtime_snapshot();
         snapshot
@@ -186,6 +189,36 @@ impl AppState {
             .await
     }
 
+    pub async fn update_tunnel_config(
+        &self,
+        request: TunnelConfigRequest,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        let (operation, cancellation, mut core, baseline) = self
+            .begin_operation(DesktopOperationKind::TunnelConfigUpdate, false)
+            .await?;
+        let result = async {
+            cancellation.check()?;
+            let path = core.data_dir.join("secrets").join("tunnel-config.json");
+            let mut config = core.tunnel_config.clone();
+            core.tunnel_config = tokio::task::spawn_blocking(move || {
+                config.update(&path, request)?;
+                Ok::<_, DesktopError>(config)
+            })
+            .await
+            .map_err(|_| {
+                DesktopError::new(
+                    "tunnel_config_save_failed",
+                    "Could not complete the configuration save",
+                    "Check the saved configuration before retrying.",
+                )
+            })??;
+            core.get_state().await
+        }
+        .await;
+        self.finish_operation(operation, cancellation, core, baseline, result)
+            .await
+    }
+
     pub async fn update_tunnel_proxy(
         &self,
         mode: TunnelProxyMode,
@@ -210,6 +243,20 @@ impl AppState {
             .await?;
         let result = core
             .configure_local_setup(project_path, &cancellation)
+            .await;
+        self.finish_operation(operation, cancellation, core, baseline, result)
+            .await
+    }
+
+    pub async fn activate_local_project(
+        &self,
+        project_path: &str,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        let (operation, cancellation, mut core, baseline) = self
+            .begin_operation(DesktopOperationKind::LocalProjectActivate, true)
+            .await?;
+        let result = core
+            .activate_local_project(project_path, &cancellation)
             .await;
         self.finish_operation(operation, cancellation, core, baseline, result)
             .await
@@ -500,6 +547,7 @@ pub struct DesktopCore {
     default_project_dir: PathBuf,
     config_path: PathBuf,
     config: StoredDesktopConfig,
+    tunnel_config: TunnelConfig,
     snapshot: DesktopStateSnapshot,
     adapter: WebCodexAdapter,
     supervisor: SharedSupervisor,
@@ -513,10 +561,24 @@ impl DesktopCore {
         let default_project_dir = default_management_project_dir(&data_dir, &resource_dir);
         let config_path = data_dir.join("desktop-state.json");
         let config = load_config(&config_path, &activity)?;
+        let tunnel_config =
+            TunnelConfig::load(&data_dir.join("secrets").join("tunnel-config.json"));
         let mut snapshot = DesktopStateSnapshot::default();
         snapshot.topology = config.topology.clone();
         snapshot.project = project_snapshot(&config);
-        apply_openai_tunnel_configuration(&mut snapshot);
+        if config.topology.is_some() && config.runtime_autostart == Some(false) {
+            snapshot.readiness = aggregate_readiness(
+                ServerReadiness::Stopped,
+                RunnerReadiness::Stopped,
+                ExposureReadiness::Disabled,
+                if config.project.is_some() {
+                    ProjectReadiness::Configured
+                } else {
+                    ProjectReadiness::None
+                },
+            );
+        }
+        apply_openai_tunnel_configuration(&mut snapshot, &tunnel_config);
         snapshot.regular_tunnel_available = true;
         snapshot.powershell_runtime = crate::platform::powershell_runtime_snapshot();
         apply_config_projection(&mut snapshot, &config);
@@ -527,6 +589,7 @@ impl DesktopCore {
             default_project_dir,
             config_path,
             config,
+            tunnel_config,
             snapshot,
             adapter: WebCodexAdapter::new(Some(resource_dir.join("webcodex-runtime"))),
             supervisor,
@@ -536,7 +599,7 @@ impl DesktopCore {
     }
 
     pub async fn get_state(&mut self) -> DesktopResult<DesktopStateSnapshot> {
-        apply_openai_tunnel_configuration(&mut self.snapshot);
+        apply_openai_tunnel_configuration(&mut self.snapshot, &self.tunnel_config);
         self.snapshot.regular_tunnel_available = true;
         apply_config_projection(&mut self.snapshot, &self.config);
         if self.snapshot.regular_tunnel.is_some() {
@@ -674,6 +737,18 @@ impl DesktopCore {
             Err(_) => ServerReadiness::Unknown,
         };
         cancellation.check()?;
+        // A saved user stop remains stopped across refresh, while a reachable
+        // external service is still observed normally.
+        if !runtime_autostart(&self.config) && server != ServerReadiness::Ready {
+            self.snapshot.chatgpt_activity = None;
+            self.snapshot.readiness = aggregate_readiness(
+                ServerReadiness::Stopped,
+                RunnerReadiness::Stopped,
+                ExposureReadiness::Disabled,
+                ProjectReadiness::Configured,
+            );
+            return self.get_state().await;
+        }
         let runner = match self.adapter.runner_ready(&identity, cancellation).await {
             Ok(true) => RunnerReadiness::Ready,
             Ok(false) => RunnerReadiness::Connecting,
@@ -735,7 +810,7 @@ impl DesktopCore {
     fn publish_snapshot(&mut self) -> DesktopStateSnapshot {
         self.snapshot.current_operation = None;
         self.snapshot.activity_sequence = self.activity.latest_sequence();
-        apply_openai_tunnel_configuration(&mut self.snapshot);
+        apply_openai_tunnel_configuration(&mut self.snapshot, &self.tunnel_config);
         self.snapshot.regular_tunnel_available = true;
         self.snapshot.powershell_runtime = crate::platform::powershell_runtime_snapshot();
         apply_config_projection(&mut self.snapshot, &self.config);
@@ -891,6 +966,108 @@ impl DesktopCore {
         };
         self.config.tunnel_proxy = TunnelProxyConfig { mode, custom_url };
         self.save_config().await?;
+        self.get_state().await
+    }
+
+    pub async fn activate_local_project(
+        &mut self,
+        project_path: &str,
+        cancellation: &CancellationContext,
+    ) -> DesktopResult<DesktopStateSnapshot> {
+        cancellation.check()?;
+        let local_full = self.config.topology.as_ref().is_some_and(|topology| {
+            topology.experience == Experience::Full
+                && matches!(topology.server, ServerTopology::Local)
+        });
+        if !local_full || self.snapshot.quick_share.is_some() {
+            return Err(DesktopError::new(
+                "unsupported_topology",
+                "Projects can only be activated in place on a local Full Runtime",
+                "Use the full runtime setup flow before activating another project.",
+            ));
+        }
+        if !self.snapshot.readiness.runtime_ready {
+            return Err(DesktopError::new(
+                "runtime_not_ready",
+                "The local Full Runtime is not ready for an in-place project activation",
+                "Restore the local runtime, then choose the project again.",
+            ));
+        }
+
+        let project = self.adapter.inspect_project(project_path).await?;
+        cancellation.check()?;
+        let identity = identity_from_config(&self.config).ok_or_else(|| {
+            DesktopError::new(
+                "runtime_not_ready",
+                "The saved local Runner identity is incomplete",
+                "Restore or reconfigure the local runtime before activating another project.",
+            )
+        })?;
+        let runner_client_id = stored_runner_client_id(&self.config).ok_or_else(|| {
+            DesktopError::new(
+                "runner_offline",
+                "The saved local Runner client identity is unavailable",
+                "Restore or reconfigure the local runtime before activating another project.",
+            )
+        })?;
+        let runner = self
+            .adapter
+            .observe_runner_connection(&identity, Some(&runner_client_id), cancellation)
+            .await?;
+        cancellation.check()?;
+        if !runner.online {
+            return Err(DesktopError::new(
+                "runner_offline",
+                "The current local Runner is not online",
+                "Restore the local runtime, then choose the project again.",
+            ));
+        }
+
+        let identity = self
+            .adapter
+            .activate_project(&identity, &runner_client_id, &project, cancellation)
+            .await?;
+        self.wait_for_project(&identity, cancellation).await?;
+        cancellation.check()?;
+
+        let previous_config = self.config.clone();
+        let previous_snapshot = self.snapshot.clone();
+        let mut committed_project = project;
+        committed_project.runtime_project_id = Some(identity.runtime_project_id.clone());
+        let runtime = self.config.runtime.as_mut().ok_or_else(|| {
+            DesktopError::new(
+                "runtime_not_ready",
+                "The local runtime disappeared during project activation",
+                "Restore the local runtime, then choose the project again.",
+            )
+        })?;
+        runtime.project_id = Some(identity.project_id);
+        runtime.runtime_project_id = Some(identity.runtime_project_id);
+        self.config.project = Some(committed_project.clone());
+        if let Err(error) = self.save_config().await {
+            self.config = previous_config;
+            self.snapshot = previous_snapshot;
+            self.publish_snapshot();
+            return Err(error);
+        }
+
+        self.activity.push(
+            ActivityEventKind::ProjectActivated,
+            "desktop",
+            ActivityLevel::Info,
+            std::path::Path::new(&committed_project.path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        );
+        self.snapshot.project = Some(committed_project);
+        self.snapshot.chatgpt_activity = None;
+        self.snapshot.readiness = aggregate_readiness(
+            self.snapshot.readiness.server.clone(),
+            self.snapshot.readiness.runner.clone(),
+            self.snapshot.readiness.exposure.clone(),
+            ProjectReadiness::Ready,
+        );
         self.get_state().await
     }
 
@@ -1556,11 +1733,14 @@ impl DesktopCore {
         }
         let deadline = Deadline::after(QUICK_SHARE_READY_TIMEOUT);
         let tunnel_proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
-        let command = self.adapter.quick_share_command(
+        let mut command = self.adapter.quick_share_command(
             Path::new(&project.path),
             provider,
             tunnel_proxy.url.as_deref(),
         )?;
+        if provider == "openai" {
+            self.tunnel_config.apply_to_command(&mut command)?;
+        }
         if deadline.is_elapsed() {
             return Err(readiness_timeout_error(
                 "quick_share_not_ready",
@@ -1763,11 +1943,11 @@ impl DesktopCore {
                 "Manage external exposure on the remote Server instead.",
             ));
         }
-        if !openai_tunnel_configuration().is_configured() {
+        if !self.tunnel_config.snapshot().is_configured() {
             return Err(DesktopError::new(
                 "tunnel_unavailable",
                 "OpenAI Secure Tunnel is not configured",
-                "Configure the canonical Control Plane Tunnel environment, then retry.",
+                "Save the Tunnel ID and API key in Desktop settings, then retry.",
             ));
         }
         if self
@@ -1814,9 +1994,10 @@ impl DesktopCore {
             })?;
         let deadline = Deadline::after(REGULAR_TUNNEL_READY_TIMEOUT);
         let tunnel_proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
-        let command = self
+        let mut command = self
             .adapter
             .regular_tunnel_command(&env_file, tunnel_proxy.url.as_deref())?;
+        self.tunnel_config.apply_to_command(&mut command)?;
         if deadline.is_elapsed() {
             return Err(readiness_timeout_error(
                 "tunnel_unavailable",
@@ -1942,13 +2123,17 @@ impl DesktopCore {
             ));
         }
         cancellation.check()?;
-        let handoff_available = event.connection.clipboard_state == "copied";
+        // The schema-v1 ready event is emitted only after the daemon is ready.
+        // Its ready_for_chatgpt flag additionally requires CLI clipboard success;
+        // Desktop can also hand off the same non-secret ID through its copy field.
+        let id_available = self.tunnel_config.snapshot().effective_tunnel_id.is_some();
+        let handoff_available = event.connection.clipboard_state == "copied" || id_available;
         self.snapshot.regular_tunnel = Some(RegularTunnelState {
             provider: event.provider,
             status: RegularTunnelStatus::Ready,
             clipboard_state: event.connection.clipboard_state,
             clipboard_contains: event.connection.clipboard_contains,
-            ready_for_chatgpt: event.ready_for_chatgpt && handoff_available,
+            ready_for_chatgpt: (event.ready_for_chatgpt || id_available) && handoff_available,
         });
         self.config.preferred_connection = Some(RegularConnectionPreference::OpenAiTunnel);
         self.save_config().await?;
@@ -2594,7 +2779,7 @@ fn state_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), id))
 }
 
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_file_with_hook(path, bytes, |_| Ok(()))
 }
 
@@ -2938,29 +3123,8 @@ fn apply_config_projection(snapshot: &mut DesktopStateSnapshot, config: &StoredD
     };
 }
 
-fn openai_tunnel_configuration() -> OpenAiTunnelConfigSnapshot {
-    openai_tunnel_configuration_from_presence(
-        environment_variable_present("CONTROL_PLANE_TUNNEL_ID"),
-        environment_variable_present("CONTROL_PLANE_API_KEY"),
-    )
-}
-
-fn openai_tunnel_configuration_from_presence(
-    tunnel_id_present: bool,
-    api_key_present: bool,
-) -> OpenAiTunnelConfigSnapshot {
-    OpenAiTunnelConfigSnapshot {
-        tunnel_id_present,
-        api_key_present,
-    }
-}
-
-fn environment_variable_present(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| !value.is_empty())
-}
-
-fn apply_openai_tunnel_configuration(snapshot: &mut DesktopStateSnapshot) {
-    let configuration = openai_tunnel_configuration();
+fn apply_openai_tunnel_configuration(snapshot: &mut DesktopStateSnapshot, config: &TunnelConfig) {
+    let configuration = config.snapshot();
     snapshot.openai_tunnel_configured = configuration.is_configured();
     snapshot.openai_tunnel_config = configuration;
 }
@@ -3337,6 +3501,34 @@ mod tests {
         assert!(!json.contains("wc_pat_"));
         assert!(!json.contains("wc_agent_"));
         assert!(!json.contains("CONTROL_PLANE_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_survives_refresh_and_desktop_restart() {
+        let data_dir = unique_state_dir("stopped-refresh");
+        let mut core = DesktopCore::new(data_dir.clone(), data_dir.join("resources")).unwrap();
+        core.config = test_stored_config("stopped");
+        core.config.topology = Some(RuntimeTopology {
+            experience: Experience::Full,
+            server: ServerTopology::Local,
+            runner: RunnerTopology::Local,
+            exposure: Exposure::None,
+            enrollment: Enrollment::ManagedPairing,
+        });
+        let cancellation = CancellationContext::never();
+        core.stop_local_runtime(&cancellation).await.unwrap();
+        let refreshed = core.refresh_runtime_status(&cancellation).await.unwrap();
+        assert_eq!(
+            refreshed.readiness.summary_kind,
+            ReadinessSummaryKind::RuntimeStopped
+        );
+        assert!(!refreshed.runtime_autostart);
+        let restarted = DesktopCore::new(data_dir.clone(), data_dir.join("resources")).unwrap();
+        assert_eq!(
+            restarted.snapshot.readiness.summary_kind,
+            ReadinessSummaryKind::RuntimeStopped
+        );
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[test]
@@ -3892,7 +4084,7 @@ mod tests {
             .await
             .expect("inspect second project fixture");
         let switched = match core
-            .configure_local_setup(Some(&second_project.to_string_lossy()), &cancellation)
+            .activate_local_project(&second_project.to_string_lossy(), &cancellation)
             .await
         {
             Ok(snapshot) => snapshot,
@@ -3967,7 +4159,7 @@ mod tests {
 
         let project_b_runtime_id = switched_identity.runtime_project_id.clone();
         let repeated = core
-            .configure_local_setup(Some(&second_project.to_string_lossy()), &cancellation)
+            .activate_local_project(&second_project.to_string_lossy(), &cancellation)
             .await
             .expect("reselecting Project B is idempotent");
         assert_eq!(repeated.readiness.project, ProjectReadiness::Ready);
@@ -4231,25 +4423,6 @@ mod tests {
             snapshot.readiness.next_action_kind,
             Some(ReadinessNextActionKind::CheckConnection)
         );
-    }
-
-    #[test]
-    fn tunnel_configuration_presence_matrix_is_value_free() {
-        for (tunnel_id_present, api_key_present, configured) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, true),
-        ] {
-            let observation =
-                openai_tunnel_configuration_from_presence(tunnel_id_present, api_key_present);
-            assert_eq!(observation.tunnel_id_present, tunnel_id_present);
-            assert_eq!(observation.api_key_present, api_key_present);
-            assert_eq!(observation.is_configured(), configured);
-            let encoded =
-                serde_json::to_value(&observation).expect("serialize presence observation");
-            assert_eq!(encoded.as_object().map(|object| object.len()), Some(2));
-        }
     }
 
     #[cfg(windows)]

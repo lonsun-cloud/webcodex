@@ -1,10 +1,11 @@
+import brandIcon from "./assets/brand.png";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi } from "./lib/desktop-api";
 import type {
   ActivityEntry,
   DesktopError,
-  DesktopOperationKind,
   DesktopState,
 } from "./models/topology";
 import { FirstRun } from "./features/onboarding/FirstRun";
@@ -13,10 +14,12 @@ import { ProjectsPanel } from "./features/projects/ProjectsPanel";
 import { ConnectionPanel } from "./features/connection/ConnectionPanel";
 import { ActivityPanel } from "./features/activity/ActivityPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
-import { useLocale } from "./i18n/locale";
-import { desktopErrorPresentation, normalizeDesktopError } from "./i18n/presentation";
+import { LANGUAGES, useLocale } from "./i18n/locale";
+import { desktopErrorPresentation, normalizeDesktopError, runtimeLabel, operationLabel } from "./i18n/presentation";
 
 type Navigation = "home" | "projects" | "connection" | "activity" | "settings";
+
+const NAVIGATION: Navigation[] = ["home", "projects", "connection", "activity", "settings"];
 
 const REGULAR_TUNNEL_OBSERVATION_INTERVAL_MS = 1_500;
 const CHATGPT_ACTIVITY_OBSERVATION_INTERVAL_MS = 30_000;
@@ -80,6 +83,18 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
+  }, []);
+
+  useEffect(() => {
+    const navigateWithKeyboard = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.repeat) return;
+      const page = NAVIGATION[Number(event.key) - 1];
+      if (!page) return;
+      event.preventDefault();
+      setNavigation(page);
+    };
+    window.addEventListener("keydown", navigateWithKeyboard);
+    return () => window.removeEventListener("keydown", navigateWithKeyboard);
   }, []);
 
   const openSetup = () => {
@@ -225,6 +240,48 @@ export default function App() {
     }
   };
 
+  const chooseLocalProject = async () => {
+    if (!state || state.current_operation) return;
+    const topology = state.topology;
+    if (
+      !topology ||
+      topology.experience !== "full" ||
+      topology.server.kind !== "local" ||
+      !state.project ||
+      !state.readiness.runtime_ready
+    ) {
+      openSetup();
+      return;
+    }
+    setError(null);
+    try {
+      const selection = await open({
+        directory: true,
+        multiple: false,
+        title: t("setup.chooseProject"),
+      });
+      if (typeof selection !== "string") return;
+      try {
+        commitState(await desktopApi.activateLocalProject(selection));
+      } catch (value) {
+        const normalized = normalizeDesktopError(value);
+        if (
+          normalized.code !== "project_activation_capability_unavailable" &&
+          normalized.code !== "project_activation_restart_required"
+        ) {
+          throw normalized;
+        }
+        // Older Runners may need the existing bounded Local Setup fallback to
+        // refresh only the Desktop-owned Runner. Keep the user's already-running
+        // Tunnel untouched and do not require a second confirmation click.
+        commitState(await desktopApi.configureLocal(selection));
+      }
+      setShowSetup(false);
+    } catch (value) {
+      setError(normalizeDesktopError(value));
+    }
+  };
+
   const refresh = async () => {
     setRefreshing(true);
     try {
@@ -268,7 +325,7 @@ export default function App() {
   if (!state) {
     return (
       <main className="splash">
-        <div className="brand-mark" aria-hidden="true">W</div>
+        <img className="brand-mark" src={brandIcon} alt="" />
         {error ? (
           <section className="startup-error" aria-label="WebCodex">
             <AppError error={error} />
@@ -296,18 +353,21 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark" aria-hidden="true">W</div><div><strong>WebCodex</strong><span>Desktop</span></div></div>
+        <div className="brand"><img className="brand-mark" src={brandIcon} alt="" /><div><strong>WebCodex</strong><span>Desktop</span></div></div>
         <nav aria-label={t("nav.main")}>
-          {(["home", "projects", "connection", "activity", "settings"] as Navigation[]).map((item) => (
+          {NAVIGATION.map((item, index) => (
             <button
               key={item}
               className={navigation === item ? "active" : ""}
               onClick={() => setNavigation(item)}
               aria-current={navigation === item ? "page" : undefined}
+              aria-keyshortcuts={`Control+${index + 1} Meta+${index + 1}`}
+              title={`${t(`nav.${item}`)} (⌘ / Ctrl + ${index + 1})`}
               data-webcodex-action={`navigate-${item}`}
             >
               <span className={`nav-icon nav-${item}`} aria-hidden="true" />
               {t(`nav.${item}`)}
+              <kbd aria-hidden="true">{index + 1}</kbd>
             </button>
           ))}
         </nav>
@@ -320,13 +380,12 @@ export default function App() {
             onChange={(event) => setLocale(event.target.value as typeof locale)}
             data-webcodex-control="locale"
           >
-            <option value="zh-CN">{t("locale.zh")}</option>
-            <option value="en-US">{t("locale.en")}</option>
+            {LANGUAGES.map((language) => <option key={language.value} value={language.value}>{language.label}</option>)}
           </select>
         </div>
         <div className="sidebar-status">
           <i className={`status-dot ${state.readiness.runtime_ready ? "ready" : "unknown"}`} aria-hidden="true" />
-          <div><strong>{state.readiness.runtime_ready ? t("sidebar.runtimeReady") : state.topology ? t("common.stopped") : t("sidebar.needsSetup")}</strong><span>{sidebarConnectionLabel(state, t)}</span></div>
+          <div><strong>{runtimeLabel(state, t)}</strong><span>{sidebarConnectionLabel(state, t)}</span></div>
         </div>
       </aside>
 
@@ -386,6 +445,7 @@ export default function App() {
             onRefresh={() => void refresh()}
             onResumeRuntime={() => void resumeRuntime()}
             onConnectChatGpt={() => void runStateOperation(desktopApi.startRegularTunnel)}
+            onChooseProject={() => void chooseLocalProject()}
             onChangeSetup={openSetup}
             onNavigate={setNavigation}
             onStopQuickShare={() => void runStateOperation(desktopApi.stopQuickShare)}
@@ -393,7 +453,7 @@ export default function App() {
           />
         ))}
         {navigation === "projects" && (
-          <ProjectsPanel state={state} onConfigure={openSetup} />
+          <ProjectsPanel state={state} onChooseProject={() => void chooseLocalProject()} />
         )}
         {navigation === "connection" && <ConnectionPanel state={state} onState={commitState} />}
         {navigation === "activity" && <ActivityPanel activity={activity} />}
@@ -404,6 +464,7 @@ export default function App() {
 }
 
 function sidebarConnectionLabel(state: DesktopState, t: ReturnType<typeof useLocale>["t"]) {
+  if (!state.readiness.runtime_ready) return t("workspace.afterStart");
   if (state.regular_tunnel?.status !== "error" && state.readiness.runtime_ready && state.chatgpt_activity?.observed) {
     return t("sidebar.chatgptObserved");
   }
@@ -419,24 +480,6 @@ function shouldStartPreferredTunnel(state: DesktopState) {
     state.readiness.runtime_ready &&
     state.openai_tunnel_configured &&
     !state.regular_tunnel;
-}
-
-function operationLabel(
-  kind: DesktopOperationKind,
-  t: ReturnType<typeof useLocale>["t"],
-) {
-  switch (kind) {
-    case "local_setup": return t("operation.localSetup");
-    case "remote_setup": return t("operation.remoteSetup");
-    case "quick_share_start": return t("operation.quickShareStart");
-    case "quick_share_stop": return t("operation.quickShareStop");
-    case "regular_tunnel_start": return t("operation.regularTunnelStart");
-    case "regular_tunnel_stop": return t("operation.regularTunnelStop");
-    case "local_runtime_stop": return t("operation.localRuntimeStop");
-    case "runtime_refresh": return t("operation.runtimeRefresh");
-    case "runtime_resume": return t("operation.runtimeResume");
-    case "tunnel_proxy_update": return t("operation.tunnelProxyUpdate");
-  }
 }
 
 function AppError({ error }: { error: DesktopError }) {

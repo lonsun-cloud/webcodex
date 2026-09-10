@@ -55,6 +55,8 @@ export type ProjectReadiness =
 
 export type ReadinessSummaryKind =
   | "ready_for_chat_gpt"
+  | "runtime_stopped"
+  | "runtime_starting"
   | "service_needs_attention"
   | "runner_disconnected"
   | "project_not_ready"
@@ -132,6 +134,7 @@ export interface TunnelProxySnapshot {
 
 export type DesktopOperationKind =
   | "local_setup"
+  | "local_project_activate"
   | "remote_setup"
   | "quick_share_start"
   | "quick_share_stop"
@@ -140,7 +143,8 @@ export type DesktopOperationKind =
   | "local_runtime_stop"
   | "runtime_refresh"
   | "runtime_resume"
-  | "tunnel_proxy_update";
+  | "tunnel_proxy_update"
+  | "tunnel_config_update";
 
 export type DesktopOperationPhase = "running" | "cancelling";
 
@@ -155,6 +159,9 @@ export interface DesktopOperation {
 export interface OpenAiTunnelConfigSnapshot {
   tunnel_id_present: boolean;
   api_key_present: boolean;
+  source: "file" | "environment" | "invalid";
+  saved_tunnel_id: string | null;
+  effective_tunnel_id?: string | null;
 }
 
 export interface PowerShellRuntimeSnapshot {
@@ -215,6 +222,8 @@ export interface ActivityEntry {
     | "regular_tunnel_ready"
     | "regular_tunnel_stopped"
     | "runtime_stopped"
+    | "project_activated"
+    | "state_recovered"
     | "operation_started"
     | "operation_cancel_requested"
     | "operation_cancelled"

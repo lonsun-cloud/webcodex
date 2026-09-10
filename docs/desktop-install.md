@@ -8,7 +8,7 @@ The normal path is intentionally product-level; you do not need to understand th
 
 ```text
 install Desktop
-→ prepare and confirm the Tunnel configuration
+→ save the Tunnel ID and API key in Desktop
 → choose the real project ChatGPT should use
 → wait for Service / Runner / Project to become ready
 → start the official OpenAI Secure Tunnel
@@ -18,6 +18,8 @@ install Desktop
 ```
 
 **Important:** “OpenAI Secure Tunnel ready” proves only that the local Tunnel is ready **for** ChatGPT. It does **not** prove that ChatGPT has connected or that a project tool can already execute. The real project read in step 8 is the final proof. For CLI, an existing remote Server, production hosting, or advanced networking, use the [Full Setup](PERSONAL_SETUP.md) or [Deployment](DEPLOYMENT.md) guides instead.
+
+For everyday use after installation, see [Using Desktop](desktop-guide.md). Home now centers the current project and three usage steps; component details live under “View runtime diagnostics”. OpenAI Platform screenshots below are configuration references; follow the current Desktop control names in the text.
 
 ## 1. Install WebCodex Desktop
 
@@ -48,6 +50,13 @@ WebCodex Desktop is a long-running local runtime controller. Closing the main wi
 
 In **Settings → Background & startup**, **Launch WebCodex at login** registers Desktop with the operating system and starts it in the background without opening the main window. This setting is separate from the saved runtime preferences: `runtime_autostart` still decides whether the saved local runtime is restored, and the saved connection preference still decides whether the regular ChatGPT Tunnel is restored when appropriate.
 
+### Everyday controls
+
+- Use the sidebar to open Home, Projects, Connection, Activity, and Settings. Use **⌘ + 1–5** on macOS or **Ctrl + 1–5** on Windows. Navigation shortcuts also work inside inputs and language selectors; ordinary typing and text-editing shortcuts remain available.
+- Home shows the current project, next action, and three usage steps. Expand **View runtime diagnostics** to inspect all four components.
+- In **Activity**, search messages or sources, or select **Warnings and errors only**. Results are newest first. Filtering changes the view without deleting records.
+- Use Tab to focus main buttons and Enter to activate them. Navigation moves focus into page content.
+
 ## 2. Prepare an OpenAI Tunnel
 
 Create a Tunnel in the OpenAI Platform and prepare an API key that can use that Tunnel:
@@ -63,64 +72,45 @@ The Tunnel name is up to you. Record the Tunnel ID. A Restricted API key with on
 
 Do not commit or share real API keys, WebCodex tokens, or authorization values.
 
-## 3. Give Desktop the Tunnel settings
+## 3. Save Tunnel configuration inside Desktop (recommended)
 
-The normal Desktop Tunnel path needs only:
+Open **Settings → OpenAI Tunnel network**, or expand **Optional: check ChatGPT tunnel configuration** in **Connection**:
+
+1. Enter your Tunnel ID in **Tunnel ID**.
+2. Enter an API key authorized for that Tunnel in the **Tunnel API key** password field.
+3. Click **Save configuration**. Once the source shows the local configuration file, you can start the connection. **No Desktop restart is required.**
+
+The same fields are available in the optional Tunnel section during local setup. When a key is already saved, leaving its field blank keeps that key. Desktop never retrieves the secret into the UI; submission clears the input. A failed save retains the Tunnel ID but requires re-entering an unsaved key.
+
+**Priority: complete saved configuration → inherited Desktop process environment.** Desktop never combines a saved Tunnel ID with an environment API key. Saving does not modify system variables or start/stop a connection. New values apply to the next regular OpenAI Tunnel or OpenAI Quick Share start. Stop and start an active connection to apply them.
+
+The file is `secrets/tunnel-config.json` in Desktop's local application data directory:
+
+- macOS: `~/Library/Application Support/dev.webcodex.desktop/secrets/tunnel-config.json`.
+- Windows: `%LOCALAPPDATA%\dev.webcodex.desktop\secrets\tunnel-config.json`.
+
+This file contains an **unencrypted API key**. Keep it out of projects, Git, tickets, and shared backups. macOS/Unix writes are owner-only (`0600`); Windows inherits access permissions from the current user's local application data directory. Saves use atomic replacement without retaining old secret backups. The `secrets` directory is excluded by WebCodex’s existing sensitive-path policy. Ordinary `desktop-state.json` remains non-secret runtime state.
+
+**Clear saved configuration and use environment** clears the saved pair and restores environment fallback; the file records `null`. Invalid or unreadable saved configuration does not fall back automatically. Repair it by saving again in the UI or explicitly clear it. Manual file edits require restarting Desktop; in-app saves do not.
+
+### Optional: continue using environment variables
+
+Without saved configuration, Desktop uses its inherited process environment:
 
 ```text
 CONTROL_PLANE_TUNNEL_ID
 CONTROL_PLANE_API_KEY
 ```
 
-You do not need `OPENAI_ADMIN_KEY` or `OPENAI_API_KEY` for this path. The Desktop package does not bundle `tunnel-client`; when the official OpenAI Secure Tunnel is first needed, WebCodex downloads and verifies the pinned client automatically. Most users therefore do not install it manually. If managed download fails, check the network/proxy first; `WEBCODEX_TUNNEL_CLIENT_BIN` is an advanced override.
+No additional `OPENAI_ADMIN_KEY` or `OPENAI_API_KEY` is needed. On first OpenAI Secure Tunnel use, WebCodex automatically downloads and verifies a pinned `tunnel-client`; manual installation is normally unnecessary. If download fails, check networking or proxies. Advanced users can set `WEBCODEX_TUNNEL_CLIENT_BIN`.
 
-### Windows
+Windows users can set persistent variables for the current user. On macOS, Finder / Dock launches do not read `~/.zshrc`; launch from a Terminal that has loaded the variables or configure the login session environment. After changing variables through this advanced path, use **Quit WebCodex** in the tray and launch it again. Closing the window only hides it and cannot refresh its process environment. **Recheck configuration** neither executes shell startup scripts nor reloads manually edited configuration files.
 
-Set the values as persistent variables for the current user, then **fully quit WebCodex and start it again**:
+### macOS Computer Use permissions
 
-```powershell
-[Environment]::SetEnvironmentVariable("CONTROL_PLANE_TUNNEL_ID", "tunnel_...", "User")
-[Environment]::SetEnvironmentVariable("CONTROL_PLANE_API_KEY", "<restricted-tunnel-key>", "User")
-```
+For screenshots, window observation, keyboard or pointer control, grant the relevant permissions under **System Settings → Privacy & Security** to the process actually running WebCodex Runner/Desktop. These include **Screen & System Audio Recording**, and **Accessibility** for UI control. Restart the affected process when macOS requires it.
 
-![Windows Desktop example](desktop-install/image-20260906171812348.png)
-
-### macOS
-
-Apps launched from Finder or the Dock do **not** read `~/.zshrc`. If you keep the values in your shell setup, Terminal may see them while Desktop does not.
-
-For a temporary test, launch Desktop from a Terminal that already has the variables:
-
-```bash
-source ~/.zshrc
-"/Applications/WebCodex Desktop.app/Contents/MacOS/WebCodex"
-```
-
-To keep launching from Finder or the Dock, copy the current values into the login session's launchd environment, then reopen Desktop:
-
-```bash
-source ~/.zshrc
-launchctl setenv CONTROL_PLANE_TUNNEL_ID "$CONTROL_PLANE_TUNNEL_ID"
-launchctl setenv CONTROL_PLANE_API_KEY "$CONTROL_PLANE_API_KEY"
-```
-
-If you want Computer Use features such as screenshots, window observation, keyboard, or pointer control, grant the permissions required by macOS to the process actually running WebCodex Runner/Desktop. At minimum this may include **Screen & System Audio Recording**; UI control also requires **Accessibility**. Restart the affected process after changing these permissions when macOS requires it.
-
-Back in Desktop, check **OpenAI Tunnel configuration detection**:
-
-- `Tunnel ID` should say **Detected**;
-- `Tunnel API key` should say **Detected**;
-- the UI reports presence only and never displays the API-key value.
-
-If you just changed environment variables, use **Recheck configuration**. Recheck only observes the environment visible to the **current Desktop process**. It does not execute `~/.zshrc` or secretly load credentials.
-
-If Recheck still says **Not detected**, remember that clicking the window close button only hides WebCodex in the menu bar/system tray. It does not create a new process. Use the tray/menu-bar **Quit WebCodex** action, make sure Desktop has actually exited, then start it again. On macOS, Finder/Dock still will not read `~/.zshrc`; use the Terminal-launch or login-session environment approach above.
-
-**Success looks like:** both fields say **Detected** and the OpenAI Secure Tunnel action is available.
-
-**If it fails:** use Recheck first; if the current process still cannot see the settings, fully quit WebCodex and relaunch it. Closing and reopening the window is not a restart.
-
-**Next:** choose the real project ChatGPT should use.
+**Success looks like:** the source is the local file and both presence checks pass. Next, select the actual project ChatGPT should use.
 
 ## 4. Start the local runtime and add your project
 
@@ -132,9 +122,9 @@ This is an intentional authority boundary: the default Desktop project does not 
 
 For local pairing, Desktop derives a Server-compatible username from your OS username: names the Server already accepts are kept as-is; otherwise ASCII letters are lowercased, each run of unsupported characters becomes a single `-`, the name's own `-` characters are preserved, leading and trailing generated separators are removed, and the result is limited to 64 characters. Names with nothing left use `desktop`. This local pairing name is not an OS login identity; existing saved enrollment is reused on restart.
 
-Home puts overall readiness and the next action first, with direct shortcuts to Projects, Connection, and Activity. In Projects, use **Choose another project** when a default project already exists, or **Add project** when none is configured. Choose a runtime mode and workspace in setup before applying the change. **Back to overview** exits setup; entering or leaving setup alone does not change the runtime.
+Home puts overall readiness and the next action first, with direct shortcuts to Projects, Connection, and Activity. After a local Full Runtime is configured, **Choose another project** or **Add project** on Projects opens the folder picker and applies the selected exact project immediately. The full setup flow is reserved for first use or changing runtime topology.
 
-After setup, confirm all three items:
+After setup, expand **View runtime diagnostics** on Home and confirm all three items:
 
 - Service: Running / Ready;
 - Runner: Connected / Ready;
@@ -142,15 +132,13 @@ After setup, confirm all three items:
 
 If you see **Project not ready** / `project_not_loaded`, normal Desktop users do **not** need to inspect a project registry. Use the **Reload project** action in the error card. Desktop retries the same project and, when required, restarts only the Runner process it owns within a bounded readiness window.
 
-When the runtime is already running and you choose another project, do not manually stop the whole runtime first. Select the new project and apply the change. Desktop keeps the local Service running, replaces its own old Runner when required, and waits for the new project to become ready. A failed transition must not leave the old project falsely displayed as ready.
+When the runtime is already running and you choose another project, do not manually stop the runtime or OpenAI Secure Tunnel first. Desktop extends the Runner policy with the exact selected root, hot-activates it when the Runner supports config reload, persists the new current project after readiness, and keeps the existing local Service and Tunnel. Only a legacy or incompatible Desktop-owned Runner is replaced. A failed transition must not leave the old project falsely displayed as ready.
 
 **Success looks like:** Service, Runner, and Project are all Ready, and the displayed project path is exact.
 
 **If it fails:** use **Reload project**, then inspect Activity/error details if it still fails. Do not broaden allowed roots or substitute a different Runner to bypass project authority.
 
 **Next:** start the OpenAI Secure Tunnel only after these three are ready.
-
-![Local runtime example](desktop-install/image-20260906171904811.png)
 
 ## 5. Configure Tunnel networking if needed
 
@@ -168,13 +156,9 @@ If the Tunnel is already running, stop it, save the new network setting, and sta
 
 **Next:** start the OpenAI Secure Tunnel.
 
-![Connection page](desktop-install/image-20260906172102174.png)
-
-![Tunnel network settings](desktop-install/image-20260906173905826.png)
-
 ## 6. Start the official OpenAI Secure Tunnel
 
-Open **Connection → OpenAI Secure Tunnel** and start it. When local handoff is ready, Desktop should show wording such as:
+Open **Connection**, select **OpenAI Secure Tunnel**, then click **Start secure tunnel**. Selection alone does not start or stop processes. If an existing tunnel reports an error, stop it before starting again; failures remain visible with a retry path. When local handoff is ready, Desktop should show wording such as:
 
 > OpenAI Secure Tunnel ready; waiting for ChatGPT
 
@@ -187,8 +171,6 @@ Desktop must **not** promote daemon readiness or a successful clipboard copy to 
 **If it fails:** first confirm that both configuration-presence fields from step 3 are Detected, then check the proxy mode in step 5 and use the on-screen Tunnel recovery action.
 
 **Next:** enter the Tunnel ID in ChatGPT.
-
-![OpenAI Secure Tunnel running](desktop-install/image-20260906174123335.png)
 
 ## 7. Add WebCodex to ChatGPT
 
@@ -216,7 +198,7 @@ After saving the ChatGPT connection, return to Desktop. Saving a connection in C
 
 ## 8. Minimal acceptance check
 
-After connecting, start with **one minimal real project read**, for example: “List the WebCodex projects, then read README from the project I just selected.” Only this proves the full path is actually working:
+After connecting, start with **one minimal real project read**, for example: “List the WebCodex projects, then list the top-level files in the project I just selected; report an empty directory as empty.” Only this proves the full path is actually working:
 
 - list the WebCodex projects;
 - read a file from the project you explicitly added;
@@ -230,7 +212,7 @@ If Desktop shows a healthy Service / Runner / Project / Tunnel but ChatGPT still
 
 ## Troubleshooting
 
-**OpenAI Secure Tunnel is disabled:** use **OpenAI Tunnel configuration detection**. It shows exactly which presence check is missing. **Recheck configuration** observes only the current process. If you just set the variables, fully quit WebCodex and launch a new process; closing the window is not a quit.
+**OpenAI Secure Tunnel is disabled:** save a complete Tunnel ID and API key in Desktop, then check that the local runtime is ready. If using environment fallback, fully quit and reopen after changing variables.
 
 **macOS Terminal sees the values but Desktop does not:** Finder/Dock apps do not load `~/.zshrc`; use the Terminal-launch or `launchctl setenv` path above. Desktop Recheck does not execute shell startup scripts.
 

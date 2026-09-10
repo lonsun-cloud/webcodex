@@ -7,6 +7,15 @@ use crate::tray;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
+#[tauri::command]
+pub async fn update_tunnel_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::tunnel_config::TunnelConfigRequest,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.update_tunnel_config(request).await)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRequest {
@@ -166,6 +175,18 @@ pub async fn configure_local_setup(
         .configure_local_setup(request.project_path.as_deref())
         .await;
     project_state_result(&app, result)
+}
+
+#[tauri::command]
+pub async fn activate_local_project(
+    request: ProjectRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(
+        &app,
+        state.activate_local_project(&request.project_path).await,
+    )
 }
 
 #[tauri::command]
