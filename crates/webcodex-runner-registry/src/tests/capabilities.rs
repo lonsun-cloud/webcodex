@@ -85,6 +85,8 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
         RunnerFeature::Shell,
         RunnerFeature::Git,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
         RunnerFeature::ApplyTextEditLineScope,
         RunnerFeature::ApplyPatchMatchMetadata,
         RunnerFeature::ApplyPatchMatchingMode,
@@ -257,6 +259,8 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
         RunnerFeature::CodingAgentRuns,
         RunnerFeature::ManagedSshResources,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
     ] {
         assert_eq!(
             feature.inference(),
@@ -295,6 +299,8 @@ async fn current_protocol_generation_never_infers_registration_required_host_fea
         RunnerFeature::ComputerControl,
         RunnerFeature::ComputerTextInput,
         RunnerFeature::CodingAgentRuns,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
     ] {
         assert!(
             !registry
@@ -552,6 +558,8 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
     ] {
         let registry = RunnerRegistry::default();
         let client_id = format!("sticky-{}", feature.as_wire_name());

@@ -118,7 +118,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             true,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Run bounded sh, bash, or PowerShell content as typed script data from a Runner-owned file. Prefer this for program-like shell content such as loops, if/else branches, functions, traps, or multi-stage scripts rather than a short command chain. Long work continues as the same execution, owned by the current Runner; the script body never becomes shell command text. If work must outlive the current Runner process, use a native executable and discover run_detached_process instead.",
+        "Run bounded sh, bash, PowerShell, JavaScript, or TypeScript as typed Runner-owned script data. JavaScript is Node.js-backed with fixed .mjs ESM. TypeScript uses Node native erasable type stripping from .mts ESM, requires Node.js 22.6+, does not type-check, and rejects transform-required syntax such as enum. The Runner owns runtime selection/flags; WebCodex does not install npm dependencies, run tsc, or fall back to Bun/Deno/tsx. Relative ESM imports resolve from the Runner-owned temporary module, not project cwd. Prefer run_process for native argv, run_script for program-like scripts, and run_shell when shell grammar is required. Args/stdin stay separate. Long work continues as the same execution / same Job and is never restarted; script bodies never become shell command text. Use run_detached_process only for native work that must outlive the Runner.",
         run_script_input_schema,
     ),
     adaptive_runtime_direct(

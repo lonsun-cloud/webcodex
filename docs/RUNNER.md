@@ -302,6 +302,57 @@ Security notes for profiles:
 - Profiles run with a cleared environment plus an explicit allowlist; declare
   the env they need.
 
+### Typed `run_script` languages
+
+`run_script` accepts `sh`, `bash`, `powershell`, `javascript`, and `typescript`.
+JavaScript and TypeScript are external Node.js execution on the Runner. WebCodex
+resolves `node` from the prepared shell/profile PATH (or uses the configured
+shell/profile program when it is `node`/`node.exe`). JavaScript bodies are
+written to Runner-owned `.mjs` files and launched as
+`node <temporary.mjs> <args...>` with native argv. `.mjs` fixes ESM semantics
+independently of project `package.json` or temporary-directory metadata.
+
+TypeScript is deliberately a typed-script runtime, not a project compiler. The
+Runner writes the body to a Runner-owned `.mts` file, so the entry module is
+always ESM, and uses Node's native erasable type stripping. Node.js 22.6.0 is
+the minimum supported runtime. Before creating or starting the user script, the
+Runner performs one bounded `node --version` capability probe. Node 22.6 through
+22.17 and Node 23.0 through 23.5 receive the Runner-owned
+`--experimental-strip-types` prefix; Node 22.18+, 23.6+, and later supported
+lines use the default native stripping behavior without that flag. A missing
+Node, an unrecognizable version, or Node older than 22.6 is reported as
+`not_started` / `interpreter_unavailable`, and the user script is never launched.
+If Node accepts the version probe but the eventual script process rejects its
+runtime semantics, the ordinary started-process lifecycle remains authoritative.
+
+The TypeScript contract covers syntax that Node can erase, including type
+annotations, interfaces/type aliases, generics, and ordinary JavaScript features
+such as async/await, ESM, and Node built-ins. WebCodex does not type-check, invoke
+`tsc`, consume `tsconfig.json` as a build configuration, implement path aliases,
+or promise transform-required TypeScript syntax such as enums, parameter
+properties, runtime namespaces, or import aliases. WebCodex also does not use
+`--experimental-transform-types`: that flag is not part of the stable runtime
+contract. On older Node versions that still mark type stripping experimental,
+Node's own `ExperimentalWarning` may appear on stderr. WebCodex does not suppress
+or filter that warning because doing so could also hide warnings emitted by the
+user script.
+
+For rolling upgrades, JavaScript requires the additive
+`structured_script_javascript` capability and TypeScript independently requires
+`structured_script_typescript`. These bits mean the running Runner binary
+understands the corresponding typed-script wire semantics; they do not assert
+that a compatible Node installation is present. Script args remain literal
+native argv values, stdin remains independent, and both languages use the same
+resolved project cwd, timeout/cancellation, Runner policy, and Job lifecycle as
+other typed scripts.
+
+WebCodex does not install or bootstrap npm dependencies, inject `node_modules`
+or `NODE_PATH`, select a package manager, or fall back to Bun, Deno, `tsx`,
+`npx`, or another runtime. Because the `.mjs`/`.mts` entry lives in a Runner-owned
+temporary directory, relative ESM imports resolve from that temporary module,
+not from the project cwd; use Node built-ins or explicit project paths/file URLs
+when importing project code.
+
 ## Jobs and concurrency
 
 A Job is a long-running command or validation that continues after the
