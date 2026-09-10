@@ -19,14 +19,14 @@ pub const PLUGIN_MAX_TOOL_NAME_BYTES: usize = 128;
 pub const PLUGIN_MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const PLUGIN_MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const PLUGIN_MAX_ARGUMENT_BYTES: usize = 64 * 1024;
-pub const PLUGIN_MAX_STRUCTURED_CONTENT_BYTES: usize = 128 * 1024;
-pub const PLUGIN_MAX_TEXT_CONTENT_BYTES: usize = 64 * 1024;
-pub const PLUGIN_MAX_RESULT_BYTES: usize = 256 * 1024;
+pub const PLUGIN_MAX_STRUCTURED_CONTENT_BYTES: usize = 512 * 1024;
+pub const PLUGIN_MAX_TEXT_CONTENT_BYTES: usize = 512 * 1024;
+pub const PLUGIN_MAX_RESULT_BYTES: usize = 512 * 1024;
 pub const PLUGIN_MAX_CONTENT_ITEMS: usize = 32;
 pub const PLUGIN_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const PLUGIN_MAX_JSON_DEPTH: usize = 16;
 pub const PLUGIN_MAX_JSON_NODES: usize = 4_096;
-pub const PLUGIN_MAX_JSON_STRING_BYTES: usize = 64 * 1024;
+pub const PLUGIN_MAX_JSON_STRING_BYTES: usize = 512 * 1024;
 pub const PLUGIN_MAX_CHECK_DETAIL_BYTES: usize = 512;
 pub const PLUGIN_SCHEMA_MAX_PROPERTIES: usize = 128;
 pub const PLUGIN_SCHEMA_MAX_REQUIRED: usize = 128;
@@ -506,8 +506,9 @@ fn parse_plugin_schema_type(value: &str) -> Option<PluginSchemaType> {
 fn preflight_plugin_schema_profile(
     schema: &Value,
     require_object_root: bool,
+    max_string_schema_length: usize,
 ) -> Result<(), SchemaProfileFailure> {
-    let schema_type = preflight_plugin_schema_node(schema, 0)?;
+    let schema_type = preflight_plugin_schema_node(schema, 0, max_string_schema_length)?;
     if require_object_root && schema_type != PluginSchemaType::Object {
         return Err(SchemaProfileFailure::invalid(
             "tool schema root type must be object",
@@ -519,6 +520,7 @@ fn preflight_plugin_schema_profile(
 fn preflight_plugin_schema_node(
     schema: &Value,
     depth: usize,
+    max_string_schema_length: usize,
 ) -> Result<PluginSchemaType, SchemaProfileFailure> {
     if depth > PLUGIN_MAX_JSON_DEPTH {
         return Err(SchemaProfileFailure::invalid(
@@ -606,7 +608,7 @@ fn preflight_plugin_schema_node(
         }
         if let Some(properties) = properties {
             for child in properties.values() {
-                preflight_plugin_schema_node(child, depth + 1)?;
+                preflight_plugin_schema_node(child, depth + 1, max_string_schema_length)?;
             }
         }
 
@@ -661,8 +663,8 @@ fn preflight_plugin_schema_node(
         ));
     }
     if schema_type == PluginSchemaType::String {
-        let minimum = bounded_schema_usize(object.get("minLength"), PLUGIN_MAX_JSON_STRING_BYTES)?;
-        let maximum = bounded_schema_usize(object.get("maxLength"), PLUGIN_MAX_JSON_STRING_BYTES)?;
+        let minimum = bounded_schema_usize(object.get("minLength"), max_string_schema_length)?;
+        let maximum = bounded_schema_usize(object.get("maxLength"), max_string_schema_length)?;
         if minimum
             .zip(maximum)
             .is_some_and(|(minimum, maximum)| minimum > maximum)
@@ -693,7 +695,7 @@ fn preflight_plugin_schema_node(
             ));
         }
         if let Some(items) = object.get("items") {
-            preflight_plugin_schema_node(items, depth + 1)?;
+            preflight_plugin_schema_node(items, depth + 1, max_string_schema_length)?;
         }
     }
 
@@ -715,12 +717,16 @@ fn bounded_schema_usize(
     Ok(Some(value))
 }
 
-fn validate_plugin_tool_schema_profile(schema: &Value, field: &str) -> Result<(), String> {
+fn validate_plugin_tool_schema_profile(
+    schema: &Value,
+    field: &str,
+    max_string_schema_length: usize,
+) -> Result<(), String> {
     if !schema.is_object() {
         return Err(format!("{field} must be a JSON object"));
     }
     validate_json_value(schema, PLUGIN_MAX_SCHEMA_BYTES, field)?;
-    preflight_plugin_schema_profile(schema, true)
+    preflight_plugin_schema_profile(schema, true, max_string_schema_length)
         .map_err(|failure| format!("{field}: {}", failure.message))
 }
 
@@ -728,7 +734,11 @@ pub fn validate_plugin_input_arguments(
     input_schema: &Value,
     arguments: &Value,
 ) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(input_schema, "tool inputSchema")?;
+    validate_plugin_tool_schema_profile(
+        input_schema,
+        "tool inputSchema",
+        PLUGIN_MAX_ARGUMENT_BYTES,
+    )?;
     validate_json_value(arguments, PLUGIN_MAX_ARGUMENT_BYTES, "tool arguments")?;
     if !plugin_schema_matches(input_schema, arguments, 0) {
         return Err("tool arguments do not match the admitted Plugin Schema Profile".to_string());
@@ -740,7 +750,11 @@ pub fn validate_plugin_structured_output(
     output_schema: &Value,
     structured_content: &Value,
 ) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(output_schema, "tool outputSchema")?;
+    validate_plugin_tool_schema_profile(
+        output_schema,
+        "tool outputSchema",
+        PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
+    )?;
     validate_json_value(
         structured_content,
         PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
@@ -921,6 +935,7 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
         field: &'static str,
         value: &Value,
         invalid_code: &'static str,
+        max_string_schema_length: Option<usize>,
     ) -> Option<PluginCheckDiagnostic> {
         if !value.is_object() {
             return Some(diagnostic(invalid_code, Some(tool), Some(field)));
@@ -933,8 +948,10 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
             };
             return Some(diagnostic(code, Some(tool), Some(field)));
         }
-        if field != "annotations" {
-            if let Err(failure) = preflight_plugin_schema_profile(value, true) {
+        if let Some(max_string_schema_length) = max_string_schema_length {
+            if let Err(failure) =
+                preflight_plugin_schema_profile(value, true, max_string_schema_length)
+            {
                 let code = match failure.kind {
                     SchemaProfileFailureKind::UnsupportedKeyword => "schema_keyword_unsupported",
                     SchemaProfileFailureKind::Invalid => invalid_code,
@@ -980,13 +997,18 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
             "inputSchema",
             &tool.input_schema,
             "input_schema_invalid",
+            Some(PLUGIN_MAX_ARGUMENT_BYTES),
         ) {
             return diagnostic;
         }
         if let Some(output) = tool.output_schema.as_ref() {
-            if let Some(diagnostic) =
-                schema_failure(&tool.name, "outputSchema", output, "output_schema_invalid")
-            {
+            if let Some(diagnostic) = schema_failure(
+                &tool.name,
+                "outputSchema",
+                output,
+                "output_schema_invalid",
+                Some(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES),
+            ) {
                 return diagnostic;
             }
         }
@@ -996,6 +1018,7 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
                 "annotations",
                 annotations,
                 "annotations_invalid",
+                None,
             ) {
                 return diagnostic;
             }
@@ -1005,9 +1028,17 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
 }
 
 pub fn validate_schema_observation(observation: &PluginSchemaObservation) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(&observation.input_schema, "tool inputSchema")?;
+    validate_plugin_tool_schema_profile(
+        &observation.input_schema,
+        "tool inputSchema",
+        PLUGIN_MAX_ARGUMENT_BYTES,
+    )?;
     if let Some(output) = observation.output_schema.as_ref() {
-        validate_plugin_tool_schema_profile(output, "tool outputSchema")?;
+        validate_plugin_tool_schema_profile(
+            output,
+            "tool outputSchema",
+            PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
+        )?;
     }
     if let Some(annotations) = observation.annotations.as_ref() {
         if !annotations.is_object() {
@@ -1408,6 +1439,14 @@ mod tests {
 
     #[test]
     fn schema_and_result_bounds_fail_closed() {
+        assert_eq!(PLUGIN_MAX_ARGUMENT_BYTES, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_SCHEMA_BYTES, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_TEXT_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_RESULT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_JSON_STRING_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_MESSAGE_BYTES, 1024 * 1024);
+
         let mut oversized_schema_tool = tool();
         oversized_schema_tool.input_schema = json!({
             "type": "object",
@@ -1415,14 +1454,96 @@ mod tests {
         });
         assert!(validate_tools(&[oversized_schema_tool]).is_err());
 
-        let oversized_result = PluginToolResult {
+        let oversized_arguments = json!({"value": "x".repeat(PLUGIN_MAX_ARGUMENT_BYTES)});
+        assert!(validate_json_value(
+            &oversized_arguments,
+            PLUGIN_MAX_ARGUMENT_BYTES,
+            "tool arguments"
+        )
+        .is_err());
+
+        let mut unreachable_input_schema = tool();
+        unreachable_input_schema.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "minLength": PLUGIN_MAX_ARGUMENT_BYTES + 1
+                }
+            }
+        });
+        assert!(validate_tools(&[unreachable_input_schema.clone()]).is_err());
+        assert_eq!(
+            diagnose_invalid_tools(&[unreachable_input_schema]).code,
+            "input_schema_invalid"
+        );
+
+        let large_text = PluginToolResult {
+            content: vec![PluginContent::Text {
+                text: "x".repeat(384 * 1024),
+            }],
+            structured_content: None,
+            is_error: false,
+        };
+        validate_tool_result(&large_text).unwrap();
+
+        let large_structured = PluginToolResult {
+            content: vec![],
+            structured_content: Some(json!({"payload": "x".repeat(384 * 1024)})),
+            is_error: false,
+        };
+        validate_tool_result(&large_structured).unwrap();
+
+        let output_schema = json!({
+            "type": "object",
+            "properties": {
+                "payload": {"type": "string", "maxLength": 256 * 1024}
+            },
+            "required": ["payload"],
+            "additionalProperties": false
+        });
+        let mut large_output_schema_tool = tool();
+        large_output_schema_tool.output_schema = Some(output_schema.clone());
+        validate_tools(&[large_output_schema_tool]).unwrap();
+        validate_plugin_structured_output(
+            &output_schema,
+            &json!({"payload": "x".repeat(192 * 1024)}),
+        )
+        .unwrap();
+        assert!(validate_plugin_input_arguments(
+            &output_schema,
+            &json!({"payload": "x".repeat(80 * 1024)}),
+        )
+        .is_err());
+
+        let aggregate_oversized = PluginToolResult {
+            content: vec![PluginContent::Text {
+                text: "x".repeat(300 * 1024),
+            }],
+            structured_content: Some(json!({"payload": "y".repeat(300 * 1024)})),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&aggregate_oversized)
+            .unwrap_err()
+            .contains("aggregate"));
+
+        let oversized_text = PluginToolResult {
             content: vec![PluginContent::Text {
                 text: "x".repeat(PLUGIN_MAX_TEXT_CONTENT_BYTES + 1),
             }],
             structured_content: None,
             is_error: false,
         };
-        assert!(validate_tool_result(&oversized_result).is_err());
+        assert!(validate_tool_result(&oversized_text).is_err());
+
+        let oversized_structured = PluginToolResult {
+            content: vec![],
+            structured_content: Some(json!({
+                "payload": "x".repeat(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES + 1)
+            })),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&oversized_structured).is_err());
     }
 
     #[test]
