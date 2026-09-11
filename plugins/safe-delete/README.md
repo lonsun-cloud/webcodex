@@ -1,8 +1,8 @@
 # Safe Delete Native Plugin
 
-`safe_delete` is a dependency-free WebCodex Native Tool Plugin that moves one
-ordinary file or directory to the operating system Trash/Recycle Bin instead of
-permanently deleting it.
+`safe_delete` is a TypeScript-authored WebCodex Native Tool Plugin built with
+`@yyjeqhc/webcodex-plugin-sdk`. It moves one ordinary file or directory to the
+operating system Trash/Recycle Bin instead of permanently deleting it.
 
 It is intentionally a Plugin rather than a built-in WebCodex filesystem tool.
 Install it only on Runners where you want the model to have this additional
@@ -46,8 +46,9 @@ unlink; it falls through to another Trash backend instead.
 ## Runner configuration
 
 Set `cwd` to the exact project/root you want this Plugin to be allowed to trash
-from. Use an absolute path to the Plugin script when the Plugin code lives
-outside that root:
+from. Build the TypeScript Plugin before check/reload, then configure the Runner
+to execute `dist/plugin.js`. Use an absolute path when the Plugin code lives
+outside the authority root:
 
 ```toml
 [plugins]
@@ -57,7 +58,7 @@ request_timeout_secs = 30
 id = "safe-delete"
 name = "Safe Delete"
 command = "node"
-args = ["/absolute/path/to/webcodex/plugins/safe-delete/plugin.mjs"]
+args = ["/absolute/path/to/webcodex/plugins/safe-delete/dist/plugin.js"]
 cwd = "/absolute/path/to/project"
 timeout_secs = 30
 ```
@@ -85,9 +86,19 @@ Possible structured outcomes are `trashed`, `already_absent`, `rejected`,
 
 ## Development
 
-No npm install is required:
+The SDK is consumed from this repository through a local `file:` dependency; no
+workspace/package-manager layer is required. From the repository root:
 
 ```bash
-node --check plugins/safe-delete/plugin.mjs
-node --test plugins/safe-delete/plugin.test.mjs
+npm ci --prefix npm/plugin-sdk
+npm --prefix npm/plugin-sdk run build
+npm ci --prefix plugins/safe-delete
+npm --prefix plugins/safe-delete run typecheck
+npm --prefix plugins/safe-delete test
 ```
+
+The Plugin implementation is TypeScript-only. Its domain module owns path authority,
+Trash backend selection, and result classification; the SDK entrypoint owns only
+authoring/runtime boilerplate. The Rust Runner remains authoritative for Plugin
+admission, schema/runtime validation, timeout, process lifecycle, and
+`OutcomeUnknown` handling.
