@@ -76,7 +76,7 @@ pub fn structured_validation_target_identity(
     let tool_name = kind.tool_name()?;
     let obj = arguments.as_object()?;
     let cwd = normalized_validation_target_cwd(obj.get("cwd"))?;
-    let semantic = match kind {
+    let mut semantic = match kind {
         ToolValidationIdentityKind::CargoFmt => serde_json::json!({
             "tool": tool_name,
             "kind": "format",
@@ -145,6 +145,9 @@ pub fn structured_validation_target_identity(
         }
         ToolValidationIdentityKind::None => return None,
     };
+    // Hash canonical JSON so workspace-wide serde_json feature unification (for example,
+    // preserve_order) cannot change stable validation identities.
+    semantic.sort_all_objects();
     let encoded = serde_json::to_vec(&semantic).ok()?;
     let digest = format!("{:x}", Sha256::digest(encoded));
     Some(format!(
