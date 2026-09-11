@@ -1,4 +1,5 @@
 mod http_metadata;
+mod presentation;
 mod protocol;
 mod resources;
 mod response;
@@ -575,6 +576,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         None
     };
     let compact_schemas = crate::config::mcp_compact_schemas_enabled();
+    let server_mcp_apps_enabled = crate::config::mcp_apps_enabled();
 
     let config = crate::auth::get_config(depot);
     let db = crate::auth::get_db(depot);
@@ -622,6 +624,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 Some(&mut guard),
                 Some(&mut model_ergonomics),
                 compact_schemas,
+                server_mcp_apps_enabled,
                 Some(&mut tool_correlation),
             )),
         ),
@@ -946,6 +949,7 @@ async fn handle_mcp_request(
 ) -> McpOutcome {
     let protocol_era = inferred_protocol_era(&request);
     let compact_schemas = crate::config::mcp_compact_schemas_enabled();
+    let server_mcp_apps_enabled = crate::config::mcp_apps_enabled();
     let outcome = handle_mcp_request_with_lifecycle(
         runtime,
         None,
@@ -957,6 +961,7 @@ async fn handle_mcp_request(
         None,
         None,
         compact_schemas,
+        server_mcp_apps_enabled,
         None,
     )
     .await;
@@ -986,6 +991,7 @@ async fn handle_mcp_request_with_lifecycle(
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
     mut model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
     compact_schemas: bool,
+    server_mcp_apps_enabled: bool,
     mut correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
 ) -> McpOutcome {
     let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
@@ -996,9 +1002,12 @@ async fn handle_mcp_request_with_lifecycle(
             && request.method == "resources/read"
             && resources::resource_read_bypasses_runtime_read(&request.params);
     let mcp_app_enabled = match runtime_exposure {
-        RuntimeExposure::Runtime(model_surface) => {
-            resources::mcp_app_enabled(stateless_2026, model_surface, &request.params)
-        }
+        RuntimeExposure::Runtime(model_surface) => resources::mcp_app_enabled(
+            server_mcp_apps_enabled,
+            stateless_2026,
+            model_surface,
+            &request.params,
+        ),
         RuntimeExposure::ProjectConnector => false,
     };
     let runtime_resource_method = matches!(runtime_exposure, RuntimeExposure::Runtime(_))
@@ -1071,7 +1080,7 @@ async fn handle_mcp_request_with_lifecycle(
                 RuntimeExposure::Runtime(model_surface)
                     if resources::model_surface_supports_computer_app(model_surface) =>
                 {
-                    resources::server_capabilities()
+                    resources::server_capabilities(server_mcp_apps_enabled)
                 }
                 RuntimeExposure::Runtime(_) => json!({ "tools": { "listChanged": false } }),
             };
@@ -1086,7 +1095,15 @@ async fn handle_mcp_request_with_lifecycle(
         ),
         "ping" if !stateless_2026 => rpc_result(id, json!({})),
         "tools/list" => {
-            return tools::handle_list(runtime, id, auth, stateless_2026, compact_schemas).await;
+            return tools::handle_list(
+                runtime,
+                id,
+                auth,
+                stateless_2026,
+                compact_schemas,
+                mcp_app_enabled,
+            )
+            .await;
         }
         "resources/list" if stateless_2026 && runtime_resource_method => {
             return resources::handle_list(id, mcp_app_enabled);
@@ -1095,7 +1112,15 @@ async fn handle_mcp_request_with_lifecycle(
             let RuntimeExposure::Runtime(model_surface) = runtime_exposure else {
                 unreachable!("runtime_resource_method requires a runtime ModelSurface");
             };
-            return resources::handle_read(runtime, request.params, id, auth, model_surface).await;
+            return resources::handle_read(
+                runtime,
+                request.params,
+                id,
+                auth,
+                model_surface,
+                server_mcp_apps_enabled,
+            )
+            .await;
         }
         method @ ("tasks/get" | "tasks/update" | "tasks/cancel")
             if stateless_2026 && tasks::runtime_exposure_supports_tasks(runtime_exposure) =>
@@ -1117,6 +1142,7 @@ async fn handle_mcp_request_with_lifecycle(
                 id,
                 auth,
                 stateless_2026,
+                mcp_app_enabled,
                 host_file_import_trust,
                 window,
                 lifecycle.as_deref_mut(),
