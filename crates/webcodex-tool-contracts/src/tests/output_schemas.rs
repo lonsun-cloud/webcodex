@@ -78,6 +78,89 @@ fn assert_all_objects_strict(schema: &Value, path: &str, open_boundaries: &[&str
 }
 
 #[test]
+fn git_diff_hunks_output_schema_keeps_page_and_model_budgets_distinct() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "git_diff_hunks");
+    let output = &spec.output_schema["properties"]["output"]["properties"];
+    assert!(output["max_page_bytes"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("producer-page"));
+    let recovery = &output["recovery"]["properties"]["continuation"]["properties"]["next_call"]
+        ["anyOf"][0]["properties"]["arguments"];
+    assert_eq!(
+        recovery["properties"]["max_page_bytes"]["minimum"],
+        16 * 1024
+    );
+    assert_eq!(
+        recovery["properties"]["max_page_bytes"]["maximum"],
+        192 * 1024
+    );
+    assert!(recovery["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "max_page_bytes"));
+}
+
+#[test]
+fn git_log_and_directory_listing_expose_parser_ready_next_pages() {
+    let specs = registered_tool_specs();
+
+    let git_log =
+        &spec_named(&specs, "git_log").output_schema["properties"]["output"]["properties"];
+    assert!(git_log["next_skip"]["anyOf"].is_array());
+    assert!(git_log["next_skip"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Exact skip value"));
+
+    let files = &spec_named(&specs, "list_project_files").output_schema["properties"]["output"]
+        ["properties"];
+    for field in [
+        "returned",
+        "total_entries",
+        "offset",
+        "next_offset",
+        "truncated",
+    ] {
+        assert!(
+            files.get(field).is_some(),
+            "missing list_project_files.{field}"
+        );
+    }
+    assert!(files["next_offset"]["anyOf"].is_array());
+    assert!(files["total_entries"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("fully acquired"));
+}
+
+#[test]
+fn tracked_listing_schema_separates_source_incomplete_from_safe_page_truncation() {
+    let specs = registered_tool_specs();
+    let properties = output_schema_properties(&specs, "list_project_tracked_files");
+    let truncated = properties["truncated"]["description"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    let next_offset = properties["next_offset"]["description"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    let list_truncated = properties["list_truncated"]["description"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(truncated.contains("completely acquired source"));
+    assert!(truncated.contains("list_truncated=true"));
+    assert!(next_offset.contains("null"));
+    assert!(next_offset.contains("list_truncated=true"));
+    assert!(list_truncated.contains("source acquisition"));
+    assert!(list_truncated.contains("narrow path"));
+}
+
+#[test]
 fn continuation_feedback_output_schemas_are_synchronized() {
     let specs = registered_tool_specs();
     for name in ["finish_coding_task", "session_handoff_summary"] {

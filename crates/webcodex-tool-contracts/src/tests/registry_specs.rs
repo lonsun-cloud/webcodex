@@ -146,6 +146,37 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    let git_log_desc = desc("git_log");
+    for phrase in ["next_skip", "parser-ready", "10000 skip bound"] {
+        assert!(git_log_desc.contains(phrase), "git_log: {phrase}");
+    }
+    let list_files_desc = desc("list_project_files");
+    for phrase in [
+        "deterministic page",
+        "next_offset",
+        "complete directory source",
+        "retained-tail truncation fails closed",
+    ] {
+        assert!(
+            list_files_desc.contains(phrase),
+            "list_project_files: {phrase}"
+        );
+    }
+    let tracked_files_desc = desc("list_project_tracked_files");
+    for phrase in [
+        "bounded producer source",
+        "source acquisition is complete",
+        "list_truncated=true",
+        "next_offset is null",
+        "narrow path",
+        "retained-tail source truncation fails closed",
+    ] {
+        assert!(
+            tracked_files_desc.contains(phrase),
+            "list_project_tracked_files: {phrase}"
+        );
+    }
+
     let show_changes_desc = desc("show_changes");
     for phrase in [
         "default inspect/review tool",
@@ -169,6 +200,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "scope",
         "paging inputs",
         "later records",
+        "max_page_bytes",
+        "raw producer page",
+        "512 kib",
+        "final model-facing",
         "hunk_line_limit",
         "larger max_hunk_lines",
         "narrower paths",
@@ -190,6 +225,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "paths",
         "max_hunks",
         "max_hunk_lines",
+        "max_page_bytes",
+        "later records",
         "scope-bound",
         "does not reconstruct",
     ] {

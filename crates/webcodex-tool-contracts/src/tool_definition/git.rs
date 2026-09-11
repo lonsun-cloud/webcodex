@@ -242,7 +242,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE.review(super::ToolReviewEvidence::DiffReview).diff_review(super::ToolDiffReviewEvidence::Always),
             ),
-            "Targeted/paged diff review for worktree/cached or exact base/head ranges, with paths and scope-bound opaque continuation. Replay scope and paging inputs unchanged for later records. Truncated results separate later-hunk continuation from omitted_lines recoverability: hunk_line_limit can use larger max_hunk_lines and/or narrower paths only with bounded headroom; fixed byte/line ceilings never advertise fake recovery. Read-only.",
+            "Targeted/paged diff review for worktree/cached or exact base/head ranges, with paths and scope-bound opaque continuation. max_page_bytes controls the raw producer page (64 KiB default, bounded below ordinary Runner result retention); it is separate from the 512 KiB final model-facing result ceiling. Replay scope and paging inputs unchanged for later records. Continuation only recovers later records; it never reconstructs lines omitted inside the current hunk. When the truncation reason is hunk_line_limit, use larger max_hunk_lines and/or narrower paths when recovery metadata proves that safe. Fixed byte/line ceilings never advertise fake recovery. Read-only.",
             git_diff_hunks_input_schema,
         )))),
         125,
@@ -274,7 +274,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Return bounded structured recent git commit history for a project. Does not return commit bodies or modify the worktree.",
+        "Return bounded structured recent git commit history for a project. When truncated, next_skip is the exact parser-ready offset for the next page when it can advance within the existing 10000 skip bound; null means no safe forward page is available. Retained-tail or malformed source records fail closed; retry with a smaller limit. Offset paging assumes history is unchanged between calls. Does not return commit bodies or modify the worktree.",
         git_log_input_schema,
     ))),
 ];
