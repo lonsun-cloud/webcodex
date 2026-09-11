@@ -348,7 +348,7 @@ fn plugin_init_creates_exact_public_sdk_scaffold_without_executing_dependencies(
         .unwrap();
     assert_eq!(
         rendered_entrypoint,
-        destination.join("dist/plugin.js").to_str().unwrap()
+        destination.join("dist").join("plugin.js").to_str().unwrap()
     );
     let root_entries = std::fs::read_dir(&destination)
         .unwrap()
@@ -966,6 +966,52 @@ async fn plugin_human_rendering_is_bounded_and_ignores_unknown_raw_stderr_field(
     assert!(
         result.stdout.chars().count() < 5000,
         "output was not bounded"
+    );
+}
+
+#[tokio::test]
+async fn plugin_check_renders_canonical_initialize_eof_guidance_without_a_second_error_model() {
+    let detail = "Plugin protocol output ended before initialize completed; the process may have exited or closed stdout. Verify the configured command and arguments. For a generated TypeScript Plugin, run npm run build and ensure dist/plugin.js exists on the Runner host before retrying.";
+    let canonical = json!({
+        "runner":"special",
+        "plugin":"my-plugin",
+        "ready":false,
+        "phase":"initialize",
+        "code":"plugin_eof",
+        "detail":detail,
+        "diagnostic":null,
+        "toolCount":0,
+        "tools":[]
+    });
+
+    let (human, human_requests) = run_once(
+        "check",
+        &["--runner", "special", "--plugin", "my-plugin"],
+        runtime_success(canonical.clone()),
+        false,
+    )
+    .await;
+    assert_eq!(human_requests.len(), 1);
+    let human = human.unwrap();
+    assert_eq!(human.exit_code, 2);
+    assert!(human.stdout.contains("Phase: initialize"));
+    assert!(human.stdout.contains("Code: plugin_eof"));
+    assert!(human.stdout.contains(&format!("Detail: {detail}")));
+    assert!(human.stdout.contains("Tools: 0"));
+
+    let (json_output, json_requests) = run_once(
+        "check",
+        &["--runner", "special", "--plugin", "my-plugin"],
+        runtime_success(canonical.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(json_requests.len(), 1);
+    let json_output = json_output.unwrap();
+    assert_eq!(json_output.exit_code, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(&json_output.stdout).unwrap(),
+        canonical
     );
 }
 
