@@ -532,8 +532,8 @@ class NpmStagingTests(unittest.TestCase):
 
         self.assertEqual(result["npm_smoke"], "passed")
         self.assertEqual(len(calls), 2)
-        self.assertTrue(calls[0][1].endswith("scripts/stage_npm_release.sh"))
-        self.assertTrue(calls[1][1].endswith("scripts/npm_package_smoke.sh"))
+        self.assertEqual(Path(calls[0][1]).name, "stage_npm_release.sh")
+        self.assertEqual(Path(calls[1][1]).name, "npm_package_smoke.sh")
         self.assertIn("--binary-dir", calls[1])
         self.assertFalse(any("cargo" in argument for call in calls for argument in call))
         extract.assert_called_once()
@@ -581,7 +581,7 @@ class DraftVerificationTests(unittest.TestCase):
                     timeout=5,
                 )
             self.assertTrue(summary["draft"])
-            self.assertEqual(len(summary["assets"]), 10)
+            self.assertEqual(len(summary["assets"]), 11)
 
             desktop_name = meta["desktop_artifacts"]["darwin-arm64"]["filename"]
             desktop_asset = next(asset for asset in release["assets"] if asset["name"] == desktop_name)
@@ -650,8 +650,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("dist/webcodex-desktop-*.dmg", workflow)
         self.assertIn("dist/webcodex-desktop-*.dmg.sha256", workflow)
         self.assertIn("dist/webcodex-desktop-*.dmg.evidence.json", workflow)
-        self.assertIn("dist/webcodex-desktop-*-win32-x64-setup.exe", workflow)
-        self.assertIn("dist/webcodex-desktop-*-win32-x64-setup.exe.sha256", workflow)
+        self.assertIn("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe", workflow)
+        self.assertIn("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe.sha256", workflow)
+        self.assertIn("webcodex-desktop-v$env:VERSION-$env:WEBCODEX_RELEASE_PLATFORM-setup.exe", workflow)
+        self.assertIn("-Platform $env:WEBCODEX_RELEASE_PLATFORM", workflow)
 
         self.assertNotIn('desktop="dist/${{ steps.desktop_bundle.outputs.desktop_name }}"', workflow)
         self.assertNotIn('$installer = Join-Path "dist" $env:DESKTOP_INSTALLER_NAME', workflow)

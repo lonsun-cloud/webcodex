@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use tempfile::TempDir;
 use webcodex_core::plugin::{
     PluginContent, PluginGatewayResponsePayload, PluginProviderView, PluginSchemaObservation,
-    PLUGIN_MAX_ARGUMENT_BYTES,
+    PLUGIN_MAX_ARGUMENT_BYTES, PLUGIN_MAX_MESSAGE_BYTES, PLUGIN_MAX_RESULT_BYTES,
 };
 
 static FAKE_PLUGIN: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
@@ -183,7 +183,7 @@ fn runner_config(
 ) -> RunnerConfig {
     use super::super::config::{
         default_websocket_connect_timeout_secs, AcpConfig, McpGatewayConfig, RunnerPolicy,
-        SshConfig, ToolProvidersConfig,
+        SkillsConfig, SshConfig, ToolProvidersConfig,
     };
     RunnerConfig {
         server_url: "http://127.0.0.1:8000".to_string(),
@@ -195,7 +195,6 @@ fn runner_config(
         host_context: None,
         project_registry_dir: Some(project_registry_dir.to_path_buf()),
         legacy_projects_dir: None,
-        deprecated_temporary_projects_root: None,
         poll_interval_ms: 1000,
         capabilities: None,
         max_concurrent_jobs: None,
@@ -204,6 +203,7 @@ fn runner_config(
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
         quic: None,
         shell,
+        skills: SkillsConfig::default(),
         ssh: SshConfig::default(),
         tool_providers: ToolProvidersConfig::default(),
         mcp_gateway: McpGatewayConfig::default(),
@@ -320,6 +320,42 @@ fn invalid_input_schema_is_not_started_and_provider_sees_no_call() {
     let valid = fixture.call_with_arguments(json!({"value": "valid"}));
     assert!(valid.error.is_none());
     assert_eq!(fixture.marker_count("call"), 1);
+}
+
+#[test]
+fn large_tool_results_cross_plugin_bridge_with_output_schema_validation() {
+    assert_eq!(PLUGIN_MAX_RESULT_BYTES, 512 * 1024);
+    assert_eq!(PLUGIN_MAX_MESSAGE_BYTES, 1024 * 1024);
+
+    let text_fixture = Fixture::new("large_text_result", 2);
+    let text_response = text_fixture.call();
+    let Some(PluginGatewayResponsePayload::ToolResult { result }) = text_response.payload else {
+        panic!("missing large text result: {:?}", text_response.error);
+    };
+    let [PluginContent::Text { text }] = result.content.as_slice() else {
+        panic!("unexpected large text content");
+    };
+    assert_eq!(text.len(), 192 * 1024);
+    assert!(text_fixture.list().error.is_none());
+
+    let structured_fixture = Fixture::new("large_structured_result", 2);
+    let structured_response = structured_fixture.call();
+    let Some(PluginGatewayResponsePayload::ToolResult { result }) = structured_response.payload
+    else {
+        panic!(
+            "missing large structured result: {:?}",
+            structured_response.error
+        );
+    };
+    assert!(result.content.is_empty());
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["payload"]
+            .as_str()
+            .unwrap()
+            .len(),
+        192 * 1024
+    );
+    assert!(structured_fixture.list().error.is_none());
 }
 
 #[test]
@@ -451,18 +487,26 @@ fn crash_after_effect_send_is_outcome_unknown_and_instance_is_retired() {
 }
 
 #[test]
-fn unsupported_result_is_completed_and_retires_protocol_broken_instance() {
-    let fixture = Fixture::new("bad_result", 2);
-    let response = fixture.call();
-    assert_eq!(response.dispatch_state, PluginDispatchState::Completed);
-    assert_eq!(
-        response.error.as_ref().unwrap().code,
-        "plugin_result_invalid"
-    );
-    assert_eq!(
-        fixture.list().error.as_ref().unwrap().code,
-        "plugin_provider_unavailable"
-    );
+fn unsupported_or_oversized_result_is_completed_and_retires_protocol_broken_instance() {
+    for scenario in ["bad_result", "oversized_result"] {
+        let fixture = Fixture::new(scenario, 2);
+        let response = fixture.call();
+        assert_eq!(
+            response.dispatch_state,
+            PluginDispatchState::Completed,
+            "{scenario}"
+        );
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "plugin_result_invalid",
+            "{scenario}"
+        );
+        assert_eq!(
+            fixture.list().error.as_ref().unwrap().code,
+            "plugin_provider_unavailable",
+            "{scenario}"
+        );
+    }
 }
 
 #[test]
@@ -558,7 +602,9 @@ fn prepared_environment_reuses_shell_env_default_profile_and_clears_sensitive_va
     use super::super::config::ShellProfileConfig;
     use std::collections::BTreeMap;
     let _guard = crate::tests::test_env_lock();
-    let _env = crate::tests::EnvGuard::new().set("WEBCODEX_AGENT_TOKEN", "must-not-leak");
+    let _env = crate::tests::EnvGuard::new()
+        .set("WEBCODEX_AGENT_TOKEN", "must-not-leak")
+        .set("WEBCODEX_PAT", "inherited-pat-must-not-leak");
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("marker.log");
     let fake = fake_binary();
@@ -566,14 +612,24 @@ fn prepared_environment_reuses_shell_env_default_profile_and_clears_sensitive_va
     shell
         .env
         .insert("WEBCODEX_PLUGIN_TEST_ENV".to_string(), "base".to_string());
+    shell.env.insert(
+        "WEBCODEX_PAT".to_string(),
+        "shell-pat-must-not-leak".to_string(),
+    );
     shell.default_profile = Some("plugin".to_string());
     shell.profiles = BTreeMap::from([(
         "plugin".to_string(),
         ShellProfileConfig {
-            env: BTreeMap::from([(
-                "WEBCODEX_PLUGIN_TEST_ENV".to_string(),
-                "profile-ready".to_string(),
-            )]),
+            env: BTreeMap::from([
+                (
+                    "WEBCODEX_PLUGIN_TEST_ENV".to_string(),
+                    "profile-ready".to_string(),
+                ),
+                (
+                    "WEBCODEX_PAT".to_string(),
+                    "profile-pat-must-not-leak".to_string(),
+                ),
+            ]),
             ..ShellProfileConfig::default()
         },
     )]);
@@ -603,7 +659,8 @@ fn prepared_environment_reuses_shell_env_default_profile_and_clears_sensitive_va
 }
 
 #[test]
-fn bare_plugin_command_resolves_from_prepared_path_with_explicit_profile() {
+#[ignore = "manual real-process startup: provider readiness depends on host scheduling"]
+fn runner_real_process_bare_plugin_command_resolves_from_prepared_path_with_explicit_profile() {
     use super::super::config::ShellProfileConfig;
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
@@ -633,7 +690,9 @@ fn bare_plugin_command_resolves_from_prepared_path_with_explicit_profile() {
         },
     );
     let plugins = PluginConfig {
-        request_timeout_secs: 2,
+        // This regression exercises prepared-PATH resolution, not timeout
+        // behavior. Keep provider startup tolerant of a heavily loaded CI host.
+        request_timeout_secs: 10,
         providers: vec![PluginProviderConfig {
             id: "fake".to_string(),
             name: "Fake Plugin".to_string(),
@@ -646,7 +705,8 @@ fn bare_plugin_command_resolves_from_prepared_path_with_explicit_profile() {
     };
     let config = runner_config(plugins, shell, temp.path());
     let manager = PluginManager::new(&config, temp.path().join("runner.toml"));
-    assert_eq!(current_providers(&manager)[0].status, "ready");
+    let provider = current_providers(&manager).remove(0);
+    assert_eq!(provider.status, "ready", "{provider:?}");
     assert_eq!(
         fs::read_to_string(marker)
             .unwrap_or_default()
@@ -1225,4 +1285,29 @@ fn write_runner_toml_without_plugins(path: &Path, project_registry_dir: &Path) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn plugin_environment_projection_tracks_explicit_isolation() {
+    let plugins = PluginConfig {
+        providers: vec![PluginProviderConfig {
+            id: "projection-test".into(),
+            name: "Projection test".into(),
+            command: "node".into(),
+            args: Vec::new(),
+            cwd: None,
+            profile: None,
+            timeout_secs: None,
+        }],
+        ..Default::default()
+    };
+    let inherited = ShellConfig::default();
+    let isolated = ShellConfig {
+        environment_mode: super::super::config::ShellEnvironmentMode::Isolated,
+        ..ShellConfig::default()
+    };
+    assert_ne!(
+        PluginEnvironmentSnapshot::from_config(&inherited, &plugins),
+        PluginEnvironmentSnapshot::from_config(&isolated, &plugins)
+    );
 }

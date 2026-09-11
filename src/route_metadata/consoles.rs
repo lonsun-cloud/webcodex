@@ -1,7 +1,7 @@
 use super::RouteAuth::AuthMiddleware;
 use super::{
-    route, AuditClass::*, OpenApiVisibility::*, RouteAuth, RouteId::*, RouteMethod::*, RouteSpec,
-    RouteSurface::*,
+    route, AuditClass::*, RouteAuth, RouteId::*, RouteMethod::*, RouteOpenApiProjection::*,
+    RouteSpec, RouteSurface::*,
 };
 use webcodex_core::authority::{
     OAuthRouteScopePolicy::*, SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ,
@@ -259,6 +259,26 @@ pub(super) const ROUTES: &[RouteSpec] = &[
         RuntimeConsoleRunner,
         Post,
         "/api/runtime-console/runner",
+        Require(SCOPE_RUNTIME_READ),
+        RuntimeConsole,
+        Hidden,
+        Other,
+        AuthMiddleware,
+    ),
+    route(
+        RuntimeConsoleWindows,
+        Post,
+        "/api/runtime-console/windows",
+        Require(SCOPE_RUNTIME_READ),
+        RuntimeConsole,
+        Hidden,
+        Other,
+        AuthMiddleware,
+    ),
+    route(
+        RuntimeConsoleWindow,
+        Post,
+        "/api/runtime-console/window",
         Require(SCOPE_RUNTIME_READ),
         RuntimeConsole,
         Hidden,

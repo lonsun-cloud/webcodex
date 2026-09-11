@@ -17,7 +17,7 @@ use crate::tool_runtime::{ToolCall, ToolRuntime};
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 const DEFAULT_PROJECT_LIMIT: usize = 50;
@@ -36,12 +36,21 @@ const HOME_RECENT_SESSION_LIMIT: usize = 10;
 const DEFAULT_MESSAGE_LIMIT: usize = 100;
 const MAX_MESSAGE_LIMIT: usize = 100;
 const MAX_OBSERVATION_TOKEN_CHARS: usize = 192;
+const DEFAULT_WINDOW_LIMIT: usize = 100;
+const MAX_WINDOW_LIMIT: usize = 100;
+const DEFAULT_WINDOW_ACTIVITY_LIMIT: usize = 100;
+const MAX_WINDOW_ACTIVITY_LIMIT: usize = 500;
+const DEFAULT_WINDOW_SESSION_LIMIT: usize = 50;
+const MAX_WINDOW_SESSION_LIMIT: usize = 100;
+const MAX_WINDOW_KEY_CHARS: usize = 128;
 
 pub(crate) fn routes() -> Router {
     use crate::route_metadata::{api_path, RouteId};
     Router::new()
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleOverview)).post(overview))
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleRunner)).post(runner))
+        .push(Router::with_path(api_path(RouteId::RuntimeConsoleWindows)).post(windows))
+        .push(Router::with_path(api_path(RouteId::RuntimeConsoleWindow)).post(window))
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleProjects)).post(projects))
         .push(
             Router::with_path(api_path(RouteId::RuntimeConsoleWorkflowSessions))
@@ -165,6 +174,25 @@ struct RunnerInput {
     client_id: String,
     #[serde(default)]
     project_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsInput {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowInput {
+    client_window_key: String,
+    #[serde(default)]
+    activity_limit: Option<usize>,
+    #[serde(default)]
+    session_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +414,141 @@ struct RuntimeConsoleOverview {
     recent_sessions: RuntimeConsoleRecentSessions,
     runners: Vec<RuntimeConsoleRunnerSummary>,
     projects: Vec<RuntimeConsoleProject>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConsoleWindows {
+    windows: Vec<RuntimeConsoleWindowSummary>,
+    returned: usize,
+    total: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeConsoleWindowSummary {
+    client_window_key: String,
+    source: String,
+    last_seen_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_tool_call_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_meaningful_activity_at_ms: Option<i64>,
+    active_count: usize,
+    linked_session_count: usize,
+    recorder_gap_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConsoleWindowDetail {
+    client_window_key: String,
+    source: String,
+    last_seen_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_tool_call_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_meaningful_activity_at_ms: Option<i64>,
+    active_count: usize,
+    active_requests: Vec<RuntimeConsoleActiveWindowRequest>,
+    linked_sessions: Vec<RuntimeConsoleWindowSession>,
+    sessions_returned: usize,
+    sessions_truncated: bool,
+    activity: Vec<RuntimeConsoleWindowActivity>,
+    activity_returned: usize,
+    activity_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConsoleActiveWindowRequest {
+    server_trace_id: String,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    started_at_ms: i64,
+    elapsed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeConsoleWindowSession {
+    workflow_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    first_linked_at_ms: i64,
+    last_linked_at_ms: i64,
+    relations: Vec<String>,
+    relation_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeConsoleWindowActivity {
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    duration_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_call_gap_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_transition_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_streaming: Option<bool>,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    status: String,
+    meaningful: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorder_gap_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_trace_id: Option<String>,
+    workflow_sessions: Vec<RuntimeConsoleWindowActivitySession>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowActivityTimingProjection {
+    service_ms: Option<i64>,
+    next_call_gap_ms: Option<i64>,
+    cycle_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeConsoleWindowActivitySession {
+    workflow_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    relation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConsoleWorkflowSessionDetail {
+    #[serde(flatten)]
+    session: crate::tool_runtime::sessions::WorkflowSessionConsoleDetail,
+    window_activity_available: bool,
+    linked_windows: Vec<RuntimeConsoleSessionWindow>,
+    window_activity_after_last_session_record: Vec<RuntimeConsoleWindowActivity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeConsoleSessionWindow {
+    client_window_key: String,
+    source: String,
+    first_linked_at_ms: i64,
+    last_linked_at_ms: i64,
+    last_seen_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_meaningful_activity_at_ms: Option<i64>,
+    relations: Vec<String>,
+    relation_count: usize,
+    recorder_gap_count: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1390,6 +1553,743 @@ async fn workflow_session_for_auth(
     Ok(detail)
 }
 
+fn window_principal_filter(
+    auth: &AuthContext,
+) -> Result<Option<(String, String)>, RuntimeConsoleError> {
+    if auth.is_admin_caller() {
+        return Ok(None);
+    }
+    crate::tool_runtime::runtime_observation_principal(Some(auth))
+        .map(Some)
+        .map_err(|_| RuntimeConsoleError::Internal)
+}
+
+fn window_principal_ref(principal: &Option<(String, String)>) -> Option<(&str, &str)> {
+    principal
+        .as_ref()
+        .map(|(kind, id)| (kind.as_str(), id.as_str()))
+}
+
+fn valid_window_key(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn window_event_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    cache: &mut HashMap<String, bool>,
+    event: &webcodex_store::models::WindowActivityEventRecord,
+) -> bool {
+    if event.project.is_some() {
+        return window_project_visible_cached(runtime, auth, cache, event.project.as_deref()).await;
+    }
+    if event.workflow_links.is_empty() {
+        return true;
+    }
+    for link in &event.workflow_links {
+        match link.project.as_deref() {
+            None => return true,
+            Some(project)
+                if window_project_visible_cached(runtime, auth, cache, Some(project)).await =>
+            {
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+    false
+}
+
+async fn active_window_request_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    cache: &mut HashMap<String, bool>,
+    request: &crate::tool_runtime::ActiveWindowRequest,
+) -> bool {
+    if request.project.is_some() {
+        return window_project_visible_cached(runtime, auth, cache, request.project.as_deref())
+            .await;
+    }
+    if auth.is_admin_caller() || request.method == "tools/list" {
+        return true;
+    }
+    request
+        .tool_name
+        .as_deref()
+        .is_some_and(|tool| !crate::tool_runtime::observations::is_meaningful_activity_tool(tool))
+}
+
+fn project_window_loop_timings(
+    events: &[webcodex_store::models::WindowActivityEventRecord],
+    visible: &[bool],
+) -> Vec<WindowActivityTimingProjection> {
+    let mut projections = vec![WindowActivityTimingProjection::default(); events.len()];
+    let mut previous_meaningful = BTreeMap::<(String, String), usize>::new();
+
+    for index in (0..events.len()).rev() {
+        let event = &events[index];
+        if event.response_streaming == Some(false) {
+            if let (Some(started), Some(handed)) =
+                (event.request_observed_at_ms, event.response_handed_at_ms)
+            {
+                if handed >= started {
+                    projections[index].service_ms = Some(handed - started);
+                }
+            }
+        }
+        if !event.meaningful {
+            continue;
+        }
+        let Some(principal_kind) = event.principal_correlation_kind.as_ref() else {
+            continue;
+        };
+        let Some(principal_id) = event.principal_correlation_id.as_ref() else {
+            continue;
+        };
+        let key = (principal_kind.clone(), principal_id.clone());
+        let previous_index = previous_meaningful.remove(&key);
+        if event.window_transition_kind.as_deref() == Some("serial") {
+            if let Some(previous_index) = previous_index {
+                let previous = &events[previous_index];
+                // Do not bridge over an event whose Project is hidden/revoked:
+                // exposing a derived timestamp across that boundary would turn
+                // Window timing into a Project-existence oracle.
+                if visible.get(previous_index) == Some(&true) && visible.get(index) == Some(&true) {
+                    if let (Some(current_started), Some(previous_handed), Some(previous_started)) = (
+                        event.request_observed_at_ms,
+                        previous.response_handed_at_ms,
+                        previous.request_observed_at_ms,
+                    ) {
+                        if current_started >= previous_handed {
+                            projections[previous_index].next_call_gap_ms =
+                                Some(current_started - previous_handed);
+                        }
+                        if current_started >= previous_started {
+                            projections[previous_index].cycle_ms =
+                                Some(current_started - previous_started);
+                        }
+                    }
+                }
+            }
+        }
+        if event.window_continuity_eligible == Some(true) {
+            previous_meaningful.insert(key, index);
+        }
+    }
+    projections
+}
+
+async fn project_visible_window_activity(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    visibility_cache: &mut HashMap<String, bool>,
+    event: webcodex_store::models::WindowActivityEventRecord,
+    timing: WindowActivityTimingProjection,
+) -> RuntimeConsoleWindowActivity {
+    let mut activity_sessions = Vec::new();
+    for link in event.workflow_links {
+        if !window_project_visible_cached(runtime, auth, visibility_cache, link.project.as_deref())
+            .await
+        {
+            continue;
+        }
+        activity_sessions.push(RuntimeConsoleWindowActivitySession {
+            workflow_session_id: link.workflow_session_id,
+            project: link.project,
+            relation: link.relation,
+        });
+    }
+    RuntimeConsoleWindowActivity {
+        started_at_ms: event.started_at_ms,
+        ended_at_ms: event.ended_at_ms,
+        duration_ms: event.duration_ms,
+        service_ms: timing.service_ms,
+        next_call_gap_ms: timing.next_call_gap_ms,
+        cycle_ms: timing.cycle_ms,
+        window_transition_kind: event.window_transition_kind,
+        response_streaming: event.response_streaming,
+        method: match event.action_name.as_str() {
+            "toolsCall" => "tools/call".to_string(),
+            "toolsList" => "tools/list".to_string(),
+            other => other.to_string(),
+        },
+        tool_name: event.operation,
+        project: event.project,
+        status: event.status,
+        meaningful: event.meaningful,
+        recorder_gap_session_id: event.recorder_gap_session_id,
+        server_trace_id: event.server_trace_id,
+        workflow_sessions: activity_sessions,
+    }
+}
+
+async fn project_window_activity(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    event: webcodex_store::models::WindowActivityEventRecord,
+) -> Option<RuntimeConsoleWindowActivity> {
+    let mut visibility_cache = HashMap::new();
+    if !window_event_visible_cached(runtime, auth, &mut visibility_cache, &event).await {
+        return None;
+    }
+    let service_ms = if event.response_streaming == Some(false) {
+        event
+            .request_observed_at_ms
+            .zip(event.response_handed_at_ms)
+            .and_then(|(started, handed)| handed.checked_sub(started))
+            .filter(|elapsed| *elapsed >= 0)
+    } else {
+        None
+    };
+    Some(
+        project_visible_window_activity(
+            runtime,
+            auth,
+            &mut visibility_cache,
+            event,
+            WindowActivityTimingProjection {
+                service_ms,
+                ..WindowActivityTimingProjection::default()
+            },
+        )
+        .await,
+    )
+}
+
+async fn window_project_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    cache: &mut HashMap<String, bool>,
+    project: Option<&str>,
+) -> bool {
+    let Some(project) = project else {
+        return true;
+    };
+    if let Some(visible) = cache.get(project) {
+        return *visible;
+    }
+    let visible = authorize_exact_project(runtime, auth, project)
+        .await
+        .is_ok();
+    cache.insert(project.to_string(), visible);
+    visible
+}
+
+async fn visible_window_summary_for_auth(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    principal: Option<(&str, &str)>,
+    window_key: &str,
+    visibility_cache: &mut HashMap<String, bool>,
+    project_filter: Option<&str>,
+) -> Result<Option<RuntimeConsoleWindowSummary>, RuntimeConsoleError> {
+    let db = runtime
+        .window_activity_db
+        .as_ref()
+        .ok_or(RuntimeConsoleError::Internal)?;
+    let events = db
+        .list_window_activity_events(window_key, principal, MAX_WINDOW_ACTIVITY_LIMIT)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let mut source = None;
+    let mut last_seen_at_ms = None;
+    let mut last_tool_call_at_ms = None;
+    let mut last_meaningful_activity_at_ms = None;
+    let mut recorder_gap_count = 0usize;
+    for event in events {
+        if !window_event_visible_cached(runtime, auth, visibility_cache, &event).await
+            || project_filter.is_some_and(|project| event.project.as_deref() != Some(project))
+        {
+            continue;
+        }
+        source = Some(event.client_window_source.clone());
+        last_seen_at_ms = Some(last_seen_at_ms.unwrap_or(i64::MIN).max(event.ended_at_ms));
+        if event.action_name == "toolsCall" {
+            last_tool_call_at_ms = Some(
+                last_tool_call_at_ms
+                    .unwrap_or(i64::MIN)
+                    .max(event.ended_at_ms),
+            );
+        }
+        if event.meaningful {
+            last_meaningful_activity_at_ms = Some(
+                last_meaningful_activity_at_ms
+                    .unwrap_or(i64::MIN)
+                    .max(event.ended_at_ms),
+            );
+        }
+        if event.recorder_gap_session_id.is_some() {
+            recorder_gap_count = recorder_gap_count.saturating_add(1);
+        }
+    }
+
+    // Session-link history has its own bounded relation query. Do not derive
+    // the cardinality only from the latest activity-page events: a busy Window
+    // may have >500 later calls while an older authoritative Session relation
+    // remains part of its many-to-many history.
+    let relation_rows = db
+        .list_window_workflow_sessions(window_key, principal, MAX_WINDOW_SESSION_LIMIT)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let mut linked_session_count = 0usize;
+    for link in relation_rows {
+        if project_filter.is_some_and(|project| link.project.as_deref() != Some(project)) {
+            continue;
+        }
+        if window_project_visible_cached(runtime, auth, visibility_cache, link.project.as_deref())
+            .await
+        {
+            linked_session_count = linked_session_count.saturating_add(1);
+        }
+    }
+
+    let mut active_count = 0usize;
+    for request in runtime
+        .window_activity
+        .list_for_window(window_key, principal)
+    {
+        if !active_window_request_visible_cached(runtime, auth, visibility_cache, &request).await
+            || project_filter.is_some_and(|project| request.project.as_deref() != Some(project))
+        {
+            continue;
+        }
+        source = Some(request.client_window_source.clone());
+        last_seen_at_ms = Some(
+            last_seen_at_ms
+                .unwrap_or(i64::MIN)
+                .max(request.started_at_ms),
+        );
+        active_count = active_count.saturating_add(1);
+    }
+
+    let Some(last_seen_at_ms) = last_seen_at_ms else {
+        return Ok(None);
+    };
+    Ok(Some(RuntimeConsoleWindowSummary {
+        client_window_key: window_key.to_string(),
+        source: source.unwrap_or_default(),
+        last_seen_at_ms,
+        last_tool_call_at_ms,
+        last_meaningful_activity_at_ms,
+        active_count,
+        linked_session_count,
+        recorder_gap_count,
+    }))
+}
+
+async fn windows_for_auth(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    limit: Option<usize>,
+    project_filter: Option<&str>,
+) -> Result<RuntimeConsoleWindows, RuntimeConsoleError> {
+    require_runtime_read(auth)?;
+    if let Some(project) = project_filter {
+        authorize_exact_project(runtime, auth, project).await?;
+    }
+    let db = runtime
+        .window_activity_db
+        .as_ref()
+        .ok_or(RuntimeConsoleError::Internal)?;
+    let principal = window_principal_filter(auth)?;
+    let principal_ref = window_principal_ref(&principal);
+    let limit = limit
+        .unwrap_or(DEFAULT_WINDOW_LIMIT)
+        .clamp(1, MAX_WINDOW_LIMIT);
+    let durable = db
+        .list_window_activity_summaries(principal_ref, MAX_WINDOW_LIMIT)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let active = runtime.window_activity.active_windows(principal_ref);
+    let mut by_key = BTreeMap::<String, RuntimeConsoleWindowSummary>::new();
+    let total;
+    let source_truncated;
+    if auth.is_admin_caller() && project_filter.is_none() {
+        let durable_total = db
+            .count_window_activity_summaries(principal_ref)
+            .map_err(|_| RuntimeConsoleError::Internal)?;
+        for summary in durable {
+            by_key.insert(
+                summary.client_window_key.clone(),
+                RuntimeConsoleWindowSummary {
+                    client_window_key: summary.client_window_key,
+                    source: summary.client_window_source,
+                    last_seen_at_ms: summary.last_seen_at_ms,
+                    last_tool_call_at_ms: summary.last_tool_call_at_ms,
+                    last_meaningful_activity_at_ms: summary.last_meaningful_activity_at_ms,
+                    active_count: 0,
+                    linked_session_count: summary.linked_session_count,
+                    recorder_gap_count: summary.recorder_gap_count,
+                },
+            );
+        }
+        let mut active_only = 0usize;
+        for live in active {
+            if let Some(existing) = by_key.get_mut(&live.client_window_key) {
+                existing.active_count = live.active_count;
+                existing.last_seen_at_ms = existing.last_seen_at_ms.max(live.last_started_at_ms);
+            } else if let Some(summary) = db
+                .get_window_activity_summary(&live.client_window_key, principal_ref)
+                .map_err(|_| RuntimeConsoleError::Internal)?
+            {
+                // A live Window can be older than the bounded durable page.
+                // It is already included in durable_total and retains its history.
+                by_key.insert(
+                    live.client_window_key.clone(),
+                    RuntimeConsoleWindowSummary {
+                        client_window_key: live.client_window_key,
+                        source: live.client_window_source,
+                        last_seen_at_ms: summary.last_seen_at_ms.max(live.last_started_at_ms),
+                        last_tool_call_at_ms: summary.last_tool_call_at_ms,
+                        last_meaningful_activity_at_ms: summary.last_meaningful_activity_at_ms,
+                        active_count: live.active_count,
+                        linked_session_count: summary.linked_session_count,
+                        recorder_gap_count: summary.recorder_gap_count,
+                    },
+                );
+            } else {
+                active_only = active_only.saturating_add(1);
+                by_key.insert(
+                    live.client_window_key.clone(),
+                    RuntimeConsoleWindowSummary {
+                        client_window_key: live.client_window_key,
+                        source: live.client_window_source,
+                        last_seen_at_ms: live.last_started_at_ms,
+                        last_tool_call_at_ms: None,
+                        last_meaningful_activity_at_ms: None,
+                        active_count: live.active_count,
+                        linked_session_count: 0,
+                        recorder_gap_count: 0,
+                    },
+                );
+            }
+        }
+        total = durable_total.saturating_add(active_only);
+        source_truncated = durable_total > MAX_WINDOW_LIMIT;
+    } else {
+        // Principal equality is necessary but not sufficient: a historical
+        // Project grant may have been revoked after the event was written. Use
+        // the principal-filtered rows only as bounded candidate keys, then
+        // re-project every visible field through current canonical Project
+        // authority. This keeps a known Window hash from becoming an existence
+        // or timestamp oracle for an inaccessible Project.
+        let mut candidate_keys = durable
+            .iter()
+            .map(|summary| summary.client_window_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        candidate_keys.extend(
+            active
+                .iter()
+                .map(|summary| summary.client_window_key.clone()),
+        );
+        let mut visibility_cache = HashMap::new();
+        for window_key in candidate_keys {
+            if let Some(summary) = visible_window_summary_for_auth(
+                runtime,
+                auth,
+                principal_ref,
+                &window_key,
+                &mut visibility_cache,
+                project_filter,
+            )
+            .await?
+            {
+                by_key.insert(window_key, summary);
+            }
+        }
+        total = by_key.len();
+        // Candidate discovery itself is bounded. Conservatively report
+        // truncation whenever that principal-filtered candidate scan reaches
+        // the hard cap; hidden rows are never identified or counted in the
+        // response, but an older currently-visible Window may exist beyond it.
+        source_truncated = durable.len() == MAX_WINDOW_LIMIT;
+    }
+    let mut window_rows = by_key.into_values().collect::<Vec<_>>();
+    window_rows.sort_by(|left, right| {
+        right
+            .last_seen_at_ms
+            .cmp(&left.last_seen_at_ms)
+            .then_with(|| left.client_window_key.cmp(&right.client_window_key))
+    });
+    window_rows.truncate(limit);
+    Ok(RuntimeConsoleWindows {
+        returned: window_rows.len(),
+        truncated: source_truncated || total > window_rows.len(),
+        total,
+        windows: window_rows,
+    })
+}
+
+async fn window_for_auth(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    input: WindowInput,
+) -> Result<RuntimeConsoleWindowDetail, RuntimeConsoleError> {
+    require_runtime_read(auth)?;
+    if input.client_window_key.chars().count() > MAX_WINDOW_KEY_CHARS
+        || !valid_window_key(&input.client_window_key)
+    {
+        return Err(RuntimeConsoleError::Invalid);
+    }
+    let db = runtime
+        .window_activity_db
+        .as_ref()
+        .ok_or(RuntimeConsoleError::Internal)?;
+    let principal = window_principal_filter(auth)?;
+    let principal_ref = window_principal_ref(&principal);
+    let activity_limit = input
+        .activity_limit
+        .unwrap_or(DEFAULT_WINDOW_ACTIVITY_LIMIT)
+        .clamp(1, MAX_WINDOW_ACTIVITY_LIMIT);
+    let session_limit = input
+        .session_limit
+        .unwrap_or(DEFAULT_WINDOW_SESSION_LIMIT)
+        .clamp(1, MAX_WINDOW_SESSION_LIMIT);
+
+    let mut visibility_cache = HashMap::new();
+    let summary = visible_window_summary_for_auth(
+        runtime,
+        auth,
+        principal_ref,
+        &input.client_window_key,
+        &mut visibility_cache,
+        None,
+    )
+    .await?;
+    let mut active_requests = Vec::new();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for request in runtime
+        .window_activity
+        .list_for_window(&input.client_window_key, principal_ref)
+    {
+        if !active_window_request_visible_cached(runtime, auth, &mut visibility_cache, &request)
+            .await
+        {
+            continue;
+        }
+        active_requests.push(RuntimeConsoleActiveWindowRequest {
+            server_trace_id: request.server_trace_id,
+            method: request.method,
+            tool_name: request.tool_name,
+            project: request.project,
+            started_at_ms: request.started_at_ms,
+            elapsed_ms: now_ms.saturating_sub(request.started_at_ms),
+        });
+    }
+
+    let active_count = active_requests.len();
+    active_requests.truncate(crate::tool_runtime::MAX_ACTIVE_REQUESTS_PER_WINDOW);
+
+    let activity_scan_limit = if auth.is_admin_caller() {
+        activity_limit
+            .saturating_add(1)
+            .min(MAX_WINDOW_ACTIVITY_LIMIT)
+    } else {
+        MAX_WINDOW_ACTIVITY_LIMIT
+    };
+    let raw_activity = db
+        .list_window_activity_events(&input.client_window_key, principal_ref, activity_scan_limit)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let raw_activity_at_cap = raw_activity.len() == activity_scan_limit;
+    let mut activity_visible = Vec::with_capacity(raw_activity.len());
+    for event in &raw_activity {
+        activity_visible
+            .push(window_event_visible_cached(runtime, auth, &mut visibility_cache, event).await);
+    }
+    let timing = project_window_loop_timings(&raw_activity, &activity_visible);
+    let mut activity = Vec::new();
+    for ((event, visible), timing) in raw_activity
+        .into_iter()
+        .zip(activity_visible.into_iter())
+        .zip(timing.into_iter())
+    {
+        if !visible {
+            continue;
+        }
+        activity.push(
+            project_visible_window_activity(runtime, auth, &mut visibility_cache, event, timing)
+                .await,
+        );
+    }
+    let activity_truncated = activity.len() > activity_limit || raw_activity_at_cap;
+    activity.truncate(activity_limit);
+
+    let session_scan_limit = if auth.is_admin_caller() {
+        session_limit
+            .saturating_add(1)
+            .min(MAX_WINDOW_SESSION_LIMIT)
+    } else {
+        MAX_WINDOW_SESSION_LIMIT
+    };
+    let raw_sessions = db
+        .list_window_workflow_sessions(&input.client_window_key, principal_ref, session_scan_limit)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let raw_sessions_at_cap = raw_sessions.len() == session_scan_limit;
+    let mut linked_sessions = Vec::new();
+    for link in raw_sessions {
+        let Some(project) = link.project.as_deref() else {
+            continue;
+        };
+        if authorize_exact_project(runtime, auth, project)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let detail =
+            runtime.workflow_session_console_detail(project, &link.workflow_session_id, Some(1));
+        linked_sessions.push(RuntimeConsoleWindowSession {
+            workflow_session_id: link.workflow_session_id,
+            project: link.project,
+            first_linked_at_ms: link.first_linked_at_ms,
+            last_linked_at_ms: link.last_linked_at_ms,
+            relations: link.relations,
+            relation_count: link.relation_count,
+            title: detail.as_ref().map(|detail| detail.title.clone()),
+            lifecycle: detail.as_ref().map(|detail| detail.lifecycle.clone()),
+        });
+    }
+    let sessions_truncated = linked_sessions.len() > session_limit || raw_sessions_at_cap;
+    linked_sessions.truncate(session_limit);
+
+    if summary.is_none()
+        && active_requests.is_empty()
+        && activity.is_empty()
+        && linked_sessions.is_empty()
+    {
+        return Err(RuntimeConsoleError::NotFound);
+    }
+    let active_last_seen = active_requests
+        .iter()
+        .map(|request| request.started_at_ms)
+        .max();
+    let last_seen_at_ms = summary
+        .as_ref()
+        .map(|summary| summary.last_seen_at_ms)
+        .into_iter()
+        .chain(active_last_seen)
+        .chain(linked_sessions.iter().map(|link| link.last_linked_at_ms))
+        .max()
+        .unwrap_or(0);
+    let source = summary
+        .as_ref()
+        .map(|summary| summary.source.clone())
+        .unwrap_or_else(|| "openai-session".to_string());
+    Ok(RuntimeConsoleWindowDetail {
+        client_window_key: input.client_window_key,
+        source,
+        last_seen_at_ms,
+        last_tool_call_at_ms: summary
+            .as_ref()
+            .and_then(|summary| summary.last_tool_call_at_ms),
+        last_meaningful_activity_at_ms: summary
+            .as_ref()
+            .and_then(|summary| summary.last_meaningful_activity_at_ms),
+        active_count,
+        active_requests,
+        sessions_returned: linked_sessions.len(),
+        sessions_truncated,
+        linked_sessions,
+        activity_returned: activity.len(),
+        activity_truncated,
+        activity,
+    })
+}
+
+async fn workflow_session_detail_with_windows(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    project: &str,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Result<RuntimeConsoleWorkflowSessionDetail, RuntimeConsoleError> {
+    let session = workflow_session_for_auth(runtime, auth, project, session_id, limit).await?;
+    if !auth.has_scope(SCOPE_RUNTIME_READ) {
+        return Ok(RuntimeConsoleWorkflowSessionDetail {
+            session,
+            window_activity_available: false,
+            linked_windows: Vec::new(),
+            window_activity_after_last_session_record: Vec::new(),
+        });
+    }
+    let db = runtime
+        .window_activity_db
+        .as_ref()
+        .ok_or(RuntimeConsoleError::Internal)?;
+    let principal = window_principal_filter(auth)?;
+    let principal_ref = window_principal_ref(&principal);
+    let links = db
+        .list_session_linked_windows(session_id, principal_ref, 32)
+        .map_err(|_| RuntimeConsoleError::Internal)?;
+    let mut visibility_cache = HashMap::new();
+    let mut linked_windows = Vec::with_capacity(links.len());
+    for link in &links {
+        // The link itself is safe because the enclosing Session project was
+        // already authorized above. Re-project Window-wide liveness through
+        // current Project visibility so later activity on a revoked/hidden
+        // Project cannot leak its timestamp through this reverse panel.
+        let visible_summary = visible_window_summary_for_auth(
+            runtime,
+            auth,
+            principal_ref,
+            &link.client_window_key,
+            &mut visibility_cache,
+            None,
+        )
+        .await?;
+        linked_windows.push(RuntimeConsoleSessionWindow {
+            client_window_key: link.client_window_key.clone(),
+            source: visible_summary
+                .as_ref()
+                .map(|summary| summary.source.clone())
+                .unwrap_or_else(|| link.client_window_source.clone()),
+            first_linked_at_ms: link.first_linked_at_ms,
+            last_linked_at_ms: link.last_linked_at_ms,
+            last_seen_at_ms: visible_summary
+                .as_ref()
+                .map(|summary| summary.last_seen_at_ms.max(link.last_linked_at_ms))
+                .unwrap_or(link.last_linked_at_ms),
+            last_meaningful_activity_at_ms: visible_summary
+                .as_ref()
+                .and_then(|summary| summary.last_meaningful_activity_at_ms),
+            relations: link.relations.clone(),
+            relation_count: link.relation_count,
+            recorder_gap_count: link.recorder_gap_count,
+        });
+    }
+    let session_updated_at_ms = session.updated_at.saturating_mul(1000);
+    let mut gap_activity = Vec::new();
+    for link in &links {
+        if link.recorder_gap_count == 0 {
+            continue;
+        }
+        let events = db
+            .list_window_activity_events(&link.client_window_key, principal_ref, 32)
+            .map_err(|_| RuntimeConsoleError::Internal)?;
+        for event in events {
+            if event.recorder_gap_session_id.as_deref() != Some(session_id)
+                || event.started_at_ms <= session_updated_at_ms
+                || event.project.as_deref() != Some(project)
+            {
+                continue;
+            }
+            if let Some(event) = project_window_activity(runtime, auth, event).await {
+                gap_activity.push(event);
+            }
+        }
+    }
+    gap_activity.sort_by(|left, right| {
+        right
+            .started_at_ms
+            .cmp(&left.started_at_ms)
+            .then_with(|| left.method.cmp(&right.method))
+    });
+    gap_activity.truncate(50);
+    Ok(RuntimeConsoleWorkflowSessionDetail {
+        session,
+        window_activity_available: true,
+        linked_windows,
+        window_activity_after_last_session_record: gap_activity,
+    })
+}
+
 async fn runtime_status_value(
     runtime: &ToolRuntime,
     auth: &AuthContext,
@@ -1854,6 +2754,38 @@ async fn runner(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 }
 
 #[handler]
+async fn windows(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = match prepared(req, depot).await {
+        Ok(value) => value,
+        Err(error) => return render_error(res, error),
+    };
+    let input = match req.parse_json::<WindowsInput>().await {
+        Ok(input) => input,
+        Err(_) => return render_error(res, RuntimeConsoleError::Invalid),
+    };
+    match windows_for_auth(&runtime, &auth, input.limit, input.project.as_deref()).await {
+        Ok(output) => res.render(Json(output)),
+        Err(error) => render_error(res, error),
+    }
+}
+
+#[handler]
+async fn window(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = match prepared(req, depot).await {
+        Ok(value) => value,
+        Err(error) => return render_error(res, error),
+    };
+    let input = match req.parse_json::<WindowInput>().await {
+        Ok(input) => input,
+        Err(_) => return render_error(res, RuntimeConsoleError::Invalid),
+    };
+    match window_for_auth(&runtime, &auth, input).await {
+        Ok(output) => res.render(Json(output)),
+        Err(error) => render_error(res, error),
+    }
+}
+
+#[handler]
 async fn projects(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (runtime, auth) = match prepared(req, depot).await {
         Ok(value) => value,
@@ -1903,7 +2835,7 @@ async fn workflow_session(req: &mut Request, depot: &mut Depot, res: &mut Respon
         Ok(input) => input,
         Err(_) => return render_error(res, RuntimeConsoleError::Invalid),
     };
-    match workflow_session_for_auth(
+    match workflow_session_detail_with_windows(
         &runtime,
         &auth,
         &input.project,
@@ -2397,6 +3329,137 @@ mod tests {
             Arc::new(crate::RunnerRegistry::default()),
             Arc::new(RuntimeInfo::default()),
         ))
+    }
+
+    fn test_runtime_with_window_db() -> (tempfile::TempDir, Arc<crate::Database>, Arc<ToolRuntime>)
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::Database::open(&tmp.path().join("window-console.db")).unwrap());
+        let runtime = Arc::new(
+            ToolRuntime::new(
+                Arc::new(crate::RunnerRegistry::default()),
+                Arc::new(RuntimeInfo::default()),
+            )
+            .with_window_activity_database(db.clone()),
+        );
+        (tmp, db, runtime)
+    }
+
+    fn record_window_event(
+        db: &Arc<crate::Database>,
+        auth: &AuthContext,
+        window_key: &str,
+        project: Option<&str>,
+        workflow_link: Option<(&str, &str)>,
+        at_ms: i64,
+    ) {
+        let (principal_kind, principal_id) =
+            crate::tool_runtime::runtime_observation_principal(Some(auth)).unwrap();
+        crate::action_audit_sessions::record_action_event(
+            db,
+            crate::action_audit_sessions::ActionAuditEventInput {
+                explicit_session_id: None,
+                session_title: None,
+                endpoint: "/mcp".to_string(),
+                action_name: "toolsCall".to_string(),
+                operation: Some("workspace_hygiene_check".to_string()),
+                project: project.map(str::to_string),
+                principal_kind: None,
+                principal_user_id: None,
+                oauth_client_id: None,
+                status: "success".to_string(),
+                http_status: Some(200),
+                started_at: at_ms / 1000,
+                ended_at: at_ms / 1000,
+                duration_ms: 1,
+                error_summary: None,
+                warning_summary: None,
+                changed_files: Vec::new(),
+                ids: json!({}),
+                summary: json!({}),
+                request_bytes: None,
+                response_bytes: None,
+                client_window_key: Some(window_key.to_string()),
+                client_window_source: Some("openai-session".to_string()),
+                server_trace_id: Some(format!("trace-{at_ms}")),
+                principal_correlation_kind: Some(principal_kind),
+                principal_correlation_id: Some(principal_id),
+                window_started_at_ms: Some(at_ms),
+                window_ended_at_ms: Some(at_ms + 1),
+                request_observed_at_ms: None,
+                response_handed_at_ms: None,
+                window_transition_kind: None,
+                response_streaming: None,
+                window_continuity_eligible: None,
+                window_meaningful: true,
+                recorder_gap_session_id: None,
+                workflow_links: workflow_link
+                    .map(|(session_id, project)| {
+                        vec![crate::action_audit_sessions::ActionAuditWorkflowLinkInput {
+                            workflow_session_id: session_id.to_string(),
+                            relation:
+                                crate::action_audit_sessions::WorkflowSessionRelation::Recording,
+                            project: Some(project.to_string()),
+                        }]
+                    })
+                    .unwrap_or_default(),
+            },
+        );
+    }
+
+    fn record_timed_window_event(
+        db: &Arc<crate::Database>,
+        auth: &AuthContext,
+        window_key: &str,
+        project: Option<&str>,
+        request_observed_at_ms: i64,
+        response_handed_at_ms: i64,
+        legacy_window_ended_at_ms: i64,
+        transition: &str,
+    ) {
+        let (principal_kind, principal_id) =
+            crate::tool_runtime::runtime_observation_principal(Some(auth)).unwrap();
+        crate::action_audit_sessions::record_action_event(
+            db,
+            crate::action_audit_sessions::ActionAuditEventInput {
+                explicit_session_id: None,
+                session_title: None,
+                endpoint: "/mcp".to_string(),
+                action_name: "toolsCall".to_string(),
+                operation: Some("read_files".to_string()),
+                project: project.map(str::to_string),
+                principal_kind: None,
+                principal_user_id: None,
+                oauth_client_id: None,
+                status: "success".to_string(),
+                http_status: Some(200),
+                started_at: request_observed_at_ms / 1000,
+                ended_at: legacy_window_ended_at_ms / 1000,
+                duration_ms: response_handed_at_ms - request_observed_at_ms,
+                error_summary: None,
+                warning_summary: None,
+                changed_files: Vec::new(),
+                ids: json!({}),
+                summary: json!({}),
+                request_bytes: None,
+                response_bytes: None,
+                client_window_key: Some(window_key.to_string()),
+                client_window_source: Some("openai-session".to_string()),
+                server_trace_id: Some(format!("timed-trace-{request_observed_at_ms}")),
+                principal_correlation_kind: Some(principal_kind),
+                principal_correlation_id: Some(principal_id),
+                window_started_at_ms: Some(request_observed_at_ms),
+                window_ended_at_ms: Some(legacy_window_ended_at_ms),
+                request_observed_at_ms: Some(request_observed_at_ms),
+                response_handed_at_ms: Some(response_handed_at_ms),
+                window_transition_kind: Some(transition.to_string()),
+                response_streaming: Some(false),
+                window_continuity_eligible: Some(true),
+                window_meaningful: true,
+                recorder_gap_session_id: None,
+                workflow_links: Vec::new(),
+            },
+        );
     }
 
     fn scoped_oauth(scopes: &[&str]) -> AuthContext {
@@ -3403,6 +4466,439 @@ mod tests {
             .unwrap_err(),
             RuntimeConsoleError::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn window_activity_counts_all_visible_requests_before_bounding_details() {
+        let (_tmp, _db, runtime) = test_runtime_with_window_db();
+        let auth = test_bootstrap_auth();
+        let client_window = crate::client_window::ClientWindow::for_test("concurrent-window");
+        let guards = (0..12)
+            .map(|index| {
+                runtime.window_activity.start(
+                    &client_window,
+                    &format!("trace-{index}"),
+                    "tools/list",
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let detail = window_for_auth(
+            &runtime,
+            &auth,
+            WindowInput {
+                client_window_key: client_window.key().to_string(),
+                activity_limit: None,
+                session_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.active_count, guards.len());
+        assert_eq!(
+            detail.active_requests.len(),
+            crate::tool_runtime::MAX_ACTIVE_REQUESTS_PER_WINDOW
+        );
+        let list = windows_for_auth(&runtime, &auth, None, None).await.unwrap();
+        assert_eq!(list.windows[0].active_count, detail.active_count);
+    }
+
+    #[tokio::test]
+    async fn window_activity_live_history_outside_durable_page_is_not_counted_twice() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth = test_bootstrap_auth();
+        let old = crate::client_window::ClientWindow::for_test("old-active-window");
+        record_window_event(&db, &auth, old.key(), None, None, 1_000);
+        for index in 0..MAX_WINDOW_LIMIT {
+            record_window_event(
+                &db,
+                &auth,
+                &format!("{index:064x}"),
+                None,
+                None,
+                2_000 + index as i64,
+            );
+        }
+        let _active = runtime
+            .window_activity
+            .start(&old, "old-active", "tools/call", None);
+        let list = windows_for_auth(&runtime, &auth, None, None).await.unwrap();
+        assert_eq!(list.total, MAX_WINDOW_LIMIT + 1);
+        assert!(list.truncated);
+        let row = list
+            .windows
+            .iter()
+            .find(|row| row.client_window_key == old.key())
+            .unwrap();
+        assert_eq!(row.active_count, 1);
+        assert_eq!(row.last_tool_call_at_ms, Some(1_001));
+        assert_eq!(row.last_meaningful_activity_at_ms, Some(1_001));
+    }
+
+    #[tokio::test]
+    async fn window_activity_project_filter_returns_only_exact_project_evidence() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth = crate::auth::shared_key_context("window-filter");
+        let project_a = "agent:window-filter-a:proj-a";
+        let project_b = "agent:window-filter-b:proj-b";
+        register_project(
+            &runtime,
+            "window-filter-a",
+            "proj-a",
+            "/private/window-filter-a",
+            Some(&auth),
+        )
+        .await;
+        register_project(
+            &runtime,
+            "window-filter-b",
+            "proj-b",
+            "/private/window-filter-b",
+            Some(&auth),
+        )
+        .await;
+        let window_a = "a".repeat(64);
+        let window_b = "b".repeat(64);
+        record_window_event(&db, &auth, &window_a, Some(project_a), None, 1_000);
+        record_window_event(&db, &auth, &window_b, Some(project_b), None, 2_000);
+
+        let all = windows_for_auth(&runtime, &auth, Some(20), None)
+            .await
+            .unwrap();
+        assert_eq!(all.total, 2);
+
+        let filtered = windows_for_auth(&runtime, &auth, Some(20), Some(project_a))
+            .await
+            .unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.returned, 1);
+        assert_eq!(filtered.windows[0].client_window_key, window_a);
+        assert_eq!(
+            filtered.windows[0].last_meaningful_activity_at_ms,
+            Some(1_001)
+        );
+    }
+
+    #[tokio::test]
+    async fn window_activity_lookup_is_principal_and_current_project_authority_bounded() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth_a = crate::auth::shared_key_context("window-group-a");
+        let auth_b = crate::auth::shared_key_context("window-group-b");
+        let project_a = "agent:window-a:proj-a";
+        let project_b = "agent:window-b:proj-b";
+        register_project(
+            &runtime,
+            "window-a",
+            "proj-a",
+            "/private/window-a",
+            Some(&auth_a),
+        )
+        .await;
+        register_project(
+            &runtime,
+            "window-b",
+            "proj-b",
+            "/private/window-b",
+            Some(&auth_b),
+        )
+        .await;
+
+        let window_a = "a".repeat(64);
+        let window_b = "b".repeat(64);
+        let revoked_project_window = "c".repeat(64);
+        let revoked_session_window = "d".repeat(64);
+        record_window_event(&db, &auth_a, &window_a, Some(project_a), None, 1_000);
+        record_window_event(&db, &auth_b, &window_b, Some(project_b), None, 2_000);
+        // Model a historical event that was legitimate for this principal before
+        // a Project grant was revoked. The current registry intentionally exposes
+        // project_b only to auth_b, so auth_a must not retain Window metadata for it.
+        record_window_event(
+            &db,
+            &auth_a,
+            &revoked_project_window,
+            Some(project_b),
+            None,
+            3_000,
+        );
+        // Session/collaboration events can be projectless at the business-call
+        // layer while their authoritative Workflow link carries the Project.
+        // That link must still enforce current Project visibility.
+        record_window_event(
+            &db,
+            &auth_a,
+            &revoked_session_window,
+            None,
+            Some(("wc_sess_hidden", project_b)),
+            4_000,
+        );
+
+        // A meaningful tools/call is not exposed to a non-admin during the
+        // tiny pre-resolution interval where its exact Project is not known yet.
+        let pre_resolution_window =
+            crate::client_window::ClientWindow::for_test("runtime-console-pre-resolution-hidden");
+        let pre_resolution_key = pre_resolution_window.key().to_string();
+        let (principal_kind, principal_id) =
+            crate::tool_runtime::runtime_observation_principal(Some(&auth_a)).unwrap();
+        let _pre_resolution = runtime.window_activity.start(
+            &pre_resolution_window,
+            "trace-pre-resolution",
+            "tools/call",
+            Some((&principal_kind, &principal_id)),
+        );
+        runtime.window_activity.update(
+            "trace-pre-resolution",
+            Some("workspace_hygiene_check"),
+            None,
+        );
+
+        let visible = windows_for_auth(&runtime, &auth_a, Some(20), None)
+            .await
+            .unwrap();
+        assert_eq!(visible.total, 1);
+        assert_eq!(visible.returned, 1);
+        assert_eq!(visible.windows[0].client_window_key, window_a);
+        let serialized = serde_json::to_string(&visible).unwrap();
+        assert!(!serialized.contains(&window_b));
+        assert!(!serialized.contains(&revoked_project_window));
+        assert!(!serialized.contains(&revoked_session_window));
+        assert!(!serialized.contains(&pre_resolution_key));
+        assert!(!serialized.contains(project_b));
+
+        let own = window_for_auth(
+            &runtime,
+            &auth_a,
+            WindowInput {
+                client_window_key: window_a.clone(),
+                activity_limit: Some(20),
+                session_limit: Some(20),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.client_window_key, window_a);
+        assert_eq!(own.last_seen_at_ms, 1_001);
+
+        for hidden_key in [
+            &window_b,
+            &revoked_project_window,
+            &revoked_session_window,
+            &pre_resolution_key,
+        ] {
+            assert_eq!(
+                window_for_auth(
+                    &runtime,
+                    &auth_a,
+                    WindowInput {
+                        client_window_key: hidden_key.clone(),
+                        activity_limit: Some(20),
+                        session_limit: Some(20),
+                    },
+                )
+                .await
+                .unwrap_err(),
+                RuntimeConsoleError::NotFound
+            );
+        }
+
+        let admin = test_bootstrap_auth();
+        let global = windows_for_auth(&runtime, &admin, Some(20), None)
+            .await
+            .unwrap();
+        let keys = global
+            .windows
+            .iter()
+            .map(|row| row.client_window_key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                window_a.as_str(),
+                window_b.as_str(),
+                revoked_project_window.as_str(),
+                revoked_session_window.as_str(),
+                pre_resolution_key.as_str(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_timing_uses_response_handoff_not_legacy_audit_end() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth = crate::auth::shared_key_context("window-timing");
+        let project = "agent:window-timing:visible";
+        register_project(
+            &runtime,
+            "window-timing",
+            "visible",
+            "/private/window-timing",
+            Some(&auth),
+        )
+        .await;
+        let window_key = "e".repeat(64);
+        record_timed_window_event(
+            &db,
+            &auth,
+            &window_key,
+            Some(project),
+            1_000,
+            1_100,
+            1_900,
+            "unavailable",
+        );
+        record_timed_window_event(
+            &db,
+            &auth,
+            &window_key,
+            Some(project),
+            1_500,
+            1_550,
+            1_600,
+            "serial",
+        );
+
+        let detail = window_for_auth(
+            &runtime,
+            &auth,
+            WindowInput {
+                client_window_key: window_key,
+                activity_limit: Some(20),
+                session_limit: Some(20),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.activity.len(), 2);
+        let first = detail
+            .activity
+            .iter()
+            .find(|event| event.service_ms == Some(100))
+            .expect("first canonical-timing event");
+        assert_eq!(
+            first.ended_at_ms, 1_900,
+            "legacy audit boundary remains distinct"
+        );
+        assert_eq!(first.next_call_gap_ms, Some(400));
+        assert_eq!(first.cycle_ms, Some(500));
+        let second = detail
+            .activity
+            .iter()
+            .find(|event| event.service_ms == Some(50))
+            .expect("second canonical-timing event");
+        assert_eq!(second.window_transition_kind.as_deref(), Some("serial"));
+    }
+
+    #[test]
+    fn window_timing_does_not_bridge_an_ineligible_meaningful_event() {
+        let (_tmp, db, _runtime) = test_runtime_with_window_db();
+        let auth = crate::auth::shared_key_context("interrupted-timing");
+        let window_key = "a".repeat(64);
+        for (start, transition) in [(1_000, "unavailable"), (1_500, "serial"), (2_000, "serial")] {
+            record_timed_window_event(
+                &db,
+                &auth,
+                &window_key,
+                None,
+                start,
+                start + 100,
+                start + 100,
+                transition,
+            );
+        }
+        let mut events = db
+            .list_window_activity_events(&window_key, None, 20)
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        // A retained pre-fix sequence can still label the third request serial.
+        // Neither a visible nor a revoked stream may be skipped to pair it with A.
+        events[1].window_continuity_eligible = Some(false);
+        events[1].response_streaming = Some(true);
+        for visible in [[true, true, true], [true, false, true]] {
+            let timings = project_window_loop_timings(&events, &visible);
+            assert_eq!(timings[2].next_call_gap_ms, visible[1].then_some(400));
+            assert_eq!(timings[2].cycle_ms, visible[1].then_some(500));
+            assert!(timings[1].next_call_gap_ms.is_none());
+            assert!(timings[1].service_ms.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_project_event_cannot_be_bridged_by_window_gap_projection() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let auth_a = crate::auth::shared_key_context("timing-visible-a");
+        let auth_b = crate::auth::shared_key_context("timing-hidden-b");
+        let project_a = "agent:timing-a:visible";
+        let project_b = "agent:timing-b:hidden";
+        register_project(
+            &runtime,
+            "timing-a",
+            "visible",
+            "/private/timing-a",
+            Some(&auth_a),
+        )
+        .await;
+        register_project(
+            &runtime,
+            "timing-b",
+            "hidden",
+            "/private/timing-b",
+            Some(&auth_b),
+        )
+        .await;
+        let window_key = "f".repeat(64);
+        record_timed_window_event(
+            &db,
+            &auth_a,
+            &window_key,
+            Some(project_a),
+            1_000,
+            1_100,
+            1_101,
+            "unavailable",
+        );
+        // Historical same-principal event whose Project is no longer visible.
+        record_timed_window_event(
+            &db,
+            &auth_a,
+            &window_key,
+            Some(project_b),
+            1_500,
+            1_550,
+            1_551,
+            "serial",
+        );
+        record_timed_window_event(
+            &db,
+            &auth_a,
+            &window_key,
+            Some(project_a),
+            2_000,
+            2_050,
+            2_051,
+            "serial",
+        );
+
+        let detail = window_for_auth(
+            &runtime,
+            &auth_a,
+            WindowInput {
+                client_window_key: window_key,
+                activity_limit: Some(20),
+                session_limit: Some(20),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.activity.len(), 2);
+        assert!(detail
+            .activity
+            .iter()
+            .all(|event| event.project.as_deref() == Some(project_a)));
+        assert!(detail
+            .activity
+            .iter()
+            .all(|event| event.next_call_gap_ms.is_none() && event.cycle_ms.is_none()));
+        let serialized = serde_json::to_string(&detail).unwrap();
+        assert!(!serialized.contains(project_b));
     }
 
     #[tokio::test]

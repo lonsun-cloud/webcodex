@@ -12,7 +12,7 @@
 
 如果你准备让 ChatGPT 长期使用自己的开发环境，推荐从 **普通 Server + Runner** 开始。这是 WebCodex 的完整开发体验：可以长期连接多个项目，并使用项目探索、编辑、Git、命令、测试、长任务和代码导航能力。公网 HTTPS、Cloudflare Tunnel 或 OpenAI Secure MCP Tunnel 只是 ChatGPT 到 Server 的连接方式，不会把你切换到另一套受限体验。
 
-Windows / macOS 普通用户最推荐 **WebCodex Desktop + 官方 OpenAI Secure Tunnel**，直接按带截图的 [Desktop 安装与连接指南](docs/desktop-install.zh-CN.md)操作即可；CLI、已有 Server、自托管或高级配置再看[完整使用指南](docs/PERSONAL_SETUP.zh-CN.md)。
+Windows / macOS 普通用户最推荐 **WebCodex Desktop + 官方 OpenAI Secure Tunnel**，直接按 [Desktop 安装与连接指南](docs/desktop-install.zh-CN.md)操作即可；CLI、已有 Server、自托管或高级配置再看[完整使用指南](docs/PERSONAL_SETUP.zh-CN.md)。
 
 ### 只想先试几分钟：临时分享
 
@@ -59,12 +59,16 @@ WebCodex
 
 如果需要了解内部的 Server/Runner 架构、协议接口和权限边界，再阅读[架构说明](docs/ARCHITECTURE.md)、[MCP](docs/MCP.zh-CN.md)和[认证模型](docs/AUTH_MODEL.zh-CN.md)。
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/image?repos=yyjeqhc/webcodex&type=Date)](https://www.star-history.com/yyjeqhc/webcodex)
+
 ## 平台支持
 
 - **Linux x64/arm64** —— 支持本机 `share`、Server 和 Runner 工作流。
 - **macOS x64/arm64** —— 支持 Desktop 本机 Server + Runner、OpenAI Secure Tunnel、本机 `share` 和独立 Runner 工作流。
 - **Windows x64** —— 推荐 Desktop 本机 Server + Runner + 官方 OpenAI Secure Tunnel；同时支持 CLI + Runner、本地前台 Server，以及显式 `webcodex share --tunnel cloudflare|openai|none`。
-- **Windows arm64** —— 支持 CLI + Runner、本地前台 Server 与 `share`，managed OpenAI `tunnel-client` 可用。固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此使用 Cloudflare 时需要受信任的显式/`PATH` `cloudflared`。0.4.0 Desktop installer 仅提供 Windows x64。除 Desktop 自己托管的前台 runtime 外，WebCodex-managed Windows Server service 仍不支持。
+- **Windows arm64** —— 支持 CLI + Runner、本地前台 Server 与 `share`，managed OpenAI `tunnel-client` 可用。固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此使用 Cloudflare 时需要受信任的显式/`PATH` `cloudflared`。当前 Desktop installer 仅提供 Windows x64。除 Desktop 自己托管的前台 runtime 外，WebCodex-managed Windows Server service 仍不支持。
 
 Windows 接入和长期部署见[部署指南](docs/DEPLOYMENT.zh-CN.md)与 [MCP](docs/MCP.zh-CN.md)。
 
@@ -77,6 +81,7 @@ Windows 接入和长期部署见[部署指南](docs/DEPLOYMENT.zh-CN.md)与 [MCP
 ## 文档
 
 - [Desktop 安装与连接](docs/desktop-install.zh-CN.md) —— Windows / macOS 推荐路径：Desktop + 官方 OpenAI Secure Tunnel
+- [Desktop 日常使用](docs/desktop-guide.zh-CN.md) —— 项目、连接、活动与后台运行
 - [完整使用指南](docs/PERSONAL_SETUP.zh-CN.md) —— CLI、已有 Server、Linux 与高级普通 Server + Runner 配置
 - [快速试用](docs/QUICK_START.zh-CN.md) —— 用 `share` 临时体验一个仓库
 - [MCP](docs/MCP.zh-CN.md) —— ChatGPT、Claude、认证方式和 MCP 参考

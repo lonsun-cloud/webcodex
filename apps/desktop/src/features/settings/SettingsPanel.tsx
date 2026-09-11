@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { desktopApi } from "../../lib/desktop-api";
 import type { DesktopError, DesktopState, TunnelProxyMode } from "../../models/topology";
-import { useLocale } from "../../i18n/locale";
+import { LANGUAGES, useLocale } from "../../i18n/locale";
 import { desktopErrorPresentation, normalizeDesktopError } from "../../i18n/presentation";
+import { PowerShellInstallGuidance } from "./PowerShellInstallGuidance";
 
 export function SettingsPanel({
   state,
@@ -16,7 +17,22 @@ export function SettingsPanel({
   const [customProxy, setCustomProxy] = useState(state.tunnel_proxy.custom_url ?? "");
   const [savingProxy, setSavingProxy] = useState(false);
   const [proxyError, setProxyError] = useState<DesktopError | null>(null);
+  const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
+  const [savingLaunchAtLogin, setSavingLaunchAtLogin] = useState(false);
+  const [launchAtLoginError, setLaunchAtLoginError] = useState<DesktopError | null>(null);
   const operationBusy = Boolean(state.current_operation);
+
+  useEffect(() => {
+    let cancelled = false;
+    void desktopApi.getLaunchAtLogin().then((enabled) => {
+      if (!cancelled) setLaunchAtLogin(enabled);
+    }).catch((value) => {
+      if (!cancelled) setLaunchAtLoginError(normalizeDesktopError(value));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const saveProxy = async () => {
     if (operationBusy) return;
@@ -28,6 +44,19 @@ export function SettingsPanel({
       setProxyError(normalizeDesktopError(value));
     } finally {
       setSavingProxy(false);
+    }
+  };
+
+  const updateLaunchAtLogin = async (enabled: boolean) => {
+    if (savingLaunchAtLogin) return;
+    setSavingLaunchAtLogin(true);
+    setLaunchAtLoginError(null);
+    try {
+      setLaunchAtLogin(await desktopApi.setLaunchAtLogin(enabled));
+    } catch (value) {
+      setLaunchAtLoginError(normalizeDesktopError(value));
+    } finally {
+      setSavingLaunchAtLogin(false);
     }
   };
   return (
@@ -46,10 +75,28 @@ export function SettingsPanel({
             onChange={(event) => setLocale(event.target.value as typeof locale)}
             data-webcodex-control="locale"
           >
-            <option value="zh-CN">{t("locale.zh")}</option>
-            <option value="en-US">{t("locale.en")}</option>
+            {LANGUAGES.map((language) => <option key={language.value} value={language.value}>{language.label}</option>)}
           </select>
         </div>
+      </section>
+
+      <section className="settings-section" aria-labelledby="settings-background-title">
+        <h2 id="settings-background-title">{t("settings.backgroundStartup")}</h2>
+        <article className="detail-card setting-row">
+          <div className="field-group">
+            <label htmlFor="desktop-launch-at-login">{t("settings.launchAtLogin")}</label>
+            <span className="field-help">{t("settings.launchAtLoginHelp")}</span>
+          </div>
+          <input
+            id="desktop-launch-at-login"
+            type="checkbox"
+            checked={launchAtLogin ?? false}
+            onChange={(event) => void updateLaunchAtLogin(event.target.checked)}
+            disabled={launchAtLogin === null || savingLaunchAtLogin}
+            data-webcodex-control="launch-at-login"
+          />
+        </article>
+        {launchAtLoginError && <SettingsError error={launchAtLoginError} />}
       </section>
 
       <section className="settings-section" aria-labelledby="settings-tunnel-title">
@@ -68,7 +115,7 @@ export function SettingsPanel({
               <option value="direct">{t("settings.tunnelProxyDirect")}</option>
               <option value="custom">{t("settings.tunnelProxyCustom")}</option>
             </select>
-            {proxyMode === "auto" && <span className="field-help">{t("settings.tunnelProxyAutoHelp")}</span>}
+            {proxyMode === "auto" && <span className="field-help">{t(navigator.platform.startsWith("Win") ? "settings.tunnelProxyAutoHelp" : "settings.tunnelProxyAutoHelpLocal")}</span>}
           </div>
           {proxyMode === "custom" && (
             <div className="field-group">
@@ -110,8 +157,9 @@ export function SettingsPanel({
         </article>
       </section>
 
-      <section className="settings-section" aria-labelledby="settings-diagnostics-title">
-        <h2 id="settings-diagnostics-title">{t("settings.diagnostics")}</h2>
+      <details className="settings-section">
+        <summary>{t("settings.diagnostics")}</summary>
+        <PowerShellInstallGuidance state={state} onState={onState} />
         <article className="detail-card">
         {state.binaries ? (
           <dl className="detail-list">
@@ -124,16 +172,13 @@ export function SettingsPanel({
           <p>{t("settings.binariesPending")}</p>
         )}
         </article>
-      </section>
 
-      <section className="settings-section" aria-labelledby="settings-advanced-title">
-        <h2 id="settings-advanced-title">{t("settings.advanced")}</h2>
         <article className="detail-card">
           <dl className="detail-list">
             <div><dt>{t("settings.runtimeProjectId")}</dt><dd>{state.project?.runtime_project_id ?? t("settings.notEstablished")}</dd></div>
           </dl>
         </article>
-      </section>
+      </details>
     </section>
   );
 }

@@ -1,4 +1,7 @@
 //! Tool-call event helpers: classification, expectations, validation excerpts, path extraction.
+pub(super) use super::audit::context_result_summary_for_tool_result;
+use super::audit::execution_policy_for_tool;
+pub use super::audit::session_input_summary_for_tool;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use webcodex_core::lsp_bridge::{
@@ -6,7 +9,11 @@ use webcodex_core::lsp_bridge::{
     LocationsResult, WorkspaceSymbolsResult,
 };
 use webcodex_core::workflow_session_contract::is_tool_call_expectation_metadata_field as shared_is_tool_call_expectation_metadata_field;
-pub use webcodex_core::workflow_session_contract::{is_valid_session_id, EXPLORATION_TOOL_NAMES};
+pub use webcodex_core::workflow_session_contract::is_valid_session_id;
+use webcodex_tool_contracts::{
+    runtime_tool_session_evidence_policy, ToolChangedPathEvidence, ToolDiffReviewEvidence,
+    ToolExplorationEvidence, ToolNavigationEvidenceKind,
+};
 
 use super::model::{
     PersistentShellEventEvidence, SessionEvent, SessionSummary, ToolCallExpectation,
@@ -19,7 +26,6 @@ use super::model::{
     TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS,
     TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
-use super::util::redact_and_bound_value;
 use super::util::{bound_summary_string, looks_like_secret_string, validation_excerpt};
 
 impl ToolCallRecorderMetadata {
@@ -716,17 +722,15 @@ pub fn changed_paths_for_tool(contract: SessionToolContract, arguments: &Value) 
     paths
 }
 
-fn is_dry_run_change_projection(tool_name: &str, value: &Value) -> bool {
-    matches!(tool_name, "apply_patch" | "apply_text_edits")
-        && value.get("dry_run").and_then(Value::as_bool) == Some(true)
+fn is_dry_run_change_projection(value: &Value) -> bool {
+    value.get("dry_run").and_then(Value::as_bool) == Some(true)
 }
 
 pub(super) fn changed_paths_for_tool_call(
-    tool_name: &str,
     contract: SessionToolContract,
     arguments: &Value,
 ) -> Vec<String> {
-    if is_dry_run_change_projection(tool_name, arguments) {
+    if contract.project_write && is_dry_run_change_projection(arguments) {
         return Vec::new();
     }
     changed_paths_for_tool(contract, arguments)
@@ -736,15 +740,14 @@ pub(super) fn changed_paths_for_tool_call(
 /// intentionally does not expose a structured path list. Never parses raw diff
 /// text; only authoritative bounded runtime result metadata is accepted.
 pub fn changed_paths_for_tool_result(tool_name: &str, output: &Value) -> Vec<String> {
-    if is_dry_run_change_projection(tool_name, output) {
+    let ToolChangedPathEvidence::ResultField(key) =
+        runtime_tool_session_evidence_policy(tool_name).changed_paths
+    else {
+        return Vec::new();
+    };
+    if is_dry_run_change_projection(output) {
         return Vec::new();
     }
-    let key = match tool_name {
-        "apply_unified_diff" => "affected_files",
-        "apply_patch" => "changed_paths",
-        "workspace_checkpoint_restore" => "changed_paths",
-        _ => return Vec::new(),
-    };
     output
         .get(key)
         .and_then(Value::as_array)
@@ -763,13 +766,15 @@ pub enum ExplorationToolKind {
 }
 
 pub fn exploration_tool_kind(tool_name: &str) -> Option<ExplorationToolKind> {
-    if !EXPLORATION_TOOL_NAMES.contains(&tool_name) {
-        return None;
-    }
-    match tool_name {
-        "read_file" | "read_files" => Some(ExplorationToolKind::Read),
-        "search_project_text" | "search_project_texts" => Some(ExplorationToolKind::Search),
-        _ => Some(ExplorationToolKind::Navigation),
+    match runtime_tool_session_evidence_policy(tool_name).exploration {
+        ToolExplorationEvidence::None => None,
+        ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {
+            Some(ExplorationToolKind::Read)
+        }
+        ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
+            Some(ExplorationToolKind::Search)
+        }
+        ToolExplorationEvidence::Navigation(_) => Some(ExplorationToolKind::Navigation),
     }
 }
 
@@ -781,120 +786,43 @@ pub fn observed_input_paths_for_tool(
     contract: SessionToolContract,
     arguments: &Value,
 ) -> Vec<String> {
-    let Some(kind) = exploration_tool_kind(tool_name) else {
-        return Vec::new();
-    };
-    if kind == ExplorationToolKind::Search {
-        return Vec::new();
-    }
-
-    let mut paths = Vec::new();
-    if tool_name == "read_files" {
-        if let Some(items) = arguments.get("items").and_then(Value::as_array) {
-            for item in items.iter().filter_map(Value::as_object) {
-                if let Some(path) = item.get("path").and_then(Value::as_str) {
-                    push_observed_path(&mut paths, path);
+    match runtime_tool_session_evidence_policy(tool_name).exploration {
+        ToolExplorationEvidence::None
+        | ToolExplorationEvidence::Search
+        | ToolExplorationEvidence::SearchBatch => return Vec::new(),
+        ToolExplorationEvidence::ReadBatch => {
+            let mut paths = Vec::new();
+            if let Some(items) = arguments.get("items").and_then(Value::as_array) {
+                for item in items.iter().filter_map(Value::as_object) {
+                    if let Some(path) = item.get("path").and_then(Value::as_str) {
+                        push_observed_path(&mut paths, path);
+                    }
                 }
             }
+            return paths;
         }
-        return paths;
+        ToolExplorationEvidence::Read | ToolExplorationEvidence::Navigation(_) => {}
     }
 
     if contract.path_hint != SessionPathHint::SinglePath {
         return Vec::new();
     }
+    let mut paths = Vec::new();
     if let Some(path) = arguments.get("path").and_then(Value::as_str) {
         push_observed_path(&mut paths, path);
     }
     paths
 }
 
-/// Build the bounded audit input retained on a session event while ensuring
-/// exploration queries and shell command summaries never enter the ledger,
-/// even when an internal caller bypasses `ToolCall::session_log_arguments`.
-pub fn session_input_summary_for_tool(tool_name: &str, arguments: &Value) -> Value {
-    let mut summary = redact_and_bound_value(arguments);
-    let Some(object) = summary.as_object_mut() else {
-        return summary;
-    };
-    match tool_name {
-        "list_projects" => {
-            object.remove("client_id");
-            object.remove("project");
-            object.remove("query");
-        }
-        // `list_agents` is retained only for historical pre-0.4 Session events.
-        "list_runners" | "list_agents" => {
-            object.remove("client_id");
-            object.remove("client_ids");
-        }
-        "runtime_status" => {
-            object.remove("client_id");
-        }
-        "list_jobs" => {
-            object.remove("project");
-            object.remove("session_id");
-        }
-        "search_project_text" => {
-            object.remove("pattern");
-        }
-        "search_project_texts" => {
-            if let Some(queries) = object.get_mut("queries").and_then(Value::as_array_mut) {
-                for query in queries.iter_mut().filter_map(Value::as_object_mut) {
-                    query.remove("pattern");
-                }
-            }
-        }
-        "workspace_symbols" => {
-            object.remove("query");
-        }
-        "run_process" => {
-            object.remove("executable");
-            object.remove("args");
-            object.remove("stdin");
-            object.remove("process_summary");
-        }
-        "run_detached_process" => {
-            object.remove("executable");
-            object.remove("args");
-            object.remove("stdin");
-            object.remove("idempotency_key");
-            object.remove("process_summary");
-        }
-        "run_script" => {
-            object.remove("script");
-            object.remove("args");
-            object.remove("stdin");
-            object.remove("script_summary");
-        }
-        "run_shell" | "run_job" | "session_shell_exec" => {
-            object.remove("command");
-            object.remove("command_summary");
-        }
-        "git_diff_hunks" => {
-            object.remove("continuation");
-        }
-        "observe_jobs" => {
-            if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
-                for item in items.iter_mut().filter_map(Value::as_object_mut) {
-                    item.remove("after_observation_token");
-                }
-            }
-        }
-        _ => {}
-    }
-    summary
-}
-
 pub fn persistent_shell_event_evidence_for_tool_result(
     tool_name: &str,
     output: &Value,
 ) -> Option<PersistentShellEventEvidence> {
-    let action = persistent_shell_action(tool_name)?;
+    let action = runtime_tool_session_evidence_policy(tool_name).persistent_shell?;
     sanitize_persistent_shell_event_evidence(
         tool_name,
         PersistentShellEventEvidence {
-            action: action.to_string(),
+            action: action.as_str().to_string(),
             shell_id: output
                 .get("shell_id")
                 .and_then(Value::as_str)
@@ -922,7 +850,10 @@ pub fn sanitize_persistent_shell_event_evidence(
     tool_name: &str,
     mut evidence: PersistentShellEventEvidence,
 ) -> Option<PersistentShellEventEvidence> {
-    evidence.action = persistent_shell_action(tool_name)?.to_string();
+    evidence.action = runtime_tool_session_evidence_policy(tool_name)
+        .persistent_shell?
+        .as_str()
+        .to_string();
     evidence.shell_id = evidence.shell_id.filter(|value| {
         value.starts_with("wc_shell_")
             && value.len() <= 96
@@ -936,17 +867,6 @@ pub fn sanitize_persistent_shell_event_evidence(
         .and_then(sanitize_shell_evidence_atom);
     evidence.error_code = evidence.error_code.and_then(sanitize_shell_evidence_atom);
     Some(evidence)
-}
-
-fn persistent_shell_action(tool_name: &str) -> Option<&'static str> {
-    match tool_name {
-        "open_session_shell" => Some("open"),
-        "session_shell_exec" => Some("exec"),
-        "session_shell_status" => Some("status"),
-        "close_session_shell" => Some("close"),
-        "close_session" => Some("close"),
-        _ => None,
-    }
 }
 
 fn sanitize_shell_evidence_atom(value: String) -> Option<String> {
@@ -971,25 +891,25 @@ pub fn observed_paths_for_successful_result(
     input_paths: Vec<String>,
     output: &Value,
 ) -> Vec<String> {
-    let Some(kind) = exploration_tool_kind(tool_name) else {
-        return Vec::new();
-    };
+    let exploration = runtime_tool_session_evidence_policy(tool_name).exploration;
     let mut paths = sanitize_observed_paths(input_paths);
-    match kind {
-        ExplorationToolKind::Read => {}
-        ExplorationToolKind::Search => {
-            let search_outputs: Vec<&Value> = if tool_name == "search_project_texts" {
-                output
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
-                    .filter_map(|item| item.get("output"))
-                    .collect()
-            } else {
-                vec![output]
-            };
+    match exploration {
+        ToolExplorationEvidence::None => return Vec::new(),
+        ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {}
+        ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
+            let search_outputs: Vec<&Value> =
+                if matches!(exploration, ToolExplorationEvidence::SearchBatch) {
+                    output
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
+                        .filter_map(|item| item.get("output"))
+                        .collect()
+                } else {
+                    vec![output]
+                };
             for search_output in search_outputs {
                 for key in ["matches", "files"] {
                     for record in search_output
@@ -1005,39 +925,43 @@ pub fn observed_paths_for_successful_result(
                 }
             }
         }
-        ExplorationToolKind::Navigation => {
-            push_lsp_result_paths(tool_name, output, &mut paths);
+        ToolExplorationEvidence::Navigation(kind) => {
+            push_lsp_result_paths(kind, output, &mut paths);
         }
     }
     paths
 }
 
-fn push_lsp_result_paths(tool_name: &str, output: &Value, paths: &mut Vec<String>) {
-    match tool_name {
-        "document_symbols" => {
+fn push_lsp_result_paths(
+    kind: ToolNavigationEvidenceKind,
+    output: &Value,
+    paths: &mut Vec<String>,
+) {
+    match kind {
+        ToolNavigationEvidenceKind::DocumentSymbols => {
             if let Ok(result) = serde_json::from_value::<DocumentSymbolsResult>(output.clone()) {
                 push_observed_path(paths, &result.path);
             }
         }
-        "document_diagnostics" => {
+        ToolNavigationEvidenceKind::DocumentDiagnostics => {
             if let Ok(result) = serde_json::from_value::<DocumentDiagnosticsResult>(output.clone())
             {
                 push_observed_path(paths, &result.path);
             }
         }
-        "hover" => {
+        ToolNavigationEvidenceKind::Hover => {
             if let Ok(result) = serde_json::from_value::<HoverResult>(output.clone()) {
                 push_observed_path(paths, &result.path);
             }
         }
-        "workspace_symbols" => {
+        ToolNavigationEvidenceKind::WorkspaceSymbols => {
             if let Ok(result) = serde_json::from_value::<WorkspaceSymbolsResult>(output.clone()) {
                 for symbol in result.symbols {
                     push_observed_path(paths, &symbol.path);
                 }
             }
         }
-        "goto_definition" | "find_references" => {
+        ToolNavigationEvidenceKind::Locations => {
             if let Ok(result) = serde_json::from_value::<LocationsResult>(output.clone()) {
                 push_observed_path(paths, &result.path);
                 for location in result.locations {
@@ -1045,7 +969,7 @@ fn push_lsp_result_paths(tool_name: &str, output: &Value, paths: &mut Vec<String
                 }
             }
         }
-        "call_hierarchy" => {
+        ToolNavigationEvidenceKind::CallHierarchy => {
             if let Ok(result) = serde_json::from_value::<CallHierarchyResult>(output.clone()) {
                 push_observed_path(paths, &result.path);
                 for root in result.roots {
@@ -1057,7 +981,6 @@ fn push_lsp_result_paths(tool_name: &str, output: &Value, paths: &mut Vec<String
                 }
             }
         }
-        _ => {}
     }
 }
 
@@ -1144,13 +1067,13 @@ pub(super) fn push_path(paths: &mut Vec<String>, path: &str) {
 /// Only reads a safe boolean (`include_diff`) from arguments for `show_changes`.
 /// Does not store raw input, command text, or diff content.
 pub(super) fn diff_review_like_for_tool(tool_name: &str, arguments: &Value) -> bool {
-    match tool_name {
-        "git_diff" | "git_diff_summary" | "git_diff_hunks" => true,
-        "show_changes" => arguments
-            .get("include_diff")
+    match runtime_tool_session_evidence_policy(tool_name).diff_review {
+        ToolDiffReviewEvidence::None => false,
+        ToolDiffReviewEvidence::Always => true,
+        ToolDiffReviewEvidence::ArgumentBool(field) => arguments
+            .get(field)
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        _ => false,
     }
 }
 
@@ -1164,284 +1087,8 @@ pub(super) fn extract_job_id(output: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-pub(super) fn context_result_summary_for_tool_result(
-    tool_name: &str,
-    output: &Value,
-) -> Option<Value> {
-    fn selected(output: &Value, keys: &[&str]) -> Option<Value> {
-        let source = output.as_object()?;
-        let mut summary = serde_json::Map::new();
-        for key in keys {
-            if let Some(value) = source.get(*key) {
-                summary.insert((*key).to_string(), value.clone());
-            }
-        }
-        (!summary.is_empty()).then_some(Value::Object(summary))
-    }
-
-    let summary = match tool_name {
-        "workspace_checkpoint_create" => selected(
-            output,
-            &[
-                "checkpoint_id",
-                "head",
-                "branch",
-                "complete",
-                "tracked_diff_bytes",
-                "staged_diff_bytes",
-                "untracked_file_count",
-                "status_summary",
-                "kind",
-            ],
-        ),
-        "create_agent_identity" | "update_agent_identity" => output.as_object().map(|source| {
-            json!({
-                "agent_id": output.pointer("/agent/agent_id").cloned().unwrap_or(Value::Null),
-                "profile_revision": output.pointer("/agent/profile_revision").cloned().unwrap_or(Value::Null),
-                "created": source.get("created").cloned().unwrap_or(Value::Null),
-                "replayed": source.get("replayed").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "list_agent_identities" => output.as_object().map(|source| {
-            json!({
-                "total_count": source.get("total_count").cloned().unwrap_or(Value::Null),
-                "returned_count": source.get("agents").and_then(Value::as_array).map(Vec::len),
-                "offset": source.get("offset").cloned().unwrap_or(Value::Null),
-                "next_offset": source.get("next_offset").cloned().unwrap_or(Value::Null),
-                "truncated": source.get("truncated").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "attach_agent_endpoint" | "detach_agent_endpoint" => output.as_object().map(|source| {
-            json!({
-                "endpoint_id": output.pointer("/endpoint/endpoint_id").cloned().unwrap_or(Value::Null),
-                "agent_id": output.pointer("/endpoint/agent_id").cloned().unwrap_or(Value::Null),
-                "created": source.get("created").cloned().unwrap_or(Value::Null),
-                "replayed": source.get("replayed").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "create_conversation" => output.as_object().map(|source| {
-            json!({
-                "conversation_id": output.pointer("/conversation/conversation/conversation_id").cloned().unwrap_or(Value::Null),
-                "participant_count": output.pointer("/conversation/participants").and_then(Value::as_array).map(Vec::len),
-                "created": source.get("created").cloned().unwrap_or(Value::Null),
-                "replayed": source.get("replayed").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "list_conversations" => output.as_object().map(|source| {
-            json!({
-                "total_count": source.get("total_count").cloned().unwrap_or(Value::Null),
-                "returned_count": source.get("conversations").and_then(Value::as_array).map(Vec::len),
-                "offset": source.get("offset").cloned().unwrap_or(Value::Null),
-                "next_offset": source.get("next_offset").cloned().unwrap_or(Value::Null),
-                "truncated": source.get("truncated").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "read_conversation" => output.as_object().map(|source| {
-            json!({
-                "conversation_id": output.pointer("/conversation/conversation_id").cloned().unwrap_or(Value::Null),
-                "participant_count": source.get("participants").and_then(Value::as_array).map(Vec::len),
-                "message_count": source.get("messages").and_then(Value::as_array).map(Vec::len),
-                "after_seq": source.get("after_seq").cloned().unwrap_or(Value::Null),
-                "next_after_seq": source.get("next_after_seq").cloned().unwrap_or(Value::Null),
-                "truncated": source.get("truncated").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "post_conversation_message" => output.as_object().map(|source| {
-            json!({
-                "message_id": output.pointer("/message/message_id").cloned().unwrap_or(Value::Null),
-                "conversation_id": output.pointer("/message/conversation_id").cloned().unwrap_or(Value::Null),
-                "seq": output.pointer("/message/seq").cloned().unwrap_or(Value::Null),
-                "delivery_count": output.pointer("/message/deliveries").and_then(Value::as_array).map(Vec::len),
-                "replayed": source.get("replayed").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "list_agent_inbox" => output.as_object().map(|source| {
-            json!({
-                "agent_id": source.get("agent_id").cloned().unwrap_or(Value::Null),
-                "total_queued_count": source.get("total_queued_count").cloned().unwrap_or(Value::Null),
-                "returned_count": source.get("deliveries").and_then(Value::as_array).map(Vec::len),
-                "after_delivery_order": source.get("after_delivery_order").cloned().unwrap_or(Value::Null),
-                "next_after_delivery_order": source.get("next_after_delivery_order").cloned().unwrap_or(Value::Null),
-                "truncated": source.get("truncated").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "consume_agent_deliveries" => output.as_object().map(|source| {
-            json!({
-                "agent_id": source.get("agent_id").cloned().unwrap_or(Value::Null),
-                "consumed_count": source.get("consumed_delivery_ids").and_then(Value::as_array).map(Vec::len),
-                "already_consumed_count": source.get("already_consumed_delivery_ids").and_then(Value::as_array).map(Vec::len),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "consume_agent_wake" => output.as_object().map(|source| {
-            json!({
-                "wake_id": source.get("wake_id").cloned().unwrap_or(Value::Null),
-                "target_agent_id": source.get("target_agent_id").cloned().unwrap_or(Value::Null),
-                "state": source.get("state").cloned().unwrap_or(Value::Null),
-                "already_consumed": source.get("already_consumed").cloned().unwrap_or(Value::Null),
-                "consumed_at_unix_ms": source.get("consumed_at_unix_ms").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "memory_search" => selected(
-            output,
-            &[
-                "catalog_revision",
-                "total_count",
-                "returned_count",
-                "offset",
-                "next_offset",
-                "truncated",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "memory_read" => output.as_object().map(|source| {
-            json!({
-                "memory_id": source.get("memory_id").cloned().unwrap_or(Value::Null),
-                "memory_key": source.get("memory_key").cloned().unwrap_or(Value::Null),
-                "revision": source.get("revision").cloned().unwrap_or(Value::Null),
-                "bootstrap": source.get("bootstrap").cloned().unwrap_or(Value::Null),
-                "priority": source.get("priority").cloned().unwrap_or(Value::Null),
-                "returned_body_bytes": source.get("body").and_then(Value::as_str).map(str::len),
-                "error_kind": source.get("error_kind").cloned().unwrap_or(Value::Null),
-                "state_changed": source.get("state_changed").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "memory_set" => selected(
-            output,
-            &[
-                "memory_id",
-                "memory_key",
-                "old_revision",
-                "revision",
-                "created",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "memory_delete" => selected(
-            output,
-            &[
-                "memory_id",
-                "memory_key",
-                "revision",
-                "deleted",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "memory_scope_list" => selected(
-            output,
-            &[
-                "total_count",
-                "returned_count",
-                "truncated",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "memory_scope_purge" => selected(
-            output,
-            &[
-                "memory_scope_id",
-                "catalog_revision",
-                "current_catalog_revision",
-                "purged_count",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "skill_list" => selected(
-            output,
-            &[
-                "catalog_revision",
-                "total_count",
-                "returned_count",
-                "offset",
-                "next_offset",
-                "truncated",
-                "invalid_count",
-                "discovery_truncated",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "skill_read_file" => selected(
-            output,
-            &[
-                "skill_id",
-                "definition_revision",
-                "package_revision",
-                "path",
-                "sha256",
-                "start_line",
-                "end_line",
-                "returned_lines",
-                "has_more",
-                "next_start_line",
-                "error_kind",
-                "state_changed",
-            ],
-        ),
-        "git_status" if output.get("status_excerpt").is_some() => selected(
-            output,
-            &["clean", "status_excerpt", "status_truncated", "exit_code"],
-        ),
-        "git_status" => output.as_object().map(|source| {
-            let stdout = source
-                .get("stdout")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let status_excerpt = validation_excerpt(stdout);
-            json!({
-                "clean": stdout.trim().is_empty(),
-                "status_excerpt": status_excerpt.text,
-                "status_truncated": status_excerpt.filtered,
-                "exit_code": source.get("exit_code").cloned().unwrap_or(Value::Null),
-            })
-        }),
-        "git_log" => selected(output, &["commits", "next_skip", "truncated"]),
-        "git_diff_summary" | "show_changes" => selected(
-            output,
-            &[
-                "clean",
-                "branch",
-                "head",
-                "upstream",
-                "ahead",
-                "behind",
-                "counts",
-                "changed_files",
-            ],
-        ),
-        _ => None,
-    };
-    summary.map(|value| redact_and_bound_value(&value))
-}
 pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value) -> Option<Value> {
-    if !is_cargo_validation_tool(tool_name)
-        && !matches!(
-            tool_name,
-            "run_process" | "run_script" | "run_shell" | "run_job"
-        )
-    {
-        return None;
-    }
+    let execution_policy = execution_policy_for_tool(tool_name)?;
     let stdout_value = output.get("stdout_tail")?;
     let stderr_value = output.get("stderr_tail")?;
     let stdout = stdout_value.as_str()?;
@@ -1479,13 +1126,13 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
         "shell": output
             .get("shell")
             .cloned()
-            .unwrap_or_else(|| {
-                if tool_name == "run_process" {
+            .unwrap_or_else(|| match execution_policy.shell {
+                webcodex_tool_contracts::ToolAuditExecutionShell::Output => Value::Null,
+                webcodex_tool_contracts::ToolAuditExecutionShell::DirectArgv => {
                     Value::String("direct_argv".to_string())
-                } else if tool_name == "run_script" {
+                }
+                webcodex_tool_contracts::ToolAuditExecutionShell::ScriptLanguage => {
                     output.get("language").cloned().unwrap_or(Value::Null)
-                } else {
-                    Value::Null
                 }
             }),
         "executor": output.get("executor").cloned().unwrap_or(Value::Null),
@@ -1493,8 +1140,9 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
         "validation_tool": output.get("validation_tool").cloned().unwrap_or(Value::Null),
     });
     if matches!(
-        tool_name,
-        "cargo_test" | "go_test" | "run_process" | "run_script" | "run_shell" | "run_job"
+        execution_policy.detail,
+        webcodex_tool_contracts::ToolAuditExecutionDetail::TestCounts
+            | webcodex_tool_contracts::ToolAuditExecutionDetail::TestAssertions
     ) {
         if output.get("tests_detected").is_some() {
             summary["tests_detected"] = cargo_test_tests_detected(output);
@@ -1512,7 +1160,8 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
             summary["zero_tests_run"] = cargo_test_zero_tests_run(output);
         }
     }
-    if tool_name == "cargo_test" {
+    if execution_policy.detail == webcodex_tool_contracts::ToolAuditExecutionDetail::TestAssertions
+    {
         if let Some(require_tests) = output.get("require_tests").and_then(Value::as_bool) {
             summary["require_tests"] = json!(require_tests);
         }
@@ -1531,14 +1180,7 @@ pub(super) fn sanitize_persisted_validation_output_summary(
     tool_name: &str,
     value: &Value,
 ) -> Option<Value> {
-    if !is_cargo_validation_tool(tool_name)
-        && !matches!(
-            tool_name,
-            "run_process" | "run_script" | "run_shell" | "run_job"
-        )
-    {
-        return None;
-    }
+    let execution_policy = execution_policy_for_tool(tool_name)?;
     let object = value.as_object()?;
     let stdout = object
         .get("stdout_tail_excerpt")
@@ -1579,8 +1221,9 @@ pub(super) fn sanitize_persisted_validation_output_summary(
         "validation_tool": object.get("validation_tool").and_then(Value::as_str),
     });
     if matches!(
-        tool_name,
-        "cargo_test" | "go_test" | "run_process" | "run_script" | "run_shell" | "run_job"
+        execution_policy.detail,
+        webcodex_tool_contracts::ToolAuditExecutionDetail::TestCounts
+            | webcodex_tool_contracts::ToolAuditExecutionDetail::TestAssertions
     ) {
         if object.contains_key("tests_detected") {
             summary["tests_detected"] = persisted_cargo_test_tests_detected(object);
@@ -1598,7 +1241,8 @@ pub(super) fn sanitize_persisted_validation_output_summary(
             summary["zero_tests_run"] = persisted_cargo_test_zero_tests_run(object);
         }
     }
-    if tool_name == "cargo_test" {
+    if execution_policy.detail == webcodex_tool_contracts::ToolAuditExecutionDetail::TestAssertions
+    {
         if let Some(require_tests) = object.get("require_tests").and_then(Value::as_bool) {
             summary["require_tests"] = json!(require_tests);
         }
@@ -1639,13 +1283,6 @@ fn sanitized_test_count_assertion(value: Option<&Value>) -> Option<Value> {
             "reason_code": reason_code,
         })
     })
-}
-
-pub(super) fn is_cargo_validation_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test"
-    )
 }
 
 pub(super) fn cargo_test_tests_detected(output: &Value) -> Value {

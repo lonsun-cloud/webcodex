@@ -2,7 +2,9 @@ use super::config::{
     default_true, project_registry_dir, validate_shell_profile_name, RunnerConfig, RunnerPolicy,
 };
 use super::shell::canonicalize_existing;
-use crate::runner_protocol::{RunnerProjectSummary, RunnerRequest};
+use crate::runner_protocol::RunnerProjectSummary;
+#[cfg(test)]
+use crate::runner_protocol::RunnerRequest;
 use crate::{err_cmd, ok_cmd, write_created_file};
 use crate::{CommandResult, CreatedProjectPaths};
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,9 @@ use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use webcodex_core::runner_operation::RunnerOperation;
+use webcodex_core::runner_operation::{RunnerProjectOperation, RunnerProjectOperationKind};
 use webcodex_process::{GracefulTermination, ManagedChild};
 use webcodex_runner_config::paths::paths_equal;
 
@@ -773,19 +778,63 @@ impl RunnerProjectCache {
     }
 }
 
-/// Windows-only fail-closed rule: project roots must be on a local disk drive
-/// (`C:\repo`, `D:\repo`, or the canonicalized `\\?\C:\repo` form). UNC
-/// (`\\server\share\repo`), verbatim-UNC (`\\?\UNC\...`), device-namespace
-/// (`\\.\...`) and every other non-disk Windows path prefix is rejected with
-/// the stable `unc_project_path_unsupported` error before any filesystem
-/// access happens.
+/// Windows-only raw/canonical namespace fence. Local disks plus UNC and
+/// verbatim-UNC shares may proceed; device namespaces and generic verbatim
+/// namespaces fail closed with a stable error before filesystem access.
 ///
 /// The shared `webcodex_runner_config::paths::validate_project_path_ingress`
 /// owns the grammar-based prefix rule; it never falls back to a string
 /// `starts_with` check.
 fn validate_windows_project_root(path: &Path) -> Result<(), &'static str> {
+    if webcodex_runner_config::paths::project_path_has_parent_traversal(path) {
+        return Err("path_outside_allowed_roots");
+    }
     webcodex_runner_config::paths::validate_project_path_ingress(path)
-        .map_err(|_| "unc_project_path_unsupported")
+        .map_err(|_| "windows_project_path_unsupported")
+}
+
+/// Before a model-facing request dereferences a raw Windows network path, require
+/// it to fall under Runner authority that was already configured by the user.
+/// This prevents an untrusted `\\server\share` spelling from triggering SMB I/O
+/// (and possible OS authentication) merely to discover that policy rejects it.
+fn validate_model_network_project_ingress_authority(
+    policy: &RunnerPolicy,
+    path: &Path,
+) -> Result<(), &'static str> {
+    #[cfg(windows)]
+    {
+        if !webcodex_runner_config::paths::is_windows_network_share_path(path) {
+            return Ok(());
+        }
+        // Containment below is lexical: a parent component could escape an
+        // authorized directory before the canonical policy gets a chance to run.
+        if webcodex_runner_config::paths::project_path_has_parent_traversal(path) {
+            return Err("path_outside_allowed_roots");
+        }
+        if policy.allowed_roots.iter().any(|root| {
+            root.is_absolute() && webcodex_runner_config::paths::path_is_within(path, root)
+        }) {
+            return Ok(());
+        }
+        // A configured mapped drive may canonicalize to the same UNC share. It is
+        // safe to resolve configured roots here because those roots are already
+        // user-authorized; never canonicalize the untrusted target before this gate.
+        let canonical_roots =
+            webcodex_runner_config::paths::canonicalize_usable_allowed_roots(&policy.allowed_roots);
+        if canonical_roots
+            .iter()
+            .any(|root| webcodex_runner_config::paths::path_is_within(path, root))
+        {
+            return Ok(());
+        }
+        return Err("path_outside_allowed_roots");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (policy, path);
+        Ok(())
+    }
 }
 
 /// Escape a string for use as a TOML basic string (double-quoted). NUL is
@@ -1197,7 +1246,7 @@ fn choose_auto_project_id(
 }
 
 fn path_resolution_success(
-    request: &RunnerRequest,
+    client_id: &str,
     project: &RunnerProjectFile,
     canonical_path: &Path,
     outcome: &'static str,
@@ -1205,9 +1254,9 @@ fn path_resolution_success(
     project_record_path: Option<&Path>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "id": format!("agent:{}:{}", request.client_id, project.id),
+        "id": format!("agent:{}:{}", client_id, project.id),
         "agent_project_id": project.id,
-        "client_id": request.client_id,
+        "client_id": client_id,
         "name": project.name,
         "path": canonical_path.to_string_lossy(),
         "kind": project_wire_kind(project),
@@ -1229,7 +1278,7 @@ fn path_resolution_success(
 
 fn existing_path_resolution_result(
     start: Instant,
-    request: &RunnerRequest,
+    client_id: &str,
     canonical_path: &Path,
     matches: Vec<RunnerProjectFile>,
 ) -> Option<CommandResult> {
@@ -1259,7 +1308,7 @@ fn existing_path_resolution_result(
     Some(ok_cmd(
         start,
         path_resolution_success(
-            request,
+            client_id,
             &project,
             canonical_path,
             "reused_existing_registration",
@@ -1272,10 +1321,11 @@ fn existing_path_resolution_result(
 /// Resolve an existing Runner registration by canonical path or atomically
 /// persist a new one. This is an internal Server↔Runner operation, not a
 /// model-visible runtime tool.
-pub(crate) fn handle_resolve_or_register_project(
+pub(crate) fn handle_resolve_or_register_project_operation(
     policy: &RunnerPolicy,
     project_registry_dir: &Path,
-    request: &RunnerRequest,
+    client_id: &str,
+    operation: &RunnerProjectOperation,
 ) -> CommandResult {
     let start = Instant::now();
     let _registry_guard = match project_registry_write_lock().lock() {
@@ -1289,10 +1339,8 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
-    let payload = match request
-        .stdin
-        .as_deref()
-        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+    let payload = match serde_json::from_str::<serde_json::Value>(&operation.payload)
+        .ok()
         .and_then(|payload| payload.as_object().cloned())
     {
         Some(payload) => payload,
@@ -1326,10 +1374,20 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
-    // The raw input path is checked before any filesystem access so a UNC
-    // path is rejected as `unc_project_path_unsupported` even when the share
-    // is unreachable (which would otherwise surface as `project_path_not_found`).
+    // Reject unsupported namespaces before filesystem access. Raw UNC/VerbatimUNC
+    // inputs must also be covered by pre-existing Runner authority before they may
+    // trigger SMB I/O; local CLI/Desktop onboarding owns any authority extension.
     if let Err(error_kind) = validate_windows_project_root(Path::new(path)) {
+        return structured_project_error_cmd(
+            start,
+            error_kind,
+            false,
+            serde_json::json!({"field": "path"}),
+        );
+    }
+    if let Err(error_kind) =
+        validate_model_network_project_ingress_authority(policy, Path::new(path))
+    {
         return structured_project_error_cmd(
             start,
             error_kind,
@@ -1348,9 +1406,8 @@ pub(crate) fn handle_resolve_or_register_project(
             )
         }
     };
-    // The canonical form is checked too: Windows canonicalization rewrites
-    // reachable UNC paths into `\\?\UNC\...`, which the raw check may not
-    // have seen verbatim.
+    // Re-check the canonical form so canonicalization cannot introduce a device
+    // or other unsupported Windows namespace. VerbatimUNC remains supported.
     if let Err(error_kind) = validate_windows_project_root(&canonical_path) {
         return structured_project_error_cmd(
             start,
@@ -1391,7 +1448,8 @@ pub(crate) fn handle_resolve_or_register_project(
         }
     };
     let matches = projects_matching_canonical_path(&projects, &canonical_path);
-    if let Some(result) = existing_path_resolution_result(start, request, &canonical_path, matches)
+    if let Some(result) =
+        existing_path_resolution_result(start, client_id, &canonical_path, matches)
     {
         return result;
     }
@@ -1427,7 +1485,7 @@ pub(crate) fn handle_resolve_or_register_project(
                 if let Ok(projects) = load_project_files_for_path_resolution(project_registry_dir) {
                     let matches = projects_matching_canonical_path(&projects, &canonical_path);
                     if let Some(result) =
-                        existing_path_resolution_result(start, request, &canonical_path, matches)
+                        existing_path_resolution_result(start, client_id, &canonical_path, matches)
                     {
                         return result;
                     }
@@ -1462,7 +1520,7 @@ pub(crate) fn handle_resolve_or_register_project(
     ok_cmd(
         start,
         path_resolution_success(
-            request,
+            client_id,
             &project,
             &canonical_path,
             "auto_registered",
@@ -1632,7 +1690,7 @@ fn managed_worktree_project_toml(
 
 fn managed_worktree_success(
     start: Instant,
-    request: &RunnerRequest,
+    client_id: &str,
     project: &RunnerProjectFile,
     worktree: &Path,
     base_ref: &str,
@@ -1645,9 +1703,9 @@ fn managed_worktree_success(
     ok_cmd(
         start,
         serde_json::json!({
-            "id": format!("agent:{}:{}", request.client_id, project.id),
+            "id": format!("agent:{}:{}", client_id, project.id),
             "agent_project_id": project.id,
-            "client_id": request.client_id,
+            "client_id": client_id,
             "name": project.name,
             "path": worktree.to_string_lossy(),
             "kind": project_wire_kind(project),
@@ -1674,7 +1732,7 @@ fn resume_managed_worktree(
     start: Instant,
     policy: &RunnerPolicy,
     project_registry_dir: &Path,
-    request: &RunnerRequest,
+    client_id: &str,
     source_root: &Path,
     source_dirty: bool,
     requested_base_ref: Option<&str>,
@@ -1832,7 +1890,7 @@ fn resume_managed_worktree(
         .unwrap_or(requested_base_ref.unwrap_or("HEAD"));
     managed_worktree_success(
         start,
-        request,
+        client_id,
         &project,
         &worktree,
         projected_base_ref,
@@ -1847,10 +1905,11 @@ fn resume_managed_worktree(
 /// Internal Server↔Runner operation that owns Git/ref/path semantics for managed
 /// worktrees. It is intentionally not model-visible; successful output is fed
 /// back through the ordinary registered runtime Project authority path.
-pub(crate) fn handle_prepare_managed_worktree(
+pub(crate) fn handle_prepare_managed_worktree_operation(
     policy: &RunnerPolicy,
     project_registry_dir: &Path,
-    request: &RunnerRequest,
+    client_id: &str,
+    operation: &RunnerProjectOperation,
 ) -> CommandResult {
     let start = Instant::now();
     let _registry_guard = match project_registry_write_lock().lock() {
@@ -1859,10 +1918,8 @@ pub(crate) fn handle_prepare_managed_worktree(
             return managed_worktree_error(start, "operation_failed", false, None, None, None)
         }
     };
-    let Some(payload) = request
-        .stdin
-        .as_deref()
-        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+    let Some(payload) = serde_json::from_str::<serde_json::Value>(&operation.payload)
+        .ok()
         .and_then(|payload| payload.as_object().cloned())
     else {
         return managed_worktree_error(start, "invalid_request", false, None, None, None);
@@ -1927,6 +1984,11 @@ pub(crate) fn handle_prepare_managed_worktree(
             None,
         );
     }
+    if let Err(error_kind) =
+        validate_model_network_project_ingress_authority(policy, Path::new(path))
+    {
+        return managed_worktree_error(start, error_kind, false, Some(&base_ref), None, None);
+    }
     let source = match canonicalize_existing(Path::new(path)) {
         Ok(source) if source.is_dir() && source.to_str().is_some() => source,
         _ => {
@@ -1986,7 +2048,7 @@ pub(crate) fn handle_prepare_managed_worktree(
             start,
             policy,
             project_registry_dir,
-            request,
+            client_id,
             &source_root,
             source_dirty,
             requested_base_ref.as_deref(),
@@ -2297,7 +2359,7 @@ pub(crate) fn handle_prepare_managed_worktree(
         }
         return managed_worktree_success(
             start,
-            request,
+            client_id,
             &project,
             &canonical_worktree,
             &base_ref,
@@ -2380,7 +2442,7 @@ pub(crate) fn handle_prepare_managed_worktree(
     };
     managed_worktree_success(
         start,
-        request,
+        client_id,
         &project,
         &canonical_worktree,
         &base_ref,
@@ -2469,28 +2531,23 @@ fn unregister_project_config(path: &Path) -> Result<(), ProjectUnregisterError> 
 
 /// Structured, non-shell project lifecycle mutation. Unregister only removes
 /// the registry TOML and never touches the project path or Git data.
-pub(crate) fn handle_project_lifecycle_op(
+pub(crate) fn handle_project_lifecycle_operation(
     policy: &RunnerPolicy,
     project_registry_dir: &Path,
-    request: &RunnerRequest,
+    operation: &RunnerProjectOperation,
 ) -> CommandResult {
     let _registry_guard = match project_registry_write_lock().lock() {
         Ok(guard) => guard,
         Err(_) => return project_error_cmd(Instant::now(), "operation_failed"),
     };
     let start = Instant::now();
-    let action = request
-        .kind
-        .strip_prefix("project_lifecycle_")
-        .unwrap_or("");
-    if !matches!(action, "enable" | "disable" | "unregister") {
-        return project_error_cmd(start, "unsupported_runner_version");
-    }
-    let payload: serde_json::Value = match request
-        .stdin
-        .as_deref()
-        .and_then(|v| serde_json::from_str(v).ok())
-    {
+    let action = match operation.kind {
+        RunnerProjectOperationKind::LifecycleEnable => "enable",
+        RunnerProjectOperationKind::LifecycleDisable => "disable",
+        RunnerProjectOperationKind::LifecycleUnregister => "unregister",
+        _ => return project_error_cmd(start, "unsupported_runner_version"),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&operation.payload).ok() {
         Some(v) => v,
         None => return project_error_cmd(start, "invalid_request"),
     };
@@ -2657,7 +2714,7 @@ fn validate_recovered_create_side_effects(
 }
 
 fn recovered_project_result(
-    kind: &str,
+    create: bool,
     runtime_id: &str,
     client_id: &str,
     project: &RunnerProjectFile,
@@ -2672,8 +2729,8 @@ fn recovered_project_result(
         "created_directory": false, "created_config": false, "overwritten": false,
         "allow_patch": project.allow_patch, "template": template,
         "git_initialized": git_init, "recovered": true, "changed": false,
-        "operation": if kind == "create_project" { "create" } else { "register" },
-        "outcome": if kind == "create_project" { "created" } else { "registered" },
+        "operation": if create { "create" } else { "register" },
+        "outcome": if create { "created" } else { "registered" },
         "revision": project_revision(project),
     })
 }
@@ -2683,19 +2740,21 @@ fn recovered_project_result(
 /// policy, writes `project_registry_dir/<id>.toml` atomically (and for
 /// `create_project` creates the directory / templates / optional git init),
 /// and returns structured JSON in `CommandResult.stdout`.
-pub(crate) fn handle_project_op(
+pub(crate) fn handle_project_operation(
     policy: &RunnerPolicy,
     project_registry_dir: &Path,
-    request: &RunnerRequest,
+    client_id: &str,
+    operation: &RunnerProjectOperation,
 ) -> CommandResult {
     let _registry_guard = match project_registry_write_lock().lock() {
         Ok(guard) => guard,
         Err(_) => return project_error_cmd(Instant::now(), "operation_failed"),
     };
     let start = Instant::now();
-    let kind = request.kind.as_str();
-    let payload = match request.stdin.as_deref() {
-        Some(s) if !s.is_empty() => s,
+    let kind = operation.kind.wire_kind();
+    let create = operation.kind == RunnerProjectOperationKind::Create;
+    let payload = match operation.payload.as_str() {
+        s if !s.is_empty() => s,
         _ => {
             return CommandResult {
                 exit_code: None,
@@ -2769,14 +2828,26 @@ pub(crate) fn handle_project_op(
     if path.is_empty() || path.contains('\0') || !Path::new(&path).is_absolute() {
         return err_cmd(start, "path must be a non-empty absolute path".to_string());
     }
-    // Windows supports local-drive project roots only; UNC and other
-    // non-disk prefixes fail closed here, before the directory is touched,
-    // so an unreachable share cannot masquerade as a missing directory.
+    // Existing project registration accepts local disks and network shares;
+    // special Windows namespaces still fail before filesystem access.
     if let Err(error_kind) = validate_windows_project_root(Path::new(&path)) {
         return project_error_cmd(start, error_kind);
     }
+    if !create {
+        if let Err(error_kind) =
+            validate_model_network_project_ingress_authority(policy, Path::new(&path))
+        {
+            return project_error_cmd(start, error_kind);
+        }
+    }
+    #[cfg(windows)]
+    if create && webcodex_runner_config::paths::is_windows_network_share_path(Path::new(&path)) {
+        // Network project creation is deliberately outside this phase. Existing
+        // network directories can be registered when RunnerPolicy already grants them.
+        return project_error_cmd(start, "windows_project_path_unsupported");
+    }
 
-    let client_id = request.client_id.clone();
+    let client_id = client_id.to_string();
     let runtime_id = format!("agent:{}:{}", client_id, id);
 
     let toml_content = build_project_toml(&id, &name, &path, &description, allow_patch);
@@ -2793,11 +2864,11 @@ pub(crate) fn handle_project_op(
         .get("adopt_existing_empty")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if kind == "create_project" && template != "empty" && template != "basic" {
+    if create && template != "empty" && template != "basic" {
         return project_error_cmd(start, "invalid_request");
     }
 
-    if kind == "register_project" {
+    if !create {
         // The directory must exist and be a directory.
         let path_buf = PathBuf::from(&path);
         let canonical = match path_buf.canonicalize() {
@@ -2834,7 +2905,7 @@ pub(crate) fn handle_project_op(
                     return ok_cmd(
                         start,
                         recovered_project_result(
-                            kind,
+                            create,
                             &runtime_id,
                             &client_id,
                             &project,
@@ -2920,6 +2991,12 @@ pub(crate) fn handle_project_op(
     if let Err(error_kind) = validate_windows_project_root(&canonical_for_policy) {
         return project_error_cmd(start, error_kind);
     }
+    #[cfg(windows)]
+    if webcodex_runner_config::paths::is_windows_network_share_path(&canonical_for_policy) {
+        // A mapped drive may canonicalize to VerbatimUNC. Keep create_project
+        // local-only even when the raw spelling looked like a drive letter.
+        return project_error_cmd(start, "windows_project_path_unsupported");
+    }
     if validate_project_path_policy(policy, &canonical_for_policy).is_err() {
         return project_error_cmd(start, "path_outside_allowed_roots");
     }
@@ -2941,7 +3018,7 @@ pub(crate) fn handle_project_op(
                 return ok_cmd(
                     start,
                     recovered_project_result(
-                        kind,
+                        create,
                         &runtime_id,
                         &client_id,
                         &project,
@@ -3073,6 +3150,81 @@ pub(crate) fn handle_project_op(
         "operation": "create", "outcome": "created", "changed": true, "recovered": false,
     });
     ok_cmd(start, result)
+}
+
+#[cfg(test)]
+fn test_project_operation(
+    request: &RunnerRequest,
+) -> Result<RunnerProjectOperation, CommandResult> {
+    match request.decode_operation() {
+        Ok(RunnerOperation::Project(operation)) => Ok(operation),
+        _ => Err(project_error_cmd(
+            Instant::now(),
+            "unsupported_runner_version",
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn handle_project_op(
+    policy: &RunnerPolicy,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
+) -> CommandResult {
+    let operation = match test_project_operation(request) {
+        Ok(operation) => operation,
+        Err(result) => return result,
+    };
+    handle_project_operation(policy, project_registry_dir, &request.client_id, &operation)
+}
+
+#[cfg(test)]
+pub(crate) fn handle_resolve_or_register_project(
+    policy: &RunnerPolicy,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
+) -> CommandResult {
+    let operation = match test_project_operation(request) {
+        Ok(operation) => operation,
+        Err(result) => return result,
+    };
+    handle_resolve_or_register_project_operation(
+        policy,
+        project_registry_dir,
+        &request.client_id,
+        &operation,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn handle_prepare_managed_worktree(
+    policy: &RunnerPolicy,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
+) -> CommandResult {
+    let operation = match test_project_operation(request) {
+        Ok(operation) => operation,
+        Err(result) => return result,
+    };
+    handle_prepare_managed_worktree_operation(
+        policy,
+        project_registry_dir,
+        &request.client_id,
+        &operation,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn handle_project_lifecycle_op(
+    policy: &RunnerPolicy,
+    project_registry_dir: &Path,
+    request: &RunnerRequest,
+) -> CommandResult {
+    let operation = match test_project_operation(request) {
+        Ok(operation) => operation,
+        Err(result) => return result,
+    };
+    handle_project_lifecycle_operation(policy, project_registry_dir, &operation)
 }
 
 #[cfg(test)]

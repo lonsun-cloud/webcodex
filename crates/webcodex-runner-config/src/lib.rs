@@ -25,6 +25,9 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 /// 30 seconds leaves one full interval of scheduling/network slack.
 pub const MAX_POLL_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3600;
+/// Default Runner policy for captured/presented bytes in each stdout or stderr
+/// stream. It is a per-stream execution-retention policy, not a protocol
+/// request/body/frame ceiling and not the model-facing ToolResult ceiling.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Config value selecting the polling transport (HTTP `/api/shell/agent/poll`).
 pub const TRANSPORT_POLLING: &str = "polling";
@@ -264,6 +267,13 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             structured_go_test_packages: false,
             structured_process_argv: true,
             structured_script_payload: true,
+            // JavaScript is an additive typed-script semantic implemented by
+            // the running binary. Static config must not make an older binary
+            // appear to understand the newer language variant.
+            structured_script_javascript: false,
+            // TypeScript is another additive running-binary semantic. Generated
+            // static config must not claim that older Runners understand it.
+            structured_script_typescript: false,
             // Internal generated-program execution is a running-binary
             // capability and must fail closed across mixed-version rollout.
             internal_posix_script: false,
@@ -278,6 +288,9 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             managed_worktree: false,
             // Runner-global Skill store support is runtime-only and never
             // inferred from project/file capabilities in generated config.
+            // Configured live Skill roots are Runner-owned runtime config and
+            // require an explicit running-binary capability.
+            configured_skill_roots_read: false,
             skill_store_read: false,
             skill_store_manage: false,
             // Desktop observation is a runtime/platform capability and is never

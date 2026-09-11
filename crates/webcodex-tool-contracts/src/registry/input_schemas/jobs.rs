@@ -48,7 +48,7 @@ pub fn run_process_input_schema() -> Value {
         (
             "executable",
             "string",
-            "Native executable name or path. It is executed directly and never parsed as shell text. Windows .cmd/.bat files are rejected because they require shell semantics.",
+            "Executable name or path, resolved through the Runner execution environment. Native executables use literal argv. Windows .cmd/.bat shims use Runner-owned cmd.exe conversion with AutoRun and delayed expansion disabled; no model shell string. Batch paths/arguments reject quotes, %, !, ^, control characters and trailing backslashes before spawn; use a native runtime for these values. Batch command lines are limited to 8000 UTF-16 units and require a local drive cwd; UNC cwd is rejected before spawn.",
             true,
         ),
         (
@@ -163,7 +163,7 @@ pub fn run_script_input_schema() -> Value {
         (
             "language",
             "string",
-            "Required semantic script language. The Runner selects the concrete interpreter; Session default_shell never overrides this field.",
+            "Required semantic script language. JavaScript uses Runner-resolved Node.js with fixed .mjs ESM semantics. TypeScript uses Runner-resolved Node.js native erasable type stripping from a fixed .mts ESM file and requires Node.js 22.6.0 or newer. The Runner owns any runtime compatibility flags; callers cannot provide a runtime path or runtime flags. Session default_shell never overrides this field.",
             true,
         ),
         (
@@ -209,7 +209,8 @@ pub fn run_script_input_schema() -> Value {
             false,
         ),
     ]));
-    schema["properties"]["language"]["enum"] = json!(["sh", "bash", "powershell"]);
+    schema["properties"]["language"]["enum"] =
+        json!(["sh", "bash", "powershell", "javascript", "typescript"]);
     schema["properties"]["script"]["minLength"] = json!(1);
     schema["properties"]["script"]["maxLength"] = json!(SCRIPT_MAX_BYTES);
     schema["properties"]["args"]["maxItems"] = json!(SCRIPT_ARG_MAX_COUNT);

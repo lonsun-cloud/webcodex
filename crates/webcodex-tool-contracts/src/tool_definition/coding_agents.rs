@@ -20,6 +20,19 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             require_all_scopes(
                 def(
                     "coding_agent_start",
+                    super::ToolAuditPolicy::typed_fields(&[
+                        super::ToolAuditResultField::value("run_id"),
+                        super::ToolAuditResultField::value("project"),
+                        super::ToolAuditResultField::value("provider_id"),
+                        super::ToolAuditResultField::value("state"),
+                        super::ToolAuditResultField::value("execution_state"),
+                        super::ToolAuditResultField::value("cancel_requested"),
+                        super::ToolAuditResultField::pointer("terminal_stop_reason", "/terminal/stop_reason"),
+                        super::ToolAuditResultField::pointer("terminal_error_code", "/terminal/error_code"),
+                        super::ToolAuditResultField::pointer("terminal_completed_at", "/terminal/completed_at"),
+                        super::ToolAuditResultField::value("error_kind"),
+                        super::ToolAuditResultField::value("recovery_kind"),
+                    ]),
                     ModelVisible,
                     TOOL_CATEGORY_CODING_AGENT,
                     Some(CodingAgentRuns),
@@ -35,6 +48,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     NoPath,
                     true,
                     false,
+                    super::ToolSessionEvidencePolicy::NONE,
                 ),
                 &[CODING_AGENT_RUN, webcodex_core::authority::SCOPE_PROJECT_WRITE],
             ),
@@ -46,6 +60,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "coding_agent_observe",
+            super::ToolAuditPolicy::typed_semantic(
+                super::ToolAuditSemanticResultPolicy::CodingAgentObservation,
+            ),
             ModelVisible,
             TOOL_CATEGORY_CODING_AGENT,
             None,
@@ -61,6 +78,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Observe bounded normalized events and lifecycle for one existing CodingAgentRun. Return the opaque token for only-new follow-ups; history loss/reset is explicit. Observation never starts, retries, or resumes ACP work.",
         coding_agent_observe_input_schema,
@@ -69,6 +87,19 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "coding_agent_cancel",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("run_id"),
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("provider_id"),
+                super::ToolAuditResultField::value("state"),
+                super::ToolAuditResultField::value("execution_state"),
+                super::ToolAuditResultField::value("cancel_requested"),
+                super::ToolAuditResultField::pointer("terminal_stop_reason", "/terminal/stop_reason"),
+                super::ToolAuditResultField::pointer("terminal_error_code", "/terminal/error_code"),
+                super::ToolAuditResultField::pointer("terminal_completed_at", "/terminal/completed_at"),
+                super::ToolAuditResultField::value("error_kind"),
+                super::ToolAuditResultField::value("recovery_kind"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_CODING_AGENT,
             None,
@@ -86,6 +117,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
             ),
             "Request cancellation of one existing CodingAgentRun. This does not grant permission, retry a prompt, or create a replacement Run; observe the same run_id for authoritative terminal state.",
             coding_agent_cancel_input_schema,

@@ -5,10 +5,7 @@ use super::session_context::{
     add_session_hint, session_guard_denied_result, session_lifecycle_denied_result,
     session_project_mismatch_result, SessionProjectMismatch,
 };
-use super::{
-    permissions, session_context, sessions, tool_disabled_result_from_definition, ToolCall,
-    ToolResult, ToolRuntime,
-};
+use super::{permissions, session_context, sessions, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
 use serde_json::{json, Value};
@@ -862,7 +859,7 @@ impl ToolRuntime {
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
     ) -> ToolResult {
-        let (mut result, projection) = self
+        let (mut result, projection, _) = self
             .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
             call,
             auth,
@@ -895,8 +892,13 @@ impl ToolRuntime {
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
         protocol_capabilities: super::kernel::ToolProtocolCapabilities,
-    ) -> (ToolResult, ModelFacingProjectionPlan) {
+    ) -> (
+        ToolResult,
+        ModelFacingProjectionPlan,
+        super::window_activity::ToolCallCorrelation,
+    ) {
         let mut result_projection = ModelFacingProjectionPlan::capture(&call);
+        let mut correlation = super::window_activity::ToolCallCorrelation::default();
         // Edit usage telemetry retains only fixed safe classifications. For
         // apply_patch it captures the requested matching enum before the call is
         // moved, never the patch/path/content arguments.
@@ -912,6 +914,7 @@ impl ToolRuntime {
                 context_request.clone(),
                 material_capabilities,
                 protocol_capabilities,
+                &mut correlation,
                 &mut result_projection,
             )
             .await;
@@ -932,7 +935,7 @@ impl ToolRuntime {
         if let Some(guard) = edit_usage.as_mut() {
             guard.finish_with_result(&result);
         }
-        (result, result_projection)
+        (result, result_projection, correlation)
     }
 
     /// Everything the activity ledger needs from a call, captured before the
@@ -1045,6 +1048,7 @@ impl ToolRuntime {
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
         protocol_capabilities: super::kernel::ToolProtocolCapabilities,
+        correlation: &mut super::window_activity::ToolCallCorrelation,
         result_projection: &mut ModelFacingProjectionPlan,
     ) -> ToolResult {
         call = call
@@ -1122,6 +1126,13 @@ impl ToolRuntime {
         let activity_project = resolved_project
             .as_ref()
             .map(|resolved| resolved.resolved_id.clone());
+        correlation.resolved_project = activity_project.clone();
+        if let (Some(project), Some(trace_id)) = (
+            activity_project.as_deref(),
+            crate::tool_request_trace::current_active_trace_id(),
+        ) {
+            self.window_activity.update(&trace_id, None, Some(project));
+        }
         let context_projection_project = if context_request.is_empty() {
             None
         } else {
@@ -1252,37 +1263,6 @@ impl ToolRuntime {
                     call = call.with_session_execution_context(&execution_context);
                 }
             }
-        }
-        if let Some(mut result) = tool_disabled_result_from_definition(call.tool_name()) {
-            decorate_structured_execution_prestart_denial(
-                call.tool_name(),
-                &mut result,
-                "capability_unavailable",
-            );
-            if let Some(session_id) = session_id.as_deref() {
-                let session_start = self.sessions.record_tool_call_started_with_metadata(
-                    Some(session_id),
-                    transport,
-                    call.tool_name(),
-                    &call.session_log_arguments(),
-                    None,
-                    recorder_metadata.clone(),
-                    session_contract,
-                );
-                self.record_dispatch_session_result(
-                    &mut result,
-                    session_id,
-                    session_start,
-                    call.tool_name(),
-                    Some("tool_disabled"),
-                    auth,
-                    inner_model_facing_recording,
-                    inner_ack_observation.as_ref(),
-                    inner_ack_requested,
-                )
-                .await;
-            }
-            return result;
         }
         if let Some(session_id) = session_id.as_deref() {
             // Lifecycle denial is orthogonal to mode/guards and wins first.
@@ -1462,6 +1442,7 @@ impl ToolRuntime {
                 trusted_recording_session_id,
                 trusted_recording_session_project,
                 protocol_capabilities,
+                correlation,
             )
             .await;
         let permission = permission.filter(|_| {
@@ -1544,6 +1525,7 @@ impl ToolRuntime {
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
         protocol_capabilities: super::kernel::ToolProtocolCapabilities,
+        correlation: &mut super::window_activity::ToolCallCorrelation,
     ) -> ToolResult {
         match call {
             call @ (ToolCall::ListTools { .. }
@@ -1593,6 +1575,7 @@ impl ToolRuntime {
                     transport,
                     trusted_recording_session_id,
                     trusted_recording_session_project,
+                    correlation,
                 )
                 .await
             }

@@ -45,6 +45,83 @@ fn tool_definitions_cover_known_names_and_public_specs() {
 }
 
 #[test]
+fn every_runtime_tool_has_an_explicit_fail_closed_audit_contract() {
+    for definition in tool_definitions() {
+        assert_eq!(
+            runtime_tool_audit_policy(definition.name),
+            Some(definition.audit_policy()),
+            "{} audit policy must resolve only through ToolDefinition",
+            definition.name
+        );
+        assert!(
+            matches!(
+                definition.audit_policy().request,
+                ToolAuditRequestPolicy::Typed | ToolAuditRequestPolicy::TypedDropNullValues
+            ),
+            "{} request audit must use the typed canonical boundary",
+            definition.name
+        );
+        if let ToolAuditResultPolicy::Fields(fields) = definition.audit_policy().result {
+            assert!(
+                !fields.is_empty(),
+                "{} narrowed result audit must declare at least one bounded field",
+                definition.name
+            );
+        }
+        match definition.audit_policy().session_input {
+            ToolAuditSessionInputPolicy::OmitTopLevel(fields) => assert!(
+                !fields.is_empty(),
+                "{} Session input omission policy must name at least one field",
+                definition.name
+            ),
+            ToolAuditSessionInputPolicy::Bounded
+            | ToolAuditSessionInputPolicy::SearchProjectTexts
+            | ToolAuditSessionInputPolicy::ObserveJobs => {}
+        }
+        match definition.audit_policy().context {
+            ToolAuditContextPolicy::ResultProjection => assert!(
+                matches!(
+                    definition.audit_policy().result,
+                    ToolAuditResultPolicy::Fields(_)
+                ),
+                "{} may reuse Session context only from a bounded field result projection",
+                definition.name
+            ),
+            ToolAuditContextPolicy::Fields(fields) => assert!(
+                !fields.is_empty(),
+                "{} Session context policy must declare at least one bounded field",
+                definition.name
+            ),
+            ToolAuditContextPolicy::Omit | ToolAuditContextPolicy::WorkingTreeStatus => {}
+        }
+        if definition.audit_policy().execution.detail == ToolAuditExecutionDetail::Omit {
+            assert_eq!(
+                definition.audit_policy().execution.shell,
+                ToolAuditExecutionShell::Output,
+                "{} omitted execution evidence must not declare synthetic shell provenance",
+                definition.name
+            );
+        }
+    }
+
+    assert_eq!(
+        runtime_tool_audit_policy("coding_agent_observe").map(|policy| policy.result),
+        Some(ToolAuditResultPolicy::Semantic(
+            ToolAuditSemanticResultPolicy::CodingAgentObservation
+        ))
+    );
+    for name in ["git_commit_paths", "git_review_summary"] {
+        assert_eq!(
+            runtime_tool_audit_policy(name).map(|policy| policy.request),
+            Some(ToolAuditRequestPolicy::TypedDropNullValues),
+            "{name} must preserve legacy omission of invalid normalized commit values"
+        );
+    }
+    assert_eq!(runtime_tool_audit_policy("unknown_open_world_tool"), None);
+    assert_eq!(runtime_tool_audit_policy("start_coding_task"), None);
+}
+
+#[test]
 fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     let mut seen_ranks = std::collections::BTreeMap::new();
     for definition in tool_definitions() {
@@ -74,6 +151,22 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
             < apply_patch.adaptive_runtime_direct_rank()
     );
 
+    for (name, expected_rank) in [
+        ("import_conversation_files_to_project", 55),
+        ("export_project_artifact", 56),
+        ("run_shell", 75),
+    ] {
+        let definition = derived
+            .iter()
+            .copied()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("{name} must be adaptive-direct"));
+        assert_eq!(
+            definition.adaptive_runtime_direct_rank(),
+            Some(expected_rank)
+        );
+    }
+
     for name in [
         "runner_config_check",
         "runner_config_reload",
@@ -82,6 +175,13 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "session_shell_exec",
         "session_shell_status",
         "close_session_shell",
+        "run_script",
+        "save_project_artifact",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
         "go_test",
     ] {
         let definition = lookup_tool_definition(name).expect("model-visible long-tail definition");

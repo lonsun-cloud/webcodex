@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use webcodex_admin::ServerHttpOptions;
 
-use super::{
-    http_post_json_status, read_env_file_value, read_optional_token, validate_user_api_token,
-};
+use super::{call_runtime_tool_status, http_post_json_status, resolve_user_api_token};
 
 const DEFAULT_EXPECTED_TOOL_COUNT: u64 = 66;
 pub(crate) const DEFAULT_RUNNER_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -28,6 +26,13 @@ pub(crate) struct OpsSmokePreflightOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpsWindowsOptions {
+    pub(crate) common: OpsCommonOptions,
+    pub(crate) project: String,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpsRunnerOptions {
     pub(crate) common: OpsCommonOptions,
     pub(crate) client_id: String,
@@ -40,6 +45,7 @@ pub(crate) enum OpsCommand {
     Runners(OpsCommonOptions),
     Runner(OpsRunnerOptions),
     Projects(OpsCommonOptions),
+    Windows(OpsWindowsOptions),
     SmokePreflight(OpsSmokePreflightOptions),
 }
 
@@ -50,6 +56,7 @@ impl OpsCommand {
                 opts.strict
             }
             OpsCommand::Runner(opts) => opts.common.strict,
+            OpsCommand::Windows(opts) => opts.common.strict,
             OpsCommand::SmokePreflight(opts) => opts.common.strict,
         }
     }
@@ -194,6 +201,27 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 };
             render_ops_command_output(report, opts.json, render_ops_projects)
         }
+        OpsCommand::Windows(opts) => {
+            let token = resolve_ops_token(&opts.common)?;
+            let report = match fetch_ops_json_output(
+                &opts.common.server_url,
+                &opts.common.server_http,
+                "/api/runtime-console/windows",
+                token.as_deref(),
+                json!({"project": opts.project, "limit": opts.limit}),
+            )
+            .await
+            {
+                Ok(windows) => ops_windows_report(&opts.common.server_url, windows),
+                Err(failure) => ops_http_failure_report(
+                    &opts.common.server_url,
+                    "runtime_console_windows",
+                    failure,
+                    token.is_some(),
+                ),
+            };
+            render_ops_command_output(report, opts.common.json, render_ops_windows)
+        }
         OpsCommand::SmokePreflight(opts) => {
             let token = resolve_ops_token(&opts.common)?;
             let runtime_status = match fetch_ops_json_output(
@@ -329,35 +357,7 @@ fn render_ops_command_output(
 }
 
 fn resolve_ops_token(opts: &OpsCommonOptions) -> Result<Option<String>, String> {
-    if let Some(token) = &opts.token {
-        let token = token.trim().to_string();
-        if token.is_empty() {
-            return Err("--token cannot be empty".to_string());
-        }
-        validate_user_api_token(&token)?;
-        return Ok(Some(token));
-    }
-    if let Some(token) = read_optional_token(&opts.token_file, "--token-file")? {
-        validate_user_api_token(&token)?;
-        return Ok(Some(token));
-    }
-    if let Some(path) = &opts.env_file {
-        if let Some(token) = read_env_file_value(path, "WEBCODEX_TOKEN")? {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                validate_user_api_token(&token)?;
-                return Ok(Some(token));
-            }
-        }
-    }
-    if let Ok(token) = std::env::var("WEBCODEX_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            validate_user_api_token(&token)?;
-            return Ok(Some(token));
-        }
-    }
-    Ok(None)
+    resolve_user_api_token(&opts.token, &opts.token_file, &opts.env_file)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,15 +531,17 @@ async fn call_runtime_tool(
     tool: &str,
     params: Value,
 ) -> Result<Option<Value>, OpsHttpFailure> {
-    fetch_ops_json_output(
-        server_url,
-        server_http,
-        "/api/tools/call",
-        token,
-        json!({"tool": tool, "params": params}),
-    )
-    .await
-    .map(Some)
+    match call_runtime_tool_status(server_url, server_http, token, tool, params).await {
+        Ok((status, _content_type, Some(value))) if (200..300).contains(&status) => {
+            Ok(Some(output_payload(value)))
+        }
+        Ok((status, content_type, value)) => Err(OpsHttpFailure::from_response(
+            status,
+            content_type,
+            value.is_some(),
+        )),
+        Err(error) => Err(OpsHttpFailure::from_transport_error(error)),
+    }
 }
 
 fn output_payload(value: Value) -> Value {
@@ -820,6 +822,14 @@ pub(crate) fn ops_runner_report(
         verdict: verdict.finish(),
         summary,
         source: source_json(server_url, runtime_commit(runtime), "runtime_status"),
+    }
+}
+
+pub(crate) fn ops_windows_report(server_url: &str, windows: Value) -> OpsReport {
+    OpsReport {
+        verdict: OpsVerdict::pass().finish(),
+        summary: output_payload(windows),
+        source: source_json(server_url, None, "runtime_console_windows"),
     }
 }
 
@@ -1179,6 +1189,31 @@ pub(crate) fn render_ops_projects(report: &OpsReport, json_output: bool) -> Resu
             display_value(&project["safe_smoke_project"]),
             display_value(&project["allow_patch"]),
             display_value(&project["path"])
+        ));
+    }
+    out.push_str(&render_reasons(report));
+    Ok(out)
+}
+
+pub(crate) fn render_ops_windows(report: &OpsReport, json_output: bool) -> Result<String, String> {
+    if json_output {
+        return render_ops_json(report);
+    }
+    let mut out = render_overall_header(report);
+    out.push_str(&render_http_failure(report));
+    out.push_str("Windows:\n");
+    out.push_str(&format!(
+        "  returned: {}\n  total: {}\n  truncated: {}\n",
+        display_value(&report.summary["returned"]),
+        display_value(&report.summary["total"]),
+        display_value(&report.summary["truncated"]),
+    ));
+    for window in report.summary["windows"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  - last_seen_at_ms={} last_meaningful_activity_at_ms={} active_count={}\n",
+            display_value(&window["last_seen_at_ms"]),
+            display_value(&window["last_meaningful_activity_at_ms"]),
+            display_value(&window["active_count"]),
         ));
     }
     out.push_str(&render_reasons(report));

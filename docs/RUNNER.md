@@ -119,6 +119,59 @@ The runtime tools `register_project` and `create_project` let a client register
 an existing directory or create a new one on an online Runner, subject to the
 Runner's `allowed_roots` policy.
 
+## Skill sources
+
+`skill_list` presents one catalog while preserving three distinct ownership and
+lifecycle models:
+
+| Source | Location / owner | Trust | Version semantics |
+| --- | --- | --- | --- |
+| Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Live project content; no package revision. |
+| Configured live Runner Skill roots | Operator-selected absolute directories on the Runner host | `operator_configured_guidance` | Live read-only filesystem content; no install, activation, rollback, or package revision. |
+| Managed Runner Skill Store | Runner state under `runner-skills-v1` | `operator_installed_guidance` | Immutable package revisions with install, activation, removal, and rollback-oriented Store semantics. |
+
+Configured live roots are optional and have no implicit defaults. Each configured
+root contains normal Agent Skill packages directly:
+
+```toml
+[skills]
+roots = [
+    "/home/alice/.codex/skills",
+    "/home/alice/.agents/skills",
+    "/opt/company/agent-skills",
+]
+```
+
+On Windows, use absolute local paths; TOML literal strings are convenient for
+backslashes:
+
+```toml
+[skills]
+roots = [
+    'C:\Users\alice\.codex\skills',
+    'C:\Users\alice\.agents\skills',
+]
+```
+
+A root has the form `<root>/<package>/SKILL.md`, with optional package resources
+such as `references/`. These directories are read directly by the Runner. WebCodex
+does not copy them into the managed Store, and `skill_install`, `skill_activate`,
+and `skill_remove_revision` continue to mutate only that Store.
+
+The configured paths belong to the **Runner host**, even when the Server is on a
+different machine. They are not added to `[policy].allowed_roots`, do not grant
+ordinary Project file/shell/process tools access to those directories, and native
+root paths are not projected through the model-facing Skill catalog. Skill reads
+accept only an opaque `skill_id` plus a package-relative resource path; the Runner
+resolves the root from its trusted configuration and rejects traversal or link
+escapes.
+
+Skill files remain live: editing `SKILL.md` or a resource is visible to the next
+discovery/read without any reload. Changing the configured `roots` list is a
+hot-reloadable Runner configuration change: edit `runner.toml`, run
+`runner_config_check`, then `runner_config_reload` with the current generation.
+No Runner process restart is required.
+
 ## Local MCP providers
 
 The Runner can directly host persistent stdio MCP providers for WebCodex's built-in MCP gateway:
@@ -158,16 +211,36 @@ Unsupported protocol/content shapes fail closed instead of being silently transl
 
 ## Shell profiles
 
-By default, `run_shell` and `run_job` do not keep a persistent shell session.
-They prepare an environment snapshot once per project/profile and then run each
-command as an independent process with that snapshot. The snapshot is captured
-by starting the profile program with a cleared environment, applying the
-profile `env`, running the profile `init_script` (if any), and capturing the
-resulting environment.
+Ordinary project shell/process execution defaults to `[shell] environment_mode =
+"inherit"`: PATH, HOME/USERPROFILE and toolchain variables come from the process
+that started the Runner. WebCodex transport/account credentials are filtered.
+Shell `env` overrides inherited values; profile `env` overrides shell `env`.
+Profiles cache this environment per project/config generation. An explicit
+`init_script` can modify the snapshot; no startup script runs otherwise.
 
-WebCodex does **not** source `~/.bashrc` or `~/.profile` by default: they can
-be slow, interactive-only, environment-polluting, and non-reproducible. Use an
-explicit profile instead.
+Set `environment_mode = "isolated"` for a minimal environment: `/usr/bin:/bin` on
+Unix, or SystemRoot and its System32 PATH on Windows, plus configured env and
+path_prepend. This is environment isolation, not a filesystem sandbox.
+WebCodex does not automatically source `~/.bashrc` or `~/.profile`.
+Configured MCP credential delegation remains explicit; this setting does not
+expand its `env_from_env` allowlist. Native Plugins continue to use the existing
+filtered shell/profile environment and native-only executable contract.
+
+Windows `run_process` and `run_detached_process` accept `.cmd`/`.bat` shims through
+Runner-owned `cmd.exe /d /s /v:off /c` conversion. Each argument is quoted; spaces,
+empty arguments, `&`, `|`, and parentheses are supported. Quotes, `%`, `!`, `^`,
+control characters and trailing backslashes are rejected before startup. The
+command is bounded to 8000 UTF-16 units. Batch shims require a local drive cwd;
+UNC cwd is rejected before spawn because cmd.exe cannot preserve it. Use a native runtime executable when
+arguments fall outside this contract. Batch scripts remain responsible for how
+they handle their own arguments (for example, forwarding with `%*`). Process
+ownership, stdin, cwd, timeout, cancellation and detached reconciliation are
+unchanged; a rejected argument never starts a Job payload.
+
+Structured exact reads can inspect `node_modules` and `target`; recursive
+search/listing skip those trees. Structured edits still reject generated trees.
+Credentials, `.env*`, Runner configuration and `.git` control data remain protected
+for both reads and writes.
 
 Example Rust/Cargo profile in `runner.toml`:
 
@@ -228,6 +301,57 @@ Security notes for profiles:
   bodies or environment values.
 - Profiles run with a cleared environment plus an explicit allowlist; declare
   the env they need.
+
+### Typed `run_script` languages
+
+`run_script` accepts `sh`, `bash`, `powershell`, `javascript`, and `typescript`.
+JavaScript and TypeScript are external Node.js execution on the Runner. WebCodex
+resolves `node` from the prepared shell/profile PATH (or uses the configured
+shell/profile program when it is `node`/`node.exe`). JavaScript bodies are
+written to Runner-owned `.mjs` files and launched as
+`node <temporary.mjs> <args...>` with native argv. `.mjs` fixes ESM semantics
+independently of project `package.json` or temporary-directory metadata.
+
+TypeScript is deliberately a typed-script runtime, not a project compiler. The
+Runner writes the body to a Runner-owned `.mts` file, so the entry module is
+always ESM, and uses Node's native erasable type stripping. Node.js 22.6.0 is
+the minimum supported runtime. Before creating or starting the user script, the
+Runner performs one bounded `node --version` capability probe. Node 22.6 through
+22.17 and Node 23.0 through 23.5 receive the Runner-owned
+`--experimental-strip-types` prefix; Node 22.18+, 23.6+, and later supported
+lines use the default native stripping behavior without that flag. A missing
+Node, an unrecognizable version, or Node older than 22.6 is reported as
+`not_started` / `interpreter_unavailable`, and the user script is never launched.
+If Node accepts the version probe but the eventual script process rejects its
+runtime semantics, the ordinary started-process lifecycle remains authoritative.
+
+The TypeScript contract covers syntax that Node can erase, including type
+annotations, interfaces/type aliases, generics, and ordinary JavaScript features
+such as async/await, ESM, and Node built-ins. WebCodex does not type-check, invoke
+`tsc`, consume `tsconfig.json` as a build configuration, implement path aliases,
+or promise transform-required TypeScript syntax such as enums, parameter
+properties, runtime namespaces, or import aliases. WebCodex also does not use
+`--experimental-transform-types`: that flag is not part of the stable runtime
+contract. On older Node versions that still mark type stripping experimental,
+Node's own `ExperimentalWarning` may appear on stderr. WebCodex does not suppress
+or filter that warning because doing so could also hide warnings emitted by the
+user script.
+
+For rolling upgrades, JavaScript requires the additive
+`structured_script_javascript` capability and TypeScript independently requires
+`structured_script_typescript`. These bits mean the running Runner binary
+understands the corresponding typed-script wire semantics; they do not assert
+that a compatible Node installation is present. Script args remain literal
+native argv values, stdin remains independent, and both languages use the same
+resolved project cwd, timeout/cancellation, Runner policy, and Job lifecycle as
+other typed scripts.
+
+WebCodex does not install or bootstrap npm dependencies, inject `node_modules`
+or `NODE_PATH`, select a package manager, or fall back to Bun, Deno, `tsx`,
+`npx`, or another runtime. Because the `.mjs`/`.mts` entry lives in a Runner-owned
+temporary directory, relative ESM imports resolve from that temporary module,
+not from the project cwd; use Node built-ins or explicit project paths/file URLs
+when importing project code.
 
 ## Jobs and concurrency
 
@@ -456,7 +580,7 @@ of finding its PID or sending signals manually:
 4. Inspect `runtime_status(client_id=...)` (or `list_runners`) after reload.
 
 `runner_config_reload` never writes `runner.toml`; it only activates the candidate
-already on disk. Hot-reloadable policy, shell, Native Plugin, and static SSH-resource changes can
+already on disk. Hot-reloadable policy, shell, configured Skill roots, Native Plugin, and static SSH-resource changes can
 become active immediately, while fields reported in `restart_required_fields`
 remain startup-only until the Runner restarts. Invalid candidates leave the active
 snapshot and generation unchanged. Managed `ssh_resource` mutations are different:

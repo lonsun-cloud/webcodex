@@ -76,13 +76,171 @@ fn tool_definitions_are_context_continuity_ssot() {
 }
 
 #[test]
+fn tool_definitions_are_session_evidence_policy_ssot() {
+    use crate::tool_definition::{
+        exploration_tool_names, runtime_tool_session_evidence_policy,
+        PersistentShellEvidenceAction, ToolChangedPathEvidence, ToolDiffReviewEvidence,
+        ToolExplorationEvidence, ToolFailureEvidence, ToolNavigationEvidenceKind,
+        ToolReviewEvidence, ToolSessionEvidencePolicy, ToolSessionLifecycleEffect,
+        ToolValidationIdentityKind, TOOL_CATEGORY_FILE, TOOL_CATEGORY_LSP,
+    };
+
+    let exploration_names = exploration_tool_names().collect::<Vec<_>>();
+    let unique_exploration_names = exploration_names.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(exploration_names.len(), unique_exploration_names.len());
+
+    for definition in tool_definitions() {
+        let policy = definition.session_evidence_policy();
+        assert_eq!(
+            runtime_tool_session_evidence_policy(definition.name),
+            policy,
+            "{} Session evidence facade must use ToolDefinition",
+            definition.name
+        );
+
+        match policy.exploration {
+            ToolExplorationEvidence::None => {
+                assert!(!exploration_names.contains(&definition.name));
+            }
+            ToolExplorationEvidence::Read
+            | ToolExplorationEvidence::ReadBatch
+            | ToolExplorationEvidence::Search
+            | ToolExplorationEvidence::SearchBatch => {
+                assert_eq!(
+                    definition.category, TOOL_CATEGORY_FILE,
+                    "{}",
+                    definition.name
+                );
+                assert!(definition.is_read_like(), "{}", definition.name);
+                assert!(exploration_names.contains(&definition.name));
+            }
+            ToolExplorationEvidence::Navigation(_) => {
+                assert_eq!(
+                    definition.category, TOOL_CATEGORY_LSP,
+                    "{}",
+                    definition.name
+                );
+                assert!(definition.is_read_like(), "{}", definition.name);
+                assert!(exploration_names.contains(&definition.name));
+            }
+        }
+
+        if let ToolChangedPathEvidence::ResultField(field) = policy.changed_paths {
+            assert!(!field.is_empty(), "{}", definition.name);
+            assert!(
+                definition.metadata().requires_project,
+                "{}",
+                definition.name
+            );
+        }
+        if policy.persistent_shell.is_some() {
+            assert!(
+                definition.requires_explicit_business_session(),
+                "{} persistent-shell evidence must remain Session-bound",
+                definition.name
+            );
+        }
+        if !matches!(policy.diff_review, ToolDiffReviewEvidence::None) {
+            assert!(definition.is_git_like(), "{}", definition.name);
+        }
+        if !matches!(policy.review, ToolReviewEvidence::None) {
+            assert!(definition.is_read_like(), "{}", definition.name);
+        }
+        if policy.failure == ToolFailureEvidence::ProvenNoStateChangeNonActionable {
+            assert!(definition.is_git_like(), "{}", definition.name);
+        }
+        if !matches!(policy.validation_identity, ToolValidationIdentityKind::None) {
+            assert!(
+                definition.captures_validation_output(),
+                "{}",
+                definition.name
+            );
+        }
+        if matches!(
+            policy.lifecycle,
+            ToolSessionLifecycleEffect::IdempotentClose
+        ) {
+            assert_eq!(definition.name, "close_session");
+        }
+    }
+
+    assert_eq!(
+        runtime_tool_session_evidence_policy("__unknown_session_evidence_tool__"),
+        ToolSessionEvidencePolicy::NONE
+    );
+    assert_eq!(
+        lookup_tool_definition("workspace_checkpoint_create")
+            .unwrap()
+            .session_evidence
+            .failure,
+        ToolFailureEvidence::ProvenNoStateChangeNonActionable
+    );
+    assert_eq!(
+        lookup_tool_definition("read_files")
+            .unwrap()
+            .session_evidence
+            .exploration,
+        ToolExplorationEvidence::ReadBatch
+    );
+    assert_eq!(
+        lookup_tool_definition("goto_definition")
+            .unwrap()
+            .session_evidence
+            .exploration,
+        ToolExplorationEvidence::Navigation(ToolNavigationEvidenceKind::Locations)
+    );
+    assert_eq!(
+        lookup_tool_definition("apply_unified_diff")
+            .unwrap()
+            .session_evidence
+            .changed_paths,
+        ToolChangedPathEvidence::ResultField("affected_files")
+    );
+    assert_eq!(
+        lookup_tool_definition("session_shell_exec")
+            .unwrap()
+            .session_evidence
+            .persistent_shell,
+        Some(PersistentShellEvidenceAction::Exec)
+    );
+    assert_eq!(
+        lookup_tool_definition("show_changes")
+            .unwrap()
+            .session_evidence
+            .diff_review,
+        ToolDiffReviewEvidence::ArgumentBool("include_diff")
+    );
+    assert_eq!(
+        lookup_tool_definition("show_changes")
+            .unwrap()
+            .session_evidence
+            .review,
+        ToolReviewEvidence::WorkspaceReview
+    );
+    assert_eq!(
+        lookup_tool_definition("workspace_hygiene_check")
+            .unwrap()
+            .session_evidence
+            .review,
+        ToolReviewEvidence::HygieneReview
+    );
+    assert_eq!(
+        lookup_tool_definition("cargo_test")
+            .unwrap()
+            .session_evidence
+            .validation_identity,
+        ToolValidationIdentityKind::CargoTest
+    );
+}
+
+#[test]
 fn tool_definitions_drive_session_and_permission_policy() {
     use crate::metadata::{
         ToolApprovalPolicy, ToolAuthorityPolicy, ToolEffect, ToolIdempotency, ToolRisk,
+        PROJECT_WRITE,
     };
     use crate::tool_definition::{
         runtime_tool_approval_policy, runtime_tool_captures_validation_output,
-        runtime_tool_disabled_message, runtime_tool_extra_accepted_flattened_args,
         runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
         runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_permission_risk,
         runtime_tool_requires_explicit_business_session, runtime_tool_requires_permission,
@@ -108,6 +266,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
     );
 
     for (name, effect, risk) in [
+        ("apply_patch", ToolEffect::Mutate, ToolRisk::ProjectWrite),
         (
             "apply_text_edits",
             ToolEffect::Mutate,
@@ -139,6 +298,18 @@ fn tool_definitions_drive_session_and_permission_policy() {
         assert_eq!(metadata.approval, ToolApprovalPolicy::Standard, "{name}");
         assert!(runtime_tool_requires_permission(name), "{name}");
     }
+
+    let patch_metadata = lookup_tool_definition("apply_patch")
+        .expect("apply_patch definition")
+        .metadata();
+    assert_eq!(
+        patch_metadata.authority,
+        ToolAuthorityPolicy::Require(PROJECT_WRITE)
+    );
+    assert_eq!(patch_metadata.effect, ToolEffect::Mutate);
+    assert_eq!(patch_metadata.risk, ToolRisk::ProjectWrite);
+    assert_eq!(patch_metadata.approval, ToolApprovalPolicy::Standard);
+    assert_eq!(patch_metadata.idempotency, ToolIdempotency::NonIdempotent);
 
     let git_group = TOOL_DISCOVERY_GROUPS
         .iter()
@@ -299,18 +470,6 @@ fn tool_definitions_drive_session_and_permission_policy() {
             definition.name
         );
         assert_eq!(
-            runtime_tool_disabled_message(definition.name),
-            definition.disabled_message(),
-            "{} disabled facade must use ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_extra_accepted_flattened_args(definition.name),
-            definition.extra_accepted_flattened_args(),
-            "{} extra accepted flattened args facade must use ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
             runtime_tool_requires_permission(definition.name),
             definition.requires_permission(),
             "{} permission facade must use ToolDefinition",
@@ -372,26 +531,6 @@ fn tool_definitions_drive_session_and_permission_policy() {
             "session_shell_status",
             "close_session_shell"
         ]
-    );
-
-    let disabled_tools = tool_definitions()
-        .filter(|definition| definition.disabled_message().is_some())
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    assert_eq!(disabled_tools, Vec::<&'static str>::new());
-
-    let extra_accepted_flattened_arg_tools = tool_definitions()
-        .filter(|definition| !definition.extra_accepted_flattened_args().is_empty())
-        .map(|definition| {
-            (
-                definition.name,
-                definition.extra_accepted_flattened_args().to_vec(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        extra_accepted_flattened_arg_tools,
-        Vec::<(&str, Vec<&str>)>::new()
     );
 
     let unit_argument_tools = tool_definitions()

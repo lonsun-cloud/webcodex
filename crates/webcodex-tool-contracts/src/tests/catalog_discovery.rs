@@ -145,9 +145,31 @@ fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
     assert_eq!(flow.tools.first().copied(), Some("read_files"));
     assert_eq!(flow.tools.get(1).copied(), Some("apply_text_edits"));
     assert_eq!(flow.tools.get(2).copied(), Some("apply_patch"));
-    assert!(flow
-        .summary
-        .starts_with("Edit: after read_file/read_files, prefer apply_text_edits"));
+    assert!(flow.summary.starts_with(
+        "Edit: after read_file/read_files, apply_text_edits with current SHA is the default"
+    ));
+    assert!(flow.summary.contains("even when many lines change"));
+    assert!(flow.summary.contains("Use apply_patch only when"));
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "canonical default even when many lines change",
+        "stable unique containing function/impl/type/test/module context",
+        "matching_mode_rejected",
+        "do not weaken the guard or switch to first_match",
+        "prefer apply_text_edits if exact edits are easy",
+        "bounded read_files recovery",
+        "preserve the requested guard",
+        "unique retries use matching_mode=unique with unique context",
+        "exact_unique retries remain matching_mode=exact_unique",
+        "never downgrade the stale-context/concurrency fence",
+        "context_mismatch requires bounded reread",
+        "never blind retry",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "edit flow should mention {phrase}: {guidance}"
+        );
+    }
 }
 
 #[test]
@@ -198,6 +220,7 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     }
     for cat in [
         TOOL_DISCOVERY_GROUP_INSPECT,
+        TOOL_DISCOVERY_GROUP_FILE_TRANSFER,
         TOOL_DISCOVERY_GROUP_GIT,
         TOOL_DISCOVERY_GROUP_REVIEW,
         TOOL_DISCOVERY_GROUP_VALIDATION,
@@ -228,8 +251,10 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     let inspect = categories[TOOL_DISCOVERY_GROUP_INSPECT].as_array().unwrap();
     for name in [
         "read_file",
+        "read_files",
         "run_shell",
         "search_project_text",
+        "search_project_texts",
         "show_changes",
     ] {
         assert!(
@@ -253,6 +278,28 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
             "save_project_artifact"
         ]
     );
+    let file_transfer = categories[TOOL_DISCOVERY_GROUP_FILE_TRANSFER]
+        .as_array()
+        .expect("file_transfer category present");
+    for name in [
+        "import_conversation_files_to_project",
+        "export_project_artifact",
+        "save_project_artifact",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
+    ] {
+        assert!(
+            file_transfer.iter().any(|value| value == name),
+            "file_transfer: {name}"
+        );
+    }
+    assert!(edit
+        .iter()
+        .any(|value| value == "import_conversation_files_to_project"));
+    assert!(edit.iter().any(|value| value == "export_project_artifact"));
     let flows = recommended_flows();
     assert!(!flows.is_empty());
     for flow in &flows {
@@ -262,25 +309,29 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     for phrase in [
         "if the user gives an exact runner client_id",
         "runtime_status/list_projects for that runner",
-        "persistent shell: use an active runner-local ssh resource",
-        "ssh_resource list/register persists it",
-        "restart runner, list again",
-        "bind with update_session_context",
-        "explicit one-shot/no-persistence ssh",
+        "persistent shell: primarily reuse one shell for repeated commands on an active named ssh resource",
+        "keep remote shell state",
+        "ssh_resource list/register -> restart -> list -> bind -> open/reuse",
+        "local persistent shell is only for true same-process state",
+        "one-shot ssh uses run_process",
         "execution lifetime: run_process/run_job stay runner-owned",
         "outlive the current runner process",
         "discover run_detached_process",
         "supervisor-owned job",
-        "inspect: use search_project_text and read_file before editing",
-        "run_shell with rg or git grep is the diagnostic escape hatch",
-        "edit: after read_file/read_files, prefer apply_text_edits",
-        "using the returned current sha",
-        "use apply_patch for contextual or large multi-hunk changes",
-        "apply_unified_diff only for external raw diffs",
-        "write_project_file only for intentional whole-file rewrites",
+        "inspect: on adaptive runtime prefer search_project_texts/read_files even for one query/range",
+        "run_shell for a short tightly related shell chain",
+        "run_script for program-like shell content",
+        "edit: after read_file/read_files, apply_text_edits with current sha is the default",
+        "even when many lines change",
+        "use apply_patch only when contextual/large multi-hunk patch form is materially clearer",
+        "external diffs use apply_unified_diff",
         "validate: use cargo_check / cargo_test / go_test",
-        "raw run_shell is a bounded escape hatch",
-        "not the primary validation path",
+        "run_shell only for shell-specific validation",
+        "keep independent validation/effect boundaries separate",
+        "file transfer: host/conversation attachment -> import_conversation_files_to_project",
+        "project artifact -> export_project_artifact",
+        "caller-held bounded binary -> save_project_artifact/artifact_upload_*",
+        "bounded inspection -> read_project_artifact",
         "copy show_changes.head.commit",
         "review: start with show_changes for the bounded worktree overview",
         "if hunks truncate, continue/focus with git_diff_hunks",
@@ -331,12 +382,17 @@ fn discovery_and_persistent_shell_flows_route_high_value_adaptive_tools() {
     assert!(persistent.tools.contains(&"session_shell_status"));
     assert!(persistent.tools.contains(&"close_session_shell"));
     assert!(persistent.tools.contains(&"run_process"));
+    assert!(persistent.summary.contains("primarily reuse one shell"));
+    assert!(persistent.summary.contains("active named SSH resource"));
+    assert!(persistent.summary.contains("remote shell state"));
+    assert!(persistent.summary.contains("ssh_resource list/register"));
     assert!(persistent
         .summary
-        .contains("active Runner-local SSH resource"));
-    assert!(persistent.summary.contains("ssh_resource list/register"));
-    assert!(persistent.summary.contains("restart Runner"));
-    assert!(persistent.summary.contains("one-shot/no-persistence SSH"));
+        .contains("restart -> list -> bind -> open/reuse"));
+    assert!(persistent
+        .summary
+        .contains("Local persistent shell is only for true same-process state"));
+    assert!(persistent.summary.contains("one-shot SSH uses run_process"));
     assert!(persistent
         .manifest_purpose
         .contains("SSH target does not run WebCodex Runner"));
@@ -344,6 +400,22 @@ fn discovery_and_persistent_shell_flows_route_high_value_adaptive_tools() {
     assert!(persistent
         .manifest_purpose
         .contains("ssh_resource register"));
+    for phrase in [
+        "ssh-resource-primary",
+        "session_shell_exec repeatedly preserves remote cwd/env/exports/functions/umask",
+        "local persistent shell remains supported only when same local-process state is required",
+        "several ordinary local commands are not enough",
+        "explicit one-shot/no-persistence ssh",
+    ] {
+        assert!(
+            persistent
+                .manifest_purpose
+                .to_ascii_lowercase()
+                .contains(phrase),
+            "persistent_shell should mention {phrase}: {}",
+            persistent.manifest_purpose
+        );
+    }
     for tool in [
         "ssh_resource",
         "update_session_context",
@@ -391,7 +463,14 @@ fn tool_categories_include_projects_with_management_tools() {
 
 #[test]
 fn tool_manifest_intents_reference_only_known_model_visible_tools() {
-    let expected = ["coding", "audit", "exploration", "release", "discovery"];
+    let expected = [
+        "coding",
+        "audit",
+        "exploration",
+        "file_transfer",
+        "release",
+        "discovery",
+    ];
     let names = TOOL_MANIFEST_INTENTS
         .iter()
         .map(|intent| intent.name)

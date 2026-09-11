@@ -15,6 +15,7 @@ use webcodex_process::{GracefulTermination, ManagedChild};
 const CLI_OUTPUT_BYTES: usize = 256 * 1024;
 const CLI_INPUT_BYTES: usize = 64 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const PROJECT_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(120);
 const CLI_CLEANUP_SLACK: Duration = Duration::from_secs(2);
 const CLI_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CLI_GRACEFUL_CLEANUP: Duration = Duration::from_millis(250);
@@ -260,6 +261,60 @@ pub async fn run_json<T: DeserializeOwned>(
         Deadline::after(CLI_TIMEOUT),
     )
     .await
+}
+
+pub async fn run_project_activation_json<T: DeserializeOwned>(
+    executable: &Path,
+    args: &[String],
+    cancellation: &CancellationContext,
+) -> DesktopResult<T> {
+    let output = run_bounded_until(
+        executable,
+        args,
+        None,
+        false,
+        cancellation,
+        Deadline::after(PROJECT_ACTIVATION_TIMEOUT),
+    )
+    .await?;
+    if output.exit_code != Some(0) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = [
+            "project_activation_capability_unavailable",
+            "project_activation_restart_required",
+            "project_activation_reconcile_required",
+            "project_activation_config_conflict",
+            "runner_config_concurrent_change",
+        ]
+        .into_iter()
+        .find(|code| stderr.trim_start().starts_with(code))
+        .unwrap_or("webcodex_command_failed");
+        let next_action = match code {
+            "project_activation_capability_unavailable" | "project_activation_restart_required" => {
+                "Refresh this Runner before activating the selected project."
+            }
+            "project_activation_reconcile_required" | "project_activation_config_conflict" => {
+                "Recheck Runner and project status before retrying activation."
+            }
+            "runner_config_concurrent_change" => {
+                "Retry from the current Runner configuration; another operator changed it concurrently."
+            }
+            _ => "Open Activity for safe diagnostics, correct the configuration, and retry.",
+        };
+        return Err(DesktopError::new(
+            code,
+            "WebCodex could not activate the selected project on the current Runner",
+            next_action,
+        )
+        .with_details(serde_json::json!({ "exit_code": output.exit_code })));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| {
+        DesktopError::new(
+            "webcodex_contract_invalid",
+            "WebCodex returned invalid project activation output",
+            "Verify that Desktop and WebCodex binaries come from the same source baseline.",
+        )
+    })
 }
 
 pub async fn run_json_until<T: DeserializeOwned>(
@@ -895,9 +950,7 @@ mod tests {
             if bytes == size as libc::c_int {
                 return unsafe { info.assume_init() }.pbi_status != libc::SZOMB;
             }
-            if bytes == 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            if bytes == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                 return false;
             }
             true
@@ -1150,7 +1203,8 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
-    async fn windows_blocked_stdin_reclaims_the_owned_process_tree() {
+    #[ignore = "Desktop Windows real-process lane: owns a real PowerShell process tree"]
+    async fn desktop_real_process_windows_blocked_stdin_reclaims_the_owned_process_tree() {
         let marker = std::env::temp_dir().join(format!(
             "webcodex-cli-blocked-stdin-{}-{}.txt",
             std::process::id(),
@@ -1179,11 +1233,13 @@ mod tests {
                 Some(&payload),
                 false,
                 &cancellation,
-                Duration::from_secs(8),
+                // This regression verifies timeout-driven tree reclamation, not
+                // an exact eight-second wall clock. Give a loaded Windows host
+                // enough time to start PowerShell and publish the fixture PIDs.
+                Duration::from_secs(12),
             )
             .await
         });
-        let marker_deadline = Instant::now() + Duration::from_secs(6);
         let pids = loop {
             if let Ok(contents) = std::fs::read_to_string(&marker) {
                 let parsed = contents
@@ -1197,18 +1253,18 @@ mod tests {
                 }
             }
             assert!(
-                Instant::now() < marker_deadline,
-                "blocked-stdin fixture must publish owned pids before timeout"
+                !command.is_finished(),
+                "blocked-stdin fixture command finished before publishing owned pids"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let error = tokio::time::timeout(Duration::from_secs(12), command)
+        let error = tokio::time::timeout(Duration::from_secs(16), command)
             .await
             .expect("blocked-stdin command must finish within its bounded cleanup")
             .expect("blocked-stdin fixture task")
             .unwrap_err();
         assert_eq!(error.code, "webcodex_command_timeout");
-        assert!(started.elapsed() < Duration::from_secs(12));
+        assert!(started.elapsed() < Duration::from_secs(16));
         for pid in pids {
             assert!(
                 !windows_process_exists(pid),

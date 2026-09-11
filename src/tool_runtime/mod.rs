@@ -59,10 +59,17 @@ mod read_files;
 mod registry;
 mod runtime;
 mod runtime_info;
+pub(crate) mod runtime_metrics;
 mod script;
 mod search_project_texts;
 mod semantic_navigation;
 mod session_context;
+pub(crate) use observations::is_meaningful_activity_tool;
+pub(crate) use session_context::runtime_observation_principal;
+pub(crate) use window_activity::{
+    ToolCallCorrelation, WindowActivityGuard, WindowLoopTransition, WorkflowSessionCorrelation,
+    WorkflowSessionCorrelationRelation,
+};
 mod session_shell;
 mod session_tools;
 pub(crate) mod sessions;
@@ -85,6 +92,8 @@ mod tool_spec;
 mod validation_events;
 pub(crate) mod validation_parser;
 pub(crate) mod validation_profile;
+mod window_activity;
+pub(crate) use window_activity::{ActiveWindowRequest, MAX_ACTIVE_REQUESTS_PER_WINDOW};
 
 #[cfg(test)]
 pub(crate) use webcodex_tool_contracts::MODEL_TOOL_DESCRIPTION_MAX_CHARS;
@@ -135,8 +144,6 @@ pub use tool_result::ToolResult;
 pub(crate) use tool_result::{RecoveryKind, RecoveryTool, RECOVERY_KIND_VALUES};
 pub use tool_spec::ToolSpec;
 
-use serde_json::json;
-
 #[cfg(test)]
 pub(crate) use project_resolution::ProjectResolverErrorKind;
 pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
@@ -154,25 +161,6 @@ pub(crate) use session_context::{add_session_hint, unknown_session_result};
 pub(crate) use session_shell::SessionShellRegistry;
 #[cfg(test)]
 pub(crate) use surface::registered_tool_categories;
-
-pub(crate) fn tool_disabled_result(tool_name: &str, message: &'static str) -> ToolResult {
-    let error_kind = format!("{tool_name}_disabled");
-    ToolResult::err_with_output(
-        message,
-        json!({
-            "code": error_kind.clone(),
-            "error_kind": error_kind,
-            "tool": tool_name,
-            "message": message,
-        }),
-    )
-    .with_recovery(RecoveryKind::NoAction, None)
-}
-
-pub(crate) fn tool_disabled_result_from_definition(tool_name: &str) -> Option<ToolResult> {
-    tool_definition::runtime_tool_disabled_message(tool_name)
-        .map(|message| tool_disabled_result(tool_name, message))
-}
 
 #[cfg(test)]
 mod tests;

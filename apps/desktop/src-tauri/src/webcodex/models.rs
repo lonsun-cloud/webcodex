@@ -13,6 +13,23 @@ pub struct RegisteredProjectOutput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ProjectActivationOutput {
+    pub client_id: String,
+    pub project: RegisteredProjectOutput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LegacyProjectRegisterOutput {
+    pub project: LegacyRegisteredProjectOutput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LegacyRegisteredProjectOutput {
+    pub id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoginOutput {
     pub server_url: String,
     pub runner_config: String,
@@ -72,6 +89,25 @@ pub struct OpsProject {
     pub connected: Option<bool>,
     #[serde(default)]
     pub agent_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpsWindowsOutput {
+    pub summary: OpsWindowsSummary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpsWindowsSummary {
+    #[serde(default)]
+    pub windows: Vec<OpsWindow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpsWindow {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub last_meaningful_activity_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

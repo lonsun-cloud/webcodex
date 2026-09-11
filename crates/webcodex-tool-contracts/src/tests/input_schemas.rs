@@ -121,9 +121,89 @@ fn search_project_text_schema_declares_bounded_advanced_inputs() {
 }
 
 #[test]
+fn batch_inspection_result_budget_schema_uses_explicit_512_kib_ceiling() {
+    let specs = registered_tool_specs();
+    for name in ["read_files", "search_project_texts"] {
+        let schema = &spec_named(&specs, name).input_schema;
+        let budget = &schema["properties"]["max_result_bytes"];
+        assert_eq!(budget["minimum"], 8 * 1024, "{name}");
+        assert_eq!(budget["default"], 64 * 1024, "{name}");
+        assert_eq!(budget["maximum"], 512 * 1024, "{name}");
+
+        let request = |max_result_bytes| match name {
+            "read_files" => json!({
+                "project": "demo",
+                "items": [{"path": "src/lib.rs"}],
+                "max_result_bytes": max_result_bytes
+            }),
+            _ => json!({
+                "project": "demo",
+                "queries": [{"pattern": "needle"}],
+                "max_result_bytes": max_result_bytes
+            }),
+        };
+        assert!(test_support::validate_schema_instance(&request(256 * 1024), schema).is_ok());
+        assert!(test_support::validate_schema_instance(&request(512 * 1024), schema).is_ok());
+        assert!(test_support::validate_schema_instance(&request(512 * 1024 + 1), schema).is_err());
+    }
+}
+
+#[test]
+fn git_diff_hunks_page_budget_schema_is_producer_scoped_and_bounded() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "git_diff_hunks").input_schema;
+    let page = &schema["properties"]["max_page_bytes"];
+    assert_eq!(page["minimum"], 16 * 1024);
+    assert_eq!(page["default"], 64 * 1024);
+    assert_eq!(page["maximum"], 192 * 1024);
+    let description = page["description"].as_str().unwrap().to_ascii_lowercase();
+    assert!(description.contains("producer page"));
+    assert!(description.contains("final serialized model result"));
+    for bytes in [16 * 1024, 64 * 1024, 192 * 1024] {
+        assert!(test_support::validate_schema_instance(
+            &json!({"project":"demo","max_page_bytes":bytes}),
+            schema,
+        )
+        .is_ok());
+    }
+    assert!(test_support::validate_schema_instance(
+        &json!({"project":"demo","max_page_bytes":192 * 1024 + 1}),
+        schema,
+    )
+    .is_err());
+}
+
+#[test]
+fn list_project_files_paging_schema_keeps_cardinality_bounded() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "list_project_files").input_schema;
+    let properties = &schema["properties"];
+    assert_eq!(properties["limit"]["default"], 200);
+    assert!(properties["limit"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("1..500"));
+    assert_eq!(properties["offset"]["minimum"], 0);
+    assert_eq!(properties["offset"]["default"], 0);
+    assert!(properties["offset"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("next_offset"));
+    assert!(test_support::validate_schema_instance(
+        &json!({"project":"demo","limit":200,"offset":500}),
+        schema,
+    )
+    .is_ok());
+}
+
+#[test]
 fn sync_validation_and_run_shell_timeout_schema_bounds() {
     let specs = registered_tool_specs();
-    for (name, default) in [("cargo_check", 600), ("cargo_test", 1800)] {
+    for (name, default) in [
+        ("cargo_check", 600),
+        ("cargo_test", 1800),
+        ("go_test", 1800),
+    ] {
         let spec = spec_named(&specs, name);
         let timeout = &spec.input_schema["properties"]["timeout_secs"];
         assert_eq!(timeout["type"], "integer", "{name}");
@@ -132,6 +212,18 @@ fn sync_validation_and_run_shell_timeout_schema_bounds() {
         assert_eq!(timeout["default"], default, "{name}");
         let desc = timeout["description"].as_str().unwrap_or("");
         assert!(desc.contains("3600") && desc.to_ascii_lowercase().contains("job"));
+
+        let sync_wait = &spec.input_schema["properties"]["sync_wait_secs"];
+        assert_eq!(sync_wait["type"], "integer", "{name}");
+        assert_eq!(sync_wait["minimum"], 1, "{name}");
+        assert_eq!(sync_wait["maximum"], 60, "{name}");
+        assert!(sync_wait.get("default").is_none(), "{name}");
+        let desc = sync_wait["description"].as_str().unwrap_or("");
+        assert!(desc.contains("same execution"), "{name}: {desc}");
+        assert!(
+            desc.contains("never extends timeout_secs"),
+            "{name}: {desc}"
+        );
     }
     let cargo_fmt = spec_named(&specs, "cargo_fmt");
     let timeout = &cargo_fmt.input_schema["properties"]["timeout_secs"];
@@ -139,6 +231,11 @@ fn sync_validation_and_run_shell_timeout_schema_bounds() {
     assert_eq!(timeout["minimum"], 1);
     assert_eq!(timeout["maximum"], 3600);
     assert_eq!(timeout["default"], 120);
+    let sync_wait = &cargo_fmt.input_schema["properties"]["sync_wait_secs"];
+    assert_eq!(sync_wait["type"], "integer");
+    assert_eq!(sync_wait["minimum"], 1);
+    assert_eq!(sync_wait["maximum"], 60);
+    assert!(sync_wait.get("default").is_none());
     assert_eq!(
         cargo_fmt.input_schema["allOf"][0]["then"]["properties"]["timeout_secs"]["maximum"],
         3600
@@ -146,6 +243,10 @@ fn sync_validation_and_run_shell_timeout_schema_bounds() {
     assert_eq!(
         cargo_fmt.input_schema["allOf"][0]["else"]["properties"]["timeout_secs"]["maximum"],
         120
+    );
+    assert_eq!(
+        cargo_fmt.input_schema["allOf"][0]["else"]["properties"]["sync_wait_secs"]["type"],
+        "null"
     );
 
     let run_shell = spec_named(&specs, "run_shell");
@@ -257,8 +358,23 @@ fn run_script_schema_is_typed_bounded_and_hides_execution_infrastructure() {
     );
     assert_eq!(
         properties["language"]["enum"],
-        json!(["sh", "bash", "powershell"])
+        json!(["sh", "bash", "powershell", "javascript", "typescript"])
     );
+    let language_description = properties["language"]["description"]
+        .as_str()
+        .expect("run_script language description");
+    for phrase in [
+        ".mjs ESM",
+        ".mts ESM",
+        "erasable type stripping",
+        "Node.js 22.6.0 or newer",
+        "callers cannot provide a runtime path or runtime flags",
+    ] {
+        assert!(
+            language_description.contains(phrase),
+            "run_script language description is missing {phrase:?}: {language_description}"
+        );
+    }
     assert_eq!(properties["script"]["minLength"], 1);
     assert_eq!(properties["script"]["maxLength"], 512 * 1024);
     assert_eq!(properties["args"]["type"], "array");
@@ -286,11 +402,29 @@ fn cargo_fmt_conditional_timeout_schema_matches_contract() {
     assert!(validates(
         &json!({"project": "demo", "check": true, "timeout_secs": 3600})
     ));
+    assert!(validates(
+        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 1})
+    ));
+    assert!(validates(
+        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 60})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 0})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 61})
+    ));
     assert!(!validates(
         &json!({"project": "demo", "check": true, "timeout_secs": 3601})
     ));
     assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 120})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "check": false, "timeout_secs": 120, "sync_wait_secs": 1})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "timeout_secs": 120, "sync_wait_secs": 1})
     ));
     assert!(!validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 121})

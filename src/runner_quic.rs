@@ -590,6 +590,8 @@ mod tests {
             structured_go_test_packages: true,
             structured_process_argv: true,
             structured_script_payload: false,
+            structured_script_javascript: false,
+            structured_script_typescript: false,
             internal_posix_script: false,
             structured_execution_jobs: false,
             detached_process_jobs: false,
@@ -598,6 +600,7 @@ mod tests {
             project_lifecycle: false,
             project_path_registration: false,
             managed_worktree: false,
+            configured_skill_roots_read: false,
             skill_store_read: false,
             skill_store_manage: false,
             computer_observe: false,
@@ -836,8 +839,6 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             token: None,
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
         let registry = Arc::new(RunnerRegistry::default());
@@ -1468,8 +1469,6 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             token: None,
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
         let registry = Arc::new(RunnerRegistry::default());
@@ -1525,8 +1524,6 @@ mod tests {
             data_dir: std::path::PathBuf::from("./data"),
             token: None,
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
         let registry = Arc::new(RunnerRegistry::default());

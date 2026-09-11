@@ -55,10 +55,13 @@ export type ProjectReadiness =
 
 export type ReadinessSummaryKind =
   | "ready_for_chat_gpt"
+  | "runtime_stopped"
+  | "runtime_starting"
   | "service_needs_attention"
   | "runner_disconnected"
   | "project_not_ready"
   | "runtime_ready_local_only"
+  | "tunnel_ready_waiting_for_chat_gpt"
   | "connection_unverified"
   | "quick_share_stopped";
 
@@ -131,6 +134,7 @@ export interface TunnelProxySnapshot {
 
 export type DesktopOperationKind =
   | "local_setup"
+  | "local_project_activate"
   | "remote_setup"
   | "quick_share_start"
   | "quick_share_stop"
@@ -139,7 +143,8 @@ export type DesktopOperationKind =
   | "local_runtime_stop"
   | "runtime_refresh"
   | "runtime_resume"
-  | "tunnel_proxy_update";
+  | "tunnel_proxy_update"
+  | "tunnel_config_update";
 
 export type DesktopOperationPhase = "running" | "cancelling";
 
@@ -151,16 +156,37 @@ export interface DesktopOperation {
   cancellable: boolean;
 }
 
+export interface OpenAiTunnelConfigSnapshot {
+  tunnel_id_present: boolean;
+  api_key_present: boolean;
+  source: "file" | "environment" | "invalid";
+  saved_tunnel_id: string | null;
+  effective_tunnel_id?: string | null;
+}
+
+export interface PowerShellRuntimeSnapshot {
+  pwsh_available: boolean;
+  windows_powershell_available: boolean;
+}
+
+export interface ChatGptActivitySnapshot {
+  observed: boolean;
+  last_meaningful_activity_at_ms?: number | null;
+}
+
 export interface DesktopState {
   topology?: RuntimeTopology | null;
   readiness: ReadinessSnapshot;
   project?: ProjectSelection | null;
   binaries?: BinaryInfo | null;
+  powershell_runtime?: PowerShellRuntimeSnapshot | null;
+  chatgpt_activity?: ChatGptActivitySnapshot | null;
   quick_share?: QuickShareState | null;
   regular_tunnel?: RegularTunnelState | null;
   current_operation?: DesktopOperation | null;
   activity_sequence: number;
   openai_tunnel_configured: boolean;
+  openai_tunnel_config: OpenAiTunnelConfigSnapshot;
   regular_tunnel_available: boolean;
   runtime_autostart: boolean;
   preferred_connection: RegularConnectionPreference;
@@ -196,6 +222,8 @@ export interface ActivityEntry {
     | "regular_tunnel_ready"
     | "regular_tunnel_stopped"
     | "runtime_stopped"
+    | "project_activated"
+    | "state_recovered"
     | "operation_started"
     | "operation_cancel_requested"
     | "operation_cancelled"

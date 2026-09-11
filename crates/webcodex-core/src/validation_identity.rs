@@ -11,6 +11,27 @@ pub const VALIDATION_IDENTITY_HEX_LEN: usize = 24;
 pub const GENERIC_VALIDATION_IDENTITY_PREFIX: &str = "command:";
 const ASSERTION_VALIDATION_IDENTITY_PREFIX: &str = "assertion:";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolValidationIdentityKind {
+    None,
+    CargoFmt,
+    CargoCheck,
+    CargoTest,
+    GoTest,
+}
+
+impl ToolValidationIdentityKind {
+    pub const fn tool_name(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::CargoFmt => Some("cargo_fmt"),
+            Self::CargoCheck => Some("cargo_check"),
+            Self::CargoTest => Some("cargo_test"),
+            Self::GoTest => Some("go_test"),
+        }
+    }
+}
+
 pub fn is_structured_validation_target_identity(value: &str) -> bool {
     let Some(hex) = value.strip_prefix(STRUCTURED_VALIDATION_TARGET_PREFIX) else {
         return false;
@@ -48,17 +69,21 @@ pub fn assertion_validation_identity(assertion_name: &str) -> String {
     )
 }
 
-pub fn structured_validation_target_identity(tool_name: &str, arguments: &Value) -> Option<String> {
+pub fn structured_validation_target_identity(
+    kind: ToolValidationIdentityKind,
+    arguments: &Value,
+) -> Option<String> {
+    let tool_name = kind.tool_name()?;
     let obj = arguments.as_object()?;
     let cwd = normalized_validation_target_cwd(obj.get("cwd"))?;
-    let semantic = match tool_name {
-        "cargo_fmt" => serde_json::json!({
+    let semantic = match kind {
+        ToolValidationIdentityKind::CargoFmt => serde_json::json!({
             "tool": tool_name,
             "kind": "format",
             "cwd": cwd,
             "check": obj.get("check").and_then(Value::as_bool).unwrap_or(false),
         }),
-        "cargo_check" => {
+        ToolValidationIdentityKind::CargoCheck => {
             if obj.get("features_present").and_then(Value::as_bool) == Some(true)
                 && obj.get("features").is_none()
             {
@@ -77,7 +102,7 @@ pub fn structured_validation_target_identity(tool_name: &str, arguments: &Value)
                 "no_default_features": obj.get("no_default_features").and_then(Value::as_bool).unwrap_or(false),
             })
         }
-        "cargo_test" => {
+        ToolValidationIdentityKind::CargoTest => {
             if obj.get("filter_present").and_then(Value::as_bool) == Some(true)
                 && obj.get("filter").is_none()
             {
@@ -104,7 +129,7 @@ pub fn structured_validation_target_identity(tool_name: &str, arguments: &Value)
                 "no_run": obj.get("no_run").and_then(Value::as_bool).unwrap_or(false),
             })
         }
-        "go_test" => {
+        ToolValidationIdentityKind::GoTest => {
             if obj.get("packages_present").and_then(Value::as_bool) == Some(true)
                 && obj.get("packages").is_none()
             {
@@ -118,7 +143,7 @@ pub fn structured_validation_target_identity(tool_name: &str, arguments: &Value)
                 "packages": packages,
             })
         }
-        _ => return None,
+        ToolValidationIdentityKind::None => return None,
     };
     let encoded = serde_json::to_vec(&semantic).ok()?;
     let digest = format!("{:x}", Sha256::digest(encoded));
@@ -184,6 +209,61 @@ fn normalized_go_test_target_packages(value: Option<&Value>) -> Option<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_validation_target_identity_hashes_are_stable() {
+        let cases = [
+            (
+                ToolValidationIdentityKind::CargoFmt,
+                serde_json::json!({"cwd": ".", "check": true}),
+                "target:dfd175fca2d6e3c744338849",
+            ),
+            (
+                ToolValidationIdentityKind::CargoCheck,
+                serde_json::json!({
+                    "cwd": ".",
+                    "package": "webcodex",
+                    "features": "serde",
+                    "all_targets": true,
+                    "all_features": false,
+                    "no_default_features": false
+                }),
+                "target:1db935c208ff30ab1716b2ab",
+            ),
+            (
+                ToolValidationIdentityKind::CargoTest,
+                serde_json::json!({
+                    "cwd": ".",
+                    "package": "webcodex",
+                    "filter": "focused",
+                    "features": "serde",
+                    "all_targets": false,
+                    "all_features": false,
+                    "no_default_features": false,
+                    "no_run": false
+                }),
+                "target:fde1a5cfa80b68da00bb489f",
+            ),
+            (
+                ToolValidationIdentityKind::GoTest,
+                serde_json::json!({"cwd": ".", "packages": ["./..."]}),
+                "target:53578a0709b0ce549e125eb7",
+            ),
+        ];
+        for (kind, arguments, expected) in cases {
+            assert_eq!(
+                structured_validation_target_identity(kind, &arguments).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            structured_validation_target_identity(
+                ToolValidationIdentityKind::None,
+                &serde_json::json!({})
+            ),
+            None
+        );
+    }
 
     #[test]
     fn validation_identity_shapes_are_stable() {

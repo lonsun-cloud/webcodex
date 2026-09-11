@@ -3,6 +3,7 @@ import { useLocale } from "../../i18n/locale";
 import {
   projectReadinessLabel,
   readinessNextAction,
+  runtimeLabel,
   readinessSummary,
   runnerReadinessLabel,
   serverReadinessLabel,
@@ -14,6 +15,7 @@ interface DashboardProps {
   onRefresh: () => void;
   onResumeRuntime: () => void;
   onConnectChatGpt: () => void;
+  onChooseProject: () => void;
   onChangeSetup: () => void;
   onNavigate: (page: "projects" | "connection" | "activity") => void;
   onStopQuickShare: () => void;
@@ -26,6 +28,7 @@ export function Dashboard({
   onRefresh,
   onResumeRuntime,
   onConnectChatGpt,
+  onChooseProject,
   onChangeSetup,
   onNavigate,
   onStopQuickShare,
@@ -34,13 +37,14 @@ export function Dashboard({
   const { t } = useLocale();
   const isQuickShare = state.topology?.experience === "quick_share";
   const operationBusy = Boolean(state.current_operation);
+  const connectionVerified = chatgptActivityObserved(state) && state.regular_tunnel?.status !== "error";
   const canResumeRuntime = !isQuickShare && Boolean(state.topology) && !state.readiness.runtime_ready;
   const canConnectChatGpt = !isQuickShare &&
     state.topology?.server.kind === "local" &&
     state.readiness.runtime_ready &&
     state.openai_tunnel_configured &&
     !state.regular_tunnel;
-  const summary = readinessSummary(state.readiness.summary_kind, state.readiness.summary, t);
+  const summary = state.readiness.runtime_ready ? readinessSummary(state.readiness.summary_kind, state.readiness.summary, t) : runtimeLabel(state, t);
   const nextAction = readinessNextAction(
     state.readiness.next_action_kind,
     state.readiness.next_action,
@@ -57,7 +61,7 @@ export function Dashboard({
         <div>
           <div className="eyebrow">{t("home.eyebrow")}</div>
           <h1 id="home-title">WebCodex</h1>
-          <p className="lede">{summary}</p>
+          <p className="lede">{t("workspace.description")}</p>
         </div>
         <button
           className="secondary-button"
@@ -90,52 +94,24 @@ export function Dashboard({
               {t("home.connectChatGpt")}
             </button>
           )}
+          {state.readiness.runtime_ready && !canConnectChatGpt && !connectionVerified && (
+            <button className="primary-button" onClick={() => onNavigate("connection")}>{t("workspace.connectionSettings")}</button>
+          )}
           {nextAction && !canResumeRuntime && !canConnectChatGpt && <span>{nextAction}</span>}
         </div>
       </div>
 
-      <div className="status-grid" aria-label={t("home.components")}>
-        <StatusCard
-          title={t("home.service")}
-          value={serviceLabel(state, t)}
-          state={state.readiness.server}
-          explanation={serviceExplanation(state, t)}
-        />
-        <StatusCard
-          title={t("home.runner")}
-          value={runnerReadinessLabel(state.readiness.runner, t)}
-          state={state.readiness.runner}
-          explanation={t("home.runnerExplanation")}
-        />
-        <StatusCard
-          title={t("home.projects")}
-          value={state.readiness.project === "ready" ? t("home.projectReady") : projectReadinessLabel(state.readiness.project, t)}
-          state={state.readiness.project}
-          explanation={state.project?.path ?? t("home.noProject")}
-        />
-        <StatusCard
-          title={t("home.connection")}
-          value={connectionLabel(state, t)}
-          state={state.readiness.exposure}
-          explanation={connectionExplanation(state, t)}
-        />
-      </div>
-
-      <section className="dashboard-shortcuts" aria-labelledby="home-shortcuts-title">
-        <div className="section-heading">
-          <h2 id="home-shortcuts-title">{t("home.shortcuts")}</h2>
+      <article className="workspace-project">
+        <div className="project-emblem" aria-hidden="true"><span className="nav-icon nav-projects" /></div>
+        <div className="workspace-project-copy">
+          <span className="section-kicker">{t("workspace.currentProject")}</span>
+          <h2>{state.project?.path.split(/[\\/]/).filter(Boolean).pop() ?? t("home.noProject")}</h2>
+          <p>{state.project?.path ?? t("setup.projectRequired")}</p>
         </div>
-        <div className="shortcut-grid">
-          {(["projects", "connection", "activity"] as const).map((page) => (
-            <button className="shortcut-card" key={page} onClick={() => onNavigate(page)}>
-              <span className={`nav-icon nav-${page}`} aria-hidden="true" />
-              <strong>{t(`home.open.${page}`)}</strong>
-              <span>{t(`home.hint.${page}`)}</span>
-              <span className="shortcut-arrow" aria-hidden="true">↗</span>
-            </button>
-          ))}
-        </div>
-      </section>
+        <button className="secondary-button" onClick={onChooseProject} disabled={operationBusy || refreshing}>
+          {state.project ? t("project.change") : t("project.add")}
+        </button>
+      </article>
 
       {state.quick_share && (
         <div className="handoff-card">
@@ -149,17 +125,70 @@ export function Dashboard({
         </div>
       )}
 
-      {!isQuickShare && state.topology && (
-        <div className="runtime-actions">
-          <span>{t("home.runtimeOwnership")}</span>
-          <div className="runtime-action-buttons">
-            <button className="secondary-button" onClick={onChangeSetup} disabled={operationBusy} data-webcodex-action="change-runtime-setup">{t("home.changeSetup")}</button>
-            {state.readiness.runtime_ready && (
-              <button className="secondary-button" onClick={onStopRuntime} disabled={operationBusy} data-webcodex-action="stop-runtime">{t("home.stopRuntime")}</button>
-            )}
-          </div>
-        </div>
+      {!isQuickShare && (
+        <details className="workflow-guide" open={!connectionVerified}>
+          <summary>{t("workspace.progress")}</summary>
+          <ol className="workflow-steps" aria-label={t("workspace.progress")}>
+            <li className={state.readiness.runtime_ready ? "complete" : ""}>
+              <span className="step-number" aria-hidden="true">01</span>
+              <strong>{t("workspace.prepare")}</strong>
+              <p>{state.readiness.runtime_ready ? t("sidebar.runtimeReady") : t("workspace.prepareHint")}</p>
+            </li>
+            <li className={state.readiness.runtime_ready && (state.readiness.ready_for_chatgpt || state.regular_tunnel?.ready_for_chatgpt) ? "complete" : ""}>
+              <span className="step-number" aria-hidden="true">02</span>
+              <strong>{t("workspace.connect")}</strong>
+              <p>{connectionExplanation(state, t)}</p>
+            </li>
+            <li className={connectionVerified ? "complete" : ""}>
+              <span className="step-number" aria-hidden="true">03</span>
+              <strong>{t("workspace.verify")}</strong>
+              <p>{!state.readiness.runtime_ready ? t("workspace.afterStart") : connectionVerified ? t("home.connectionObserved") : t("workspace.verifyHint")}</p>
+            </li>
+          </ol>
+        </details>
       )}
+
+      <details className="runtime-details">
+        <summary>{t("workspace.diagnostics")}</summary>
+        <div className="status-grid" aria-label={t("home.components")}>
+          <StatusCard
+            title={t("home.service")}
+            value={serviceLabel(state, t)}
+            state={state.readiness.server}
+            explanation={serviceExplanation(state, t)}
+          />
+          <StatusCard
+            title={t("home.runner")}
+            value={runnerReadinessLabel(state.readiness.runner, t)}
+            state={state.readiness.runner}
+            explanation={t("home.runnerExplanation")}
+          />
+          <StatusCard
+            title={t("home.projects")}
+            value={state.readiness.project === "ready" ? t("home.projectReady") : projectReadinessLabel(state.readiness.project, t)}
+            state={state.readiness.project}
+            explanation={state.project?.path ?? t("home.noProject")}
+          />
+          <StatusCard
+            title={t("home.connection")}
+            value={connectionLabel(state, t)}
+            state={connectionCardState(state)}
+            explanation={connectionExplanation(state, t)}
+          />
+        </div>
+
+        {!isQuickShare && state.topology && (
+          <div className="runtime-actions">
+            <span>{t("home.runtimeOwnership")}</span>
+            <div className="runtime-action-buttons">
+              <button className="secondary-button" onClick={onChangeSetup} disabled={operationBusy} data-webcodex-action="change-runtime-setup">{t("home.changeSetup")}</button>
+              {state.readiness.runtime_ready && (
+                <button className="secondary-button" onClick={onStopRuntime} disabled={operationBusy} data-webcodex-action="stop-runtime">{t("home.stopRuntime")}</button>
+              )}
+            </div>
+          </div>
+        )}
+      </details>
     </section>
   );
 }
@@ -205,15 +234,33 @@ function quickShareClipboardLabel(state: string, contains: string, t: Translate)
   return t("clipboard.copied");
 }
 
+function chatgptActivityObserved(state: DesktopState) {
+  return state.readiness.runtime_ready && Boolean(state.chatgpt_activity?.observed);
+}
+
+function connectionCardState(state: DesktopState) {
+  if (state.regular_tunnel?.status === "error") return "error";
+  if (chatgptActivityObserved(state)) return "ready";
+  return state.readiness.exposure;
+}
+
 function connectionLabel(state: DesktopState, t: Translate) {
+  if (chatgptActivityObserved(state) && state.regular_tunnel?.status !== "error") {
+    return t("home.connectionObservedLabel");
+  }
   const exposure = state.topology?.exposure;
-  if (!exposure || exposure.kind === "none") return t("common.noChatGpt");
+  if (!exposure || exposure.kind === "none") return t("connection.noDesktopTunnel");
   if (exposure.kind === "cloudflare") return "Cloudflare";
   if (exposure.kind === "open_ai_tunnel") return "OpenAI Secure Tunnel";
   return "Existing HTTPS";
 }
 
 function connectionExplanation(state: DesktopState, t: Translate) {
+  if (!state.readiness.runtime_ready) return t("workspace.afterStart");
+  if (state.regular_tunnel?.status !== "error" && chatgptActivityObserved(state)) {
+    return t("home.connectionObserved");
+  }
+  if (state.regular_tunnel?.status === "ready" && state.regular_tunnel.ready_for_chatgpt) return t("home.connectionTunnelReady");
   if (state.readiness.exposure === "remote_ready") return t("home.connectionRemoteReady");
   if (state.readiness.exposure === "local_ready") return t("home.connectionLocalReady");
   return t("home.connectionUnverified");

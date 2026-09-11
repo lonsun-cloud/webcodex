@@ -1,0 +1,370 @@
+<div id="app" style="font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;border:1px solid var(--color-border-primary,rgba(127,127,127,.35));border-radius:12px;max-width:760px;color:var(--color-text-primary,inherit);background:var(--color-background-primary,transparent)">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+    <strong id="title" style="font-size:17px">WebCodex Result</strong>
+    <span id="state" style="font-size:12px">HTML loaded</span>
+  </div>
+  <div id="summary" style="margin-top:8px;font-size:13px">Minimal MCP Apps handshake · waiting for a supported result</div>
+  <div id="cards" style="display:grid;gap:10px;margin-top:12px"></div>
+</div>
+<script>
+(() => {
+  const APP_PROTOCOL = "2026-01-26";
+  const PRESENTATION_KEY = "webcodex/presentation";
+  const MAX_ITEMS = 8;
+  const MAX_TEXT = 256;
+  const stateEl = document.getElementById("state");
+  const titleEl = document.getElementById("title");
+  const summaryEl = document.getElementById("summary");
+  const cardsEl = document.getElementById("cards");
+  const pending = new Map();
+  let nextId = 1;
+  let receivedToolResult = false;
+
+  function boundedString(value) {
+    if (typeof value !== "string") return null;
+    const chars = Array.from(value);
+    return chars.length <= MAX_TEXT ? value : chars.slice(0, MAX_TEXT - 1).join("") + "…";
+  }
+
+  function request(method, params, timeoutMs = 10000) {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(method + " timed out"));
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timeout });
+      try {
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params: params || {} }, "*");
+      } catch (error) {
+        pending.delete(id);
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+  }
+
+  function notify(method, params) {
+    window.parent.postMessage({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) }, "*");
+  }
+
+  function clearCards() {
+    while (cardsEl.firstChild) cardsEl.removeChild(cardsEl.firstChild);
+  }
+
+  function addRow(card, label, value) {
+    if (value === undefined || value === null || value === "") return;
+    const row = document.createElement("div");
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = "minmax(100px, 140px) 1fr";
+    row.style.gap = "10px";
+    row.style.fontSize = "13px";
+    const key = document.createElement("span");
+    key.style.opacity = ".68";
+    key.textContent = label;
+    const text = document.createElement("span");
+    text.style.overflowWrap = "anywhere";
+    text.textContent = typeof value === "string" ? (boundedString(value) || "") : String(value);
+    row.appendChild(key);
+    row.appendChild(text);
+    card.appendChild(row);
+  }
+
+  function toolTitle(tool) {
+    if (tool === "cargo_check") return "Cargo Check";
+    if (tool === "cargo_test") return "Cargo Test";
+    if (tool === "go_test") return "Go Test";
+    return boundedString(tool) || "Validation";
+  }
+
+  function durationText(value) {
+    if (!Number.isFinite(value)) return null;
+    if (value < 1000) return String(value) + " ms";
+    return (value / 1000).toFixed(value < 10000 ? 2 : 1) + " s";
+  }
+
+  function validationRunState(presentation) {
+    const execution = boundedString(presentation.execution_state);
+    const failure = boundedString(presentation.failure_kind);
+    if (execution === "queued") return "Queued";
+    if (execution === "running") return "Running";
+    if (execution === "timed_out") return "Timed out";
+    if (execution === "outcome_unknown") return "Outcome unknown";
+    if (execution === "not_started") return "Not started";
+    if (execution === "completed" && presentation.passed === true) return "Passed";
+    if (execution === "completed" && failure === "validation_failed") return "Validation failed";
+    if (execution === "completed" && failure === "process_exit") return "Process exited";
+    if (execution === "completed" && presentation.passed === false) return failure || "Completed · not passed";
+    return execution || failure || "Validation result";
+  }
+
+  function appendDetailsCard(configure) {
+    const details = document.createElement("details");
+    details.style.border = "1px solid var(--color-border-secondary,rgba(127,127,127,.25))";
+    details.style.borderRadius = "10px";
+    details.style.padding = "10px 12px";
+    const summary = document.createElement("summary");
+    summary.style.cursor = "pointer";
+    summary.style.fontSize = "13px";
+    summary.style.fontWeight = "600";
+    summary.textContent = "Details";
+    details.appendChild(summary);
+    const body = document.createElement("div");
+    body.style.display = "grid";
+    body.style.gap = "6px";
+    body.style.marginTop = "10px";
+    configure(body);
+    details.appendChild(body);
+    cardsEl.appendChild(details);
+  }
+
+  function addDiagnostic(body, item) {
+    if (!item || typeof item !== "object") return;
+    const severity = boundedString(item.severity) || "diagnostic";
+    const code = boundedString(item.code);
+    const message = boundedString(item.message);
+    if (!message) return;
+    const line = document.createElement("div");
+    line.style.fontSize = "12px";
+    line.style.overflowWrap = "anywhere";
+    line.textContent = severity + (code ? " [" + code + "]" : "") + ": " + message;
+    body.appendChild(line);
+  }
+
+  function addFailedTest(body, item) {
+    if (!item || typeof item !== "object") return;
+    const name = boundedString(item.name);
+    if (!name) return;
+    const kind = boundedString(item.failure_kind);
+    const line = document.createElement("div");
+    line.style.fontSize = "12px";
+    line.style.overflowWrap = "anywhere";
+    line.textContent = "Test: " + name + (kind ? " · " + kind : "");
+    body.appendChild(line);
+  }
+
+  function renderValidationRun(presentation) {
+    titleEl.textContent = toolTitle(presentation.tool);
+    const state = validationRunState(presentation);
+    stateEl.textContent = state;
+    const parts = [];
+    if (Number.isInteger(presentation.tests_run_count)) {
+      parts.push(String(presentation.tests_run_count) + " tests");
+      if (Number.isInteger(presentation.tests_passed)) parts.push(String(presentation.tests_passed) + " passed");
+      if (Number.isInteger(presentation.tests_failed)) parts.push(String(presentation.tests_failed) + " failed");
+    } else if (Number.isInteger(presentation.errors_count) || Number.isInteger(presentation.warnings_count)) {
+      if (Number.isInteger(presentation.errors_count)) parts.push(String(presentation.errors_count) + " errors");
+      if (Number.isInteger(presentation.warnings_count)) parts.push(String(presentation.warnings_count) + " warnings");
+    }
+    const duration = durationText(presentation.duration_ms);
+    if (duration) parts.push(duration);
+    summaryEl.textContent = parts.length ? parts.join(" · ") : state;
+
+    appendDetailsCard((body) => {
+      addRow(body, "Execution", boundedString(presentation.execution_state));
+      addRow(body, "Failure kind", boundedString(presentation.failure_kind));
+      addRow(body, "Terminal", typeof presentation.terminal === "boolean" ? (presentation.terminal ? "yes" : "no") : null);
+      addRow(body, "Command started", typeof presentation.command_started === "boolean" ? (presentation.command_started ? "yes" : "no") : null);
+      addRow(body, "Command completed", typeof presentation.command_completed === "boolean" ? (presentation.command_completed ? "yes" : "no") : null);
+      addRow(body, "Job", boundedString(presentation.job_id));
+      addRow(body, "Job status", boundedString(presentation.job_status));
+      addRow(body, "Exit code", Number.isInteger(presentation.exit_code) ? presentation.exit_code : null);
+      const diagnostics = presentation.diagnostics && typeof presentation.diagnostics === "object" ? presentation.diagnostics : null;
+      if (!diagnostics) return;
+      addRow(body, "Diagnostics available", typeof diagnostics.available === "boolean" ? (diagnostics.available ? "yes" : "no") : null);
+      addRow(body, "Diagnostics", Number.isInteger(diagnostics.diagnostic_count) ? diagnostics.diagnostic_count : null);
+      addRow(body, "Diagnostics returned", Number.isInteger(diagnostics.returned_diagnostic_count) ? diagnostics.returned_diagnostic_count : null);
+      const items = Array.isArray(diagnostics.items) ? diagnostics.items.slice(0, MAX_ITEMS) : [];
+      const remaining = Math.max(0, MAX_ITEMS - items.length);
+      const failed = Array.isArray(diagnostics.failed_tests) ? diagnostics.failed_tests.slice(0, remaining) : [];
+      items.forEach((item) => addDiagnostic(body, item));
+      failed.forEach((item) => addFailedTest(body, item));
+      if (diagnostics.diagnostics_truncated === true || diagnostics.failed_test_details_truncated === true || diagnostics.presentation_items_truncated === true) {
+        addRow(body, "Diagnostic detail", "bounded/truncated");
+      }
+    });
+  }
+
+  function addEvidenceEvent(body, event) {
+    if (!event || typeof event !== "object") return;
+    const name = toolTitle(event.tool_name);
+    const summary = boundedString(event.summary);
+    const failure = boundedString(event.failure_kind);
+    const line = document.createElement("div");
+    line.style.fontSize = "12px";
+    line.style.overflowWrap = "anywhere";
+    const facts = [];
+    if (typeof event.validation_passed === "boolean") facts.push("validation " + (event.validation_passed ? "passed" : "not passed"));
+    if (typeof event.execution_success === "boolean") facts.push("execution " + (event.execution_success ? "succeeded" : "did not succeed"));
+    if (typeof event.expectation_satisfied === "boolean") facts.push("expectation " + (event.expectation_satisfied ? "satisfied" : "not satisfied"));
+    if (failure) facts.push(failure);
+    if (Number.isInteger(event.tests_run_count)) facts.push(String(event.tests_run_count) + " tests");
+    if (Number.isInteger(event.tests_failed)) facts.push(String(event.tests_failed) + " failed");
+    line.textContent = name + (summary ? " · " + summary : "") + (facts.length ? " · " + facts.join(" · ") : "");
+    body.appendChild(line);
+  }
+
+  function renderValidationSummary(presentation) {
+    const validation = presentation.validation && typeof presentation.validation === "object" ? presentation.validation : {};
+    const status = boundedString(validation.status) || "unknown";
+    const current = validation.current_evidence && typeof validation.current_evidence === "object" ? validation.current_evidence : null;
+    const currentStatus = current ? boundedString(current.status) : null;
+    const historical = validation.historical_failures && typeof validation.historical_failures === "object" ? validation.historical_failures : null;
+    titleEl.textContent = "Validation evidence";
+    stateEl.textContent = status;
+    const parts = [];
+    if (currentStatus) parts.push("current: " + currentStatus);
+    if (current && Number.isInteger(current.events_total)) parts.push(String(current.events_total) + " current events");
+    if (historical && Number.isInteger(historical.count)) parts.push(String(historical.count) + " historical failures");
+    summaryEl.textContent = parts.length ? parts.join(" · ") : "Ledger status: " + status;
+
+    appendDetailsCard((body) => {
+      addRow(body, "Ledger status", status);
+      addRow(body, "Latest status", boundedString(validation.latest_status));
+      addRow(body, "Available", typeof validation.available === "boolean" ? (validation.available ? "yes" : "no") : null);
+      if (current) {
+        addRow(body, "Current status", currentStatus);
+        addRow(body, "Current reason", boundedString(current.reason));
+        addRow(body, "Current latest", boundedString(current.latest_status));
+        addRow(body, "Boundary", boundedString(current.boundary_reason));
+        addRow(body, "Current successes", Number.isInteger(current.successes) ? current.successes : null);
+        addRow(body, "Current failures", Number.isInteger(current.failures) ? current.failures : null);
+        addRow(body, "Resolved failures", Number.isInteger(current.resolved_failure_count) ? current.resolved_failure_count : null);
+        addRow(body, "Unresolved failures", Number.isInteger(current.unresolved_failure_count) ? current.unresolved_failure_count : null);
+        addRow(body, "Evidence gaps", Number.isInteger(current.evidence_gap_event_count) ? current.evidence_gap_event_count : null);
+        addRow(body, "Evidence after content change", typeof current.evidence_after_latest_content_change === "boolean" ? (current.evidence_after_latest_content_change ? "yes" : "no") : null);
+      }
+      if (historical) {
+        addRow(body, "Historical failures", Number.isInteger(historical.count) ? historical.count : null);
+        addRow(body, "History resolved", typeof historical.resolved === "boolean" ? (historical.resolved ? "yes" : "no") : null);
+        addRow(body, "History unresolved", typeof historical.unresolved === "boolean" ? (historical.unresolved ? "yes" : "no") : null);
+      }
+      const resolved = validation.resolved_failures && typeof validation.resolved_failures === "object" ? validation.resolved_failures : null;
+      const unresolved = validation.unresolved_failures && typeof validation.unresolved_failures === "object" ? validation.unresolved_failures : null;
+      const gaps = validation.evidence_gaps && typeof validation.evidence_gaps === "object" ? validation.evidence_gaps : null;
+      addRow(body, "Resolved failures (all)", resolved && Number.isInteger(resolved.count) ? resolved.count : null);
+      addRow(body, "Unresolved failures (all)", unresolved && Number.isInteger(unresolved.count) ? unresolved.count : null);
+      addRow(body, "Evidence gaps (all)", gaps && Number.isInteger(gaps.count) ? gaps.count : null);
+      addRow(body, "Cargo test zero tests", typeof validation.cargo_test_zero_tests_run === "boolean" ? (validation.cargo_test_zero_tests_run ? "yes" : "no") : null);
+      const events = Array.isArray(validation.events) ? validation.events.slice(0, MAX_ITEMS) : [];
+      events.forEach((event) => addEvidenceEvent(body, event));
+      if (validation.events_truncated === true) addRow(body, "Event detail", "card subset bounded");
+    });
+  }
+
+  function renderItem(item) {
+    if (!item || typeof item !== "object") return;
+    const card = document.createElement("div");
+    card.style.border = "1px solid var(--color-border-secondary,rgba(127,127,127,.25))";
+    card.style.borderRadius = "10px";
+    card.style.padding = "12px";
+    addRow(card, "Job", boundedString(item.job_id));
+    addRow(card, "Status", boundedString(item.status));
+    addRow(card, "Project", boundedString(item.project));
+    addRow(card, "Terminal", typeof item.terminal === "boolean" ? (item.terminal ? "yes" : "no") : null);
+    addRow(card, "Active", typeof item.active === "boolean" ? (item.active ? "yes" : "no") : null);
+    addRow(card, "Blocking", typeof item.blocking_active === "boolean" ? (item.blocking_active ? "yes" : "no") : null);
+    addRow(card, "Stop pending", typeof item.terminal_pending === "boolean" ? (item.terminal_pending ? "yes" : "no") : null);
+    addRow(card, "Execution", boundedString(item.command_execution_state));
+    addRow(card, "Duration", Number.isFinite(item.duration_ms) ? String(item.duration_ms) + " ms" : null);
+    addRow(card, "Elapsed", Number.isFinite(item.elapsed_secs) ? String(item.elapsed_secs) + " s" : null);
+    addRow(card, "Recovery", boundedString(item.recovery_state));
+    addRow(card, "Recovery reason", boundedString(item.recovery_reason));
+    addRow(card, "Wait/log update", boundedString(item.log_delta_status));
+    addRow(card, "stdout lines", Number.isInteger(item.stdout_lines) ? item.stdout_lines : null);
+    addRow(card, "stderr lines", Number.isInteger(item.stderr_lines) ? item.stderr_lines : null);
+    addRow(card, "Error", boundedString(item.error_kind));
+    addRow(card, "Recovery action", boundedString(item.recovery_kind));
+    addRow(card, "Re-observe with", boundedString(item.recovery_tool));
+    addRow(card, "Guidance", boundedString(item.guidance));
+    cardsEl.appendChild(card);
+  }
+
+  function renderPresentation(presentation) {
+    if (!presentation || typeof presentation !== "object" || presentation.version !== 1) {
+      stateEl.textContent = "result unavailable";
+      summaryEl.textContent = "No bounded WebCodex result presentation metadata was attached.";
+      clearCards();
+      return;
+    }
+    clearCards();
+    if (presentation.kind === "validation_run") {
+      renderValidationRun(presentation);
+      return;
+    }
+    if (presentation.kind === "validation_summary") {
+      renderValidationSummary(presentation);
+      return;
+    }
+    const items = Array.isArray(presentation.items) ? presentation.items.slice(0, MAX_ITEMS) : [];
+    if (presentation.kind === "job_list") {
+      titleEl.textContent = "WebCodex Jobs";
+      const count = Number.isInteger(presentation.count) ? presentation.count : items.length;
+      const matched = Number.isInteger(presentation.matched_count) ? presentation.matched_count : count;
+      summaryEl.textContent = String(count) + " shown · " + String(matched) + " matched"
+        + (presentation.truncated === true ? " · canonical result truncated" : "")
+        + (presentation.items_truncated === true ? " · card subset bounded" : "");
+    } else if (presentation.kind === "job_observation") {
+      titleEl.textContent = items.length === 1 ? "WebCodex Job" : "WebCodex Jobs";
+      const wait = presentation.wait && typeof presentation.wait === "object" ? boundedString(presentation.wait.outcome) : null;
+      const terminal = Number.isInteger(presentation.terminal_count) ? presentation.terminal_count : null;
+      summaryEl.textContent = (wait ? "Observation: " + wait : "Job observation")
+        + (terminal === null ? "" : " · " + String(terminal) + " terminal")
+        + (presentation.output_truncated === true ? " · canonical result truncated" : "")
+        + (presentation.items_truncated === true ? " · card subset bounded" : "");
+    } else {
+      stateEl.textContent = "result rejected";
+      summaryEl.textContent = "Unsupported WebCodex presentation kind.";
+      return;
+    }
+    items.forEach(renderItem);
+    stateEl.textContent = "result received";
+  }
+
+  function renderToolResult(result) {
+    receivedToolResult = true;
+    const meta = result && typeof result === "object" && result._meta && typeof result._meta === "object"
+      ? result._meta
+      : null;
+    renderPresentation(meta ? meta[PRESENTATION_KEY] : null);
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent) return;
+    const message = event.data;
+    if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return;
+    if (message.id !== undefined && pending.has(message.id)) {
+      const item = pending.get(message.id);
+      pending.delete(message.id);
+      clearTimeout(item.timeout);
+      if (message.error !== undefined) item.reject(message.error);
+      else item.resolve(message.result);
+      return;
+    }
+    if (message.method === "ui/notifications/tool-result") renderToolResult(message.params);
+  }, { passive: true });
+
+  async function initialize() {
+    try {
+      const result = await request("ui/initialize", {
+        protocolVersion: APP_PROTOCOL,
+        appInfo: { name: "webcodex-result-app", title: "WebCodex Result", version: "1.0.0" },
+        appCapabilities: {}
+      });
+      const protocol = result && typeof result === "object" ? boundedString(result.protocolVersion) : null;
+      notify("ui/notifications/initialized", {});
+      if (!receivedToolResult) {
+        stateEl.textContent = "initialized";
+        summaryEl.textContent = "MCP Apps initialized" + (protocol ? " · " + protocol : "") + " · waiting for a supported result";
+      }
+    } catch (error) {
+      if (!receivedToolResult) {
+        stateEl.textContent = "init failed";
+        summaryEl.textContent = "ui/initialize failed: " + boundedString(String(error && error.message ? error.message : error));
+      }
+    }
+  }
+
+  void initialize();
+})();
+</script>

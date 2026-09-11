@@ -1,9 +1,11 @@
+import brandIcon from "./assets/brand.png";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi } from "./lib/desktop-api";
 import type {
   ActivityEntry,
   DesktopError,
-  DesktopOperationKind,
   DesktopState,
 } from "./models/topology";
 import { FirstRun } from "./features/onboarding/FirstRun";
@@ -12,12 +14,15 @@ import { ProjectsPanel } from "./features/projects/ProjectsPanel";
 import { ConnectionPanel } from "./features/connection/ConnectionPanel";
 import { ActivityPanel } from "./features/activity/ActivityPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
-import { useLocale } from "./i18n/locale";
-import { desktopErrorPresentation, normalizeDesktopError } from "./i18n/presentation";
+import { LANGUAGES, useLocale } from "./i18n/locale";
+import { desktopErrorPresentation, normalizeDesktopError, runtimeLabel, operationLabel } from "./i18n/presentation";
 
 type Navigation = "home" | "projects" | "connection" | "activity" | "settings";
 
+const NAVIGATION: Navigation[] = ["home", "projects", "connection", "activity", "settings"];
+
 const REGULAR_TUNNEL_OBSERVATION_INTERVAL_MS = 1_500;
+const CHATGPT_ACTIVITY_OBSERVATION_INTERVAL_MS = 30_000;
 const ACTIVE_OPERATION_OBSERVATION_INTERVAL_MS = 1_000;
 
 export default function App() {
@@ -30,16 +35,67 @@ export default function App() {
   const [cancelSubmittingId, setCancelSubmittingId] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [startupAttempt, setStartupAttempt] = useState(0);
+  const [windowFocused, setWindowFocused] = useState(true);
   const stateVersionRef = useRef(0);
   const mainRef = useRef<HTMLElement>(null);
   const hasRegularTunnel = Boolean(state?.regular_tunnel);
   const hasCurrentOperation = Boolean(state?.current_operation);
   const hasLoadedState = Boolean(state);
+  const shouldObserveChatgptActivity = Boolean(
+    state?.readiness.runtime_ready
+      && !state.chatgpt_activity?.observed
+      && !hasCurrentOperation
+      && !refreshing
+      && windowFocused,
+  );
+
+  useEffect(() => {
+    const onFocus = () => setWindowFocused(true);
+    const onBlur = () => setWindowFocused(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
     mainRef.current?.scrollTo?.({ top: 0 });
   }, [navigation, showSetup]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<unknown>("desktop:navigate", (event) => {
+      if (event.payload !== "activity" && event.payload !== "settings") return;
+      setShowSetup(false);
+      setNavigation(event.payload);
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    }).catch(() => {
+      // Host navigation is optional. Ordinary in-window navigation remains
+      // usable if the native event subscription is unavailable.
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const navigateWithKeyboard = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.repeat) return;
+      const page = NAVIGATION[Number(event.key) - 1];
+      if (!page) return;
+      event.preventDefault();
+      setNavigation(page);
+    };
+    window.addEventListener("keydown", navigateWithKeyboard);
+    return () => window.removeEventListener("keydown", navigateWithKeyboard);
+  }, []);
 
   const openSetup = () => {
     setShowSetup(true);
@@ -51,27 +107,40 @@ export default function App() {
     setState(next);
   }, []);
 
+  const commitChatgptActivity = useCallback((next: DesktopState) => {
+    stateVersionRef.current += 1;
+    setState((current) => {
+      if (!current) return next;
+      if (current.chatgpt_activity?.observed && !next.chatgpt_activity?.observed) return current;
+      return { ...current, chatgpt_activity: next.chatgpt_activity };
+    });
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const initial = await desktopApi.getState();
         if (cancelled) return;
+        // Keep first-run setup mounted through intermediate topology snapshots
+        // and the optional Tunnel handoff, including their error/retry paths.
+        if (!initial.topology) setShowSetup(true);
         commitState(initial);
         if (initial.current_operation) return;
-        const bootstrapLocal = !initial.topology;
         const resumeExisting = Boolean(
           initial.topology
           && initial.runtime_autostart
           && initial.topology.experience === "full",
         );
-        if (!bootstrapLocal && !resumeExisting) return;
+        // A fresh Desktop must stay in product setup until the user chooses
+        // the real project and runtime topology. Silently bootstrapping the
+        // Desktop workspace creates a fake "configured" happy path and makes
+        // users configure the product twice before ChatGPT can use their code.
+        if (!resumeExisting) return;
 
         setRefreshing(true);
         try {
-          let next = bootstrapLocal
-            ? await desktopApi.configureLocal(null)
-            : await desktopApi.resumeSavedRuntime();
+          let next = await desktopApi.resumeSavedRuntime();
           if (cancelled) return;
           commitState(next);
           if (shouldStartPreferredTunnel(next)) {
@@ -128,6 +197,35 @@ export default function App() {
   }, [commitState, hasCurrentOperation, hasLoadedState, hasRegularTunnel, refreshing]);
 
   useEffect(() => {
+    if (!shouldObserveChatgptActivity) return;
+
+    let cancelled = false;
+    let timeoutId: number | undefined;
+    const observe = async () => {
+      try {
+        const next = await desktopApi.observeChatgptActivity();
+        if (!cancelled) commitChatgptActivity(next);
+      } catch {
+        // Observation is best-effort. Keep the runtime usable and retry only
+        // while the Desktop window remains focused.
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(
+            () => void observe(),
+            CHATGPT_ACTIVITY_OBSERVATION_INTERVAL_MS,
+          );
+        }
+      }
+    };
+
+    void observe();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
+  }, [commitChatgptActivity, shouldObserveChatgptActivity]);
+
+  useEffect(() => {
     if (navigation === "activity") {
       void desktopApi.activity().then(setActivity).catch(() => undefined);
     }
@@ -137,6 +235,48 @@ export default function App() {
     setError(null);
     try {
       commitState(await operation());
+    } catch (value) {
+      setError(normalizeDesktopError(value));
+    }
+  };
+
+  const chooseLocalProject = async () => {
+    if (!state || state.current_operation) return;
+    const topology = state.topology;
+    if (
+      !topology ||
+      topology.experience !== "full" ||
+      topology.server.kind !== "local" ||
+      !state.project ||
+      !state.readiness.runtime_ready
+    ) {
+      openSetup();
+      return;
+    }
+    setError(null);
+    try {
+      const selection = await open({
+        directory: true,
+        multiple: false,
+        title: t("setup.chooseProject"),
+      });
+      if (typeof selection !== "string") return;
+      try {
+        commitState(await desktopApi.activateLocalProject(selection));
+      } catch (value) {
+        const normalized = normalizeDesktopError(value);
+        if (
+          normalized.code !== "project_activation_capability_unavailable" &&
+          normalized.code !== "project_activation_restart_required"
+        ) {
+          throw normalized;
+        }
+        // Older Runners may need the existing bounded Local Setup fallback to
+        // refresh only the Desktop-owned Runner. Keep the user's already-running
+        // Tunnel untouched and do not require a second confirmation click.
+        commitState(await desktopApi.configureLocal(selection));
+      }
+      setShowSetup(false);
     } catch (value) {
       setError(normalizeDesktopError(value));
     }
@@ -185,7 +325,7 @@ export default function App() {
   if (!state) {
     return (
       <main className="splash">
-        <div className="brand-mark" aria-hidden="true">W</div>
+        <img className="brand-mark" src={brandIcon} alt="" />
         {error ? (
           <section className="startup-error" aria-label="WebCodex">
             <AppError error={error} />
@@ -213,18 +353,21 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark" aria-hidden="true">W</div><div><strong>WebCodex</strong><span>Desktop</span></div></div>
+        <div className="brand"><img className="brand-mark" src={brandIcon} alt="" /><div><strong>WebCodex</strong><span>Desktop</span></div></div>
         <nav aria-label={t("nav.main")}>
-          {(["home", "projects", "connection", "activity", "settings"] as Navigation[]).map((item) => (
+          {NAVIGATION.map((item, index) => (
             <button
               key={item}
               className={navigation === item ? "active" : ""}
               onClick={() => setNavigation(item)}
               aria-current={navigation === item ? "page" : undefined}
+              aria-keyshortcuts={`Control+${index + 1} Meta+${index + 1}`}
+              title={`${t(`nav.${item}`)} (⌘ / Ctrl + ${index + 1})`}
               data-webcodex-action={`navigate-${item}`}
             >
               <span className={`nav-icon nav-${item}`} aria-hidden="true" />
               {t(`nav.${item}`)}
+              <kbd aria-hidden="true">{index + 1}</kbd>
             </button>
           ))}
         </nav>
@@ -237,13 +380,12 @@ export default function App() {
             onChange={(event) => setLocale(event.target.value as typeof locale)}
             data-webcodex-control="locale"
           >
-            <option value="zh-CN">{t("locale.zh")}</option>
-            <option value="en-US">{t("locale.en")}</option>
+            {LANGUAGES.map((language) => <option key={language.value} value={language.value}>{language.label}</option>)}
           </select>
         </div>
         <div className="sidebar-status">
           <i className={`status-dot ${state.readiness.runtime_ready ? "ready" : "unknown"}`} aria-hidden="true" />
-          <div><strong>{state.readiness.runtime_ready ? t("sidebar.runtimeReady") : state.topology ? t("common.stopped") : t("sidebar.needsSetup")}</strong><span>{state.readiness.ready_for_chatgpt ? t("sidebar.chatgptReady") : t("sidebar.connectionIncomplete")}</span></div>
+          <div><strong>{runtimeLabel(state, t)}</strong><span>{sidebarConnectionLabel(state, t)}</span></div>
         </div>
       </aside>
 
@@ -303,6 +445,7 @@ export default function App() {
             onRefresh={() => void refresh()}
             onResumeRuntime={() => void resumeRuntime()}
             onConnectChatGpt={() => void runStateOperation(desktopApi.startRegularTunnel)}
+            onChooseProject={() => void chooseLocalProject()}
             onChangeSetup={openSetup}
             onNavigate={setNavigation}
             onStopQuickShare={() => void runStateOperation(desktopApi.stopQuickShare)}
@@ -310,7 +453,7 @@ export default function App() {
           />
         ))}
         {navigation === "projects" && (
-          <ProjectsPanel state={state} onConfigure={openSetup} />
+          <ProjectsPanel state={state} onChooseProject={() => void chooseLocalProject()} />
         )}
         {navigation === "connection" && <ConnectionPanel state={state} onState={commitState} />}
         {navigation === "activity" && <ActivityPanel activity={activity} />}
@@ -320,6 +463,16 @@ export default function App() {
   );
 }
 
+function sidebarConnectionLabel(state: DesktopState, t: ReturnType<typeof useLocale>["t"]) {
+  if (!state.readiness.runtime_ready) return t("workspace.afterStart");
+  if (state.regular_tunnel?.status !== "error" && state.readiness.runtime_ready && state.chatgpt_activity?.observed) {
+    return t("sidebar.chatgptObserved");
+  }
+  if (state.readiness.ready_for_chatgpt) return t("sidebar.chatgptReady");
+  if (state.regular_tunnel?.status === "ready" && state.regular_tunnel.ready_for_chatgpt) return t("sidebar.tunnelWaiting");
+  return t("sidebar.connectionIncomplete");
+}
+
 function shouldStartPreferredTunnel(state: DesktopState) {
   return state.preferred_connection === "open_ai_tunnel" &&
     state.topology?.experience === "full" &&
@@ -327,24 +480,6 @@ function shouldStartPreferredTunnel(state: DesktopState) {
     state.readiness.runtime_ready &&
     state.openai_tunnel_configured &&
     !state.regular_tunnel;
-}
-
-function operationLabel(
-  kind: DesktopOperationKind,
-  t: ReturnType<typeof useLocale>["t"],
-) {
-  switch (kind) {
-    case "local_setup": return t("operation.localSetup");
-    case "remote_setup": return t("operation.remoteSetup");
-    case "quick_share_start": return t("operation.quickShareStart");
-    case "quick_share_stop": return t("operation.quickShareStop");
-    case "regular_tunnel_start": return t("operation.regularTunnelStart");
-    case "regular_tunnel_stop": return t("operation.regularTunnelStop");
-    case "local_runtime_stop": return t("operation.localRuntimeStop");
-    case "runtime_refresh": return t("operation.runtimeRefresh");
-    case "runtime_resume": return t("operation.runtimeResume");
-    case "tunnel_proxy_update": return t("operation.tunnelProxyUpdate");
-  }
 }
 
 function AppError({ error }: { error: DesktopError }) {

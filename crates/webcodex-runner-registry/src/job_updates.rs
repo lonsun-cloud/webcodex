@@ -3,15 +3,18 @@ use super::access_control::{
 };
 use super::jobs::{
     append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
-    job_view, notify_job_update, observe_job_terminal, process_preview, refresh_job_status_locked,
-    replace_log_limited, script_preview, select_log_lines,
+    job_view, notify_job_update, observe_job_terminal, parse_job_lifecycle, process_preview,
+    refresh_job_status_locked, replace_log_limited, script_preview, select_log_lines,
 };
 use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
     enqueue_pending_request_locked, next_request_id, notify_runner_locked,
     remove_pending_request_locked,
 };
-use super::state::{DetachedIdempotencyIntent, ShellJobRecord, ShellJobVisibility};
+use super::state::{
+    DetachedIdempotencyIntent, JobLifecycleState, JobObservationState, JobRecoveryPhase,
+    JobRecoveryReason, JobRecoveryState, ShellJobRecord, ShellJobVisibility,
+};
 use super::validation::{validate_id, validate_run_request, validate_runner_instance_id};
 use super::{
     now_ts, RunnerFeature, RunnerRegistry, DETACHED_IDEMPOTENCY_CONFLICT,
@@ -21,16 +24,21 @@ use crate::DetachedInitiatorIdentity;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use tokio::sync::Notify;
 use uuid::Uuid;
+use webcodex_core::runner_operation::{
+    RunnerInvocationMetadata, RunnerJobOperation, RunnerJobProcessOperation,
+    RunnerJobScriptOperation, RunnerJobShellOperation, RunnerJobValidationOperation,
+    RunnerOperation,
+};
 use webcodex_core::runner_protocol::{
     validate_process_argv, validate_script_request, validation_infrastructure_failure_code,
     RunnerJobUpdateRequest, RunnerRequest, ShellCommandExecutionState, ShellJobActivity,
     ShellJobActivityPhase, ShellJobActivitySource, ShellJobContext, ShellJobInfo,
     ShellJobOpRequest, ShellJobStructuredExecutionMetadata, ShellJobValidationMetadata,
-    ShellJobValidationStep, ShellProcessArgv, ShellRunRequest, ShellScriptPayload,
-    DETACHED_IDEMPOTENCY_KEY_MAX_BYTES, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
-    STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
+    ShellJobValidationStep, ShellProcessArgv, ShellRunRequest, ShellScriptLanguage,
+    ShellScriptPayload, DETACHED_IDEMPOTENCY_KEY_MAX_BYTES, PROCESS_CWD_MAX_BYTES,
+    PROCESS_STDIN_MAX_BYTES, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 
 #[derive(Clone, Copy)]
@@ -169,8 +177,8 @@ fn frozen_shell_job_log_projection(
         let mut view = job_view(job);
         view.observation_token = webcodex_core::job_observation::JobObservationToken::new_legacy(
             job.job_id.clone(),
-            job.observation_epoch.to_string(),
-            job.public_revision.load(Ordering::Relaxed),
+            job.observation.epoch.to_string(),
+            job.observation.revision.load(Ordering::Relaxed),
         )
         .ok()
         .map(|token| token.encode());
@@ -197,7 +205,7 @@ fn frozen_shell_job_log_projection(
         );
     }
 
-    let epoch_matches = after.is_none_or(|token| token.epoch == job.observation_epoch.as_ref());
+    let epoch_matches = after.is_none_or(|token| token.epoch == job.observation.epoch.as_ref());
     let base_mode = match after {
         None => webcodex_core::job_observation::JobLogSelectionMode::Baseline,
         Some(token) if token.is_legacy() || !epoch_matches => {
@@ -241,8 +249,8 @@ fn frozen_shell_job_log_projection(
     let mut view = job_view(job);
     view.observation_token = webcodex_core::job_observation::JobObservationToken::new(
         job.job_id.clone(),
-        job.observation_epoch.to_string(),
-        job.public_revision.load(Ordering::Relaxed),
+        job.observation.epoch.to_string(),
+        job.observation.revision.load(Ordering::Relaxed),
         stdout.next_line as u64,
         stderr.next_line as u64,
     )
@@ -275,9 +283,8 @@ fn frozen_shell_job_log_projection(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JobPublicMutationSignature {
-    status: String,
-    recovery_state: Option<String>,
-    recovery_reason_code: Option<String>,
+    lifecycle: JobLifecycleState,
+    recovery: JobRecoveryState,
     last_update_seq: u64,
     stdout: super::state::ShellJobLogState,
     stderr: super::state::ShellJobLogState,
@@ -295,9 +302,8 @@ struct JobPublicMutationSignature {
 
 fn public_mutation_signature(job: &ShellJobRecord) -> JobPublicMutationSignature {
     JobPublicMutationSignature {
-        status: job.status.clone(),
-        recovery_state: job.recovery_state.clone(),
-        recovery_reason_code: job.recovery_reason_code.clone(),
+        lifecycle: job.lifecycle,
+        recovery: job.recovery.clone(),
         last_update_seq: job.last_update_seq,
         stdout: job.stdout.clone(),
         stderr: job.stderr.clone(),
@@ -309,8 +315,8 @@ fn public_mutation_signature(job: &ShellJobRecord) -> JobPublicMutationSignature
         command_execution_state: job.command_execution_state,
         validation_progress: job.validation_progress.clone(),
         activity: job.activity,
-        recovered_after_server_restart: job.recovered_after_server_restart,
-        reconciled_at: job.reconciled_at,
+        recovered_after_server_restart: job.recovery.recovered_after_server_restart,
+        reconciled_at: job.recovery.reconciled_at,
     }
 }
 
@@ -321,6 +327,7 @@ fn invalid_progress(code: &'static str) -> Result<(), ValidationProtocolError> {
 fn validate_validation_progress(
     job: &ShellJobRecord,
     update: &RunnerJobUpdateRequest,
+    lifecycle: JobLifecycleState,
 ) -> Result<(), ValidationProtocolError> {
     if job.validation_steps.is_empty() {
         return if update.validation_progress.is_none() {
@@ -332,22 +339,31 @@ fn validate_validation_progress(
     if job.validation_steps.iter().collect::<HashSet<_>>().len() != job.validation_steps.len() {
         return invalid_progress("validation_plan_invalid");
     }
-    let status = update.status.trim();
-    if update.finished && !is_final_job_status(status) {
+    if update.finished && !lifecycle.is_terminal() {
         return invalid_progress("validation_progress_invalid");
     }
     let cancelling = matches!(
-        status,
-        "stopped" | "cancelled" | "timeout" | "timed_out" | "lost"
+        lifecycle,
+        JobLifecycleState::Stopped
+            | JobLifecycleState::Cancelled
+            | JobLifecycleState::Timeout
+            | JobLifecycleState::TimedOut
+            | JobLifecycleState::Lost
     );
     let Some(progress) = update.validation_progress.as_ref() else {
-        if matches!(status, "queued" | "agent_queued") || cancelling {
+        if matches!(
+            lifecycle,
+            JobLifecycleState::Queued | JobLifecycleState::RunnerQueued
+        ) || cancelling
+        {
             return Ok(());
         }
         return invalid_progress("validation_progress_missing");
     };
-    if matches!(status, "queued" | "agent_queued")
-        || progress.completed > job.validation_steps.len()
+    if matches!(
+        lifecycle,
+        JobLifecycleState::Queued | JobLifecycleState::RunnerQueued
+    ) || progress.completed > job.validation_steps.len()
     {
         return invalid_progress("validation_progress_invalid");
     }
@@ -365,7 +381,7 @@ fn validate_validation_progress(
         return invalid_progress("validation_progress_invalid");
     }
     let no_active_step = progress.current_step.is_none() && progress.failed_step.is_none();
-    let infrastructure_failure = status == "failed"
+    let infrastructure_failure = lifecycle == JobLifecycleState::Failed
         && update.finished
         && update.exit_code.is_none()
         && update
@@ -377,13 +393,13 @@ fn validate_validation_progress(
         no_active_step
     } else if infrastructure_failure {
         progress.completed < job.validation_steps.len() && no_active_step
-    } else if !is_final_job_status(status) {
+    } else if !lifecycle.is_terminal() {
         let expected = job.validation_steps.get(progress.completed);
         expected.map(String::as_str) == progress.current_step.as_deref()
             && progress.failed_step.is_none()
-    } else if status == "completed" && update.exit_code == Some(0) {
+    } else if lifecycle == JobLifecycleState::Completed && update.exit_code == Some(0) {
         progress.completed == job.validation_steps.len() && no_active_step
-    } else if status == "failed" {
+    } else if lifecycle == JobLifecycleState::Failed {
         let expected = job.validation_steps.get(progress.completed);
         expected.map(String::as_str) == progress.failed_step.as_deref()
             && progress.current_step.is_none()
@@ -392,7 +408,7 @@ fn validate_validation_progress(
     };
     if valid {
         Ok(())
-    } else if status == "completed" && update.exit_code == Some(0) {
+    } else if lifecycle == JobLifecycleState::Completed && update.exit_code == Some(0) {
         invalid_progress("validation_progress_incomplete")
     } else {
         invalid_progress("validation_progress_invalid")
@@ -411,14 +427,19 @@ fn validation_activity_phase(step: &str) -> Option<ShellJobActivityPhase> {
 fn validate_job_activity(
     job: &ShellJobRecord,
     update: &RunnerJobUpdateRequest,
+    lifecycle: JobLifecycleState,
 ) -> Result<(), ValidationProtocolError> {
     let Some(activity) = update.activity else {
         // Activity was added as an optional protocol field. Older Runners may
         // omit it without changing canonical Job lifecycle semantics.
         return Ok(());
     };
-    let status = update.status.trim();
-    if !activity.is_canonical() || !matches!(status, "running" | "stop_requested") {
+    if !activity.is_canonical()
+        || !matches!(
+            lifecycle,
+            JobLifecycleState::Running | JobLifecycleState::StopRequested
+        )
+    {
         return invalid_progress("job_activity_invalid");
     }
     match activity.source {
@@ -469,9 +490,9 @@ fn validate_job_activity(
 fn validate_command_execution_state(
     job: &ShellJobRecord,
     update: &RunnerJobUpdateRequest,
+    lifecycle: JobLifecycleState,
 ) -> Result<(), ValidationProtocolError> {
-    let status = update.status.trim();
-    let terminal = is_final_job_status(status);
+    let terminal = lifecycle.is_terminal();
     if !terminal && update.command_execution_state.is_some() {
         return invalid_progress("command_execution_state_on_active_job");
     }
@@ -483,14 +504,26 @@ fn validate_command_execution_state(
     };
     let valid = match state {
         ShellCommandExecutionState::NotStarted => {
-            matches!(status, "failed" | "stopped" | "cancelled" | "lost")
-                && job.started_at.is_none()
+            matches!(
+                lifecycle,
+                JobLifecycleState::Failed
+                    | JobLifecycleState::Stopped
+                    | JobLifecycleState::Cancelled
+                    | JobLifecycleState::Lost
+            ) && job.started_at.is_none()
         }
-        ShellCommandExecutionState::OutcomeUnknown => matches!(status, "failed" | "lost"),
-        ShellCommandExecutionState::TimedOut => matches!(status, "timeout" | "timed_out"),
-        ShellCommandExecutionState::Completed => {
-            matches!(status, "completed" | "failed" | "stopped" | "cancelled")
-        }
+        ShellCommandExecutionState::OutcomeUnknown => matches!(
+            lifecycle,
+            JobLifecycleState::Failed | JobLifecycleState::Lost
+        ),
+        ShellCommandExecutionState::TimedOut => lifecycle.is_timed_out(),
+        ShellCommandExecutionState::Completed => matches!(
+            lifecycle,
+            JobLifecycleState::Completed
+                | JobLifecycleState::Failed
+                | JobLifecycleState::Stopped
+                | JobLifecycleState::Cancelled
+        ),
     };
     if valid {
         Ok(())
@@ -661,6 +694,16 @@ impl RunnerRegistry {
         let validation_tool = metadata.validation_tool.clone();
         let assertion_name = metadata.assertion_name.clone();
         let structured_execution = metadata.structured_execution;
+        let javascript_script_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::Script(script))
+                if script.language == ShellScriptLanguage::Javascript
+        );
+        let typescript_script_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::Script(script))
+                if script.language == ShellScriptLanguage::Typescript
+        );
         let structured_stdin = metadata.stdin;
         if validation_steps.len() > 3
             || validation_steps.iter().any(|step| !step.is_canonical())
@@ -687,18 +730,11 @@ impl RunnerRegistry {
                     .to_string(),
             );
         }
-        let (
-            request_kind,
-            request_command,
-            request_process,
-            request_script,
-            request_stdin,
-            safe_command_preview,
-            structured_metadata,
-            job_kind,
-        ) = match structured_execution {
+        let (safe_command_preview, structured_metadata, job_kind) = match structured_execution
+            .as_ref()
+        {
             Some(StructuredJobExecution::Process(process)) => {
-                validate_process_argv(&process)?;
+                validate_process_argv(process)?;
                 validate_structured_job_common(
                     normalized_job_cwd.as_deref(),
                     structured_stdin.as_deref(),
@@ -716,19 +752,10 @@ impl RunnerRegistry {
                     validation_tool: validation_tool.clone(),
                     assertion_name: assertion_name.clone(),
                 };
-                (
-                    "start_process_job",
-                    String::new(),
-                    Some(process),
-                    None,
-                    structured_stdin,
-                    preview,
-                    Some(safe),
-                    "run_process",
-                )
+                (preview, Some(safe), "run_process")
             }
             Some(StructuredJobExecution::DetachedProcess(process)) => {
-                validate_process_argv(&process)?;
+                validate_process_argv(process)?;
                 validate_structured_job_common(
                     normalized_job_cwd.as_deref(),
                     structured_stdin.as_deref(),
@@ -745,20 +772,11 @@ impl RunnerRegistry {
                     validation_tool: validation_tool.clone(),
                     assertion_name: None,
                 };
-                (
-                    "start_detached_process_job",
-                    String::new(),
-                    Some(process),
-                    None,
-                    structured_stdin,
-                    preview,
-                    Some(safe),
-                    "run_detached_process",
-                )
+                (preview, Some(safe), "run_detached_process")
             }
             Some(StructuredJobExecution::Script(script)) => {
                 validate_script_request(
-                    &script,
+                    script,
                     structured_stdin.as_deref(),
                     normalized_job_cwd.as_deref(),
                     timeout_secs,
@@ -778,16 +796,7 @@ impl RunnerRegistry {
                     validation_tool: validation_tool.clone(),
                     assertion_name: assertion_name.clone(),
                 };
-                (
-                    "start_script_job",
-                    String::new(),
-                    None,
-                    Some(script),
-                    structured_stdin,
-                    preview,
-                    Some(safe),
-                    "run_script",
-                )
+                (preview, Some(safe), "run_script")
             }
             None => {
                 let run = ShellRunRequest {
@@ -799,17 +808,6 @@ impl RunnerRegistry {
                     wait_timeout_secs: 0,
                 };
                 validate_run_request(&run)?;
-                let request_kind = if validation_steps.is_empty() {
-                    "start_job"
-                } else {
-                    "start_validation_job"
-                };
-                let request_command = if validation_steps.is_empty() {
-                    command.clone()
-                } else {
-                    serde_json::to_string(&validation_steps)
-                        .map_err(|error| format!("could not serialize validation plan: {error}"))?
-                };
                 let preview = if validation_steps.is_empty() {
                     command_preview(&run.command)
                 } else {
@@ -822,27 +820,23 @@ impl RunnerRegistry {
                             .join(", ")
                     )
                 };
-                (
-                    request_kind,
-                    request_command,
-                    None,
-                    None,
-                    None,
-                    preview,
-                    None,
-                    "shell",
-                )
+                (preview, None, "shell")
             }
         };
+        let detached_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::DetachedProcess(_))
+        );
         let detached_idempotency_key = metadata.detached_idempotency_key.as_deref();
-        let detached_request = request_kind == "start_detached_process_job";
         if detached_request != detached_idempotency_key.is_some() {
             return Err(
                 "detached idempotency_key must be present exactly for detached process Job starts"
                     .to_string(),
             );
         }
-        let detached_intent = if detached_request {
+        let detached_intent = if let Some(StructuredJobExecution::DetachedProcess(process)) =
+            structured_execution.as_ref()
+        {
             Some(DetachedIdempotencyIntent {
                 project_id: metadata.project_id.clone(),
                 session_id: metadata.session_id.clone(),
@@ -850,11 +844,8 @@ impl RunnerRegistry {
                 cwd: normalized_job_cwd.clone(),
                 purpose: metadata.purpose.clone(),
                 shell: metadata.shell.clone(),
-                process: request_process
-                    .as_ref()
-                    .expect("detached request has typed process")
-                    .clone(),
-                stdin: request_stdin.clone(),
+                process: process.clone(),
+                stdin: structured_stdin.clone(),
                 timeout_secs,
             })
         } else {
@@ -887,35 +878,64 @@ impl RunnerRegistry {
             validation: validation.clone(),
             structured_execution: structured_metadata.clone(),
         };
-        let request = RunnerRequest {
-            request_id: request_id.clone(),
-            client_id: client_id.clone(),
-            kind: request_kind.to_string(),
-            job_id: Some(job_id.clone()),
-            cwd: normalized_job_cwd.clone(),
-            path: None,
-            content: None,
-            max_bytes: None,
-            expected_sha256: None,
-            expected_prefix: None,
-            start_line: None,
-            end_line: None,
-            create_dirs: false,
-            command: request_command,
-            process: request_process,
-            script: request_script,
-            stdin: request_stdin,
-            timeout_secs,
-            requested_by,
-            created_at,
-            validation: None,
-            lsp: None,
-            job_context: Some(job_context),
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: None,
-            persistent_shell: None,
+        let job_operation = match structured_execution {
+            Some(StructuredJobExecution::Process(process)) => {
+                RunnerJobOperation::StartProcess(RunnerJobProcessOperation {
+                    job_id: job_id.clone(),
+                    cwd: normalized_job_cwd.clone(),
+                    process,
+                    stdin: structured_stdin.clone(),
+                    timeout_secs,
+                    context: job_context,
+                })
+            }
+            Some(StructuredJobExecution::DetachedProcess(process)) => {
+                RunnerJobOperation::StartDetachedProcess(RunnerJobProcessOperation {
+                    job_id: job_id.clone(),
+                    cwd: normalized_job_cwd.clone(),
+                    process,
+                    stdin: structured_stdin.clone(),
+                    timeout_secs,
+                    context: job_context,
+                })
+            }
+            Some(StructuredJobExecution::Script(script)) => {
+                RunnerJobOperation::StartScript(RunnerJobScriptOperation {
+                    job_id: job_id.clone(),
+                    cwd: normalized_job_cwd.clone(),
+                    script,
+                    stdin: structured_stdin.clone(),
+                    timeout_secs,
+                    context: job_context,
+                })
+            }
+            None if validation_steps.is_empty() => {
+                RunnerJobOperation::StartShell(RunnerJobShellOperation {
+                    job_id: job_id.clone(),
+                    cwd: normalized_job_cwd.clone(),
+                    command: command.clone(),
+                    timeout_secs,
+                    context: job_context,
+                })
+            }
+            None => RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+                job_id: job_id.clone(),
+                cwd: normalized_job_cwd.clone(),
+                steps: validation_steps.clone(),
+                timeout_secs,
+                context: job_context,
+            }),
         };
+        debug_assert_eq!(job_operation.is_detached_process(), detached_request);
+        let request = RunnerRequest::from_operation(
+            RunnerInvocationMetadata {
+                request_id: request_id.clone(),
+                client_id: client_id.clone(),
+                requested_by,
+                created_at,
+            },
+            RunnerOperation::Job(job_operation),
+        )?;
         let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
@@ -942,7 +962,25 @@ impl RunnerRegistry {
                 "capability_unavailable: runner {client_id} does not support structured_execution_jobs"
             ));
         }
-        if request.kind == "start_detached_process_job"
+        if javascript_script_request
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptJavascript)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support structured_script_javascript"
+            ));
+        }
+        if typescript_script_request
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptTypescript)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support structured_script_typescript"
+            ));
+        }
+        if detached_request
             && !runner
                 .runner_features
                 .supports(RunnerFeature::DetachedProcessJobs)
@@ -1091,11 +1129,10 @@ impl RunnerRegistry {
             shell: metadata.shell,
             command_preview: safe_command_preview,
             detached_idempotency_intent: detached_intent,
-            status: "queued".to_string(),
+            lifecycle: JobLifecycleState::Queued,
             created_at,
             started_at: None,
             ended_at: None,
-            terminal_observed_at: None,
             exit_code: None,
             duration_ms: None,
             stdout: Default::default(),
@@ -1111,15 +1148,8 @@ impl RunnerRegistry {
             last_update_seq: 0,
             visibility: metadata.visibility,
 
-            recovery_state: None,
-            recovered_after_server_restart: false,
-            reconciled_at: None,
-            recovery_reason_code: None,
-            recovering_since: None,
-            recovery_original_status: None,
-            observation_epoch: self.observation_epoch.clone(),
-            public_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            update_notify: std::sync::Arc::new(Notify::new()),
+            recovery: JobRecoveryState::default(),
+            observation: JobObservationState::new(self.observation_epoch.clone()),
         };
         inner.request_to_job.insert(request_id, job_id.clone());
         inner.jobs_by_id.insert(job_id.clone(), job);
@@ -1155,7 +1185,7 @@ impl RunnerRegistry {
         // A terminal update may race the sync-wait deadline. Keep terminal
         // records hidden so the initiating structured tool call returns its
         // terminal result instead of handing off an already-finished Job.
-        if !is_final_job_status(&job.status) {
+        if !job.lifecycle.is_terminal() {
             let view = job_view(job);
             if view.observation_token.is_none() {
                 return Err(format!(
@@ -1278,7 +1308,7 @@ impl RunnerRegistry {
         {
             return Err(format!("unknown shell job: {job_id}"));
         }
-        if job.status == "queued" {
+        if job.lifecycle == JobLifecycleState::Queued {
             if let Some(request_id) = job.request_id.as_deref() {
                 remove_pending_request_locked(&mut inner, request_id);
                 inner.request_to_job.remove(request_id);
@@ -1286,7 +1316,7 @@ impl RunnerRegistry {
             inner.jobs_by_id.remove(job_id);
             return Ok(true);
         }
-        if is_final_job_status(&job.status) {
+        if job.lifecycle.is_terminal() {
             inner.jobs_by_id.remove(job_id);
             return Ok(true);
         }
@@ -1295,41 +1325,22 @@ impl RunnerRegistry {
             .get_mut(job_id)
             .expect("job exists")
             .visibility = ShellJobVisibility::CleanupPending;
-        if matches!(
-            job.status.as_str(),
-            "agent_queued" | "running" | "stop_requested"
-        ) && job.status != "stop_requested"
+        if !job.recovery_active()
+            && job.lifecycle.is_runner_active()
+            && job.lifecycle != JobLifecycleState::StopRequested
         {
             let stop_request_id = next_request_id();
-            let request = RunnerRequest {
-                request_id: stop_request_id.clone(),
-                client_id: job.client_id.clone(),
-                kind: "stop_job".to_string(),
-                job_id: Some(job_id.to_string()),
-                cwd: None,
-                path: None,
-                content: None,
-                max_bytes: None,
-                expected_sha256: None,
-                expected_prefix: None,
-                start_line: None,
-                end_line: None,
-                create_dirs: false,
-                command: String::new(),
-                process: None,
-                script: None,
-                stdin: None,
-                timeout_secs: 1,
-                requested_by: "tool_runtime_cleanup".to_string(),
-                created_at: now_ts(),
-                validation: None,
-                lsp: None,
-                job_context: None,
-                mcp_gateway: None,
-                plugin_gateway: None,
-                coding_agent: None,
-                persistent_shell: None,
-            };
+            let request = RunnerRequest::from_operation(
+                RunnerInvocationMetadata {
+                    request_id: stop_request_id.clone(),
+                    client_id: job.client_id.clone(),
+                    requested_by: "tool_runtime_cleanup".to_string(),
+                    created_at: now_ts(),
+                },
+                RunnerOperation::Job(RunnerJobOperation::Stop {
+                    job_id: job_id.to_string(),
+                }),
+            )?;
             enqueue_pending_request_locked(
                 self.telemetry.as_ref(),
                 &mut inner,
@@ -1340,7 +1351,7 @@ impl RunnerRegistry {
                 Some(job_id.to_string()),
             )?;
             let record = inner.jobs_by_id.get_mut(job_id).expect("job exists");
-            record.status = "stop_requested".to_string();
+            record.lifecycle = JobLifecycleState::StopRequested;
             record.error = Some("internal structured execution cleanup requested".to_string());
             notify_runner_locked(&inner, &job.client_id);
         }
@@ -1386,8 +1397,7 @@ impl RunnerRegistry {
         let Some(request_id) = job.request_id.clone() else {
             return false;
         };
-        if job.visibility != ShellJobVisibility::HiddenUntilHandoff
-            || !is_final_job_status(&job.status)
+        if job.visibility != ShellJobVisibility::HiddenUntilHandoff || !job.lifecycle.is_terminal()
         {
             return false;
         }
@@ -1527,7 +1537,7 @@ impl RunnerRegistry {
             .filter(|job| job.visibility == ShellJobVisibility::Public)
             .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
             .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
-            .filter(|job| crate::job_status_is_active(&job.status))
+            .filter(|job| job.lifecycle.is_active())
             .count()
     }
 
@@ -1548,7 +1558,7 @@ impl RunnerRegistry {
             .values()
             .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
             .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
-            .filter(|job| crate::job_status_is_active(&job.status))
+            .filter(|job| job.lifecycle.is_active())
             .count();
         if active == 0 {
             *inner
@@ -1588,7 +1598,11 @@ impl RunnerRegistry {
             .jobs_by_id
             .values()
             .filter(|job| job.client_id == client_id)
-            .filter(|job| status.map(|status| status == job.status).unwrap_or(true))
+            .filter(|job| {
+                status
+                    .map(|status| status == job.public_status())
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect::<Vec<_>>();
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
@@ -1667,11 +1681,11 @@ impl RunnerRegistry {
             {
                 return Err(format!("unknown shell job: {}", job_id));
             }
-            let revision = job.public_revision.load(Ordering::Relaxed);
+            let revision = job.observation.revision.load(Ordering::Relaxed);
             let changed = after.as_ref().is_some_and(|token| {
-                token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+                token.epoch != job.observation.epoch.as_ref() || token.revision != revision
             });
-            let terminal = is_final_job_status(&job.status);
+            let terminal = job.lifecycle.is_terminal();
             if wait_secs.is_none() || after.is_none() || changed || terminal {
                 let wait_outcome = if changed {
                     if waited {
@@ -1700,7 +1714,7 @@ impl RunnerRegistry {
                 ));
             }
 
-            let update_notify = job.update_notify.clone();
+            let update_notify = job.observation.notify.clone();
             let notified = update_notify.notified();
             drop(inner);
 
@@ -1714,11 +1728,11 @@ impl RunnerRegistry {
             {
                 return Err(format!("unknown shell job: {}", job_id));
             }
-            let revision = job.public_revision.load(Ordering::Relaxed);
+            let revision = job.observation.revision.load(Ordering::Relaxed);
             let changed = after.as_ref().is_some_and(|token| {
-                token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+                token.epoch != job.observation.epoch.as_ref() || token.revision != revision
             });
-            let terminal = is_final_job_status(&job.status);
+            let terminal = job.lifecycle.is_terminal();
             if changed || terminal {
                 let wait = JobLogWait {
                     wait_outcome: if terminal {
@@ -1760,11 +1774,11 @@ impl RunnerRegistry {
                 {
                     return Err(format!("unknown shell job: {}", job_id));
                 }
-                let revision = job.public_revision.load(Ordering::Relaxed);
+                let revision = job.observation.revision.load(Ordering::Relaxed);
                 let changed = after.as_ref().is_some_and(|token| {
-                    token.epoch != job.observation_epoch.as_ref() || token.revision != revision
+                    token.epoch != job.observation.epoch.as_ref() || token.revision != revision
                 });
-                let terminal = is_final_job_status(&job.status);
+                let terminal = job.lifecycle.is_terminal();
                 let wait = JobLogWait {
                     wait_outcome: if terminal {
                         JobLogWaitOutcome::Terminal
@@ -1814,15 +1828,21 @@ impl RunnerRegistry {
         {
             return Err(format!("unknown shell job: {}", job_id));
         }
-        match job.status.as_str() {
-            "queued" => {
+        if job.recovery_active() {
+            return Err(
+                "runner_unavailable_recovering: wait for same-instance job reconciliation before retrying stop_job"
+                    .to_string(),
+            );
+        }
+        match job.lifecycle {
+            JobLifecycleState::Queued => {
                 if let Some(request_id) = &job.request_id {
                     remove_pending_request_locked(&mut inner, request_id);
                     inner.request_to_job.remove(request_id);
                 }
                 let job = inner.jobs_by_id.get_mut(job_id).expect("job exists");
                 let terminal_now = now_ts();
-                job.status = "stopped".to_string();
+                job.lifecycle = JobLifecycleState::Stopped;
                 observe_job_terminal(job, terminal_now);
                 job.ended_at = Some(terminal_now);
                 job.error = Some("job stopped before Runner picked it up".to_string());
@@ -1832,38 +1852,23 @@ impl RunnerRegistry {
                 notify_job_update(job);
                 Ok(job_view(job))
             }
-            "agent_queued" | "running" | "stop_requested" => {
+            JobLifecycleState::StopRequested => {
+                Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists")))
+            }
+            JobLifecycleState::RunnerQueued | JobLifecycleState::Running => {
                 let stop_request_id = next_request_id();
                 let client_id = job.client_id.clone();
-                let request = RunnerRequest {
-                    request_id: stop_request_id.clone(),
-                    client_id: client_id.clone(),
-                    kind: "stop_job".to_string(),
-                    job_id: Some(job_id.to_string()),
-                    cwd: None,
-                    path: None,
-                    content: None,
-                    max_bytes: None,
-                    expected_sha256: None,
-                    expected_prefix: None,
-                    start_line: None,
-                    end_line: None,
-                    create_dirs: false,
-                    command: String::new(),
-                    process: None,
-                    script: None,
-                    stdin: None,
-                    timeout_secs: 1,
-                    requested_by,
-                    created_at: now_ts(),
-                    validation: None,
-                    lsp: None,
-                        job_context: None,
-                    mcp_gateway: None,
-                    plugin_gateway: None,
-                    coding_agent: None,
-                    persistent_shell: None,
-                };
+                let request = RunnerRequest::from_operation(
+                    RunnerInvocationMetadata {
+                        request_id: stop_request_id.clone(),
+                        client_id: client_id.clone(),
+                        requested_by,
+                        created_at: now_ts(),
+                    },
+                    RunnerOperation::Job(RunnerJobOperation::Stop {
+                        job_id: job_id.to_string(),
+                    }),
+                )?;
                 enqueue_pending_request_locked(
                     self.telemetry.as_ref(),
                     &mut inner,
@@ -1874,17 +1879,13 @@ impl RunnerRegistry {
                     Some(job_id.to_string()),
                 )?;
                 let job = inner.jobs_by_id.get_mut(job_id).expect("job exists");
-                job.status = "stop_requested".to_string();
+                job.lifecycle = JobLifecycleState::StopRequested;
                 job.error = Some("stop requested".to_string());
                 notify_job_update(job);
                 let notify_runner_id = job.client_id.clone();
                 notify_runner_locked(&inner, &notify_runner_id);
                 Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists")))
             }
-            "recovering" => Err(
-                "runner_unavailable_recovering: wait for same-instance job reconciliation before retrying stop_job"
-                    .to_string(),
-            ),
             _ => Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists"))),
         }
     }
@@ -1959,33 +1960,30 @@ impl RunnerRegistry {
                     .to_string(),
             );
         }
-        if sequenced
-            && !matches!(
-                incoming_status,
-                "agent_queued"
-                    | "running"
-                    | "stop_requested"
-                    | "completed"
-                    | "failed"
-                    | "stopped"
-                    | "timeout"
-                    | "timed_out"
-                    | "cancelled"
-                    | "lost"
-            )
+        let incoming_lifecycle = parse_job_lifecycle(incoming_status).map_err(|_| {
+            if sequenced {
+                format!(
+                    "job_state_reconciliation update status '{}' is invalid",
+                    incoming_status
+                )
+            } else {
+                format!("job update status '{}' is invalid", incoming_status)
+            }
+        })?;
+        if sequenced && !(incoming_lifecycle.is_runner_active() || incoming_lifecycle.is_terminal())
         {
             return Err(format!(
                 "job_state_reconciliation update status '{}' is invalid",
                 incoming_status
             ));
         }
-        if sequenced && body.finished != is_final_job_status(incoming_status) {
+        if sequenced && body.finished != incoming_lifecycle.is_terminal() {
             return Err(
                 "job_state_reconciliation update has inconsistent finished/status".to_string(),
             );
         }
         if sequenced
-            && !is_final_job_status(incoming_status)
+            && !incoming_lifecycle.is_terminal()
             && (body.exit_code.is_some() || body.duration_ms.is_some())
         {
             return Err(
@@ -1993,7 +1991,10 @@ impl RunnerRegistry {
                     .to_string(),
             );
         }
-        if sequenced && incoming_status == "completed" && body.exit_code != Some(0) {
+        if sequenced
+            && incoming_lifecycle == JobLifecycleState::Completed
+            && body.exit_code != Some(0)
+        {
             return Err(
                 "completed job_state_reconciliation update requires exit_code=0".to_string(),
             );
@@ -2037,7 +2038,7 @@ impl RunnerRegistry {
                         .to_string(),
                 );
             }
-            if job.status == "recovering" && sequenced && body.log_snapshot.is_none() {
+            if job.recovery_active() && sequenced && body.log_snapshot.is_none() {
                 return Err(
                     "recovering job update requires an authoritative log_snapshot or register inventory"
                         .to_string(),
@@ -2047,7 +2048,7 @@ impl RunnerRegistry {
             if sequenced && incoming_seq.is_some_and(|sequence| sequence <= job.last_update_seq) {
                 return Ok(job_view(job));
             }
-            if is_final_job_status(&job.status) {
+            if job.lifecycle.is_terminal() {
                 // Terminal class is server-authoritative once accepted.
                 return Ok(job_view(job));
             }
@@ -2065,12 +2066,12 @@ impl RunnerRegistry {
                 &body.job_id,
                 &body,
             );
-            if let Err(error) = validate_validation_progress(job, &body)
-                .and_then(|_| validate_command_execution_state(job, &body))
-                .and_then(|_| validate_job_activity(job, &body))
+            if let Err(error) = validate_validation_progress(job, &body, incoming_lifecycle)
+                .and_then(|_| validate_command_execution_state(job, &body, incoming_lifecycle))
+                .and_then(|_| validate_job_activity(job, &body, incoming_lifecycle))
             {
                 let terminal_now = now_ts();
-                job.status = "failed".to_string();
+                job.lifecycle = JobLifecycleState::Failed;
                 observe_job_terminal(job, terminal_now);
                 job.ended_at = Some(terminal_now);
                 job.exit_code = body.exit_code;
@@ -2086,7 +2087,7 @@ impl RunnerRegistry {
                 }
                 request_id_to_remove = job.request_id.clone();
             } else {
-                let was_recovering = job.status == "recovering";
+                let was_recovering = job.recovery_active();
                 if let Some(snapshot) = body.log_snapshot {
                     super::jobs::replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
                     super::jobs::replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
@@ -2105,22 +2106,28 @@ impl RunnerRegistry {
                 if job.started_at.is_none()
                     && body.command_execution_state != Some(ShellCommandExecutionState::NotStarted)
                     && matches!(
-                        incoming_status,
-                        "running" | "completed" | "failed" | "stopped" | "timeout"
+                        incoming_lifecycle,
+                        JobLifecycleState::Running
+                            | JobLifecycleState::Completed
+                            | JobLifecycleState::Failed
+                            | JobLifecycleState::Stopped
+                            | JobLifecycleState::Timeout
                     )
                 {
                     job.started_at = Some(now_ts());
                 }
-                if !incoming_status.is_empty() && !is_final_job_status(&job.status) {
-                    job.status = if incoming_status == "queued" && job.started_at.is_some() {
-                        "agent_queued".to_string()
+                if !job.lifecycle.is_terminal() {
+                    job.lifecycle = if incoming_lifecycle == JobLifecycleState::Queued
+                        && job.started_at.is_some()
+                    {
+                        JobLifecycleState::RunnerQueued
                     } else {
-                        incoming_status.to_string()
+                        incoming_lifecycle
                     };
                 }
-                if is_final_job_status(incoming_status) {
+                if incoming_lifecycle.is_terminal() {
                     let terminal_now = now_ts();
-                    job.status = incoming_status.to_string();
+                    job.lifecycle = incoming_lifecycle;
                     observe_job_terminal(job, terminal_now);
                     job.ended_at = Some(terminal_now);
                     job.exit_code = body.exit_code;
@@ -2128,19 +2135,23 @@ impl RunnerRegistry {
                     job.error = body.error;
                     job.command_execution_state = body.command_execution_state;
                     job.activity = None;
-                    job.recovery_state = job.reconciled_at.map(|_| "reconciled".to_string());
-                    job.recovering_since = None;
-                    job.recovery_original_status = None;
+                    if !was_recovering {
+                        job.recovery.phase = job
+                            .recovery
+                            .reconciled_at
+                            .map(|_| JobRecoveryPhase::Reconciled);
+                    }
+                    job.recovery.recovering_since = None;
                     request_id_to_remove = job.request_id.clone();
                 } else if body.error.is_some() {
                     job.error = body.error;
                 }
-                if body.finished && !is_final_job_status(&job.status) {
+                if body.finished && !job.lifecycle.is_terminal() {
                     let terminal_now = now_ts();
-                    job.status = if job.error.is_none() && job.exit_code == Some(0) {
-                        "completed".to_string()
+                    job.lifecycle = if job.error.is_none() && job.exit_code == Some(0) {
+                        JobLifecycleState::Completed
                     } else {
-                        "failed".to_string()
+                        JobLifecycleState::Failed
                     };
                     observe_job_terminal(job, terminal_now);
                     job.ended_at = Some(terminal_now);
@@ -2148,12 +2159,10 @@ impl RunnerRegistry {
                     request_id_to_remove = job.request_id.clone();
                 }
                 if was_recovering {
-                    job.recovery_state = Some("reconciled".to_string());
-                    job.reconciled_at = Some(now_ts());
-                    job.recovery_reason_code =
-                        Some("same_instance_update_reconciliation".to_string());
-                    job.recovering_since = None;
-                    job.recovery_original_status = None;
+                    job.recovery.phase = Some(JobRecoveryPhase::Reconciled);
+                    job.recovery.reconciled_at = Some(now_ts());
+                    job.recovery.reason = Some(JobRecoveryReason::SameInstanceUpdateReconciliation);
+                    job.recovery.recovering_since = None;
                 }
             }
             if let Some(sequence) = incoming_seq {
@@ -2162,8 +2171,8 @@ impl RunnerRegistry {
             if public_mutation_signature(job) != before {
                 notify_job_update(job);
             }
-            remove_cleanup_terminal = job.visibility == ShellJobVisibility::CleanupPending
-                && is_final_job_status(&job.status);
+            remove_cleanup_terminal =
+                job.visibility == ShellJobVisibility::CleanupPending && job.lifecycle.is_terminal();
             job_view(job)
         };
         if let Some(request_id) = request_id_to_remove {

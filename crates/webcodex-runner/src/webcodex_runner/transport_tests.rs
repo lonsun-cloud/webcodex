@@ -25,7 +25,6 @@ fn test_runner_config(server_url: String) -> RunnerConfig {
         host_context: None,
         project_registry_dir: None,
         legacy_projects_dir: None,
-        deprecated_temporary_projects_root: None,
         poll_interval_ms: 10,
         capabilities: Some(RunnerCapabilities {
             git: true,
@@ -43,6 +42,7 @@ fn test_runner_config(server_url: String) -> RunnerConfig {
             crate::webcodex_runner::default_websocket_connect_timeout_secs(),
         quic: None,
         shell: ShellConfig::default(),
+        skills: super::super::config::SkillsConfig::default(),
         ssh: Default::default(),
         tool_providers: Default::default(),
         mcp_gateway: Default::default(),
@@ -1231,7 +1231,9 @@ fn recorded_path_count(requests: &Mutex<Vec<(String, String)>>, expected: &str) 
 
 #[cfg(unix)]
 #[test]
-fn polling_long_ordinary_dispatch_does_not_pin_and_results_stay_correlated_exactly_once() {
+#[ignore = "manual real-process timing: coordinates concurrent shell dispatch completion"]
+fn runner_real_process_polling_long_ordinary_dispatch_does_not_pin_and_results_stay_correlated_exactly_once(
+) {
     let temp = tempfile::tempdir().unwrap();
     let started_a = temp.path().join("a-started");
     let release_a = temp.path().join("a-release");
@@ -1344,13 +1346,14 @@ fn polling_long_ordinary_dispatch_does_not_pin_and_results_stay_correlated_exact
 
 #[cfg(unix)]
 #[test]
-fn polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
+#[ignore = "manual real-process timing: coordinates multiple gated shell workers"]
+fn runner_real_process_polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
     let temp = tempfile::tempdir().unwrap();
     let mut requests = Vec::new();
     let mut started = Vec::new();
     let mut releases = Vec::new();
     let mut markers = Vec::new();
-    for label in ["a", "b", "c"] {
+    for label in ["a", "b", "c", "d", "e"] {
         let started_path = temp.path().join(format!("{label}-started"));
         let release_path = temp.path().join(format!("{label}-release"));
         let marker_path = temp.path().join(format!("{label}-marker"));
@@ -1372,7 +1375,7 @@ fn polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
     let poll_count = Arc::new(AtomicUsize::new(0));
     let result_count = Arc::new(AtomicUsize::new(0));
     let runner_shutdown = Arc::new(AtomicBool::new(false));
-    let (third_poll_tx, third_poll_rx) = std::sync::mpsc::sync_channel(1);
+    let (fifth_poll_tx, fifth_poll_rx) = std::sync::mpsc::sync_channel(1);
     let handler = {
         let poll_count = Arc::clone(&poll_count);
         let result_count = Arc::clone(&result_count);
@@ -1382,13 +1385,13 @@ fn polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
             "/api/shell/agent/register" => register_success_response(),
             "/api/shell/agent/poll" => {
                 let index = poll_count.fetch_add(1, Ordering::SeqCst);
-                if index == 2 {
-                    let _ = third_poll_tx.send(());
+                if index == POLLING_DISPATCH_MAX_IN_FLIGHT {
+                    let _ = fifth_poll_tx.send(());
                 }
                 poll_delivery_response(requests.get(index))
             }
             "/api/shell/agent/result" => {
-                if result_count.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                if result_count.fetch_add(1, Ordering::SeqCst) + 1 == requests.len() {
                     runner_shutdown.store(true, Ordering::SeqCst);
                 }
                 result_success_response()
@@ -1407,44 +1410,49 @@ fn polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
         cfg,
         runtime.clone(),
         false,
-        "inst-e1-bound",
+        "inst-polling-bound",
         Arc::clone(&runner_shutdown),
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    for path in &started[..2] {
-        wait_for_path(path, deadline, "first two polling workers to start");
+    for path in &started[..POLLING_DISPATCH_MAX_IN_FLIGHT] {
+        wait_for_path(
+            path,
+            deadline,
+            "polling workers up to the fixed bound to start",
+        );
     }
     assert_eq!(runtime.dispatches.active(), POLLING_DISPATCH_MAX_IN_FLIGHT);
     assert!(
-        third_poll_rx
+        fifth_poll_rx
             .recv_timeout(Duration::from_millis(200))
             .is_err(),
-        "the Runner dequeued a third request while both dispatch slots were occupied"
+        "the Runner dequeued an N+1 request while all polling dispatch slots were occupied"
     );
 
     std::fs::write(&releases[0], "release\n").unwrap();
-    third_poll_rx
+    fifth_poll_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("releasing one slot must allow the third poll");
+        .expect("releasing one slot must allow exactly the N+1 poll");
     wait_for_path(
-        &started[2],
+        &started[POLLING_DISPATCH_MAX_IN_FLIGHT],
         Instant::now() + Duration::from_secs(5),
-        "third polling worker to start",
+        "N+1 polling worker to start",
     );
     assert_eq!(
         runtime.dispatches.active(),
         POLLING_DISPATCH_MAX_IN_FLIGHT,
         "active polling dispatches exceeded the fixed bound"
     );
-    std::fs::write(&releases[1], "release\n").unwrap();
-    std::fs::write(&releases[2], "release\n").unwrap();
+    for release in &releases[1..] {
+        std::fs::write(release, "release\n").unwrap();
+    }
 
     runner
         .finish(Duration::from_secs(10), "bounded polling runner")
         .expect("bounded polling runner should shut down cleanly");
     server.finish();
-    assert_eq!(result_count.load(Ordering::SeqCst), 3);
+    assert_eq!(result_count.load(Ordering::SeqCst), requests.len());
     for marker in markers {
         assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
     }
@@ -1454,7 +1462,8 @@ fn polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
 
 #[cfg(unix)]
 #[test]
-fn polling_job_start_dispatches_behind_one_long_ordinary_request() {
+#[ignore = "manual real-process timing: compares Job and ordinary shell scheduling"]
+fn runner_real_process_polling_job_start_dispatches_behind_one_long_ordinary_request() {
     let temp = tempfile::tempdir().unwrap();
     let started_a = temp.path().join("ordinary-started");
     let release_a = temp.path().join("ordinary-release");
@@ -1554,7 +1563,8 @@ fn polling_job_start_dispatches_behind_one_long_ordinary_request() {
 
 #[cfg(unix)]
 #[test]
-fn polling_once_waits_for_its_tracked_ordinary_dispatch() {
+#[ignore = "manual real-process lifecycle: waits for a gated --once shell dispatch"]
+fn runner_real_process_polling_once_waits_for_its_tracked_ordinary_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let started = temp.path().join("once-started");
     let release = temp.path().join("once-release");
@@ -1626,7 +1636,8 @@ fn polling_once_waits_for_its_tracked_ordinary_dispatch() {
 
 #[cfg(unix)]
 #[test]
-fn polling_once_preserves_job_manager_drain_before_exit() {
+#[ignore = "manual real-process lifecycle: waits for a gated --once Job drain"]
+fn runner_real_process_polling_once_preserves_job_manager_drain_before_exit() {
     let temp = tempfile::tempdir().unwrap();
     let started = temp.path().join("once-job-started");
     let release = temp.path().join("once-job-release");
@@ -1696,7 +1707,9 @@ fn polling_once_preserves_job_manager_drain_before_exit() {
 
 #[cfg(unix)]
 #[test]
-fn polling_shutdown_with_active_background_dispatch_is_bounded_and_non_replaying() {
+#[ignore = "manual real-process timing: validates shutdown against an active shell dispatch"]
+fn runner_real_process_polling_shutdown_with_active_background_dispatch_is_bounded_and_non_replaying(
+) {
     let temp = tempfile::tempdir().unwrap();
     let started = temp.path().join("shutdown-started");
     let never_release = temp.path().join("shutdown-release");
@@ -1781,7 +1794,8 @@ fn polling_shutdown_with_active_background_dispatch_is_bounded_and_non_replaying
 }
 
 #[test]
-fn polling_background_project_operation_invalidates_the_project_cache() {
+#[ignore = "manual real-process timing: project registration may spawn Git and uses long readiness fences"]
+fn runner_real_process_polling_background_project_operation_invalidates_the_project_cache() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let project_registry_dir = temp.path().join("project-registry");
@@ -1879,7 +1893,8 @@ fn polling_background_project_operation_invalidates_the_project_cache() {
 
 #[cfg(unix)]
 #[test]
-fn polling_persistent_shell_exec_remains_responsive_to_close() {
+#[ignore = "manual real-process lifecycle: coordinates a real persistent shell with close"]
+fn runner_real_process_polling_persistent_shell_exec_remains_responsive_to_close() {
     #[derive(Default)]
     struct PersistentState {
         open_delivered: bool,

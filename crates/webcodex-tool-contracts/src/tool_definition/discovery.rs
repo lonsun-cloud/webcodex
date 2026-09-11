@@ -18,6 +18,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "list_projects",
+            super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                    "client_id",
+                    "project",
+                    "query",
+                ]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             None,
@@ -33,6 +40,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "List caller-visible Projects. When Runner/Project identity is known, pass exact client_id/project; use bounded query and summary_only instead of reading the full registry.",
         list_projects_input_schema,
@@ -40,6 +48,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "register_project",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             None,
@@ -55,6 +64,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Register an existing directory, including a non-Git or ad-hoc workspace, as a Project on one Runner. Use this when the directory already exists; policy still bounds allowed paths.",
         register_project_input_schema,
@@ -62,6 +72,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "unregister_project",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             None,
@@ -77,6 +88,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Unregister one exact Runner project using the revision from list_projects. Removes registration only; never deletes source, worktree, or branch. Re-list after an indeterminate outcome.",
         unregister_project_input_schema,
@@ -84,6 +96,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
         def(
             "create_project",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             None,
@@ -99,6 +112,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Create a directory on one Runner and register it as a Project. Use this for a new workspace; existing directories belong on the registration path.",
         create_project_input_schema,
@@ -106,6 +120,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     context_recovery_only(model_spec(
         def(
             "list_runners",
+            super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                super::ToolAuditSessionInputPolicy::OmitTopLevel(&["client_id", "client_ids"]),
+            ),
             ModelVisible,
             TOOL_CATEGORY_RUNTIME,
             None,
@@ -121,6 +138,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "List caller-visible Runners; use exact client_id/client_ids if known, summary_only + include_projects=false for health. Full mode includes shared Job concurrency and host_context advisory metadata; never authority.",
         list_runners_input_schema,
@@ -129,6 +147,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(model_spec(
             def(
                 "runtime_status",
+                super::ToolAuditPolicy::TYPED_CANONICAL.session_input(
+                    super::ToolAuditSessionInputPolicy::OmitTopLevel(&["client_id"]),
+                ),
                 ModelVisible,
                 TOOL_CATEGORY_RUNTIME,
                 None,
@@ -144,6 +165,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Read runtime status; pass exact client_id for one Runner deployment/source alignment, omit for fleet-wide. Reports shared Job concurrency; global mode includes bounded host_context advisory metadata, never authority.",
             runtime_status_input_schema,
@@ -154,6 +176,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         context_recovery_only(model_spec(
             def(
                 "tool_manifest",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_RUNTIME,
                 None,
@@ -169,8 +192,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Global runtime discovery; do not pass project. Filter by category/intent for sparse selection entries, or pass exact tool_name for one compact contract with description, route, input schema, and safety/authority hints but no output schema. If availability=direct, invoke that direct callable; if the host has not loaded it, rediscover/load it rather than routing it through call_runtime_tool. Unfiltered discovery retains the global category inventory. Discovery never changes behavior, authority, permissions, execution, or verdicts.",
+            "Global runtime discovery; do not pass project. Filter by category/intent for sparse selection entries, or pass exact tool_name for one compact contract with description, preferred route, input schema, and safety/authority hints but no output schema. availability=direct means the direct callable is the preferred model route; if that callable is unavailable or not loaded, call_runtime_tool may be used as a fallback for an otherwise admitted target. availability never changes behavior, authority, permissions, execution, or verdicts. Unfiltered discovery retains the global category inventory.",
             tool_manifest_input_schema,
         )),
         30,

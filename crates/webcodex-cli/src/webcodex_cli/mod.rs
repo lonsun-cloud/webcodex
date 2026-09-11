@@ -7,6 +7,8 @@ pub(crate) mod openrc;
 pub(crate) mod ops;
 pub(crate) mod output;
 pub(crate) mod pairing;
+pub(crate) mod plugin;
+pub(crate) mod plugin_init;
 pub(crate) mod profiles;
 pub(crate) mod project;
 pub(crate) mod runner_service;
@@ -64,13 +66,17 @@ pub(crate) use env::{
 pub(crate) use http::format_error_body;
 #[cfg(test)]
 pub(crate) use http::post_json_unauthed;
-pub(crate) use http::{fetch_runtime_status, http_post_json_status, post_json_authed, ApiCall};
+pub(crate) use http::{
+    call_runtime_tool_status, fetch_runtime_status, http_post_json_status, post_json_authed,
+    ApiCall,
+};
 pub(crate) use login::{
     base_dir_or_default, default_device_name, run_login, run_logout, run_status, LoginOptions,
     LogoutOptions, StatusOptions,
 };
 pub(crate) use ops::{
     run_ops_command, OpsCommand, OpsCommonOptions, OpsRunnerOptions, OpsSmokePreflightOptions,
+    OpsWindowsOptions,
 };
 #[cfg(test)]
 pub(crate) use output::RevisionComparison;
@@ -79,6 +85,8 @@ pub(crate) use output::{
     runtime_build_metadata, server_status_revision_check,
 };
 pub(crate) use pairing::run_pairing_create;
+pub(crate) use plugin::{parse_plugin_command, run_plugin_command, PluginCommand};
+pub(crate) use plugin_init::{parse_plugin_init, run_plugin_init, PluginInitOptions};
 #[cfg(test)]
 pub(crate) use profiles::{client_output_dir_for_profile, CLIENT_PROFILE_ERROR};
 pub(crate) use profiles::{
@@ -89,7 +97,8 @@ pub(crate) use profiles::{
     runner_service_file_for_scope, validate_client_profile, validate_service_file_scope,
 };
 pub(crate) use project::{
-    register_existing_project, run_project_register, ProjectRegisterOptions, ProjectRegistration,
+    register_existing_project, run_project_activate, run_project_register, ProjectActivateOptions,
+    ProjectRegisterOptions, ProjectRegistration,
 };
 #[cfg(all(test, unix))]
 pub(crate) use runner_service::render_runner_systemd_unit;
@@ -112,8 +121,8 @@ pub(crate) use service::{
 };
 pub(crate) use system::{
     discover_internal_binary, read_optional_token, read_optional_user_api_token,
-    system_group_exists, system_user_exists, system_user_home, system_user_is_root,
-    validate_user_api_token,
+    resolve_user_api_token, system_group_exists, system_user_exists, system_user_home,
+    system_user_is_root, validate_user_api_token,
 };
 #[cfg(test)]
 pub(crate) use token_commands::resolve_account_credential;
@@ -125,7 +134,9 @@ pub(crate) use tokens::{
 pub(crate) use usage::{
     connect_usage, disconnect_usage, login_usage, logout_usage, ops_projects_usage,
     ops_runner_usage, ops_runners_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
-    pairing_create_usage, pairing_usage, project_register_usage, runner_init_usage,
+    ops_windows_usage, pairing_create_usage, pairing_usage, plugin_check_usage,
+    plugin_describe_usage, plugin_init_usage, plugin_list_usage, plugin_reload_usage, plugin_usage,
+    project_activate_usage, project_register_usage, runner_init_usage,
     runner_install_service_usage, runner_status_usage, runner_usage, server_init_usage,
     server_install_service_usage, server_status_usage, server_tunnel_usage, server_usage,
     status_usage, usage,

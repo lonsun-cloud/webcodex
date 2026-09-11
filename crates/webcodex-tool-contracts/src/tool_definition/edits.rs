@@ -18,6 +18,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "write_project_file",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_EDIT,
             Some(FileWrite),
@@ -33,8 +34,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             SinglePath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create new files or intentional whole-file rewrites. Existing-file overwrite requires the exact current expected_sha256. For ordinary model-generated changes after read_file/read_files, prefer apply_text_edits with the returned current SHA; use apply_patch when a contextual or large multi-hunk patch is clearer. Inspect current content and worktree changes before replacing a file.",
+            "Create new files or intentional whole-file rewrites. Existing-file overwrite requires the exact current expected_sha256. For ordinary model-generated changes after read_file/read_files, prefer apply_text_edits with the returned current SHA. Use apply_patch only when contextual or multi-hunk patch form is materially clearer, not merely because many lines change. Inspect current content and worktree changes before replacing a file.",
             write_project_file_input_schema,
         ),
         PERMISSION_RISK_WRITE,
@@ -44,6 +46,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
                 def(
                 "apply_text_edits",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_EDIT,
                 Some(FileWrite),
@@ -59,8 +62,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 PathList,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Default guarded edit path after read_file/read_files for ordinary model-generated changes on the current worktree. Transactional and SHA-guarded: pass each existing file's current read SHA as expected_sha256; exact matches are unique by default, occurrence remains global source order, and optional line_scope fences matches. Supports transactional multi-file edits. Use apply_patch when a contextual or large multi-hunk patch is clearer; use apply_unified_diff only for an external raw diff.",
+                "Canonical default guarded edit path after read_file/read_files for ordinary model-generated changes on the current worktree. Transactional and SHA-guarded: pass each existing file's current read SHA as expected_sha256; exact matches are unique by default, occurrence remains global source order, and optional line_scope fences matches. Supports transactional multi-file edits. Many changed lines alone are not a reason to choose apply_patch; use apply_patch only when contextual or large multi-hunk patch form is materially clearer. Use apply_unified_diff only for an external raw diff.",
                 apply_text_edits_input_schema,
             ),
             PERMISSION_RISK_WRITE,

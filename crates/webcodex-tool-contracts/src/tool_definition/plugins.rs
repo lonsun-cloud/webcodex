@@ -16,6 +16,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[adaptive_runtime_direct(
         model_spec(
             def(
                 "plugin_tool",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_RUNTIME,
                 None,
@@ -31,6 +32,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[adaptive_runtime_direct(
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Stable gateway for Runner-owned native Tool Plugins. Provider tools are never outer WebCodex MCP tools. Discovery begins at an exact caller-visible Runner; describe observes one exact Runner/provider/tool schema and returns an opaque binding; call accepts only binding + arguments, never retargets, relists, reloads, or blindly retries. Gateway visibility requires any Plugin scope, while each action separately enforces plugin:inspect, plugin:invoke, or plugin:manage before provider dispatch.",
             plugin_tool_input_schema,

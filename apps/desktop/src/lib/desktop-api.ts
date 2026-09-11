@@ -7,8 +7,15 @@ import type {
 } from "../models/topology";
 
 export const desktopApi = {
+  updateTunnelConfig: (request: { action: "save"; tunnelId: string; apiKey: string | null } | { action: "use_environment" }) =>
+    invoke<DesktopState>("update_tunnel_config", { request }),
   getState: () => invoke<DesktopState>("get_desktop_state"),
+  openPowerShellInstallGuide: () => invoke<void>("open_powershell_install_guide"),
+  getLaunchAtLogin: () => invoke<boolean>("get_launch_at_login"),
+  setLaunchAtLogin: (enabled: boolean) =>
+    invoke<boolean>("set_launch_at_login", { request: { enabled } }),
   refresh: () => invoke<DesktopState>("refresh_runtime_status"),
+  observeChatgptActivity: () => invoke<DesktopState>("observe_chatgpt_activity"),
   resumeSavedRuntime: () => invoke<DesktopState>("resume_saved_runtime"),
   updateTunnelProxy: (mode: TunnelProxyMode, customUrl?: string | null) =>
     invoke<DesktopState>("update_tunnel_proxy", {
@@ -21,6 +28,10 @@ export const desktopApi = {
   configureLocal: (projectPath?: string | null) =>
     invoke<DesktopState>("configure_local_setup", {
       request: { projectPath: projectPath ?? null },
+    }),
+  activateLocalProject: (projectPath: string) =>
+    invoke<DesktopState>("activate_local_project", {
+      request: { projectPath },
     }),
   configureRemote: (
     serverUrl: string,

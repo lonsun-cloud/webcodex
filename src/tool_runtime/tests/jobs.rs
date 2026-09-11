@@ -1166,7 +1166,7 @@ async fn run_job_rejects_server_configured_project_without_local_spawn() {
 #[tokio::test]
 async fn stop_job_rejects_unsafe_job_id() {
     let runtime = test_runtime();
-    let result = runtime.stop_job("../escape".to_string()).await;
+    let result = runtime.stop_job("../escape".to_string(), None).await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("invalid job id"));
 }
@@ -1175,7 +1175,7 @@ async fn stop_job_rejects_unsafe_job_id() {
 async fn stop_job_unknown_job_returns_error() {
     let runtime = test_runtime();
     let result = runtime
-        .stop_job("55555555-6666-7777-8888-999999999999".to_string())
+        .stop_job("55555555-6666-7777-8888-999999999999".to_string(), None)
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("unknown job"));
@@ -2309,7 +2309,8 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
         )
         .await;
     assert!(status_a.success, "{:?}", status_a.error);
-    assert_eq!(status_a.output["jobs"]["agent_known_count"], 2);
+    assert_eq!(status_a.output["jobs"]["count"], 2);
+    assert!(status_a.output["jobs"].get("agent_known_count").is_none());
     assert_eq!(status_a.output["jobs"]["active_count"], 2);
     assert_eq!(status_a.output["jobs"]["running_count"], 1);
     assert_eq!(status_a.output["jobs"]["queued_count"], 1);
@@ -2374,7 +2375,7 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
         )
         .await;
     assert!(status_open.success, "{:?}", status_open.error);
-    assert_eq!(status_open.output["jobs"]["agent_known_count"], 1);
+    assert_eq!(status_open.output["jobs"]["count"], 1);
     assert_eq!(status_open.output["jobs"]["active_count"], 1);
     assert_eq!(status_open.output["jobs"]["running_count"], 0);
     assert_eq!(status_open.output["jobs"]["queued_count"], 1);
@@ -2390,7 +2391,7 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
         )
         .await;
     assert!(status_bootstrap.success, "{:?}", status_bootstrap.error);
-    assert_eq!(status_bootstrap.output["jobs"]["agent_known_count"], 5);
+    assert_eq!(status_bootstrap.output["jobs"]["count"], 5);
     assert_eq!(status_bootstrap.output["jobs"]["active_count"], 5);
     assert_eq!(status_bootstrap.output["jobs"]["running_count"], 2);
     assert_eq!(status_bootstrap.output["jobs"]["queued_count"], 3);
@@ -2431,7 +2432,7 @@ async fn runtime_concurrency_counts_cover_all_visible_jobs_beyond_list_paginatio
             Some(&auth),
         )
         .await;
-    assert_eq!(status.output["jobs"]["agent_known_count"], 21);
+    assert_eq!(status.output["jobs"]["count"], 21);
     assert_eq!(status.output["jobs"]["active_count"], 21);
     assert_eq!(status.output["jobs"]["running_count"], 0);
     assert_eq!(status.output["jobs"]["queued_count"], 21);

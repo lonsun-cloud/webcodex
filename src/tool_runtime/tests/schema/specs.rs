@@ -23,7 +23,7 @@ fn supports_model_facing_result_expectation(tool_name: &str) -> bool {
 
 #[test]
 fn run_script_tool_call_parser_accepts_declared_languages() {
-    for language in ["sh", "bash", "powershell"] {
+    for language in ["sh", "bash", "powershell", "javascript", "typescript"] {
         let parsed = ToolCall::from_tool_name(
             "run_script",
             json!({
@@ -42,23 +42,30 @@ fn run_script_tool_call_parser_accepts_declared_languages() {
         json!({"project": "demo", "language": "cmd", "script": "echo no"})
     )
     .is_err());
+    assert!(ToolCall::from_tool_name(
+        "run_script",
+        json!({"project": "demo", "language": "ts", "script": "const x: number = 1"})
+    )
+    .is_err());
 }
 
 #[test]
 fn cargo_fmt_tool_call_parser_accepts_contract_timeout() {
     let parsed = ToolCall::from_tool_name(
         "cargo_fmt",
-        json!({"project": "demo", "check": true, "timeout_secs": 3600}),
+        json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 60}),
     )
     .unwrap();
     match parsed {
         ToolCall::CargoFmt {
             check,
             timeout_secs,
+            sync_wait_secs,
             ..
         } => {
             assert_eq!(check, Some(true));
             assert_eq!(timeout_secs, Some(3600));
+            assert_eq!(sync_wait_secs, Some(60));
         }
         other => panic!("expected cargo_fmt, got {other:?}"),
     }

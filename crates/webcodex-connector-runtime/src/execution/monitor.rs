@@ -1,4 +1,5 @@
 use super::*;
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::validation_bridge::sanitize_bridge_text;
 use webcodex_core::validation_evidence::{PARSER_KIND, PARSER_VERSION};
 use webcodex_store::MAX_ASSERTION_EVIDENCE_BYTES;
@@ -133,19 +134,21 @@ impl ExecutionService {
             };
             let now = chrono::Utc::now().timestamp();
             if execution.is_terminal() {
-                if execution.state == "cancelled" {
+                if execution.state == ConnectorExecutionState::Cancelled {
                     self.release_cancelled_workspace(task).await;
                 }
                 return;
             }
-            let current = if execution.state == "queued" && now >= execution.queue_deadline {
+            let current = if execution.state == ConnectorExecutionState::Queued
+                && now >= execution.queue_deadline
+            {
                 self.db
                     .request_connector_queue_timeout(&execution_id, now)
                     .unwrap_or(execution)
             } else {
                 execution
             };
-            if current.state == "cancel_requested" {
+            if current.state == ConnectorExecutionState::CancelRequested {
                 let _ = self.dispatch_cancel(&task, &current, host.as_ref()).await;
             }
             match self
@@ -156,7 +159,7 @@ impl ExecutionService {
                     status_failures = 0;
                     first_status_failure = None;
                     if updated.is_terminal() {
-                        if updated.state == "cancelled" {
+                        if updated.state == ConnectorExecutionState::Cancelled {
                             self.release_cancelled_workspace(task).await;
                         }
                         return;
@@ -226,8 +229,11 @@ impl ExecutionService {
                 .min(self.monitor_timing.failure_poll_max);
         }
         if matches!(
-            execution.state.as_str(),
-            "accepted" | "starting" | "queued" | "cancel_requested"
+            execution.state,
+            ConnectorExecutionState::Accepted
+                | ConnectorExecutionState::Starting
+                | ConnectorExecutionState::Queued
+                | ConnectorExecutionState::CancelRequested
         ) {
             return self.monitor_timing.fast_poll;
         }
@@ -273,11 +279,9 @@ impl ExecutionService {
             .await
             .map_err(|error| ("executor_status_unavailable", error))?;
         let executor_failure_code = job.error.as_deref().and_then(executor_failure_code);
+        let lifecycle = RunnerJobLifecycle::from_wire(&job.status).ok();
         let terminal_candidate = executor_failure_code.is_some()
-            || matches!(
-                job.status.as_str(),
-                "completed" | "stopped" | "cancelled" | "timeout" | "timed_out" | "lost" | "failed"
-            );
+            || lifecycle.is_some_and(RunnerJobLifecycle::is_terminal);
         let mcp_task_output_tail = if terminal_candidate {
             self.bounded_output_tail(&execution, runner_access).await
         } else {
@@ -288,7 +292,7 @@ impl ExecutionService {
                 .record_connector_mcp_task_output_tail(execution_id, output_tail)
                 .map_err(|error| ("task_store_error", error.to_string()))?;
         }
-        if job.status == "lost" {
+        if lifecycle == Some(RunnerJobLifecycle::Lost) {
             return Err((
                 "executor_status_unavailable",
                 job.error
@@ -304,28 +308,29 @@ impl ExecutionService {
         let progress = job.validation_progress.as_ref();
         let check_completed = progress.map(|progress| progress.completed);
         let failed_check = progress.and_then(|progress| progress.failed_step.as_deref());
-        let assertion_evidence = if execution.kind == "check" && failed_check.is_some() {
-            let (_, full_stdout, full_stderr, _, _, _) = self
-                .runner_registry
-                .job_log_for_auth(Some(runner_access), job_id, None, None, None, None, None)
-                .await
-                .unwrap_or_else(|_| (job.clone(), None, None, 1, 1, Default::default()));
-            let stdout = full_stdout.unwrap_or_default();
-            let stderr = full_stderr.unwrap_or_default();
-            failed_check.map(|check| {
-                durable_assertion_evidence(
-                    check,
-                    execution.check_recipe.as_ref(),
-                    job.exit_code,
-                    &stdout,
-                    &stderr,
-                )
-            })
-        } else {
-            None
-        };
-        let check_succeeded_completely = execution.kind == "check"
-            && job.status == "completed"
+        let assertion_evidence =
+            if execution.kind == ConnectorExecutionKind::Check && failed_check.is_some() {
+                let (_, full_stdout, full_stderr, _, _, _) = self
+                    .runner_registry
+                    .job_log_for_auth(Some(runner_access), job_id, None, None, None, None, None)
+                    .await
+                    .unwrap_or_else(|_| (job.clone(), None, None, 1, 1, Default::default()));
+                let stdout = full_stdout.unwrap_or_default();
+                let stderr = full_stderr.unwrap_or_default();
+                failed_check.map(|check| {
+                    durable_assertion_evidence(
+                        check,
+                        execution.check_recipe.as_ref(),
+                        job.exit_code,
+                        &stdout,
+                        &stderr,
+                    )
+                })
+            } else {
+                None
+            };
+        let check_succeeded_completely = execution.kind == ConnectorExecutionKind::Check
+            && lifecycle == Some(RunnerJobLifecycle::Completed)
             && job.exit_code == Some(0)
             && progress.is_some_and(|progress| {
                 progress.completed == execution.check_plan.len()

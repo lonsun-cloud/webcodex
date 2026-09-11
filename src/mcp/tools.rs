@@ -1,3 +1,4 @@
+use super::presentation;
 use super::resources;
 use super::response::{
     connector_call_tool_result, mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error,
@@ -84,7 +85,7 @@ fn full_operator_runtime_specs_for_auth(
 fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
     ToolSpec {
         name: ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME.to_string(),
-        description: "Call one gateway-admitted long-tail runtime tool through the adaptive surface. Tools discovered with availability=direct must be invoked directly; if the host has not loaded that callable, rediscover/load it instead of retrying through this gateway. Runtime argument validation, OAuth scope checks, project authority, permission gates, and tool effects remain unchanged.".to_string(),
+        description: "Call one runtime tool admitted on the adaptive surface through the generic gateway. A tool with availability=direct should still be invoked through its direct callable when available, but call_runtime_tool is an allowed fallback when that callable is unavailable or not loaded. Directness changes preferred model exposure only: canonical runtime argument validation, OAuth scope, Project authority, permission gates, Runner capability, Session/context policy, host-file-import trust, protocol capability admission, and tool effects remain unchanged.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -92,7 +93,7 @@ fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
-                    "description": "Exact gateway-admitted runtime tool name obtained from bounded runtime discovery. Do not pass tools whose discovery availability is direct."
+                    "description": "Exact runtime tool name admitted on the adaptive surface. availability=direct is the preferred route, but the same admitted target may use this gateway as a fallback when the direct callable is unavailable or not loaded."
                 },
                 "arguments": {
                     "type": "object",
@@ -169,7 +170,7 @@ pub(crate) fn adaptive_runtime_gateway_target_admitted_for_test(
 ) -> bool {
     matches!(
         adaptive_runtime_gateway_target_route(target, stateless_2026),
-        AdaptiveRuntimeGatewayTargetRoute::Gateway
+        AdaptiveRuntimeGatewayTargetRoute::Gateway | AdaptiveRuntimeGatewayTargetRoute::Direct
     )
 }
 
@@ -219,29 +220,6 @@ fn unwrap_adaptive_runtime_gateway_arguments(
         }
     }
     Ok((target, target_arguments))
-}
-
-fn adaptive_runtime_gateway_route_failure(target: &str) -> ToolResult {
-    ToolResult::err_with_output(
-        format!("tool '{target}' is direct on the adaptive runtime surface; invoke its direct callable. If the host has not loaded it, rediscover/load that direct tool instead of retrying through call_runtime_tool"),
-        json!({
-            "error_kind": "wrong_invocation_route",
-            "execution_state": "not_started",
-            "state_changed": false,
-            "target_tool": target,
-            "correct_route": {
-                "mode": "direct",
-                "availability": "direct"
-            },
-            "recovery": {
-                "tool": target,
-                "route": {"mode": "direct"},
-                "rediscover_if_unloaded": true,
-                "retry_via_gateway": false
-            },
-            "recovery_kind": "fix_input"
-        }),
-    )
 }
 
 fn adaptive_runtime_gateway_unknown_target(target: &str) -> ToolResult {
@@ -537,7 +515,29 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
     }
 }
 
-fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, _app_enabled: bool) -> Value {
+fn tool_meta_object(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    let object = value.as_object_mut()?;
+    let meta = object
+        .entry("_meta".to_string())
+        .or_insert_with(|| json!({}));
+    meta.as_object_mut()
+}
+
+pub(super) fn attach_app_metadata(value: &mut Value, resource_uri: &str) {
+    let Some(meta) = tool_meta_object(value) else {
+        return;
+    };
+    let ui = meta.entry("ui".to_string()).or_insert_with(|| json!({}));
+    let Some(ui) = ui.as_object_mut() else {
+        return;
+    };
+    ui.insert(
+        "resourceUri".to_string(),
+        Value::String(resource_uri.to_string()),
+    );
+}
+
+fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> Value {
     let tool_name = spec.name.clone();
     if matches!(
         tool_name.as_str(),
@@ -579,12 +579,12 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, _app_enabled: bool) -> 
         }
     }
     if tool_name == "import_conversation_files_to_project" {
-        if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "_meta".to_string(),
-                json!({"openai/fileParams": ["openaiFileIdRefs"]}),
-            );
+        if let Some(meta) = tool_meta_object(&mut value) {
+            meta.insert("openai/fileParams".to_string(), json!(["openaiFileIdRefs"]));
         }
+    }
+    if app_enabled && presentation::tool_supports_result_app(&tool_name) {
+        attach_app_metadata(&mut value, resources::MCP_RESULT_UI_RESOURCE_URI);
     }
     value
 }
@@ -617,6 +617,7 @@ pub(super) async fn handle_list(
     auth: Option<&AuthContext>,
     stateless_2026: bool,
     compact_schemas: bool,
+    app_enabled: bool,
 ) -> McpOutcome {
     let result = match runtime.runtime_exposure() {
         RuntimeExposure::ProjectConnector => {
@@ -626,7 +627,7 @@ pub(super) async fn handle_list(
             let mut result = mcp_tools_list_payload_with_features_for_auth(
                 model_surface,
                 compact_schemas,
-                stateless_2026 && resources::model_surface_supports_computer_app(model_surface),
+                app_enabled,
                 stateless_2026,
                 stateless_2026,
                 auth,
@@ -1141,10 +1142,12 @@ pub(super) async fn handle_call(
     id: Option<Value>,
     auth: Option<&AuthContext>,
     stateless_2026: bool,
+    app_enabled: bool,
     host_file_import_trust: HostFileImportTrust,
     window: Option<&crate::client_window::ClientWindow>,
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
     mut model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
+    mut correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
 ) -> McpOutcome {
     let tasks_extension_declared = stateless_2026 && tasks::request_supports_tasks(&request_params);
     let mut params: McpToolCallParams = match serde_json::from_value(request_params) {
@@ -1258,45 +1261,10 @@ pub(super) async fn handle_call(
                 }
             };
         match adaptive_runtime_gateway_target_route(&target, stateless_2026) {
-            AdaptiveRuntimeGatewayTargetRoute::Gateway => {
+            AdaptiveRuntimeGatewayTargetRoute::Gateway
+            | AdaptiveRuntimeGatewayTargetRoute::Direct => {
                 params.name = target;
                 params.arguments = arguments;
-            }
-            AdaptiveRuntimeGatewayTargetRoute::Direct => {
-                if let Err(ToolCallErrorStatus::InsufficientScope {
-                    required_scope,
-                    description,
-                }) = check_runtime_tool_scope(auth, &target)
-                {
-                    if let Some(lc) = lifecycle.as_deref() {
-                        lc.dispatch_failed("forbidden");
-                        lc.dispatch_finished(false, Some(false), "forbidden");
-                    }
-                    return scope_forbidden(auth, required_scope, description);
-                }
-                if let Some(lc) = lifecycle.as_deref() {
-                    lc.dispatch_failed("wrong_invocation_route");
-                    lc.dispatch_finished(false, Some(false), "wrong_invocation_route");
-                }
-                let completion = ModelErgonomicsTimer::start(&target).map(|timer| timer.finish());
-                let rendered = mcp_runtime_tool_result_fallback(
-                    adaptive_runtime_gateway_route_failure(&target),
-                );
-                if let (Some(slot), Some(completion)) =
-                    (model_ergonomics_out.as_deref_mut(), completion.as_ref())
-                {
-                    *slot = rendered.get("structuredContent").and_then(|structured| {
-                        completion.record_for_structured_content(structured)
-                    });
-                }
-                return McpOutcome::Ok(rpc_result(
-                    id,
-                    if stateless_2026 {
-                        mcp_stateless_result(rendered, false)
-                    } else {
-                        rendered
-                    },
-                ));
             }
             AdaptiveRuntimeGatewayTargetRoute::Unknown => {
                 if let Some(lc) = lifecycle.as_deref() {
@@ -1434,6 +1402,20 @@ pub(super) async fn handle_call(
             }
         };
         let ok = invocation.success();
+        if let (Some(slot), Some(session_id)) = (
+            correlation_out.as_deref_mut(),
+            recording_session_id.as_deref(),
+        ) {
+            let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
+            let project = runtime.sessions.session_project(session_id).flatten();
+            correlation.resolved_project = project.clone();
+            correlation.add_workflow_session(crate::tool_runtime::WorkflowSessionCorrelation {
+                session_id: session_id.to_string(),
+                project,
+                relation: crate::tool_runtime::WorkflowSessionCorrelationRelation::Recording,
+            });
+            *slot = correlation;
+        }
         if let Some(lc) = lifecycle.as_deref() {
             lc.capture_payload(
                 "specialized_governance",
@@ -1553,6 +1535,20 @@ pub(super) async fn handle_call(
             }
         };
         let ok = invocation.success();
+        if let (Some(slot), Some(session_id)) = (
+            correlation_out.as_deref_mut(),
+            recording_session_id.as_deref(),
+        ) {
+            let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
+            let project = runtime.sessions.session_project(session_id).flatten();
+            correlation.resolved_project = project.clone();
+            correlation.add_workflow_session(crate::tool_runtime::WorkflowSessionCorrelation {
+                session_id: session_id.to_string(),
+                project,
+                relation: crate::tool_runtime::WorkflowSessionCorrelationRelation::Recording,
+            });
+            *slot = correlation;
+        }
         if let Some(lc) = lifecycle.as_deref() {
             lc.capture_payload("effective_arguments", &audit);
             lc.capture_payload(
@@ -1572,8 +1568,9 @@ pub(super) async fn handle_call(
         ));
     }
     // Focused model surfaces reject direct tools they do not advertise at the
-    // MCP boundary. Adaptive gateway calls are already reduced to an allowed
-    // full-operator target and continue through the normal runtime checks.
+    // MCP boundary. Adaptive gateway calls are already reduced to an admitted
+    // target and continue through the same normal runtime checks, whether that
+    // target's preferred exposure is gateway or direct.
     let surface_denied = match model_surface {
         ModelSurface::LocalCoding => !LOCAL_CODING_TOOL_NAMES.contains(&params.name.as_str()),
         ModelSurface::AdaptiveRuntime => {
@@ -1783,6 +1780,9 @@ pub(super) async fn handle_call(
         )
         .await;
     let model_ergonomics_completion = outcome.model_ergonomics;
+    if let Some(slot) = correlation_out.as_deref_mut() {
+        *slot = outcome.correlation.clone();
+    }
     let result = match outcome.error_status {
         Some(ToolCallErrorStatus::InsufficientScope {
             required_scope,
@@ -1832,7 +1832,7 @@ pub(super) async fn handle_call(
             lc.dispatch_finished(true, Some(false), category);
         }
     }
-    let result = match resources::adapt_tool_result(
+    let mut result = match resources::adapt_tool_result(
         &params.name,
         as_image_requested,
         result,
@@ -1843,6 +1843,9 @@ pub(super) async fn handle_call(
             mcp_runtime_tool_result_fallback(result)
         }
     };
+    if app_enabled {
+        presentation::attach_result_app_presentation(&params.name, &mut result);
+    }
     let model_ergonomics = model_ergonomics_completion.as_ref().and_then(|completion| {
         result
             .get("structuredContent")

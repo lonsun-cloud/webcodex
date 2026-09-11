@@ -11,523 +11,202 @@ use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_
 use webcodex_workflow_session::SessionExecutionContext;
 
 pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value) -> Value {
+    let Some(definition) = webcodex_tool_contracts::lookup_tool_definition(tool_name) else {
+        return empty_audit_projection();
+    };
+    let request_policy = definition.audit_policy().request;
+    if !matches!(
+        request_policy,
+        webcodex_tool_contracts::ToolAuditRequestPolicy::Typed
+            | webcodex_tool_contracts::ToolAuditRequestPolicy::TypedDropNullValues
+    ) {
+        return empty_audit_projection();
+    }
+
+    let Some(call) = audit_tool_call_from_request(definition, tool_name, arguments) else {
+        return empty_audit_projection();
+    };
+    let mut projected = call.session_log_arguments();
+    if request_policy == webcodex_tool_contracts::ToolAuditRequestPolicy::TypedDropNullValues {
+        if let Some(projected) = projected.as_object_mut() {
+            projected.retain(|_, value| !value.is_null());
+        }
+    }
+    projected
+}
+
+fn empty_audit_projection() -> Value {
+    serde_json::json!({})
+}
+
+fn audit_tool_call_from_request(
+    definition: &webcodex_tool_contracts::ToolDefinition,
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<ToolCall> {
+    if let Ok(call) = ToolCall::from_tool_name(tool_name, arguments.clone()) {
+        return Some(call);
+    }
+
+    // Audit happens before the authoritative concrete parser so pre-execution
+    // denials can still be recorded. For model-visible tools, retry after
+    // dropping undeclared top-level fields using the canonical ToolDefinition
+    // schema. This preserves existing privacy summaries for malformed requests
+    // without ever persisting the unknown fields themselves.
+    let schema = definition.model_spec?.input_schema;
+    let schema = schema();
+    let allowed = schema.get("properties")?.as_object()?;
+    let source = arguments.as_object()?;
+    let filtered = source
+        .iter()
+        .filter(|(key, _)| allowed.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if filtered.len() == source.len() {
+        return None;
+    }
+    ToolCall::from_tool_name(tool_name, Value::Object(filtered)).ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StructuredValidationRequestAudit {
+    CargoFmt,
+    CargoCheck,
+    CargoTest,
+    GoTest,
+}
+
+impl StructuredValidationRequestAudit {
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::CargoFmt => "cargo_fmt",
+            Self::CargoCheck => "cargo_check",
+            Self::CargoTest => "cargo_test",
+            Self::GoTest => "go_test",
+        }
+    }
+}
+
+fn typed_structured_validation_request_audit(
+    kind: StructuredValidationRequestAudit,
+    arguments: &Value,
+) -> Value {
     let Some(obj) = arguments.as_object() else {
-        return Value::Null;
+        return empty_audit_projection();
     };
     let mut out = serde_json::Map::new();
     if let Some(project) = obj.get("project").cloned() {
         out.insert("project".to_string(), project);
     }
-    match tool_name {
-        "run_process" => {
-            out.insert(
-                "executable_present".to_string(),
-                Value::Bool(obj.contains_key("executable")),
-            );
-            out.insert(
-                "stdin_present".to_string(),
-                Value::Bool(obj.contains_key("stdin")),
-            );
-            let args = obj.get("args").and_then(Value::as_array);
-            out.insert(
-                "arg_count".to_string(),
-                Value::from(args.map(Vec::len).unwrap_or_default()),
-            );
-            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
-            if let Some(executable) = obj.get("executable").and_then(Value::as_str) {
-                out.insert(
-                    "process_summary".to_string(),
-                    Value::String(process_preview(
-                        executable,
-                        args.into_iter().flatten().filter_map(Value::as_str),
-                    )),
-                );
-            }
-            if let Some(identity) =
-                obj.get("executable")
-                    .and_then(Value::as_str)
-                    .and_then(|executable| {
-                        let args = obj
-                            .get("args")
-                            .and_then(Value::as_array)
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .map(|value| value.as_str().map(str::to_string))
-                                    .collect::<Option<Vec<_>>>()
-                            })
-                            .flatten()
-                            .unwrap_or_default();
-                        run_process_validation_identity(
-                            executable,
-                            &args,
-                            obj.get("stdin").and_then(Value::as_str),
-                            obj.get("cwd").and_then(Value::as_str),
-                            obj.get("purpose").and_then(Value::as_str),
-                        )
-                    })
-            {
-                out.insert(
-                    "execution_identity".to_string(),
-                    Value::String(identity.identity.clone()),
-                );
-                if is_structured_validation_target_identity(&identity.identity) {
-                    out.insert(
-                        "validation_target_id".to_string(),
-                        Value::String(identity.identity),
-                    );
-                }
-                if let Some(tool) = identity.validation_tool {
-                    out.insert(
-                        "validation_tool".to_string(),
-                        Value::String(tool.to_string()),
-                    );
-                }
-            }
+    match kind {
+        StructuredValidationRequestAudit::CargoFmt => {
+            copy_keys(obj, &mut out, &["cwd", "check", "timeout_secs"]);
+            insert_structured_validation_target(kind.tool_name(), obj, &mut out);
         }
-        "run_detached_process" => {
-            out.insert(
-                "executable_present".to_string(),
-                Value::Bool(obj.contains_key("executable")),
+        StructuredValidationRequestAudit::CargoCheck => {
+            copy_keys(
+                obj,
+                &mut out,
+                &[
+                    "cwd",
+                    "all_targets",
+                    "all_features",
+                    "no_default_features",
+                    "package",
+                    "timeout_secs",
+                ],
             );
             out.insert(
-                "stdin_present".to_string(),
-                Value::Bool(obj.contains_key("stdin")),
-            );
-            let arg_count = obj
-                .get("args")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            out.insert("arg_count".to_string(), Value::from(arg_count));
-            out.insert(
-                "process_summary".to_string(),
-                Value::String(format!("detached process ({arg_count} args)")),
-            );
-            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
-        }
-        "coding_agent_start" => {
-            copy_keys(obj, &mut out, &["provider_id", "timeout_secs"]);
-            out.insert(
-                "instruction_bytes".to_string(),
-                Value::from(
-                    obj.get("instruction")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            out.insert(
-                "config_count".to_string(),
-                Value::from(
-                    obj.get("config")
-                        .and_then(Value::as_object)
-                        .map(serde_json::Map::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            out.insert(
-                "idempotency_key_present".to_string(),
-                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
-            );
-        }
-        "coding_agent_observe" => {
-            copy_keys(obj, &mut out, &["run_id", "wait_secs"]);
-            out.insert(
-                "token_present".to_string(),
+                "features_present".to_string(),
                 Value::Bool(
-                    obj.get("after_observation_token")
+                    obj.get("features")
                         .and_then(Value::as_str)
-                        .is_some(),
+                        .is_some_and(|value| !value.is_empty()),
                 ),
             );
+            insert_structured_validation_target(kind.tool_name(), obj, &mut out);
         }
-        "coding_agent_cancel" => {
-            copy_keys(obj, &mut out, &["run_id"]);
-        }
-        "run_script" => {
-            if let Some(language) = obj.get("language").cloned() {
-                out.insert("language".to_string(), language);
-            }
-            out.insert(
-                "script_bytes".to_string(),
-                Value::from(
-                    obj.get("script")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            out.insert(
-                "stdin_present".to_string(),
-                Value::Bool(obj.get("stdin").is_some_and(|value| !value.is_null())),
-            );
-            out.insert(
-                "arg_count".to_string(),
-                Value::from(
-                    obj.get("args")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
-            if let (Some(language), Some(script)) = (
-                obj.get("language").and_then(Value::as_str),
-                obj.get("script").and_then(Value::as_str),
-            ) {
-                let args = obj
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .map(|value| value.as_str().map(str::to_string))
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .flatten()
-                    .unwrap_or_default();
-                if let Some(identity) = run_script_validation_identity(
-                    language,
-                    script,
-                    &args,
-                    obj.get("stdin").and_then(Value::as_str),
-                    obj.get("cwd").and_then(Value::as_str),
-                    obj.get("purpose").and_then(Value::as_str),
-                ) {
-                    out.insert(
-                        "execution_identity".to_string(),
-                        Value::String(identity.identity.clone()),
-                    );
-                    if is_structured_validation_target_identity(&identity.identity) {
-                        out.insert(
-                            "validation_target_id".to_string(),
-                            Value::String(identity.identity),
-                        );
-                    }
-                    if let Some(tool) = identity.validation_tool {
-                        out.insert(
-                            "validation_tool".to_string(),
-                            Value::String(tool.to_string()),
-                        );
-                    }
-                }
-            }
-        }
-        "run_shell" | "run_job" | "session_shell_exec" => {
-            out.insert(
-                "command_present".to_string(),
-                Value::Bool(obj.contains_key("command")),
-            );
-            copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose", "shell"]);
-            if tool_name == "session_shell_exec" {
-                copy_keys(obj, &mut out, &["session_id", "shell_id"]);
-            }
-            if let Some(command) = obj.get("command").and_then(Value::as_str) {
-                out.insert(
-                    "command_summary".to_string(),
-                    Value::String(command_preview(command)),
-                );
-            }
-        }
-        "open_session_shell" => {
-            copy_keys(obj, &mut out, &["session_id", "cwd", "shell"]);
-        }
-        "session_shell_status" | "close_session_shell" => {
-            copy_keys(obj, &mut out, &["session_id", "shell_id"]);
-        }
-        "computer_list_targets" => {}
-        "computer_list_windows" => {
-            copy_keys(obj, &mut out, &["client_id", "limit"]);
-        }
-        "computer_list_applications" => {
-            copy_keys(obj, &mut out, &["client_id", "limit"]);
-        }
-        "computer_list_displays" => {
-            copy_keys(obj, &mut out, &["client_id", "limit"]);
-        }
-        "computer_launch_application" => {
-            copy_keys(obj, &mut out, &["client_id", "application_id"]);
-        }
-        "computer_accessibility_status" => {
-            copy_keys(obj, &mut out, &["client_id"]);
-        }
-        "computer_accessibility_tree" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "surface_id", "max_depth", "max_nodes"],
-            );
-        }
-        "computer_find_elements" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "surface_id", "focused", "enabled", "limit"],
-            );
-            for field in ["role", "subrole", "label"] {
-                out.insert(
-                    format!("{field}_present"),
-                    Value::Bool(obj.get(field).and_then(Value::as_str).is_some()),
-                );
-            }
-        }
-        "computer_element_state" => {
-            copy_keys(obj, &mut out, &["client_id", "surface_id", "element_id"]);
-        }
-        "computer_activate_window" => {
-            copy_keys(obj, &mut out, &["client_id", "surface_id"]);
-        }
-        "computer_control" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "surface_id", "element_id", "action"],
-            );
-        }
-        "computer_scroll_to_element" => {
-            copy_keys(obj, &mut out, &["client_id", "surface_id", "element_id"]);
-        }
-        "computer_key_input" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "surface_id", "key", "modifiers"],
-            );
-        }
-        "computer_pointer_move" | "computer_pointer_click" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "display_id", "snapshot_generation", "x", "y"],
-            );
-        }
-        "computer_read_clipboard" => {
-            copy_keys(obj, &mut out, &["client_id"]);
-        }
-        "computer_write_clipboard" => {
-            copy_keys(obj, &mut out, &["client_id"]);
-            out.insert(
-                "text_bytes".to_string(),
-                Value::from(
-                    obj.get("text")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or_default(),
-                ),
-            );
-        }
-        "computer_input_text" => {
-            copy_keys(obj, &mut out, &["client_id", "surface_id", "element_id"]);
-            out.insert(
-                "text_bytes".to_string(),
-                Value::from(
-                    obj.get("text")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or_default(),
-                ),
-            );
-        }
-        "computer_snapshot" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "surface_id", "max_width", "max_height"],
-            );
-            out.insert(
-                "region_present".to_string(),
-                Value::Bool(obj.get("region").is_some_and(|value| !value.is_null())),
-            );
-        }
-        "computer_snapshot_display" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["client_id", "display_id", "max_width", "max_height"],
-            );
-        }
-        "computer_save_snapshot" => {
+        StructuredValidationRequestAudit::CargoTest => {
             copy_keys(
                 obj,
                 &mut out,
                 &[
-                    "project",
-                    "path",
-                    "client_id",
-                    "surface_id",
-                    "max_width",
-                    "max_height",
+                    "cwd",
+                    "all_targets",
+                    "all_features",
+                    "no_default_features",
+                    "package",
+                    "no_run",
+                    "require_tests",
+                    "min_tests",
+                    "timeout_secs",
                 ],
             );
             out.insert(
-                "region_present".to_string(),
-                Value::Bool(obj.get("region").is_some_and(|value| !value.is_null())),
-            );
-        }
-        "observe_jobs" => {
-            let items = obj.get("items").and_then(Value::as_array);
-            out.insert(
-                "item_count".to_string(),
-                Value::from(items.map(Vec::len).unwrap_or_default()),
-            );
-            out.insert(
-                "token_count".to_string(),
-                Value::from(
-                    items
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| item.get("after_observation_token").is_some())
-                        .count(),
+                "filter_present".to_string(),
+                Value::Bool(
+                    obj.get("filter")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
                 ),
             );
             out.insert(
-                "job_ids".to_string(),
-                Value::Array(
-                    items
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|item| item.get("job_id").and_then(Value::as_str))
-                        .map(|job_id| Value::String(job_id.to_string()))
-                        .collect(),
+                "features_present".to_string(),
+                Value::Bool(
+                    obj.get("features")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
                 ),
             );
-            copy_keys(obj, &mut out, &["tail_lines", "wait_secs"]);
+            insert_structured_validation_target(kind.tool_name(), obj, &mut out);
         }
-        "list_projects" => {
-            out.remove("project");
+        StructuredValidationRequestAudit::GoTest => {
+            copy_keys(obj, &mut out, &["cwd", "timeout_secs"]);
+            let packages = obj.get("packages").and_then(Value::as_array);
             out.insert(
-                "client_id_present".to_string(),
-                Value::Bool(obj.get("client_id").is_some_and(|value| !value.is_null())),
+                "packages_present".to_string(),
+                Value::Bool(obj.get("packages").is_some_and(|value| !value.is_null())),
             );
             out.insert(
-                "project_present".to_string(),
-                Value::Bool(obj.get("project").is_some_and(|value| !value.is_null())),
+                "package_count".to_string(),
+                Value::from(packages.map(Vec::len).unwrap_or_default()),
             );
-            let query = obj.get("query").and_then(Value::as_str);
-            out.insert("query_present".to_string(), Value::Bool(query.is_some()));
-            out.insert(
-                "query_length".to_string(),
-                Value::from(query.map(|value| value.chars().count()).unwrap_or_default()),
-            );
-            copy_keys(obj, &mut out, &["limit", "summary_only"]);
+            insert_structured_validation_target(kind.tool_name(), obj, &mut out);
         }
-        "list_runners" => {
-            out.insert(
-                "client_id_present".to_string(),
-                Value::Bool(obj.get("client_id").is_some_and(|value| !value.is_null())),
-            );
-            out.insert(
-                "client_ids_count".to_string(),
-                Value::from(
-                    obj.get("client_ids")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            copy_keys(obj, &mut out, &["include_projects", "summary_only"]);
-        }
-        "runtime_status" => {
-            out.insert(
-                "client_id_present".to_string(),
-                Value::Bool(obj.get("client_id").is_some_and(|value| !value.is_null())),
-            );
-            copy_keys(obj, &mut out, &["compact", "summary_only"]);
-        }
-        "list_jobs" => {
-            out.remove("project");
-            out.insert(
-                "project_present".to_string(),
-                Value::Bool(obj.get("project").is_some_and(|value| !value.is_null())),
-            );
-            out.insert(
-                "session_id_present".to_string(),
-                Value::Bool(obj.get("session_id").is_some_and(|value| !value.is_null())),
-            );
-            copy_keys(obj, &mut out, &["limit", "status"]);
-        }
-        "start_session" | "update_session_context" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "project",
-                    "client_id",
-                    "title",
-                    "mode",
-                    "deny_write_tools",
-                    "deny_shell_tools",
-                    "detail",
-                    "resume_session_id",
-                    "session_id",
-                ],
-            );
-            let context = obj
-                .get("execution_context")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<SessionExecutionContext>(value).ok())
-                .map(|context| context.audit_summary())
-                .unwrap_or(Value::Null);
-            out.insert("execution_context".to_string(), context);
-        }
-        // Compatibility-only audit sanitizer for the retired wire name. The
-        // kernel records a bounded request summary before ToolCall parsing, so
-        // a rejected legacy request still passes through this branch. This is
-        // not a current ToolCall identity or dispatch path.
-        "start_coding_task" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "project",
-                    "client_id",
-                    "title",
-                    "mode",
-                    "deny_write_tools",
-                    "deny_shell_tools",
-                    "detail",
-                    "resume_session_id",
-                    "session_id",
-                ],
-            );
-            out.insert(
-                "path_source_requested".to_string(),
-                Value::Bool(obj.contains_key("path")),
-            );
-            let context = obj
-                .get("execution_context")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<SessionExecutionContext>(value).ok())
-                .map(|context| context.audit_summary())
-                .unwrap_or(Value::Null);
-            out.insert("execution_context".to_string(), context);
-        }
-        "work_on_project" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "project",
-                    "client_id",
-                    "session_id",
-                    "include_project_instructions",
-                    "include_workflow_guidance",
-                ],
-            );
-            out.insert(
-                "path_source_requested".to_string(),
-                Value::Bool(obj.contains_key("path")),
-            );
-            if let Some(instruction) = obj.get("instruction").and_then(Value::as_str) {
-                out.insert(
-                    "instruction_summary".to_string(),
-                    Value::String(command_preview(instruction)),
-                );
-                out.insert("instruction_present".to_string(), Value::Bool(true));
-            }
-        }
-        "create_agent_task" => {
+    }
+    if let Some(sync_wait_secs) = obj
+        .get("sync_wait_secs")
+        .filter(|value| !value.is_null())
+        .cloned()
+    {
+        out.insert("sync_wait_secs".to_string(), sync_wait_secs);
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentTaskRequestAudit {
+    Create,
+    List,
+    Read,
+    Assign,
+    StartAttempt,
+    StartCodingRun,
+    ReconcileCodingRun,
+    HeartbeatAttempt,
+    CompleteAttempt,
+}
+
+fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(project) = obj.get("project").cloned() {
+        out.insert("project".to_string(), project);
+    }
+    match kind {
+        AgentTaskRequestAudit::Create => {
             copy_keys(
                 obj,
                 &mut out,
@@ -562,23 +241,23 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "list_agent_tasks" => {
+        AgentTaskRequestAudit::List => {
             copy_keys(obj, &mut out, &["assignee_agent_id", "offset", "limit"]);
         }
-        "read_agent_task" => {
+        AgentTaskRequestAudit::Read => {
             copy_keys(obj, &mut out, &["task_id"]);
         }
-        "assign_agent_task" => {
+        AgentTaskRequestAudit::Assign => {
             copy_keys(obj, &mut out, &["task_id", "assignee_agent_id"]);
         }
-        "start_agent_task_attempt" => {
+        AgentTaskRequestAudit::StartAttempt => {
             copy_keys(obj, &mut out, &["task_id", "assignee_agent_id"]);
             out.insert(
                 "idempotency_key_present".to_string(),
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "start_agent_task_coding_run" => {
+        AgentTaskRequestAudit::StartCodingRun => {
             copy_keys(
                 obj,
                 &mut out,
@@ -606,10 +285,10 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ),
             );
         }
-        "reconcile_agent_task_coding_run" => {
+        AgentTaskRequestAudit::ReconcileCodingRun => {
             copy_keys(obj, &mut out, &["task_id", "attempt_id"]);
         }
-        "heartbeat_agent_task_attempt" => {
+        AgentTaskRequestAudit::HeartbeatAttempt => {
             copy_keys(
                 obj,
                 &mut out,
@@ -625,7 +304,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
             );
         }
-        "complete_agent_task_attempt" => {
+        AgentTaskRequestAudit::CompleteAttempt => {
             copy_keys(
                 obj,
                 &mut out,
@@ -664,7 +343,37 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("completion_key").and_then(Value::as_str).is_some()),
             );
         }
-        "create_agent_identity" => {
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommunicationRequestAudit {
+    CreateIdentity,
+    ListIdentities,
+    UpdateIdentity,
+    AttachEndpoint,
+    DetachEndpoint,
+    CreateConversation,
+    ListConversations,
+    ReadConversation,
+    PostMessage,
+    ListInbox,
+    ConsumeDeliveries,
+    BootstrapConversation,
+    ConsumeWake,
+}
+
+fn typed_communication_request_audit(kind: CommunicationRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(project) = obj.get("project").cloned() {
+        out.insert("project".to_string(), project);
+    }
+    match kind {
+        CommunicationRequestAudit::CreateIdentity => {
             out.insert(
                 "handle_chars".to_string(),
                 Value::from(
@@ -708,10 +417,10 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "list_agent_identities" => {
+        CommunicationRequestAudit::ListIdentities => {
             copy_keys(obj, &mut out, &["agent_id", "offset", "limit"]);
         }
-        "update_agent_identity" => {
+        CommunicationRequestAudit::UpdateIdentity => {
             copy_keys(obj, &mut out, &["agent_id", "expected_profile_revision"]);
             for field in ["handle", "display_name", "description", "specialty_labels"] {
                 out.insert(
@@ -738,7 +447,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ),
             );
         }
-        "attach_agent_endpoint" => {
+        CommunicationRequestAudit::AttachEndpoint => {
             copy_keys(obj, &mut out, &["agent_id", "host"]);
             out.insert(
                 "client_attachment_id_present".to_string(),
@@ -752,10 +461,10 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "detach_agent_endpoint" => {
+        CommunicationRequestAudit::DetachEndpoint => {
             copy_keys(obj, &mut out, &["endpoint_id"]);
         }
-        "create_conversation" => {
+        CommunicationRequestAudit::CreateConversation => {
             out.insert(
                 "title_present".to_string(),
                 Value::Bool(obj.get("title").is_some_and(|value| !value.is_null())),
@@ -774,7 +483,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "list_conversations" => {
+        CommunicationRequestAudit::ListConversations => {
             copy_keys(
                 obj,
                 &mut out,
@@ -787,7 +496,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ],
             );
         }
-        "read_conversation" => {
+        CommunicationRequestAudit::ReadConversation => {
             copy_keys(
                 obj,
                 &mut out,
@@ -801,7 +510,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ],
             );
         }
-        "post_conversation_message" => {
+        CommunicationRequestAudit::PostMessage => {
             copy_keys(
                 obj,
                 &mut out,
@@ -848,7 +557,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "list_agent_inbox" => {
+        CommunicationRequestAudit::ListInbox => {
             copy_keys(
                 obj,
                 &mut out,
@@ -861,7 +570,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ],
             );
         }
-        "consume_agent_deliveries" => {
+        CommunicationRequestAudit::ConsumeDeliveries => {
             copy_keys(
                 obj,
                 &mut out,
@@ -877,7 +586,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ),
             );
         }
-        "bootstrap_agent_conversation" => {
+        CommunicationRequestAudit::BootstrapConversation => {
             copy_keys(
                 obj,
                 &mut out,
@@ -890,7 +599,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ],
             );
         }
-        "consume_agent_wake" => {
+        CommunicationRequestAudit::ConsumeWake => {
             copy_keys(
                 obj,
                 &mut out,
@@ -910,7 +619,30 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(consume_token_present),
             );
         }
-        "memory_search" => {
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MemoryRequestAudit {
+    Search,
+    Read,
+    Set,
+    Delete,
+    ScopeList,
+    ScopePurge,
+}
+
+fn typed_memory_request_audit(kind: MemoryRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(project) = obj.get("project").cloned() {
+        out.insert("project".to_string(), project);
+    }
+    match kind {
+        MemoryRequestAudit::Search => {
             copy_keys(
                 obj,
                 &mut out,
@@ -940,14 +672,14 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ),
             );
         }
-        "memory_read" => {
+        MemoryRequestAudit::Read => {
             copy_keys(
                 obj,
                 &mut out,
                 &["project", "memory_key", "expected_revision", "session_id"],
             );
         }
-        "memory_set" => {
+        MemoryRequestAudit::Set => {
             copy_keys(
                 obj,
                 &mut out,
@@ -978,68 +710,52 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 ),
             );
         }
-        "memory_delete" => {
+        MemoryRequestAudit::Delete => {
             copy_keys(
                 obj,
                 &mut out,
                 &["project", "memory_key", "expected_revision", "session_id"],
             );
         }
-        "memory_scope_list" => {
+        MemoryRequestAudit::ScopeList => {
             copy_keys(obj, &mut out, &["offset", "limit"]);
         }
-        "memory_scope_purge" => {
+        MemoryRequestAudit::ScopePurge => {
             copy_keys(
                 obj,
                 &mut out,
                 &["memory_scope_id", "expected_catalog_revision"],
             );
         }
-        "skill_list" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "project",
-                    "offset",
-                    "limit",
-                    "expected_catalog_revision",
-                    "session_id",
-                ],
-            );
-            out.insert(
-                "query_present".to_string(),
-                Value::Bool(
-                    obj.get("query")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty()),
-                ),
-            );
-        }
-        "skill_read_file" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "project",
-                    "skill_id",
-                    "path",
-                    "start_line",
-                    "limit",
-                    "expected_definition_revision",
-                    "expected_package_revision",
-                    "session_id",
-                ],
-            );
-        }
-        "skill_versions" => {
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SkillRequestAudit {
+    Versions,
+    Install,
+    Activate,
+    RemoveRevision,
+}
+
+fn typed_skill_request_audit(kind: SkillRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(project) = obj.get("project").cloned() {
+        out.insert("project".to_string(), project);
+    }
+    match kind {
+        SkillRequestAudit::Versions => {
             copy_keys(
                 obj,
                 &mut out,
                 &["project", "skill_key", "offset", "limit", "session_id"],
             );
         }
-        "skill_install" => {
+        SkillRequestAudit::Install => {
             copy_keys(
                 obj,
                 &mut out,
@@ -1061,7 +777,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "skill_activate" | "skill_remove_revision" => {
+        SkillRequestAudit::Activate => {
             copy_keys(
                 obj,
                 &mut out,
@@ -1078,1019 +794,158 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "search_project_text" => {
+        SkillRequestAudit::RemoveRevision => {
             copy_keys(
                 obj,
                 &mut out,
                 &[
-                    "path",
-                    "limit",
-                    "context_before",
-                    "context_after",
-                    "result_mode",
-                    "timeout_secs",
-                ],
-            );
-            out.insert(
-                "pattern_present".to_string(),
-                Value::Bool(obj.contains_key("pattern")),
-            );
-            for (field, summary_field) in [
-                ("include_globs", "include_glob_count"),
-                ("exclude_globs", "exclude_glob_count"),
-            ] {
-                let count = obj
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                out.insert(summary_field.to_string(), serde_json::json!(count));
-            }
-        }
-        "search_project_texts" => {
-            out.insert(
-                "query_count".to_string(),
-                serde_json::json!(obj
-                    .get("queries")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0)),
-            );
-            out.insert(
-                "patterns_present".to_string(),
-                Value::Bool(
-                    obj.get("queries")
-                        .and_then(Value::as_array)
-                        .is_some_and(|queries| {
-                            queries.iter().any(|query| query.get("pattern").is_some())
-                        }),
-                ),
-            );
-        }
-        "write_project_file" => {
-            copy_keys(obj, &mut out, &["path", "overwrite", "expected_sha256"]);
-            out.insert(
-                "content_present".to_string(),
-                Value::Bool(obj.contains_key("content")),
-            );
-        }
-        "save_project_artifact" => {
-            copy_keys(obj, &mut out, &["path", "mime_type", "overwrite"]);
-            out.insert(
-                "content_base64_present".to_string(),
-                Value::Bool(obj.contains_key("content_base64")),
-            );
-        }
-        "import_conversation_files_to_project" => {
-            copy_keys(obj, &mut out, &["output_dir", "overwrite", "session_id"]);
-            out.insert(
-                "file_count".to_string(),
-                Value::from(
-                    obj.get("openaiFileIdRefs")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or_default(),
-                ),
-            );
-            out.insert(
-                "targets_count".to_string(),
-                Value::from(
-                    obj.get("targets")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or_default(),
-                ),
-            );
-        }
-        "artifact_upload_begin" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["path", "expected_bytes", "mime_type", "overwrite"],
-            );
-            out.insert(
-                "expected_sha256_present".to_string(),
-                Value::Bool(obj.contains_key("expected_sha256")),
-            );
-        }
-        "artifact_upload_chunk" => {
-            copy_keys(obj, &mut out, &["path", "upload_id", "offset"]);
-            out.insert(
-                "content_base64_present".to_string(),
-                Value::Bool(obj.contains_key("content_base64")),
-            );
-        }
-        "artifact_upload_finish" | "artifact_upload_abort" => {
-            copy_keys(obj, &mut out, &["path", "upload_id"]);
-        }
-        "apply_patch" => {
-            out.insert(
-                "patch_present".to_string(),
-                Value::Bool(obj.contains_key("patch")),
-            );
-            copy_keys(obj, &mut out, &["dry_run", "matching_mode"]);
-        }
-        "apply_unified_diff" => {
-            out.insert(
-                "diff_present".to_string(),
-                Value::Bool(obj.contains_key("diff")),
-            );
-            copy_keys(obj, &mut out, &["deny_sensitive_paths"]);
-        }
-        "delete_project_files" | "git_restore_paths" | "discard_untracked" => {
-            copy_keys(obj, &mut out, &["paths"]);
-        }
-        "git_commit_paths" => {
-            copy_keys(obj, &mut out, &["paths"]);
-            insert_exact_git_commit_audit(obj, &mut out, "expected_head");
-            out.insert(
-                "message_present".to_string(),
-                Value::Bool(obj.get("message").and_then(Value::as_str).is_some()),
-            );
-        }
-        "git_review_summary" => {
-            insert_exact_git_commit_audit(obj, &mut out, "base_commit");
-            insert_exact_git_commit_audit(obj, &mut out, "head_commit");
-        }
-        "git_diff_hunks" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["paths", "max_hunks", "max_hunk_lines", "cached"],
-            );
-            insert_exact_git_commit_audit(obj, &mut out, "base_commit");
-            insert_exact_git_commit_audit(obj, &mut out, "head_commit");
-            out.insert(
-                "continuation_present".to_string(),
-                Value::Bool(
-                    obj.get("continuation")
-                        .is_some_and(|value| !value.is_null()),
-                ),
-            );
-        }
-        "cargo_fmt" => {
-            copy_keys(obj, &mut out, &["cwd", "check", "timeout_secs"]);
-            insert_structured_validation_target(tool_name, obj, &mut out);
-        }
-        "cargo_check" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "cwd",
-                    "all_targets",
-                    "all_features",
-                    "no_default_features",
-                    "package",
-                    "timeout_secs",
-                ],
-            );
-            out.insert(
-                "features_present".to_string(),
-                Value::Bool(
-                    obj.get("features")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty()),
-                ),
-            );
-            insert_structured_validation_target(tool_name, obj, &mut out);
-        }
-        "cargo_test" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "cwd",
-                    "all_targets",
-                    "all_features",
-                    "no_default_features",
-                    "package",
-                    "no_run",
-                    "require_tests",
-                    "min_tests",
-                    "timeout_secs",
-                ],
-            );
-            out.insert(
-                "filter_present".to_string(),
-                Value::Bool(
-                    obj.get("filter")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty()),
-                ),
-            );
-            out.insert(
-                "features_present".to_string(),
-                Value::Bool(
-                    obj.get("features")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty()),
-                ),
-            );
-            insert_structured_validation_target(tool_name, obj, &mut out);
-        }
-        "go_test" => {
-            copy_keys(obj, &mut out, &["cwd", "timeout_secs"]);
-            let packages = obj.get("packages").and_then(Value::as_array);
-            out.insert(
-                "packages_present".to_string(),
-                Value::Bool(obj.get("packages").is_some_and(|value| !value.is_null())),
-            );
-            out.insert(
-                "package_count".to_string(),
-                Value::from(packages.map(Vec::len).unwrap_or_default()),
-            );
-            insert_structured_validation_target(tool_name, obj, &mut out);
-        }
-        "post_session_message" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["session_id", "kind", "reply_to", "priority", "requires_ack"],
-            );
-            out.insert(
-                "body_present".to_string(),
-                Value::Bool(obj.get("message").and_then(Value::as_str).is_some()),
-            );
-            out.insert(
-                "body_bytes".to_string(),
-                Value::from(
-                    obj.get("message")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or(0),
-                ),
-            );
-            out.insert(
-                "tags_count".to_string(),
-                Value::from(
-                    obj.get("tags")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or(0),
-                ),
-            );
-        }
-        "list_session_messages" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "session_id",
-                    "kind",
-                    "status",
-                    "message_id",
-                    "reply_to",
-                    "limit",
-                ],
-            );
-        }
-        "get_session_assignment" => {
-            copy_keys(obj, &mut out, &["session_id", "message_id"]);
-        }
-        "observe_session_messages" => {
-            copy_keys(obj, &mut out, &["session_id", "wait_secs", "limit"]);
-            out.insert(
-                "token_present".to_string(),
-                Value::Bool(
-                    obj.get("after_observation_token")
-                        .and_then(Value::as_str)
-                        .is_some(),
-                ),
-            );
-        }
-        "resolve_session_message" => {
-            copy_keys(obj, &mut out, &["session_id", "message_id"]);
-            out.insert(
-                "resolution_present".to_string(),
-                Value::Bool(obj.get("resolution").and_then(Value::as_str).is_some()),
-            );
-            out.insert(
-                "resolution_bytes".to_string(),
-                Value::from(
-                    obj.get("resolution")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or(0),
-                ),
-            );
-        }
-        "complete_session_message" => {
-            copy_keys(obj, &mut out, &["session_id", "message_id", "priority"]);
-            out.insert(
-                "body_present".to_string(),
-                Value::Bool(obj.get("answer").and_then(Value::as_str).is_some()),
-            );
-            out.insert(
-                "body_bytes".to_string(),
-                Value::from(
-                    obj.get("answer")
-                        .and_then(Value::as_str)
-                        .map(str::len)
-                        .unwrap_or(0),
-                ),
-            );
-            out.insert(
-                "tags_count".to_string(),
-                Value::from(
-                    obj.get("tags")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or(0),
-                ),
-            );
-            out.insert(
-                "completion_id".to_string(),
-                bounded_completion_key_fingerprint(
-                    obj.get("completion_key").and_then(Value::as_str),
-                ),
-            );
-            out.insert(
-                "assignment_fence_present".to_string(),
-                Value::Bool(
-                    obj.get("expected_assignment_fence")
-                        .and_then(Value::as_str)
-                        .is_some(),
-                ),
-            );
-        }
-        "session_discussion_summary" => {
-            copy_keys(obj, &mut out, &["session_id", "limit"]);
-        }
-        "session_handoff_summary" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "session_id",
                     "project",
-                    "include_workspace",
-                    "include_checkpoints",
-                    "include_validation",
-                    "summary_only",
-                    "limit",
+                    "skill_key",
+                    "package_revision",
+                    "expected_state_revision",
+                    "session_id",
                 ],
             );
-        }
-        "workspace_checkpoint_create" => {
-            copy_keys(obj, &mut out, &["title", "include_untracked"]);
             out.insert(
-                "note_present".to_string(),
-                Value::Bool(obj.contains_key("note")),
-            );
-            let kind = obj
-                .get("kind")
-                .and_then(Value::as_str)
-                .filter(|value| is_checkpoint_kind(value))
-                .unwrap_or(if obj.get("kind").is_some() {
-                    "invalid"
-                } else {
-                    "snapshot"
-                });
-            out.insert("kind".to_string(), Value::String(kind.to_string()));
-            let label_count = obj
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            out.insert("label_count".to_string(), Value::from(label_count));
-            let validation_status = obj
-                .get("validation")
-                .and_then(Value::as_object)
-                .and_then(|validation| validation.get("status"))
-                .and_then(Value::as_str)
-                .filter(|value| is_checkpoint_validation_status(value))
-                .unwrap_or(
-                    if obj
-                        .get("validation")
-                        .and_then(Value::as_object)
-                        .and_then(|validation| validation.get("status"))
-                        .is_some()
-                    {
-                        "invalid"
-                    } else {
-                        "unknown"
-                    },
-                );
-            out.insert(
-                "validation_status".to_string(),
-                Value::String(validation_status.to_string()),
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
-        "workspace_checkpoint_list" => {
-            copy_keys(obj, &mut out, &["limit"]);
-        }
-        "workspace_checkpoint_show" => {
-            copy_keys(obj, &mut out, &["checkpoint_id", "include_diff_stat"]);
-        }
-        "workspace_checkpoint_restore" | "workspace_checkpoint_delete" => {
-            copy_keys(obj, &mut out, &["checkpoint_id", "confirm"]);
-        }
-        _ => return arguments.clone(),
     }
     Value::Object(out)
 }
 
 pub fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Value {
-    match tool_name {
-        "read_tool_trace" => serde_json::json!({
-            "trace_ref": output.get("trace_ref").cloned().unwrap_or(Value::Null),
-            "trace_mode": output.get("trace_mode").cloned().unwrap_or(Value::Null),
-            "payload_count": output.get("payload_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("returned_count").cloned().unwrap_or(Value::Null),
-            "offset": output.get("offset").cloned().unwrap_or(Value::Null),
-            "next_offset": output.get("next_offset").cloned().unwrap_or(Value::Null),
-            "payload_index": output.get("payload_index").cloned().unwrap_or(Value::Null),
-            "phase": output.get("phase").cloned().unwrap_or(Value::Null),
-            "payload_bytes": output.get("payload_bytes").cloned().unwrap_or(Value::Null),
-            "payload_sha256": output.get("payload_sha256").cloned().unwrap_or(Value::Null),
-            "payload_available": output.get("payload_available").cloned().unwrap_or(Value::Null),
-            "reason": output.get("reason").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "coding_agent_start" | "coding_agent_cancel" => serde_json::json!({
-            "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
-            "state": output.get("state").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-            "cancel_requested": output.get("cancel_requested").cloned().unwrap_or(Value::Null),
-            "terminal_stop_reason": output.pointer("/terminal/stop_reason").cloned().unwrap_or(Value::Null),
-            "terminal_error_code": output.pointer("/terminal/error_code").cloned().unwrap_or(Value::Null),
-            "terminal_completed_at": output.pointer("/terminal/completed_at").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "recovery_kind": output.get("recovery_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "coding_agent_observe" => {
-            let mut kind_counts = serde_json::Map::new();
-            let mut event_count = 0usize;
-            let mut event_body_bytes = 0usize;
-            if let Some(events) = output.get("events").and_then(Value::as_array) {
-                event_count = events.len();
-                for event in events {
-                    if let Some(kind) = event.get("kind").and_then(Value::as_str) {
-                        let count = kind_counts.get(kind).and_then(Value::as_u64).unwrap_or(0) + 1;
-                        kind_counts.insert(kind.to_string(), Value::from(count));
-                    }
-                    event_body_bytes = event_body_bytes.saturating_add(
-                        event
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(str::len)
-                            .unwrap_or(0),
-                    );
-                }
-            }
-            serde_json::json!({
-                "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
-                "project": output.get("project").cloned().unwrap_or(Value::Null),
-                "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
-                "state": output.get("state").cloned().unwrap_or(Value::Null),
-                "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-                "event_count": event_count,
-                "event_kind_counts": kind_counts,
-                "event_body_bytes": event_body_bytes,
-                "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
-                "history_lost": output.get("history_lost").cloned().unwrap_or(Value::Null),
-                "first_retained_sequence": output.get("first_retained_sequence").cloned().unwrap_or(Value::Null),
-                "terminal_stop_reason": output.pointer("/terminal/stop_reason").cloned().unwrap_or(Value::Null),
-                "terminal_error_code": output.pointer("/terminal/error_code").cloned().unwrap_or(Value::Null),
-                "terminal_completed_at": output.pointer("/terminal/completed_at").cloned().unwrap_or(Value::Null),
-                "recovery_kind": output.get("recovery_kind").cloned().unwrap_or(Value::Null),
-                "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            })
+    let Some(definition) = webcodex_tool_contracts::lookup_tool_definition(tool_name) else {
+        return empty_audit_projection();
+    };
+    match definition.audit_policy().result {
+        webcodex_tool_contracts::ToolAuditResultPolicy::CanonicalLedgerEvidence => output.clone(),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Fields(fields) => {
+            project_declared_result_fields(fields, output)
         }
-        "git_review_summary" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "scope": output.get("scope").cloned().unwrap_or(Value::Null),
-            "stats": output.get("stats").cloned().unwrap_or(Value::Null),
-            "coverage": output.get("coverage").cloned().unwrap_or(Value::Null),
-            "truncation": output.get("truncation").cloned().unwrap_or(Value::Null),
-            "deterministic": output.get("deterministic").cloned().unwrap_or(Value::Null),
-            "llm_summary": output.get("llm_summary").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "reason_code": output.get("reason_code").cloned().unwrap_or(Value::Null),
-            "signal_count": output.get("signals").and_then(Value::as_array).map(Vec::len),
-            "file_count": output.get("files").and_then(Value::as_array).map(Vec::len),
-        }),
-        "git_diff_hunks" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "scope": output.get("scope").cloned().unwrap_or(Value::Null),
-            "cached": output.get("cached").cloned().unwrap_or(Value::Null),
-            "hunk_count": output.get("hunk_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "truncation_reasons": output.get("truncation_reasons").cloned().unwrap_or(Value::Null),
-            "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
-            "exit_code": output.get("exit_code").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "reason_code": output.get("reason_code").cloned().unwrap_or(Value::Null),
-            "file_count": output.get("files").and_then(Value::as_array).map(Vec::len),
-        }),
-        "post_session_message" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_id": output.get("message_id").cloned().unwrap_or(Value::Null),
-            "kind": output.pointer("/message/kind").cloned().unwrap_or(Value::Null),
-            "status": output.pointer("/message/status").cloned().unwrap_or(Value::Null),
-            "requires_ack": output.pointer("/message/requires_ack").cloned().unwrap_or(Value::Null),
-            "author_session_id": output.pointer("/message/author_session_id").cloned().unwrap_or(Value::Null),
-        }),
-        "list_session_messages" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_count": output.get("messages").and_then(Value::as_array).map(Vec::len),
-        }),
-        "get_session_assignment" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_id": output.get("message_id").cloned().unwrap_or(Value::Null),
-            "direct_reply_count": output.get("direct_replies").and_then(Value::as_array).map(Vec::len),
-            "assignment_fence_present": output.get("assignment_fence").and_then(Value::as_str).is_some(),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "observe_session_messages" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_count": output.get("messages").and_then(Value::as_array).map(Vec::len),
-            "changed": output.get("changed").cloned().unwrap_or(Value::Null),
-            "history_lost": output.get("history_lost").cloned().unwrap_or(Value::Null),
-            "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
-            "wait_outcome": output.get("wait_outcome").cloned().unwrap_or(Value::Null),
-        }),
-        "resolve_session_message" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_id": output.get("message_id").cloned().unwrap_or(Value::Null),
-            "status": output.pointer("/message/status").cloned().unwrap_or(Value::Null),
-            "resolved_by_message_id": output.pointer("/message/resolved_by_message_id").cloned().unwrap_or(Value::Null),
-        }),
-        "complete_session_message" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "message_id": output.get("message_id").cloned().unwrap_or(Value::Null),
-            "answer_message_id": output.get("answer_message_id").cloned().unwrap_or(Value::Null),
-            "completion_id": output.get("completion_id").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "author_session_id": output.pointer("/answer/author_session_id").cloned().unwrap_or(Value::Null),
-        }),
-        "session_discussion_summary" => serde_json::json!({
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "counts": output.get("counts").cloned().unwrap_or(Value::Null),
-            "open_todo_count": output.get("open_todos").and_then(Value::as_array).map(Vec::len),
-            "recent_answer_count": output.get("recent_answers").and_then(Value::as_array).map(Vec::len),
-            "recent_completion_count": output.get("recent_completions").and_then(Value::as_array).map(Vec::len),
-        }),
-        "session_handoff_summary" => serde_json::json!({
-            "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "lifecycle": output.get("lifecycle").cloned().unwrap_or(Value::Null),
-            "counts": output.get("counts").cloned().unwrap_or(Value::Null),
-            "open_todo_count": output.get("open_todos").and_then(Value::as_array).map(Vec::len),
-            "recent_answer_count": output.get("recent_answers").and_then(Value::as_array).map(Vec::len),
-            "recent_completion_count": output.get("recent_completions").and_then(Value::as_array).map(Vec::len),
-            "summary_only": output.get("summary_only").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "create_agent_task" | "assign_agent_task" => serde_json::json!({
-            "task_id": output.pointer("/task/summary/task_id").cloned().unwrap_or(Value::Null),
-            "state": output.pointer("/task/summary/state").cloned().unwrap_or(Value::Null),
-            "assignee_agent_id": output.pointer("/task/summary/assignee_agent_id").cloned().unwrap_or(Value::Null),
-            "created": output.get("created").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "list_agent_tasks" => serde_json::json!({
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("tasks").and_then(Value::as_array).map(Vec::len),
-            "offset": output.get("offset").cloned().unwrap_or(Value::Null),
-            "next_offset": output.get("next_offset").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "read_agent_task" => serde_json::json!({
-            "task_id": output.pointer("/task/summary/task_id").cloned().unwrap_or(Value::Null),
-            "state": output.pointer("/task/summary/state").cloned().unwrap_or(Value::Null),
-            "assignee_agent_id": output.pointer("/task/summary/assignee_agent_id").cloned().unwrap_or(Value::Null),
-            "latest_attempt_id": output.pointer("/task/summary/latest_attempt/attempt_id").cloned().unwrap_or(Value::Null),
-            "latest_attempt_state": output.pointer("/task/summary/latest_attempt/state").cloned().unwrap_or(Value::Null),
-            "latest_attempt_number": output.pointer("/task/summary/latest_attempt/attempt_number").cloned().unwrap_or(Value::Null),
-            "controller_generation": output.pointer("/task/summary/latest_attempt/attempt_controller_generation").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "start_agent_task_attempt" => serde_json::json!({
-            "task_id": output.pointer("/task/task_id").cloned().unwrap_or(Value::Null),
-            "task_state": output.pointer("/task/state").cloned().unwrap_or(Value::Null),
-            "attempt_id": output.pointer("/attempt/attempt_id").cloned().unwrap_or(Value::Null),
-            "attempt_number": output.pointer("/attempt/attempt_number").cloned().unwrap_or(Value::Null),
-            "attempt_state": output.pointer("/attempt/state").cloned().unwrap_or(Value::Null),
-            "controller_generation": output.pointer("/attempt/attempt_controller_generation").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "start_agent_task_coding_run" | "reconcile_agent_task_coding_run" => serde_json::json!({
-            "task_id": output.get("task_id").cloned().unwrap_or(Value::Null),
-            "attempt_id": output.get("attempt_id").cloned().unwrap_or(Value::Null),
-            "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
-            "dispatch_state": output.get("dispatch_state").cloned().unwrap_or(Value::Null),
-            "run_state": output.get("run_state").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-            "execution_status": output.get("execution_status").cloned().unwrap_or(Value::Null),
-            "execution_recovery": output.get("execution_recovery").cloned().unwrap_or(Value::Null),
-            "task_state": output.get("task_state").cloned().unwrap_or(Value::Null),
-            "attempt_state": output.get("attempt_state").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "heartbeat_agent_task_attempt" | "complete_agent_task_attempt" => serde_json::json!({
-            "task_id": output.pointer("/task/task_id").cloned().unwrap_or(Value::Null),
-            "task_state": output.pointer("/task/state").cloned().unwrap_or(Value::Null),
-            "attempt_id": output.pointer("/attempt/attempt_id").cloned().unwrap_or(Value::Null),
-            "attempt_number": output.pointer("/attempt/attempt_number").cloned().unwrap_or(Value::Null),
-            "attempt_state": output.pointer("/attempt/state").cloned().unwrap_or(Value::Null),
-            "controller_generation": output.pointer("/attempt/attempt_controller_generation").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "create_agent_identity" | "update_agent_identity" => serde_json::json!({
-            "agent_id": output.pointer("/agent/agent_id").cloned().unwrap_or(Value::Null),
-            "profile_revision": output.pointer("/agent/profile_revision").cloned().unwrap_or(Value::Null),
-            "created": output.get("created").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "list_agent_identities" => serde_json::json!({
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("agents").and_then(Value::as_array).map(Vec::len),
-            "offset": output.get("offset").cloned().unwrap_or(Value::Null),
-            "next_offset": output.get("next_offset").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "attach_agent_endpoint" | "detach_agent_endpoint" => serde_json::json!({
-            "endpoint_id": output.pointer("/endpoint/endpoint_id").cloned().unwrap_or(Value::Null),
-            "agent_id": output.pointer("/endpoint/agent_id").cloned().unwrap_or(Value::Null),
-            "detached": output.pointer("/endpoint/detached_at_unix_ms").is_some_and(|value| !value.is_null()),
-            "created": output.get("created").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "create_conversation" => serde_json::json!({
-            "conversation_id": output.pointer("/conversation/conversation/conversation_id").cloned().unwrap_or(Value::Null),
-            "participant_count": output.pointer("/conversation/participants").and_then(Value::as_array).map(Vec::len),
-            "message_count": output.pointer("/conversation/messages").and_then(Value::as_array).map(Vec::len),
-            "created": output.get("created").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "list_conversations" => serde_json::json!({
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("conversations").and_then(Value::as_array).map(Vec::len),
-            "offset": output.get("offset").cloned().unwrap_or(Value::Null),
-            "next_offset": output.get("next_offset").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "read_conversation" => serde_json::json!({
-            "conversation_id": output.pointer("/conversation/conversation_id").cloned().unwrap_or(Value::Null),
-            "participant_count": output.get("participants").and_then(Value::as_array).map(Vec::len),
-            "message_count": output.get("messages").and_then(Value::as_array).map(Vec::len),
-            "after_seq": output.get("after_seq").cloned().unwrap_or(Value::Null),
-            "next_after_seq": output.get("next_after_seq").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "post_conversation_message" => serde_json::json!({
-            "message_id": output.pointer("/message/message_id").cloned().unwrap_or(Value::Null),
-            "conversation_id": output.pointer("/message/conversation_id").cloned().unwrap_or(Value::Null),
-            "seq": output.pointer("/message/seq").cloned().unwrap_or(Value::Null),
-            "delivery_count": output.pointer("/message/deliveries").and_then(Value::as_array).map(Vec::len),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "list_agent_inbox" => serde_json::json!({
-            "agent_id": output.get("agent_id").cloned().unwrap_or(Value::Null),
-            "total_queued_count": output.get("total_queued_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("deliveries").and_then(Value::as_array).map(Vec::len),
-            "after_delivery_order": output.get("after_delivery_order").cloned().unwrap_or(Value::Null),
-            "next_after_delivery_order": output.get("next_after_delivery_order").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "consume_agent_deliveries" => serde_json::json!({
-            "agent_id": output.get("agent_id").cloned().unwrap_or(Value::Null),
-            "consumed_count": output.get("consumed_delivery_ids").and_then(Value::as_array).map(Vec::len),
-            "already_consumed_count": output.get("already_consumed_delivery_ids").and_then(Value::as_array).map(Vec::len),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "bootstrap_agent_conversation" => serde_json::json!({
-            "agent_id": output.pointer("/acting_agent/agent_id").cloned().unwrap_or(Value::Null),
-            "endpoint_id": output.pointer("/endpoint/endpoint_id").cloned().unwrap_or(Value::Null),
-            "controller_generation": output.pointer("/endpoint/controller_generation").cloned().unwrap_or(Value::Null),
-            "conversation_id": output.pointer("/selected_conversation/conversation_id").cloned().unwrap_or(Value::Null),
-            "queued_delivery_count": output.pointer("/inbox/queued_delivery_count").cloned().unwrap_or(Value::Null),
-            "wake_id": output.pointer("/wake/wake_id").cloned().unwrap_or(Value::Null),
-            "wake_state": output.pointer("/wake/state").cloned().unwrap_or(Value::Null),
-            "adapter_kind": output.pointer("/host_binding/adapter_kind").cloned().unwrap_or(Value::Null),
-            "runtime_wake_capable": output.pointer("/host_binding/runtime_wake_capable").cloned().unwrap_or(Value::Null),
-            "production_auto_resume_available": output.pointer("/host_binding/production_auto_resume_available").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "consume_agent_wake" => serde_json::json!({
-            "wake_id": output.get("wake_id").cloned().unwrap_or(Value::Null),
-            "target_agent_id": output.get("target_agent_id").cloned().unwrap_or(Value::Null),
-            "state": output.get("state").cloned().unwrap_or(Value::Null),
-            "already_consumed": output.get("already_consumed").cloned().unwrap_or(Value::Null),
-            "consumed_at_unix_ms": output.get("consumed_at_unix_ms").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_search" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "catalog_revision": output.get("catalog_revision").cloned().unwrap_or(Value::Null),
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("returned_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_read" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "memory_id": output.get("memory_id").cloned().unwrap_or(Value::Null),
-            "memory_key": output.get("memory_key").cloned().unwrap_or(Value::Null),
-            "revision": output.get("revision").cloned().unwrap_or(Value::Null),
-            "bootstrap": output.get("bootstrap").cloned().unwrap_or(Value::Null),
-            "priority": output.get("priority").cloned().unwrap_or(Value::Null),
-            "returned_body_bytes": output.get("body").and_then(Value::as_str).map(str::len),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_set" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "memory_id": output.get("memory_id").cloned().unwrap_or(Value::Null),
-            "memory_key": output.get("memory_key").cloned().unwrap_or(Value::Null),
-            "old_revision": output.get("old_revision").cloned().unwrap_or(Value::Null),
-            "revision": output.get("revision").cloned().unwrap_or(Value::Null),
-            "created": output.get("created").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_delete" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "memory_id": output.get("memory_id").cloned().unwrap_or(Value::Null),
-            "memory_key": output.get("memory_key").cloned().unwrap_or(Value::Null),
-            "revision": output.get("revision").cloned().unwrap_or(Value::Null),
-            "deleted": output.get("deleted").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_scope_list" => serde_json::json!({
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("returned_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "memory_scope_purge" => serde_json::json!({
-            "memory_scope_id": output.get("memory_scope_id").cloned().unwrap_or(Value::Null),
-            "catalog_revision": output.get("catalog_revision").cloned().unwrap_or(Value::Null),
-            "current_catalog_revision": output.get("current_catalog_revision").cloned().unwrap_or(Value::Null),
-            "purged_count": output.get("purged_count").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_list" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "catalog_revision": output.get("catalog_revision").cloned().unwrap_or(Value::Null),
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "returned_count": output.get("returned_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "invalid_count": output.get("invalid_count").cloned().unwrap_or(Value::Null),
-            "discovery_truncated": output.get("discovery_truncated").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_read_file" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "skill_id": output.get("skill_id").cloned().unwrap_or(Value::Null),
-            "source_scope": output.get("source_scope").cloned().unwrap_or(Value::Null),
-            "trust": output.get("trust").cloned().unwrap_or(Value::Null),
-            "package_revision": output.get("package_revision").cloned().unwrap_or(Value::Null),
-            "definition_revision": output.get("definition_revision").cloned().unwrap_or(Value::Null),
-            "path": output.get("path").cloned().unwrap_or(Value::Null),
-            "sha256": output.get("sha256").cloned().unwrap_or(Value::Null),
-            "start_line": output.get("start_line").cloned().unwrap_or(Value::Null),
-            "end_line": output.get("end_line").cloned().unwrap_or(Value::Null),
-            "returned_lines": output.get("returned_lines").cloned().unwrap_or(Value::Null),
-            "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
-            "next_start_line": output.get("next_start_line").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_versions" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "skill_id": output.get("skill_id").cloned().unwrap_or(Value::Null),
-            "skill_key": output.get("skill_key").cloned().unwrap_or(Value::Null),
-            "state_revision": output.get("state_revision").cloned().unwrap_or(Value::Null),
-            "active_package_revision": output.get("active_package_revision").cloned().unwrap_or(Value::Null),
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "offset": output.get("offset").cloned().unwrap_or(Value::Null),
-            "next_offset": output.get("next_offset").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_install" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "skill_id": output.get("skill_id").cloned().unwrap_or(Value::Null),
-            "skill_key": output.get("skill_key").cloned().unwrap_or(Value::Null),
-            "package_revision": output.get("package_revision").cloned().unwrap_or(Value::Null),
-            "definition_revision": output.get("definition_revision").cloned().unwrap_or(Value::Null),
-            "artifact_sha256": output.get("artifact_sha256").cloned().unwrap_or(Value::Null),
-            "file_count": output.get("file_count").cloned().unwrap_or(Value::Null),
-            "total_bytes": output.get("total_bytes").cloned().unwrap_or(Value::Null),
-            "installed": output.get("installed").cloned().unwrap_or(Value::Null),
-            "activated": output.get("activated").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "state_revision": output.get("state_revision").cloned().unwrap_or(Value::Null),
-            "active_package_revision": output.get("active_package_revision").cloned().unwrap_or(Value::Null),
-            "outcome_unknown": output.get("outcome_unknown").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_activate" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "skill_id": output.get("skill_id").cloned().unwrap_or(Value::Null),
-            "skill_key": output.get("skill_key").cloned().unwrap_or(Value::Null),
-            "previous_active_package_revision": output.get("previous_active_package_revision").cloned().unwrap_or(Value::Null),
-            "active_package_revision": output.get("active_package_revision").cloned().unwrap_or(Value::Null),
-            "state_revision": output.get("state_revision").cloned().unwrap_or(Value::Null),
-            "changed": output.get("changed").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "outcome_unknown": output.get("outcome_unknown").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "skill_remove_revision" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "skill_id": output.get("skill_id").cloned().unwrap_or(Value::Null),
-            "skill_key": output.get("skill_key").cloned().unwrap_or(Value::Null),
-            "package_revision": output.get("package_revision").cloned().unwrap_or(Value::Null),
-            "state_revision": output.get("state_revision").cloned().unwrap_or(Value::Null),
-            "removed": output.get("removed").cloned().unwrap_or(Value::Null),
-            "replayed": output.get("replayed").cloned().unwrap_or(Value::Null),
-            "outcome_unknown": output.get("outcome_unknown").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_list_targets" => serde_json::json!({
-            "count": output.get("count").cloned().unwrap_or(Value::Null),
-            "total_count": output.get("total_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_list_windows" => serde_json::json!({
-            "count": output.get("count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_list_applications" => serde_json::json!({
-            "count": output.get("count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_list_displays" => serde_json::json!({
-            "count": output.get("count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_launch_application" => serde_json::json!({
-            "application_id": output.get("application_id").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_pointer_move" | "computer_pointer_click" => serde_json::json!({
-            "display_id": output.get("display_id").cloned().unwrap_or(Value::Null),
-            "snapshot_generation": output.get("snapshot_generation").cloned().unwrap_or(Value::Null),
-            "x": output.get("x").cloned().unwrap_or(Value::Null),
-            "y": output.get("y").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_read_clipboard" => serde_json::json!({
-            "available": output.get("available").cloned().unwrap_or(Value::Null),
-            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_write_clipboard" => serde_json::json!({
-            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
-            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
-            "state_changed": output.get("state_changed").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_snapshot" => serde_json::json!({
-            "surface_id": output.pointer("/surface/surface_id").cloned().unwrap_or(Value::Null),
-            "source_width": output.get("source_width").cloned().unwrap_or(Value::Null),
-            "source_height": output.get("source_height").cloned().unwrap_or(Value::Null),
-            "region_present": output.get("region").is_some(),
-            "width": output.get("width").cloned().unwrap_or(Value::Null),
-            "height": output.get("height").cloned().unwrap_or(Value::Null),
-            "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
-            "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
-            "captured_at_unix_ms": output.get("captured_at_unix_ms").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_snapshot_display" => serde_json::json!({
-            "display_id": output.get("display_id").cloned().unwrap_or(Value::Null),
-            "snapshot_generation": output.get("snapshot_generation").cloned().unwrap_or(Value::Null),
-            "source_width": output.get("source_width").cloned().unwrap_or(Value::Null),
-            "source_height": output.get("source_height").cloned().unwrap_or(Value::Null),
-            "width": output.get("width").cloned().unwrap_or(Value::Null),
-            "height": output.get("height").cloned().unwrap_or(Value::Null),
-            "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
-            "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
-            "sha256": output.get("sha256").cloned().unwrap_or(Value::Null),
-            "captured_at_unix_ms": output.get("captured_at_unix_ms").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_save_snapshot" => serde_json::json!({
-            "project": output.get("project").cloned().unwrap_or(Value::Null),
-            "path": output.get("path").cloned().unwrap_or(Value::Null),
-            "client_id": output.get("client_id").cloned().unwrap_or(Value::Null),
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "source_width": output.get("source_width").cloned().unwrap_or(Value::Null),
-            "source_height": output.get("source_height").cloned().unwrap_or(Value::Null),
-            "region_present": output.get("region").is_some(),
-            "width": output.get("width").cloned().unwrap_or(Value::Null),
-            "height": output.get("height").cloned().unwrap_or(Value::Null),
-            "mime_type": output.get("mime_type").cloned().unwrap_or(Value::Null),
-            "file_bytes": output.get("file_bytes").cloned().unwrap_or(Value::Null),
-            "saved": output.get("saved").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_accessibility_status" => serde_json::json!({
-            "platform": output.get("platform").cloned().unwrap_or(Value::Null),
-            "trusted": output.get("trusted").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_accessibility_tree" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "observation_generation": output.get("observation_generation").cloned().unwrap_or(Value::Null),
-            "node_count": output.get("node_count").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-            "max_depth": output.get("max_depth").cloned().unwrap_or(Value::Null),
-            "max_nodes": output.get("max_nodes").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_find_elements" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "observation_generation": output.get("observation_generation").cloned().unwrap_or(Value::Null),
-            "count": output.get("count").cloned().unwrap_or(Value::Null),
-            "scanned_nodes": output.get("scanned_nodes").cloned().unwrap_or(Value::Null),
-            "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_element_state" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
-            "observation_generation": output.get("observation_generation").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_activate_window" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_control" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
-            "action": output.get("action").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_scroll_to_element" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_key_input" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "key": output.get("key").cloned().unwrap_or(Value::Null),
-            "modifiers": output.get("modifiers").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-        }),
-        "computer_input_text" => serde_json::json!({
-            "surface_id": output.get("surface_id").cloned().unwrap_or(Value::Null),
-            "element_id": output.get("element_id").cloned().unwrap_or(Value::Null),
-            "text_bytes": output.get("text_bytes").cloned().unwrap_or(Value::Null),
-            "success": output.get("success").cloned().unwrap_or(Value::Null),
-        }),
-        _ => output.clone(),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::CodingAgentObservation,
+        ) => coding_agent_observation_result_audit(output),
     }
+}
+
+fn project_declared_result_fields(
+    fields: &[webcodex_tool_contracts::ToolAuditResultField],
+    output: &Value,
+) -> Value {
+    use webcodex_tool_contracts::ToolAuditResultField;
+
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        let (key, value) = match *field {
+            ToolAuditResultField::Value {
+                output: key,
+                source,
+            } => (key, output.get(source).cloned().unwrap_or(Value::Null)),
+            ToolAuditResultField::Pointer {
+                output: key,
+                pointer,
+            } => (key, output.pointer(pointer).cloned().unwrap_or(Value::Null)),
+            ToolAuditResultField::ArrayLen {
+                output: key,
+                source,
+            } => (
+                key,
+                output
+                    .get(source)
+                    .and_then(Value::as_array)
+                    .map(|items| Value::from(items.len()))
+                    .unwrap_or(Value::Null),
+            ),
+            ToolAuditResultField::PointerArrayLen {
+                output: key,
+                pointer,
+            } => (
+                key,
+                output
+                    .pointer(pointer)
+                    .and_then(Value::as_array)
+                    .map(|items| Value::from(items.len()))
+                    .unwrap_or(Value::Null),
+            ),
+            ToolAuditResultField::StringBytes {
+                output: key,
+                source,
+            } => (
+                key,
+                output
+                    .get(source)
+                    .and_then(Value::as_str)
+                    .map(|value| Value::from(value.len()))
+                    .unwrap_or(Value::Null),
+            ),
+            ToolAuditResultField::Presence {
+                output: key,
+                source,
+            } => (key, Value::Bool(output.get(source).is_some())),
+            ToolAuditResultField::StringPresent {
+                output: key,
+                source,
+            } => (
+                key,
+                Value::Bool(output.get(source).and_then(Value::as_str).is_some()),
+            ),
+            ToolAuditResultField::PointerNonNull {
+                output: key,
+                pointer,
+            } => (
+                key,
+                Value::Bool(
+                    output
+                        .pointer(pointer)
+                        .is_some_and(|value| !value.is_null()),
+                ),
+            ),
+        };
+        projected.insert(key.to_string(), value);
+    }
+    Value::Object(projected)
+}
+
+fn coding_agent_observation_result_audit(output: &Value) -> Value {
+    let mut kind_counts = serde_json::Map::new();
+    let mut event_count = 0usize;
+    let mut event_body_bytes = 0usize;
+    if let Some(events) = output.get("events").and_then(Value::as_array) {
+        event_count = events.len();
+        for event in events {
+            if let Some(kind) = event.get("kind").and_then(Value::as_str) {
+                let count = kind_counts.get(kind).and_then(Value::as_u64).unwrap_or(0) + 1;
+                kind_counts.insert(kind.to_string(), Value::from(count));
+            }
+            event_body_bytes = event_body_bytes.saturating_add(
+                event
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0),
+            );
+        }
+    }
+    serde_json::json!({
+        "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
+        "project": output.get("project").cloned().unwrap_or(Value::Null),
+        "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
+        "state": output.get("state").cloned().unwrap_or(Value::Null),
+        "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+        "event_count": event_count,
+        "event_kind_counts": kind_counts,
+        "event_body_bytes": event_body_bytes,
+        "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
+        "history_lost": output.get("history_lost").cloned().unwrap_or(Value::Null),
+        "first_retained_sequence": output.get("first_retained_sequence").cloned().unwrap_or(Value::Null),
+        "terminal_stop_reason": output.pointer("/terminal/stop_reason").cloned().unwrap_or(Value::Null),
+        "terminal_error_code": output.pointer("/terminal/error_code").cloned().unwrap_or(Value::Null),
+        "terminal_completed_at": output.pointer("/terminal/completed_at").cloned().unwrap_or(Value::Null),
+        "recovery_kind": output.get("recovery_kind").cloned().unwrap_or(Value::Null),
+        "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn bounded_completion_key_fingerprint(value: Option<&str>) -> Value {
@@ -2124,28 +979,15 @@ fn normalized_exact_git_commit_for_audit(value: &str) -> Option<String> {
         .then(|| value.to_ascii_lowercase())
 }
 
-fn insert_exact_git_commit_audit(
-    obj: &serde_json::Map<String, Value>,
-    out: &mut serde_json::Map<String, Value>,
-    key: &str,
-) {
-    let normalized = obj
-        .get(key)
-        .and_then(Value::as_str)
-        .and_then(normalized_exact_git_commit_for_audit);
-    out.insert(format!("{key}_valid"), Value::Bool(normalized.is_some()));
-    if let Some(normalized) = normalized {
-        out.insert(key.to_string(), Value::String(normalized));
-    }
-}
-
 fn insert_structured_validation_target(
     tool_name: &str,
     arguments: &serde_json::Map<String, Value>,
     out: &mut serde_json::Map<String, Value>,
 ) {
+    let identity_kind = webcodex_tool_contracts::runtime_tool_session_evidence_policy(tool_name)
+        .validation_identity;
     if let Some(identity) =
-        structured_validation_target_identity(tool_name, &Value::Object(arguments.clone()))
+        structured_validation_target_identity(identity_kind, &Value::Object(arguments.clone()))
     {
         out.insert("validation_target_id".to_string(), Value::String(identity));
     }
@@ -2292,7 +1134,9 @@ fn canonical_cargo_validation_target(
         }
         _ => return None,
     };
-    let identity = structured_validation_target_identity(tool, &Value::Object(input))?;
+    let identity_kind =
+        webcodex_tool_contracts::runtime_tool_session_evidence_policy(tool).validation_identity;
+    let identity = structured_validation_target_identity(identity_kind, &Value::Object(input))?;
     Some((tool, identity))
 }
 
@@ -2390,6 +1234,165 @@ pub fn run_script_validation_identity(
 mod computer_privacy_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn request_audit_fails_closed_and_never_mutates_business_arguments() {
+        // Structured validation lifecycle controls are audit metadata, not
+        // validation identity inputs. Keep the explicit synchronous grace in
+        // the bounded request projection while preserving the business args.
+        let cargo_test = json!({
+            "project": "agent:test:demo",
+            "filter": "focused",
+            "timeout_secs": 600,
+            "sync_wait_secs": 1
+        });
+        let cargo_test_before = cargo_test.clone();
+        let cargo_test_summary = session_log_arguments_for_tool_request("cargo_test", &cargo_test);
+        assert_eq!(cargo_test_summary["sync_wait_secs"], 1);
+        assert_eq!(cargo_test_summary["timeout_secs"], 600);
+        let validation_target_id = cargo_test_summary["validation_target_id"]
+            .as_str()
+            .expect("cargo_test validation target");
+        let mut later_grace = cargo_test.clone();
+        later_grace["sync_wait_secs"] = json!(60);
+        let later_summary = session_log_arguments_for_tool_request("cargo_test", &later_grace);
+        assert_eq!(later_summary["sync_wait_secs"], 60);
+        assert_eq!(later_summary["validation_target_id"], validation_target_id);
+        assert_eq!(cargo_test, cargo_test_before);
+
+        let unknown = json!({"secret": "UNKNOWN_TOOL_SECRET"});
+        let unknown_before = unknown.clone();
+        assert_eq!(
+            session_log_arguments_for_tool_request("future_unknown_tool", &unknown),
+            json!({})
+        );
+        assert_eq!(unknown, unknown_before);
+
+        let malformed = json!({"secret": "MALFORMED_READ_SECRET"});
+        let malformed_before = malformed.clone();
+        assert_eq!(
+            session_log_arguments_for_tool_request("read_file", &malformed),
+            json!({})
+        );
+        assert_eq!(malformed, malformed_before);
+
+        let retired_alias = json!({"client_id": "PRIVATE_RETIRED_ALIAS_CLIENT"});
+        assert_eq!(
+            session_log_arguments_for_tool_request("list_agents", &retired_alias),
+            json!({}),
+            "retired aliases must not become a second audit identity"
+        );
+    }
+
+    #[test]
+    fn request_audit_omits_plugin_ssh_native_path_and_observation_secrets() {
+        const PLUGIN_SECRET: &str = "PLUGIN_ARGUMENT_SECRET";
+        const SSH_TARGET: &str = "root@private-native-target";
+        const SSH_CWD: &str = "/private/native/default/cwd";
+        const PROJECT_PATH: &str = "/private/native/project/root";
+        const JOB_TOKEN: &str = "wjob-private-observation-token";
+
+        let plugin_binding = format!("wc_pbind_{}", "a".repeat(32));
+        let plugin = json!({
+            "action": "call",
+            "binding": plugin_binding,
+            "arguments": {
+                "secret": PLUGIN_SECRET,
+                "nested": {"token": "PRIVATE_PLUGIN_TOKEN"}
+            }
+        });
+        let plugin_before = plugin.clone();
+        let plugin_summary = session_log_arguments_for_tool_request("plugin_tool", &plugin);
+        assert_eq!(plugin, plugin_before);
+        assert_eq!(plugin_summary["action"], "call");
+        assert_eq!(plugin_summary["binding_present"], true);
+        assert_eq!(plugin_summary["arguments_present"], true);
+        assert_eq!(plugin_summary["argument_key_count"], 2);
+        let plugin_serialized = serde_json::to_string(&plugin_summary).unwrap();
+        assert!(!plugin_serialized.contains(PLUGIN_SECRET));
+        assert!(!plugin_serialized.contains("PRIVATE_PLUGIN_TOKEN"));
+        assert!(!plugin_serialized.contains("wc_pbind_"));
+
+        let ssh = json!({
+            "action": "register",
+            "runner": "private-runner",
+            "binding": format!("wc_sbind_{}", "b".repeat(32)),
+            "name": "private-ssh-name",
+            "target": SSH_TARGET,
+            "default_cwd": SSH_CWD
+        });
+        let ssh_summary = session_log_arguments_for_tool_request("ssh_resource", &ssh);
+        assert_eq!(ssh_summary["action"], "register");
+        for key in [
+            "runner_present",
+            "binding_present",
+            "name_present",
+            "target_present",
+            "default_cwd_present",
+        ] {
+            assert_eq!(ssh_summary[key], true, "missing SSH presence bit {key}");
+        }
+        let ssh_serialized = serde_json::to_string(&ssh_summary).unwrap();
+        for secret in [
+            SSH_TARGET,
+            SSH_CWD,
+            "private-runner",
+            "private-ssh-name",
+            "wc_sbind_",
+        ] {
+            assert!(!ssh_serialized.contains(secret));
+        }
+
+        let register = json!({
+            "client_id": "special",
+            "id": "demo",
+            "name": "Demo",
+            "path": PROJECT_PATH,
+            "description": "PRIVATE PROJECT DESCRIPTION",
+            "allow_patch": true,
+            "overwrite": false
+        });
+        let register_summary =
+            session_log_arguments_for_tool_request("register_project", &register);
+        assert_eq!(register_summary["path_present"], true);
+        assert_eq!(register_summary["description_present"], true);
+        let register_serialized = serde_json::to_string(&register_summary).unwrap();
+        assert!(!register_serialized.contains(PROJECT_PATH));
+        assert!(!register_serialized.contains("PRIVATE PROJECT DESCRIPTION"));
+
+        let job_log = json!({
+            "job_id": "job-safe",
+            "after_observation_token": JOB_TOKEN,
+            "tail_lines": 20,
+            "wait_secs": 1
+        });
+        let job_summary = session_log_arguments_for_tool_request("job_log", &job_log);
+        assert_eq!(job_summary["job_id"], "job-safe");
+        assert_eq!(job_summary["token_present"], true);
+        assert!(!serde_json::to_string(&job_summary)
+            .unwrap()
+            .contains(JOB_TOKEN));
+    }
+
+    #[test]
+    fn result_audit_fails_closed_for_unknown_tools_without_mutating_business_output() {
+        let output = json!({
+            "secret": "UNKNOWN_RESULT_SECRET",
+            "nested": {"token": "PRIVATE_RESULT_TOKEN"}
+        });
+        let before = output.clone();
+        let projected = session_log_result_for_tool("future_unknown_tool", &output);
+        assert_eq!(projected, json!({}));
+        assert_eq!(output, before);
+        assert_eq!(
+            session_log_result_for_tool("list_agents", &output),
+            json!({}),
+            "retired aliases must not inherit a canonical result audit policy"
+        );
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(!serialized.contains("UNKNOWN_RESULT_SECRET"));
+        assert!(!serialized.contains("PRIVATE_RESULT_TOKEN"));
+    }
 
     #[test]
     fn computer_application_list_ledger_omits_names_ids_and_native_identity() {
@@ -4233,28 +3236,53 @@ impl ToolCall {
                 paths,
                 max_hunks,
                 max_hunk_lines,
+                max_page_bytes,
                 cached,
+                base_commit,
+                head_commit,
+                continuation,
                 ..
-            } => serde_json::json!({
-                "project": project,
-                "paths": paths,
-                "max_hunks": max_hunks,
-                "max_hunk_lines": max_hunk_lines,
-                "cached": cached,
-            }),
+            } => {
+                let base_commit = base_commit
+                    .as_deref()
+                    .and_then(normalized_exact_git_commit_for_audit);
+                let head_commit = head_commit
+                    .as_deref()
+                    .and_then(normalized_exact_git_commit_for_audit);
+                let mut out = serde_json::json!({
+                    "project": project,
+                    "paths": paths,
+                    "max_hunks": max_hunks,
+                    "max_hunk_lines": max_hunk_lines,
+                    "max_page_bytes": max_page_bytes,
+                    "cached": cached,
+                    "base_commit_valid": base_commit.is_some(),
+                    "head_commit_valid": head_commit.is_some(),
+                    "continuation_present": continuation.is_some(),
+                });
+                if let Some(base_commit) = base_commit {
+                    out["base_commit"] = Value::String(base_commit);
+                }
+                if let Some(head_commit) = head_commit {
+                    out["head_commit"] = Value::String(head_commit);
+                }
+                out
+            }
             Self::CargoFmt {
                 project,
                 cwd,
                 check,
                 timeout_secs,
+                sync_wait_secs,
                 ..
-            } => session_log_arguments_for_tool_request(
-                "cargo_fmt",
+            } => typed_structured_validation_request_audit(
+                StructuredValidationRequestAudit::CargoFmt,
                 &serde_json::json!({
                     "project": project,
                     "cwd": cwd,
                     "check": check,
                     "timeout_secs": timeout_secs,
+                    "sync_wait_secs": sync_wait_secs,
                 }),
             ),
             Self::CargoCheck {
@@ -4266,9 +3294,10 @@ impl ToolCall {
                 features,
                 package,
                 timeout_secs,
+                sync_wait_secs,
                 ..
-            } => session_log_arguments_for_tool_request(
-                "cargo_check",
+            } => typed_structured_validation_request_audit(
+                StructuredValidationRequestAudit::CargoCheck,
                 &serde_json::json!({
                     "project": project,
                     "cwd": cwd,
@@ -4278,6 +3307,7 @@ impl ToolCall {
                     "features": features,
                     "package": package,
                     "timeout_secs": timeout_secs,
+                    "sync_wait_secs": sync_wait_secs,
                 }),
             ),
             Self::CargoTest {
@@ -4293,9 +3323,10 @@ impl ToolCall {
                 require_tests,
                 min_tests,
                 timeout_secs,
+                sync_wait_secs,
                 ..
-            } => session_log_arguments_for_tool_request(
-                "cargo_test",
+            } => typed_structured_validation_request_audit(
+                StructuredValidationRequestAudit::CargoTest,
                 &serde_json::json!({
                     "project": project,
                     "cwd": cwd,
@@ -4309,6 +3340,7 @@ impl ToolCall {
                     "require_tests": require_tests,
                     "min_tests": min_tests,
                     "timeout_secs": timeout_secs,
+                    "sync_wait_secs": sync_wait_secs,
                 }),
             ),
             Self::GoTest {
@@ -4316,14 +3348,16 @@ impl ToolCall {
                 cwd,
                 packages,
                 timeout_secs,
+                sync_wait_secs,
                 ..
-            } => session_log_arguments_for_tool_request(
-                "go_test",
+            } => typed_structured_validation_request_audit(
+                StructuredValidationRequestAudit::GoTest,
                 &serde_json::json!({
                     "project": project,
                     "cwd": cwd,
                     "packages": packages,
                     "timeout_secs": timeout_secs,
+                    "sync_wait_secs": sync_wait_secs,
                 }),
             ),
             Self::ReadFile {
@@ -4358,8 +3392,8 @@ impl ToolCall {
                 source_message_id,
                 referenced_project_id,
                 idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "create_agent_task",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::Create,
                 &serde_json::json!({
                     "title": title,
                     "instruction": instruction,
@@ -4374,23 +3408,23 @@ impl ToolCall {
                 assignee_agent_id,
                 offset,
                 limit,
-            } => session_log_arguments_for_tool_request(
-                "list_agent_tasks",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::List,
                 &serde_json::json!({
                     "assignee_agent_id": assignee_agent_id,
                     "offset": offset,
                     "limit": limit,
                 }),
             ),
-            Self::ReadAgentTask { task_id } => session_log_arguments_for_tool_request(
-                "read_agent_task",
+            Self::ReadAgentTask { task_id } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::Read,
                 &serde_json::json!({"task_id": task_id}),
             ),
             Self::AssignAgentTask {
                 task_id,
                 assignee_agent_id,
-            } => session_log_arguments_for_tool_request(
-                "assign_agent_task",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::Assign,
                 &serde_json::json!({
                     "task_id": task_id,
                     "assignee_agent_id": assignee_agent_id,
@@ -4400,8 +3434,8 @@ impl ToolCall {
                 task_id,
                 assignee_agent_id,
                 idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "start_agent_task_attempt",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::StartAttempt,
                 &serde_json::json!({
                     "task_id": task_id,
                     "assignee_agent_id": assignee_agent_id,
@@ -4418,8 +3452,8 @@ impl ToolCall {
                 provider_id,
                 config,
                 timeout_secs,
-            } => session_log_arguments_for_tool_request(
-                "start_agent_task_coding_run",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::StartCodingRun,
                 &serde_json::json!({
                     "project": project,
                     "task_id": task_id,
@@ -4435,8 +3469,8 @@ impl ToolCall {
             Self::ReconcileAgentTaskCodingRun {
                 task_id,
                 attempt_id,
-            } => session_log_arguments_for_tool_request(
-                "reconcile_agent_task_coding_run",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::ReconcileCodingRun,
                 &serde_json::json!({
                     "task_id": task_id,
                     "attempt_id": attempt_id,
@@ -4448,8 +3482,8 @@ impl ToolCall {
                 assignee_agent_id,
                 attempt_fence,
                 attempt_controller_generation,
-            } => session_log_arguments_for_tool_request(
-                "heartbeat_agent_task_attempt",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::HeartbeatAttempt,
                 &serde_json::json!({
                     "task_id": task_id,
                     "attempt_id": attempt_id,
@@ -4468,8 +3502,8 @@ impl ToolCall {
                 terminal_result,
                 terminal_reason,
                 completion_key,
-            } => session_log_arguments_for_tool_request(
-                "complete_agent_task_attempt",
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::CompleteAttempt,
                 &serde_json::json!({
                     "task_id": task_id,
                     "attempt_id": attempt_id,
@@ -4488,8 +3522,8 @@ impl ToolCall {
                 description,
                 specialty_labels,
                 idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "create_agent_identity",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::CreateIdentity,
                 &serde_json::json!({
                     "handle": handle,
                     "display_name": display_name,
@@ -4502,8 +3536,8 @@ impl ToolCall {
                 agent_id,
                 offset,
                 limit,
-            } => session_log_arguments_for_tool_request(
-                "list_agent_identities",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ListIdentities,
                 &serde_json::json!({"agent_id": agent_id, "offset": offset, "limit": limit}),
             ),
             Self::UpdateAgentIdentity {
@@ -4513,8 +3547,8 @@ impl ToolCall {
                 display_name,
                 description,
                 specialty_labels,
-            } => session_log_arguments_for_tool_request(
-                "update_agent_identity",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::UpdateIdentity,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "expected_profile_revision": expected_profile_revision,
@@ -4529,8 +3563,8 @@ impl ToolCall {
                 host,
                 client_attachment_id,
                 idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "attach_agent_endpoint",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::AttachEndpoint,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "host": host,
@@ -4538,16 +3572,16 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
-            Self::DetachAgentEndpoint { endpoint_id } => session_log_arguments_for_tool_request(
-                "detach_agent_endpoint",
+            Self::DetachAgentEndpoint { endpoint_id } => typed_communication_request_audit(
+                CommunicationRequestAudit::DetachEndpoint,
                 &serde_json::json!({"endpoint_id": endpoint_id}),
             ),
             Self::CreateConversation {
                 title,
                 agent_ids,
                 idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "create_conversation",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::CreateConversation,
                 &serde_json::json!({
                     "title": title,
                     "agent_ids": agent_ids,
@@ -4560,8 +3594,8 @@ impl ToolCall {
                 expected_controller_generation,
                 offset,
                 limit,
-            } => session_log_arguments_for_tool_request(
-                "list_conversations",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ListConversations,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "endpoint_id": endpoint_id,
@@ -4577,8 +3611,8 @@ impl ToolCall {
                 expected_controller_generation,
                 after_seq,
                 limit,
-            } => session_log_arguments_for_tool_request(
-                "read_conversation",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ReadConversation,
                 &serde_json::json!({
                     "conversation_id": conversation_id,
                     "agent_id": agent_id,
@@ -4599,8 +3633,8 @@ impl ToolCall {
                 idempotency_key,
                 wake_reply_id,
                 reply_operation_index,
-            } => session_log_arguments_for_tool_request(
-                "post_conversation_message",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::PostMessage,
                 &serde_json::json!({
                     "conversation_id": conversation_id,
                     "body": body,
@@ -4620,8 +3654,8 @@ impl ToolCall {
                 expected_controller_generation,
                 after_delivery_order,
                 limit,
-            } => session_log_arguments_for_tool_request(
-                "list_agent_inbox",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ListInbox,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "endpoint_id": endpoint_id,
@@ -4635,8 +3669,8 @@ impl ToolCall {
                 endpoint_id,
                 expected_controller_generation,
                 delivery_ids,
-            } => session_log_arguments_for_tool_request(
-                "consume_agent_deliveries",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ConsumeDeliveries,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "endpoint_id": endpoint_id,
@@ -4651,8 +3685,8 @@ impl ToolCall {
                 conversation_id,
                 wake_id,
                 activation_idempotency_key,
-            } => session_log_arguments_for_tool_request(
-                "bootstrap_agent_conversation",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::BootstrapConversation,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "endpoint_id": endpoint_id,
@@ -4668,8 +3702,8 @@ impl ToolCall {
                 expected_controller_generation,
                 wake_id,
                 consume_token,
-            } => session_log_arguments_for_tool_request(
-                "consume_agent_wake",
+            } => typed_communication_request_audit(
+                CommunicationRequestAudit::ConsumeWake,
                 &serde_json::json!({
                     "agent_id": agent_id,
                     "endpoint_id": endpoint_id,
@@ -4686,8 +3720,8 @@ impl ToolCall {
                 limit,
                 expected_catalog_revision,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "memory_search",
+            } => typed_memory_request_audit(
+                MemoryRequestAudit::Search,
                 &serde_json::json!({
                     "project": project,
                     "query": query,
@@ -4703,8 +3737,8 @@ impl ToolCall {
                 memory_key,
                 expected_revision,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "memory_read",
+            } => typed_memory_request_audit(
+                MemoryRequestAudit::Read,
                 &serde_json::json!({
                     "project": project,
                     "memory_key": memory_key,
@@ -4722,8 +3756,8 @@ impl ToolCall {
                 tags,
                 expected_revision,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "memory_set",
+            } => typed_memory_request_audit(
+                MemoryRequestAudit::Set,
                 &serde_json::json!({
                     "project": project,
                     "memory_key": memory_key,
@@ -4741,8 +3775,8 @@ impl ToolCall {
                 memory_key,
                 expected_revision,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "memory_delete",
+            } => typed_memory_request_audit(
+                MemoryRequestAudit::Delete,
                 &serde_json::json!({
                     "project": project,
                     "memory_key": memory_key,
@@ -4750,16 +3784,16 @@ impl ToolCall {
                     "session_id": session_id,
                 }),
             ),
-            Self::MemoryScopeList { offset, limit } => session_log_arguments_for_tool_request(
-                "memory_scope_list",
+            Self::MemoryScopeList { offset, limit } => typed_memory_request_audit(
+                MemoryRequestAudit::ScopeList,
                 &serde_json::json!({"offset": offset, "limit": limit}),
             ),
             Self::MemoryScopePurge {
                 memory_scope_id,
                 expected_catalog_revision,
                 ..
-            } => session_log_arguments_for_tool_request(
-                "memory_scope_purge",
+            } => typed_memory_request_audit(
+                MemoryRequestAudit::ScopePurge,
                 &serde_json::json!({
                     "memory_scope_id": memory_scope_id,
                     "expected_catalog_revision": expected_catalog_revision,
@@ -4803,8 +3837,8 @@ impl ToolCall {
                 offset,
                 limit,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "skill_versions",
+            } => typed_skill_request_audit(
+                SkillRequestAudit::Versions,
                 &serde_json::json!({
                     "project": project,
                     "skill_key": skill_key,
@@ -4822,8 +3856,8 @@ impl ToolCall {
                 activate,
                 expected_state_revision,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "skill_install",
+            } => typed_skill_request_audit(
+                SkillRequestAudit::Install,
                 &serde_json::json!({
                     "project": project,
                     "skill_key": skill_key,
@@ -4842,8 +3876,8 @@ impl ToolCall {
                 expected_state_revision,
                 idempotency_key,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "skill_activate",
+            } => typed_skill_request_audit(
+                SkillRequestAudit::Activate,
                 &serde_json::json!({
                     "project": project,
                     "skill_key": skill_key,
@@ -4860,8 +3894,8 @@ impl ToolCall {
                 expected_state_revision,
                 idempotency_key,
                 session_id,
-            } => session_log_arguments_for_tool_request(
-                "skill_remove_revision",
+            } => typed_skill_request_audit(
+                SkillRequestAudit::RemoveRevision,
                 &serde_json::json!({
                     "project": project,
                     "skill_key": skill_key,
@@ -4875,11 +3909,13 @@ impl ToolCall {
                 project,
                 path,
                 limit,
+                offset,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "path": path,
                 "limit": limit,
+                "offset": offset,
             }),
             Self::ProjectOverview {
                 project,
@@ -5300,17 +4336,19 @@ impl ToolCall {
                 message_id,
                 answer,
                 completion_key,
+                expected_assignment_fence: _,
                 tags,
                 priority,
                 ..
             } => serde_json::json!({
                 "session_id": session_id,
                 "message_id": message_id,
-                "body_present": !answer.is_empty(),
+                "body_present": true,
                 "body_bytes": answer.len(),
                 "tags_count": tags.len(),
                 "priority": priority,
                 "completion_id": bounded_completion_key_fingerprint(Some(completion_key)),
+                "assignment_fence_present": true,
             }),
             Self::SessionDiscussionSummary { session_id, limit } => serde_json::json!({
                 "session_id": session_id,
@@ -5460,6 +4498,228 @@ impl ToolCall {
                 "summary_only": summary_only,
                 "limit": limit,
             }),
+            Self::SessionSummary { session_id, limit } => serde_json::json!({
+                "session_id": session_id,
+                "limit": limit,
+            }),
+            Self::CloseSession { session_id } => serde_json::json!({
+                "session_id": session_id,
+            }),
+            Self::ValidationSummary {
+                project,
+                session_id,
+                limit,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "limit": limit,
+            }),
+            Self::GetSessionAssignment {
+                session_id,
+                message_id,
+            } => serde_json::json!({
+                "session_id": session_id,
+                "message_id": message_id,
+            }),
+            Self::RunDetachedProcess {
+                project,
+                executable: _,
+                args,
+                stdin,
+                timeout_secs,
+                cwd,
+                purpose,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "executable_present": true,
+                "stdin_present": stdin.is_some(),
+                "arg_count": args.len(),
+                "process_summary": format!("detached process ({} args)", args.len()),
+                "timeout_secs": timeout_secs,
+                "cwd": cwd,
+                "purpose": purpose,
+            }),
+            Self::JobStatus {
+                job_id,
+                include_command_preview,
+            } => serde_json::json!({
+                "job_id": job_id,
+                "include_command_preview": include_command_preview,
+            }),
+            Self::JobLog {
+                job_id,
+                offset,
+                tail_lines,
+                after_observation_token,
+                wait_secs,
+            } => serde_json::json!({
+                "job_id": job_id,
+                "offset": offset,
+                "tail_lines": tail_lines,
+                "token_present": after_observation_token.is_some(),
+                "wait_secs": wait_secs,
+            }),
+            Self::JobTail {
+                job_id,
+                tail_lines,
+                after_observation_token,
+                wait_secs,
+            } => serde_json::json!({
+                "job_id": job_id,
+                "tail_lines": tail_lines,
+                "token_present": after_observation_token.is_some(),
+                "wait_secs": wait_secs,
+            }),
+            Self::ListProjectTrackedFiles {
+                project,
+                path,
+                globs,
+                depth,
+                limit,
+                offset,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "globs": globs,
+                "depth": depth,
+                "limit": limit,
+                "offset": offset,
+            }),
+            Self::ExportProjectArtifact { project, path, .. } => serde_json::json!({
+                "project": project,
+                "path": path,
+            }),
+            Self::ComputerListDisplays { client_id, limit } => serde_json::json!({
+                "client_id": client_id,
+                "limit": limit,
+            }),
+            Self::ComputerReadClipboard { client_id } => serde_json::json!({
+                "client_id": client_id,
+            }),
+            Self::ComputerWriteClipboard { client_id, text } => serde_json::json!({
+                "client_id": client_id,
+                "text_bytes": text.len(),
+            }),
+            Self::ComputerPointerMove {
+                client_id,
+                display_id,
+                snapshot_generation,
+                x,
+                y,
+            }
+            | Self::ComputerPointerClick {
+                client_id,
+                display_id,
+                snapshot_generation,
+                x,
+                y,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "display_id": display_id,
+                "snapshot_generation": snapshot_generation,
+                "x": x,
+                "y": y,
+            }),
+            Self::ComputerSnapshotDisplay {
+                client_id,
+                display_id,
+                max_width,
+                max_height,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "display_id": display_id,
+                "max_width": max_width,
+                "max_height": max_height,
+            }),
+            Self::RegisterProject {
+                client_id,
+                id,
+                name,
+                path,
+                description,
+                allow_patch,
+                overwrite,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "id": id,
+                "name": name,
+                "path_present": !path.is_empty(),
+                "description_present": description.is_some(),
+                "description_bytes": description.as_ref().map(String::len).unwrap_or_default(),
+                "allow_patch": allow_patch,
+                "overwrite": overwrite,
+            }),
+            Self::UnregisterProject {
+                project,
+                expected_revision,
+            } => serde_json::json!({
+                "project": project,
+                "expected_revision": expected_revision,
+            }),
+            Self::CreateProject {
+                client_id,
+                id,
+                name,
+                path,
+                description,
+                allow_patch,
+                template,
+                git_init,
+                adopt_existing_empty,
+                overwrite,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "id": id,
+                "name": name,
+                "path_present": !path.is_empty(),
+                "description_present": description.is_some(),
+                "description_bytes": description.as_ref().map(String::len).unwrap_or_default(),
+                "allow_patch": allow_patch,
+                "template": template,
+                "git_init": git_init,
+                "adopt_existing_empty": adopt_existing_empty,
+                "overwrite": overwrite,
+            }),
+            Self::RunnerConfigCheck { client_id } => serde_json::json!({
+                "client_id": client_id,
+            }),
+            Self::RunnerConfigReload {
+                client_id,
+                expected_generation,
+            } => serde_json::json!({
+                "client_id": client_id,
+                "expected_generation": expected_generation,
+            }),
+            Self::PluginTool(plugin) => serde_json::json!({
+                "action": plugin.action,
+                "runner_present": plugin.runner.is_some(),
+                "plugin_present": plugin.plugin.is_some(),
+                "tool_present": plugin.tool.is_some(),
+                "binding_present": plugin.binding.is_some(),
+                "arguments_present": plugin.arguments.is_some(),
+                "argument_key_count": plugin.arguments.as_ref().and_then(Value::as_object).map(serde_json::Map::len).unwrap_or_default(),
+            }),
+            Self::SshResource(resource) => serde_json::json!({
+                "action": resource.action,
+                "runner_present": resource.runner.is_some(),
+                "binding_present": resource.binding.is_some(),
+                "name_present": resource.name.is_some(),
+                "target_present": resource.target.is_some(),
+                "default_cwd_present": resource.default_cwd.is_some(),
+            }),
+            Self::ReadToolTrace {
+                trace_ref,
+                offset,
+                limit,
+                payload_index,
+            } => serde_json::json!({
+                "trace_ref": trace_ref,
+                "offset": offset,
+                "limit": limit,
+                "payload_index": payload_index,
+            }),
             Self::RuntimeStatus {
                 compact,
                 summary_only,
@@ -5479,7 +4739,6 @@ impl ToolCall {
                 "max_findings": max_findings,
                 "include_tracked": include_tracked,
             }),
-            _ => serde_json::json!({}),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Protocol-neutral Workflow Session domain model, ledger/store, collaboration, and deterministic projections.
 
 mod assignment;
+mod audit;
 mod closeout;
 mod console;
 mod continuation;
@@ -49,7 +50,7 @@ pub use events::{
     tool_supports_model_facing_result_expectation, validate_model_facing_assertion_name,
     validate_model_facing_result_expectation,
     validation_output_summary_for_tool_result as execution_output_summary_for_tool_result,
-    ExplorationToolKind, SessionPathHint, SessionToolContract, EXPLORATION_TOOL_NAMES,
+    ExplorationToolKind, SessionPathHint, SessionToolContract,
 };
 pub use handoff_brief::{
     build_handoff_brief, handoff_brief_size, HandoffBriefInput, HANDOFF_BRIEF_HARD_MAX_BYTES,

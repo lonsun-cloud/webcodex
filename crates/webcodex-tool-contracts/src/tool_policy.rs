@@ -4,15 +4,19 @@ use super::metadata::{
     tool_metadata, ToolApprovalPolicy, ToolEffect, ToolMetadata, ToolPathHint, ToolRisk,
 };
 use super::tool_definition::{
-    tool_definitions, RunnerCapabilityRequirement, ToolContextContinuityPolicy, ToolDefinition,
-    ToolEffectAnnotations, PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE,
-    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION,
-    PERMISSION_RISK_WRITE,
+    tool_definitions, RunnerCapabilityRequirement, ToolAuditPolicy, ToolContextContinuityPolicy,
+    ToolDefinition, ToolEffectAnnotations, ToolSessionEvidencePolicy,
+    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
+    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
 };
 
 impl ToolDefinition {
     pub fn metadata(self) -> ToolMetadata {
         self.metadata
+    }
+
+    pub fn audit_policy(self) -> ToolAuditPolicy {
+        self.audit
     }
 
     pub fn effect_annotations(self) -> ToolEffectAnnotations {
@@ -67,17 +71,13 @@ impl ToolDefinition {
         self.policy.context_continuity
     }
 
+    pub fn session_evidence_policy(self) -> ToolSessionEvidencePolicy {
+        self.session_evidence
+    }
+
     #[cfg(any(test, feature = "root-test-support"))]
     pub fn requires_explicit_business_session(self) -> bool {
         self.policy.requires_explicit_business_session
-    }
-
-    pub fn disabled_message(self) -> Option<&'static str> {
-        self.policy.disabled_message
-    }
-
-    pub fn extra_accepted_flattened_args(self) -> &'static [&'static str] {
-        self.policy.extra_accepted_flattened_args
     }
 
     pub fn uses_unit_arguments(self) -> bool {
@@ -142,6 +142,24 @@ fn fallback_permission_risk(name: &str, metadata: ToolMetadata) -> &'static str 
 
 pub fn lookup_tool_definition(name: &str) -> Option<&'static ToolDefinition> {
     tool_definitions().find(|definition| definition.name == name)
+}
+
+pub fn runtime_tool_session_evidence_policy(name: &str) -> ToolSessionEvidencePolicy {
+    lookup_tool_definition(name)
+        .map(|definition| definition.session_evidence_policy())
+        .unwrap_or(ToolSessionEvidencePolicy::NONE)
+}
+
+pub fn exploration_tool_names() -> impl Iterator<Item = &'static str> {
+    tool_definitions()
+        .filter(|definition| definition.session_evidence.exploration.is_exploration())
+        .map(|definition| definition.name)
+}
+
+/// Audit policy lookup is intentionally optional. Unknown/non-runtime names
+/// have no audit contract and callers must fail closed rather than infer one.
+pub fn runtime_tool_audit_policy(name: &str) -> Option<ToolAuditPolicy> {
+    lookup_tool_definition(name).map(|definition| definition.audit_policy())
 }
 
 fn definition_or_metadata_facade(name: &str) -> Result<&'static ToolDefinition, ToolMetadata> {
@@ -266,15 +284,6 @@ pub fn runtime_tool_captures_validation_output(name: &str) -> bool {
 pub fn runtime_tool_requires_explicit_business_session(name: &str) -> bool {
     lookup_tool_definition(name)
         .is_some_and(|definition| definition.requires_explicit_business_session())
-}
-
-pub fn runtime_tool_disabled_message(name: &str) -> Option<&'static str> {
-    lookup_tool_definition(name).and_then(|definition| definition.disabled_message())
-}
-
-pub fn runtime_tool_extra_accepted_flattened_args(name: &str) -> &'static [&'static str] {
-    lookup_tool_definition(name)
-        .map_or(&[], |definition| definition.extra_accepted_flattened_args())
 }
 
 pub fn runtime_tool_approval_policy(name: &str) -> ToolApprovalPolicy {

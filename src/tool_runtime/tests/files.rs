@@ -9,6 +9,251 @@ use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(windows)]
+async fn run_windows_tracked_listing(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: String,
+    path: Option<String>,
+) -> (ToolResult, String) {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .list_project_tracked_files(project, path, None, None, Some(100), Some(0))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(runtime, client_id).await;
+    assert_eq!(request.kind, "run_internal_posix_script");
+    assert!(request.command.is_empty());
+    let payload = request
+        .script
+        .as_ref()
+        .expect("tracked listing must carry a typed internal POSIX program");
+    assert_eq!(
+        payload.language,
+        crate::runner_protocol::ShellScriptLanguage::Sh
+    );
+    let script = payload.script.clone();
+    let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&request);
+    complete_patch_agent_request(
+        runtime,
+        client_id,
+        &request.request_id,
+        exit_code,
+        &stdout,
+        &stderr,
+    )
+    .await;
+    (task.await.unwrap(), script)
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_list_project_tracked_files_uses_internal_posix_and_preserves_scope() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    std::fs::create_dir_all(repo.path().join("src/nested")).unwrap();
+    commit_file(repo.path(), "root.txt", "root\n", "root file");
+    commit_file(repo.path(), "src/a.rs", "pub fn a() {}\n", "src file");
+    commit_file(
+        repo.path(),
+        "src/nested/b.rs",
+        "pub fn b() {}\n",
+        "nested file",
+    );
+
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "tracked-windows", "demo", repo.path()).await;
+    let (root, script) =
+        run_windows_tracked_listing(&runtime, "tracked-windows", project.clone(), None).await;
+    assert!(root.success, "{:?}", root.error);
+    assert!(script.contains("git ls-files -z --cached"));
+    assert!(
+        script.contains("head_cmd")
+            && script.contains(&format!("-c {}", LIST_TRACKED_SOURCE_MAX_BYTES + 1)),
+        "tracked listing lost its raw-output cap: {script}"
+    );
+    let root_paths = root.output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(root_paths, vec!["root.txt", "src/a.rs", "src/nested/b.rs"]);
+    assert_eq!(root.output["source"], "git_index");
+    assert_eq!(root.output["list_truncated"], false);
+
+    let (scoped, _) = run_windows_tracked_listing(
+        &runtime,
+        "tracked-windows",
+        project,
+        Some("src".to_string()),
+    )
+    .await;
+    assert!(scoped.success, "{:?}", scoped.error);
+    assert_eq!(scoped.output["path"], "src");
+    let scoped_paths = scoped.output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(scoped_paths, vec!["src/a.rs", "src/nested/b.rs"]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_list_project_tracked_files_keeps_non_git_error_contract() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "tracked-non-git", "demo", project_dir.path())
+            .await;
+    let (result, _) = run_windows_tracked_listing(&runtime, "tracked-non-git", project, None).await;
+    assert!(!result.success);
+    assert_eq!(result.output["code"], "not_a_git_repository");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn tracked_listing_failure_keeps_bounded_multiline_stderr() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "tracked-diagnostic", "demo", project_dir.path())
+            .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .list_project_tracked_files(project, None, None, None, Some(100), Some(0))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "tracked-diagnostic").await;
+    assert_eq!(request.kind, "run_internal_posix_script");
+    let stderr = format!(
+        "EARLY_DIAGNOSTIC_MUST_BE_TRUNCATED\n{}\nACTIONABLE_SECOND_LINE\nACTIONABLE_LAST_LINE",
+        "x".repeat(LIST_TRACKED_STDERR_MAX_CHARS + 1024)
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "tracked-diagnostic",
+        &request.request_id,
+        1,
+        "",
+        &stderr,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(error.contains("ACTIONABLE_SECOND_LINE"), "{error}");
+    assert!(error.contains("ACTIONABLE_LAST_LINE"), "{error}");
+    assert!(
+        error.contains('\n'),
+        "stderr excerpt must remain multi-line: {error}"
+    );
+    assert!(!error.contains("EARLY_DIAGNOSTIC_MUST_BE_TRUNCATED"));
+    assert!(
+        error.chars().count() <= LIST_TRACKED_STDERR_MAX_CHARS + 64,
+        "bounded stderr grew unexpectedly: {} chars",
+        error.chars().count()
+    );
+}
+
+async fn run_mocked_tracked_listing(
+    client_id: &str,
+    stdout: String,
+    depth: Option<usize>,
+    limit: usize,
+    offset: usize,
+) -> (ToolResult, String) {
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            shell: true,
+            internal_posix_script: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .list_project_tracked_files(project, None, None, depth, Some(limit), Some(offset))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(request.kind, "run_internal_posix_script");
+    let script = request
+        .script
+        .as_ref()
+        .expect("tracked listing must use the typed internal POSIX path")
+        .script
+        .clone();
+    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
+    (task.await.unwrap(), script)
+}
+
+#[tokio::test]
+async fn tracked_listing_source_budget_is_below_default_retention_and_disables_fake_paging() {
+    const ORDINARY_RESULT_RETENTION_COMPATIBILITY_FLOOR_BYTES: usize = 256 * 1024;
+    assert!(
+        LIST_TRACKED_SOURCE_MAX_BYTES + 1 < ORDINARY_RESULT_RETENTION_COMPATIBILITY_FLOOR_BYTES,
+        "producer source probe must keep headroom below ordinary per-stream result retention"
+    );
+
+    let mut raw = String::new();
+    let mut index = 0usize;
+    while raw.len() <= LIST_TRACKED_SOURCE_MAX_BYTES + 4096 {
+        raw.push_str(&format!("src/file-{index:05}-{}.rs\0", "x".repeat(20)));
+        index += 1;
+    }
+    assert!(raw.len() < ORDINARY_RESULT_RETENTION_COMPATIBILITY_FLOOR_BYTES);
+
+    let (result, script) =
+        run_mocked_tracked_listing("tracked-source-budget", raw, Some(16), 10, 0).await;
+    assert!(result.success, "{:?}", result.error);
+    assert!(script.contains(&format!("-c {}", LIST_TRACKED_SOURCE_MAX_BYTES + 1)));
+    assert_eq!(result.output["list_truncated"], true);
+    assert_eq!(result.output["truncated"], false);
+    assert_eq!(result.output["next_offset"], Value::Null);
+    assert_eq!(result.output["returned"], 10);
+    assert!(result.output["total_files"].as_u64().unwrap() >= 10);
+}
+
+#[tokio::test]
+async fn tracked_listing_fails_closed_when_server_retains_only_stdout_tail() {
+    let mut raw = String::new();
+    let mut index = 0usize;
+    while raw.len() <= 300 * 1024 {
+        raw.push_str(&format!("src/file-{index:05}-{}.rs\0", "y".repeat(32)));
+        index += 1;
+    }
+
+    let (result, _) =
+        run_mocked_tracked_listing("tracked-retained-tail", raw, Some(16), 10, 0).await;
+    assert!(!result.success);
+    assert_eq!(result.output["code"], "source_incomplete");
+    assert!(result.output.get("next_offset").is_none());
+    assert!(result.output.get("total_files").is_none());
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("ordinary result retention"));
+}
+
 #[tokio::test]
 async fn write_project_file_with_session_id_records_changed_path_without_content() {
     let runtime = runtime_with_agent_project("telemetry-write");
@@ -957,39 +1202,160 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
     assert!(event.permission.is_none());
 }
 
-#[test]
-fn parse_file_list_entries_is_bounded_and_marks_truncation() {
-    // Simulate agent file_list stdout: dirs suffixed with '/'.
-    let stdout = "Cargo.toml\nsrc/\nREADME.md\ntarget/\nCargo.lock\n";
-    // First, without truncation, verify kinds and project-relative paths.
-    let (all, truncated_full) = parse_file_list_entries(stdout, ".", 10);
-    assert!(!truncated_full);
-    assert_eq!(all.len(), 5);
-    let src = all.iter().find(|e| e["path"] == "src").expect("src entry");
-    assert_eq!(src["kind"], "dir");
-    let cargo = all
-        .iter()
-        .find(|e| e["path"] == "Cargo.toml")
-        .expect("Cargo.toml entry");
-    assert_eq!(cargo["kind"], "file");
+async fn run_list_project_files_page(
+    client_id: &str,
+    stdout: &str,
+    limit: usize,
+    offset: usize,
+) -> ToolResult {
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .list_project_files(project, None, Some(limit), Some(offset))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(request.kind, "file_list");
+    assert_eq!(request.path.as_deref(), Some("."));
+    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, stdout, "").await;
+    task.await.unwrap()
+}
 
-    // With a tight bound, output is truncated and sorted alphabetically.
-    let (bounded, truncated) = parse_file_list_entries(stdout, ".", 3);
-    assert_eq!(bounded.len(), 3);
-    assert!(truncated);
-    let paths: Vec<&str> = bounded
+#[tokio::test]
+async fn list_project_files_pages_complete_source_without_gap_or_duplicate() {
+    let stdout = "zeta.txt\nsrc/\nREADME.md\nCargo.toml\n.alpha\n";
+
+    let first = run_list_project_files_page("list-files-pages", stdout, 2, 0).await;
+    assert!(first.success, "{:?}", first.error);
+    assert_eq!(first.output["returned"], 2);
+    assert_eq!(first.output["total_entries"], 5);
+    assert_eq!(first.output["offset"], 0);
+    assert_eq!(first.output["next_offset"], 2);
+    assert_eq!(first.output["truncated"], true);
+
+    let second = run_list_project_files_page(
+        "list-files-pages",
+        stdout,
+        2,
+        first.output["next_offset"].as_u64().unwrap() as usize,
+    )
+    .await;
+    assert_eq!(second.output["returned"], 2);
+    assert_eq!(second.output["next_offset"], 4);
+
+    let final_page = run_list_project_files_page(
+        "list-files-pages",
+        stdout,
+        2,
+        second.output["next_offset"].as_u64().unwrap() as usize,
+    )
+    .await;
+    assert_eq!(final_page.output["returned"], 1);
+    assert_eq!(final_page.output["next_offset"], Value::Null);
+    assert_eq!(final_page.output["truncated"], false);
+
+    let reconstructed = first.output["entries"]
+        .as_array()
+        .unwrap()
         .iter()
-        .map(|e| e["path"].as_str().unwrap())
-        .collect();
-    // Sorted: Cargo.lock, Cargo.toml, README.md come first.
-    assert_eq!(paths, vec!["Cargo.lock", "Cargo.toml", "README.md"]);
+        .chain(second.output["entries"].as_array().unwrap())
+        .chain(final_page.output["entries"].as_array().unwrap())
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstructed,
+        vec![".alpha", "Cargo.toml", "README.md", "src", "zeta.txt"]
+    );
+
+    let past_end = run_list_project_files_page("list-files-pages", stdout, 2, 99).await;
+    assert!(past_end.success);
+    assert_eq!(past_end.output["returned"], 0);
+    assert_eq!(past_end.output["total_entries"], 5);
+    assert_eq!(past_end.output["offset"], 99);
+    assert_eq!(past_end.output["next_offset"], Value::Null);
+    assert_eq!(past_end.output["truncated"], false);
+}
+
+#[tokio::test]
+async fn list_project_files_fails_closed_when_runner_retained_source_is_incomplete() {
+    let stdout = "[output truncated to last 262144 bytes]\nzeta.txt\nsrc/\n";
+    let result = run_list_project_files_page("list-files-retained-tail", stdout, 200, 0).await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "source_incomplete");
+    assert_eq!(
+        result.output["reason_code"],
+        "runner_result_retention_truncated"
+    );
+    assert!(result.output.get("next_offset").is_none());
+    assert!(result.output.get("total_entries").is_none());
+}
+
+#[test]
+fn parse_and_page_file_list_entries_is_sorted_gap_free_and_unicode_safe() {
+    let long_name = format!("long-{}-终.rs", "x".repeat(180));
+    let stdout = format!(
+        "zeta.txt\nsrc/\nREADME [draft].md\n{}\n.alpha\n目录/\n",
+        long_name
+    );
+    let all = parse_file_list_entries(&stdout, ".");
+    assert_eq!(all.len(), 6);
+    assert_eq!(
+        all.iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            ".alpha",
+            "README [draft].md",
+            long_name.as_str(),
+            "src",
+            "zeta.txt",
+            "目录",
+        ]
+    );
+    assert_eq!(all[3]["kind"], "dir");
+    assert_eq!(all[5]["kind"], "dir");
+
+    let (first, next) = page_file_list_entries(&all, 0, 2);
+    assert_eq!(next, Some(2));
+    let (middle, next) = page_file_list_entries(&all, next.unwrap(), 2);
+    assert_eq!(next, Some(4));
+    let (final_page, next) = page_file_list_entries(&all, next.unwrap(), 2);
+    assert_eq!(next, None);
+    let reconstructed = first
+        .into_iter()
+        .chain(middle)
+        .chain(final_page)
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstructed,
+        all.iter()
+            .map(|entry| entry["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    );
+    let (past_end, next) = page_file_list_entries(&all, 99, 2);
+    assert!(past_end.is_empty());
+    assert_eq!(next, None);
 }
 
 #[test]
 fn parse_file_list_entries_prepends_subpath_for_relative_paths() {
     let stdout = "main.rs\nlib.rs\n";
-    let (entries, truncated) = parse_file_list_entries(stdout, "src", 10);
-    assert!(!truncated);
+    let entries = parse_file_list_entries(stdout, "src");
     let paths: Vec<&str> = entries
         .iter()
         .map(|e| e["path"].as_str().unwrap())
@@ -3706,6 +4072,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                 session_id: None,
                 path: Some("/etc".to_string()),
                 limit: None,
+                offset: None,
             },
             None,
         ),
@@ -3716,6 +4083,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                 session_id: None,
                 path: Some("../outside".to_string()),
                 limit: None,
+                offset: None,
             },
             None,
         ),
@@ -3918,6 +4286,7 @@ async fn list_project_files_rejects_non_agent_project_id() {
             session_id: None,
             path: None,
             limit: None,
+            offset: None,
         })
         .await;
     assert!(!result.success);
@@ -4293,6 +4662,78 @@ async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
 }
 
 #[tokio::test]
+async fn common_media_artifact_mime_policy_accepts_save_upload_and_octet_paths() {
+    let runtime = test_runtime();
+    let missing_project = "agent:missing:missing".to_string();
+    for (path, mime) in [
+        ("media/sample.mp3", "audio/mpeg"),
+        ("media/sample.mp4", "video/mp4"),
+    ] {
+        let save = runtime
+            .save_project_artifact(
+                missing_project.clone(),
+                path.to_string(),
+                "YQ==".to_string(),
+                Some(mime.to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!save.success, "{path}");
+        assert!(
+            !save
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unsupported mime_type"),
+            "media MIME should pass policy before project resolution: {:?}",
+            save.error
+        );
+
+        let upload = runtime
+            .artifact_upload_begin(
+                missing_project.clone(),
+                path.to_string(),
+                Some(1),
+                None,
+                Some(mime.to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!upload.success, "{path}");
+        assert!(
+            !upload
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unsupported mime_type"),
+            "media upload MIME should pass policy before project resolution: {:?}",
+            upload.error
+        );
+
+        let octet = runtime
+            .artifact_upload_begin(
+                missing_project.clone(),
+                path.to_string(),
+                Some(1),
+                None,
+                Some("application/octet-stream".to_string()),
+                Some(false),
+            )
+            .await;
+        assert!(!octet.success, "{path}");
+        assert!(
+            !octet
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("only allowed for safe artifact extensions"),
+            "media extension should be safe for host octet-stream fallback: {:?}",
+            octet.error
+        );
+    }
+}
+
+#[tokio::test]
 async fn artifact_upload_begin_rejects_invalid_inputs_before_resolving_project() {
     let runtime = test_runtime();
     let missing_project = "agent:missing:missing".to_string();
@@ -4432,7 +4873,11 @@ async fn artifact_upload_finish_and_abort_reject_invalid_upload_id_before_resolv
 async fn read_file_routes_safe_and_bulk_skipped_explicit_paths_to_agent() {
     for (client_id, path, content) in [
         ("relative-read", "src/main.rs", "fn main() {}\n"),
-        ("bulk-explicit-read", ".git/HEAD", "ref: refs/heads/main\n"),
+        (
+            "bulk-explicit-read",
+            "node_modules/foo/package.json",
+            "{}\n",
+        ),
     ] {
         let runtime = runtime_with_agent_project(client_id);
         register_agent(
@@ -4475,6 +4920,8 @@ async fn read_file_refuses_secret_paths_before_reaching_agent() {
     let project = agent_test_project_id("secret-read");
 
     for path in [
+        ".git/config",
+        ".git/HEAD",
         ".env",
         ".env.production",
         "app/.env.local",

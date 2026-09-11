@@ -55,6 +55,7 @@ struct CommittedState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PluginEnvironmentSnapshot {
+    environment_mode: super::config::ShellEnvironmentMode,
     default_profile: Option<String>,
     profiles: BTreeMap<String, PluginProfileEnvironment>,
     program: String,
@@ -89,6 +90,11 @@ impl PluginEnvironmentSnapshot {
         }
         let has_providers = !plugins.providers.is_empty();
         Self {
+            environment_mode: if has_providers {
+                shell.environment_mode
+            } else {
+                Default::default()
+            },
             default_profile: uses_default_profile
                 .then(|| shell.default_profile.clone())
                 .flatten(),
@@ -236,7 +242,7 @@ fn initialize_failure_detail(code: &str) -> &'static str {
         }
         "plugin_initialize_invalid" => "Plugin initialize result violates protocol bounds",
         "plugin_timeout" => "Plugin initialize did not complete within the provider timeout",
-        "plugin_eof" => "Plugin process ended during initialize",
+        "plugin_eof" => "Plugin protocol output ended before initialize completed; the process may have exited or closed stdout. Verify the configured command and arguments. For a generated TypeScript Plugin, run npm run build and ensure dist/plugin.js exists on the Runner host before retrying.",
         _ => "Plugin initialize did not complete successfully",
     }
 }

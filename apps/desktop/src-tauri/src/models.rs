@@ -94,10 +94,13 @@ pub enum ProjectReadiness {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessSummaryKind {
     ReadyForChatGpt,
+    RuntimeStopped,
+    RuntimeStarting,
     ServiceNeedsAttention,
     RunnerDisconnected,
     ProjectNotReady,
     RuntimeReadyLocalOnly,
+    TunnelReadyWaitingForChatGpt,
     ConnectionUnverified,
     QuickShareStopped,
 }
@@ -157,6 +160,22 @@ pub fn aggregate_readiness(
             "Ready to use with ChatGPT".to_string(),
             None,
         )
+    } else if server == ServerReadiness::Stopped && runner == RunnerReadiness::Stopped {
+        (
+            ReadinessSummaryKind::RuntimeStopped,
+            Some(ReadinessNextActionKind::StartOrReconnectService),
+            "Runtime stopped".to_string(),
+            Some("Start the runtime to continue.".to_string()),
+        )
+    } else if server == ServerReadiness::Starting
+        || (server == ServerReadiness::Ready && runner == RunnerReadiness::Connecting)
+    {
+        (
+            ReadinessSummaryKind::RuntimeStarting,
+            None,
+            "Runtime starting".to_string(),
+            None,
+        )
     } else if !matches!(server, ServerReadiness::Ready) {
         (
             ReadinessSummaryKind::ServiceNeedsAttention,
@@ -176,7 +195,7 @@ pub fn aggregate_readiness(
             ReadinessSummaryKind::ProjectNotReady,
             Some(ReadinessNextActionKind::AddOrReloadProject),
             "Project is not ready".to_string(),
-            Some("Add or reload the selected project.".to_string()),
+            Some("Prepare and activate the selected project.".to_string()),
         )
     } else if exposure == ExposureReadiness::Disabled || exposure == ExposureReadiness::LocalReady {
         (
@@ -254,6 +273,7 @@ pub struct RegularTunnelState {
 #[serde(rename_all = "snake_case")]
 pub enum DesktopOperationKind {
     LocalSetup,
+    LocalProjectActivate,
     RemoteSetup,
     QuickShareStart,
     QuickShareStop,
@@ -263,12 +283,14 @@ pub enum DesktopOperationKind {
     RuntimeRefresh,
     RuntimeResume,
     TunnelProxyUpdate,
+    TunnelConfigUpdate,
 }
 
 impl DesktopOperationKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalSetup => "local_setup",
+            Self::LocalProjectActivate => "local_project_activate",
             Self::RemoteSetup => "remote_setup",
             Self::QuickShareStart => "quick_share_start",
             Self::QuickShareStop => "quick_share_stop",
@@ -278,6 +300,7 @@ impl DesktopOperationKind {
             Self::RuntimeRefresh => "runtime_refresh",
             Self::RuntimeResume => "runtime_resume",
             Self::TunnelProxyUpdate => "tunnel_proxy_update",
+            Self::TunnelConfigUpdate => "tunnel_config_update",
         }
     }
 }
@@ -332,17 +355,62 @@ pub struct TunnelProxySnapshot {
     pub detected_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelConfigSource {
+    #[default]
+    Environment,
+    File,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OpenAiTunnelConfigSnapshot {
+    pub tunnel_id_present: bool,
+    pub api_key_present: bool,
+    #[serde(default)]
+    pub source: TunnelConfigSource,
+    #[serde(default)]
+    pub saved_tunnel_id: Option<String>,
+    #[serde(default)]
+    pub effective_tunnel_id: Option<String>,
+}
+
+impl OpenAiTunnelConfigSnapshot {
+    pub fn is_configured(&self) -> bool {
+        self.tunnel_id_present && self.api_key_present
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PowerShellRuntimeSnapshot {
+    pub pwsh_available: bool,
+    pub windows_powershell_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ChatGptActivitySnapshot {
+    pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_meaningful_activity_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopStateSnapshot {
     pub topology: Option<RuntimeTopology>,
     pub readiness: ReadinessSnapshot,
     pub project: Option<ProjectSelection>,
     pub binaries: Option<BinaryInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powershell_runtime: Option<PowerShellRuntimeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_activity: Option<ChatGptActivitySnapshot>,
     pub quick_share: Option<QuickShareState>,
     pub regular_tunnel: Option<RegularTunnelState>,
     pub current_operation: Option<DesktopOperationSnapshot>,
     pub activity_sequence: u64,
     pub openai_tunnel_configured: bool,
+    pub openai_tunnel_config: OpenAiTunnelConfigSnapshot,
     pub regular_tunnel_available: bool,
     pub runtime_autostart: bool,
     pub preferred_connection: RegularConnectionPreference,
@@ -356,11 +424,14 @@ impl Default for DesktopStateSnapshot {
             readiness: ReadinessSnapshot::default(),
             project: None,
             binaries: None,
+            powershell_runtime: None,
+            chatgpt_activity: None,
             quick_share: None,
             regular_tunnel: None,
             current_operation: None,
             activity_sequence: 0,
             openai_tunnel_configured: false,
+            openai_tunnel_config: OpenAiTunnelConfigSnapshot::default(),
             regular_tunnel_available: false,
             runtime_autostart: false,
             preferred_connection: RegularConnectionPreference::NoChatGpt,
@@ -394,6 +465,8 @@ pub struct StoredRuntime {
     pub server_env_file: Option<PathBuf>,
     pub runner_config: Option<PathBuf>,
     pub user_token_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_client_id: Option<String>,
     pub project_id: Option<String>,
     pub runtime_project_id: Option<String>,
 }
@@ -425,6 +498,37 @@ mod tests {
         assert_eq!(local.runner, remote.runner);
         assert_ne!(local.server, remote.server);
         assert_ne!(local.exposure, remote.exposure);
+    }
+
+    #[test]
+    fn stopped_starting_and_failed_readiness_are_distinct() {
+        for (server, runner, expected) in [
+            (
+                ServerReadiness::Stopped,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStopped,
+            ),
+            (
+                ServerReadiness::Starting,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStarting,
+            ),
+            (
+                ServerReadiness::Error,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::ServiceNeedsAttention,
+            ),
+        ] {
+            let state = aggregate_readiness(
+                server,
+                runner,
+                ExposureReadiness::LocalReady,
+                ProjectReadiness::Configured,
+            );
+            assert_eq!(state.summary_kind, expected);
+            assert!(!state.runtime_ready);
+            assert!(!state.ready_for_chatgpt);
+        }
     }
 
     #[test]

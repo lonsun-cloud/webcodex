@@ -169,13 +169,19 @@ fn ssh_resource_parses_as_canonical_gateway_with_closed_action_vocabulary() {
 }
 
 #[test]
-fn legacy_list_agents_alias_parses_to_canonical_list_runners() {
-    let call = ToolCall::from_tool_name(
+fn list_agents_live_ingress_is_rejected_without_second_definition() {
+    let error = ToolCall::from_tool_name(
         "list_agents",
         json!({"client_id": "special", "include_projects": false}),
     )
+    .expect_err("retired list_agents must not remain a live ingress alias");
+    assert!(error.contains("unknown tool 'list_agents'"), "{error}");
+
+    let call = ToolCall::from_tool_name(
+        "list_runners",
+        json!({"client_id": "special", "include_projects": false}),
+    )
     .unwrap();
-    assert_eq!(call.tool_name(), "list_runners");
     assert!(matches!(
         call,
         ToolCall::ListRunners {
@@ -458,6 +464,58 @@ fn from_tool_name_parses_run_shell_with_optional_fields() {
             assert_eq!(cwd, Some("sub".to_string()));
         }
         other => panic!("expected RunShell, got {:?}", other),
+    }
+}
+
+#[test]
+fn structured_validation_sync_wait_parser_enforces_lifecycle_bounds() {
+    for (name, arguments) in [
+        (
+            "cargo_check",
+            json!({"project": "demo", "timeout_secs": 600, "sync_wait_secs": 1}),
+        ),
+        (
+            "cargo_test",
+            json!({"project": "demo", "timeout_secs": 600, "sync_wait_secs": 60}),
+        ),
+        (
+            "go_test",
+            json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 60}),
+        ),
+        (
+            "cargo_fmt",
+            json!({"project": "demo", "check": true, "timeout_secs": 60, "sync_wait_secs": 60}),
+        ),
+    ] {
+        ToolCall::from_tool_name(name, arguments)
+            .unwrap_or_else(|error| panic!("{name} valid sync wait should parse: {error}"));
+    }
+
+    for (name, arguments) in [
+        (
+            "cargo_check",
+            json!({"project": "demo", "timeout_secs": 600, "sync_wait_secs": 0}),
+        ),
+        (
+            "cargo_test",
+            json!({"project": "demo", "timeout_secs": 600, "sync_wait_secs": 61}),
+        ),
+        (
+            "go_test",
+            json!({"project": "demo", "timeout_secs": 30, "sync_wait_secs": 31}),
+        ),
+        (
+            "cargo_fmt",
+            json!({"project": "demo", "check": false, "timeout_secs": 60, "sync_wait_secs": 1}),
+        ),
+        (
+            "cargo_fmt",
+            json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 1}),
+        ),
+    ] {
+        let error = ToolCall::from_tool_name(name, arguments)
+            .expect_err("invalid structured validation sync wait must fail closed");
+        assert!(error.contains("sync_wait_secs"), "{name}: {error}");
     }
 }
 
@@ -1182,17 +1240,23 @@ fn project_overview_tool_call_parses() {
 
 #[test]
 fn from_tool_name_parses_phase_a_tools() {
-    let call = ToolCall::from_tool_name("list_project_files", json!({"project": "demo"})).unwrap();
+    let call = ToolCall::from_tool_name(
+        "list_project_files",
+        json!({"project": "demo", "limit": 50, "offset": 75}),
+    )
+    .unwrap();
     match call {
         ToolCall::ListProjectFiles {
             project,
             path,
             limit,
+            offset,
             ..
         } => {
             assert_eq!(project, "demo");
             assert_eq!(path, None);
-            assert_eq!(limit, None);
+            assert_eq!(limit, Some(50));
+            assert_eq!(offset, Some(75));
         }
         other => panic!("expected ListProjectFiles, got {:?}", other),
     }
@@ -1511,26 +1575,24 @@ fn from_tool_name_parses_project_management_tools() {
 }
 
 #[test]
-fn retired_start_coding_task_wire_name_is_rejected() {
+fn start_coding_task_uses_generic_unknown_tool_and_privacy_paths() {
     let error = ToolCall::from_tool_name("start_coding_task", json!({"project": "demo"}))
-        .expect_err("retired start_coding_task entry must fail closed");
-    assert!(error.contains("no longer supported"), "{error}");
-    assert!(error.contains("work_on_project"), "{error}");
+        .expect_err("retired start_coding_task must be an ordinary unknown tool");
+    assert!(
+        error.contains("unknown tool 'start_coding_task'"),
+        "{error}"
+    );
 
-    // Kernel audit recording happens before ToolCall parsing, so rejected
-    // legacy requests keep a bounded compatibility sanitizer without reviving
-    // a current ToolCall identity or retaining the raw path.
     let audit = crate::tool_audit::session_log_arguments_for_tool_request(
         "start_coding_task",
         &json!({
             "project": "agent:legacy:demo",
             "path": "/private/legacy/path",
-            "title": "legacy request"
+            "prompt": "PRIVATE_PROMPT",
+            "secret": "PRIVATE_SECRET"
         }),
     );
-    assert_eq!(audit["path_source_requested"], true);
-    assert!(audit.get("path").is_none());
-    assert!(!audit.to_string().contains("/private/legacy/path"));
+    assert_eq!(audit, json!({}));
 }
 
 #[test]

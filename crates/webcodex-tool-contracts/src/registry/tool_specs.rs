@@ -300,8 +300,13 @@ mod tests {
                 description.contains("same execution"),
                 "{name}: {description}"
             );
-            assert!(!description.contains("run_shell"), "{name}: {description}");
             assert!(!description.contains("run_job"), "{name}: {description}");
+        }
+        assert!(find("run_process").description.contains("run_shell"));
+        assert!(find("run_script").description.contains("run_shell"));
+        for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+            let description = &find(name).description;
+            assert!(!description.contains("run_shell"), "{name}: {description}");
         }
 
         let run_job = &find("run_job").description;
@@ -366,7 +371,10 @@ mod tests {
         }
 
         for spec in &specs {
-            if spec.name != "run_shell" {
+            if !matches!(
+                spec.name.as_str(),
+                "run_shell" | "run_process" | "run_script" | "session_shell_exec"
+            ) {
                 assert!(
                     !spec.description.contains("run_shell"),
                     "{} pollutes exact run_shell discovery: {}",

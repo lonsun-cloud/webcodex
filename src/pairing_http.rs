@@ -69,14 +69,6 @@ pub(crate) struct PairingEnrollRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
-    #[serde(default)]
-    pub project_registry_dir: Option<String>,
-    #[serde(default, rename = "projects_dir")]
-    pub legacy_projects_dir: Option<String>,
-    #[serde(default)]
-    pub allowed_roots: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_cwd_anywhere: Option<bool>,
 }
 
 fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
@@ -337,13 +329,6 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
             return;
         }
     };
-    let _ = (
-        body.project_registry_dir,
-        body.legacy_projects_dir,
-        body.allowed_roots,
-        body.allow_cwd_anywhere,
-    );
-
     let Some(db) = crate::get_db(depot) else {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         res.render(json_error(

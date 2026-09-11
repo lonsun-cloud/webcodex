@@ -27,6 +27,7 @@ use std::sync::mpsc;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 use uuid::Uuid;
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::runner_protocol::{
     validate_process_argv, ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase,
     ShellJobActivitySource, ShellJobActivityState, ShellJobContext, ShellJobSnapshot,
@@ -54,7 +55,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as WindowsCommandExt;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, MOVEFILE_REPLACE_EXISTING,
@@ -1338,16 +1341,16 @@ pub(crate) fn snapshot_from_detached_record(
     }
     let terminal = record.terminal.as_ref();
     let status = match terminal.map(|value| value.status.as_str()) {
-        Some("handoff_failed") => "failed",
-        Some("supervisor_lost") => "lost",
-        Some("timeout") => "timeout",
-        Some("completed") => "completed",
-        Some("failed") => "failed",
-        Some("stopped") => "stopped",
+        Some("handoff_failed") => RunnerJobLifecycle::Failed,
+        Some("supervisor_lost") => RunnerJobLifecycle::Lost,
+        Some("timeout") => RunnerJobLifecycle::Timeout,
+        Some("completed") => RunnerJobLifecycle::Completed,
+        Some("failed") => RunnerJobLifecycle::Failed,
+        Some("stopped") => RunnerJobLifecycle::Stopped,
         Some(other) => return Err(format!("unsupported detached terminal status {other}")),
-        None if record.stop_requested => "stop_requested",
-        None if record.ownership_accepted_at_unix_ms.is_some() => "running",
-        None => "agent_queued",
+        None if record.stop_requested => RunnerJobLifecycle::StopRequested,
+        None if record.ownership_accepted_at_unix_ms.is_some() => RunnerJobLifecycle::Running,
+        None => RunnerJobLifecycle::RunnerQueued,
     };
     let command_execution_state = match terminal.map(|value| value.status.as_str()) {
         Some("handoff_failed") => Some(ShellCommandExecutionState::NotStarted),
@@ -1357,7 +1360,11 @@ pub(crate) fn snapshot_from_detached_record(
         Some(_) => None,
         None => None,
     };
-    let activity = matches!(status, "running" | "stop_requested").then_some(ShellJobActivity {
+    let activity = matches!(
+        status,
+        RunnerJobLifecycle::Running | RunnerJobLifecycle::StopRequested
+    )
+    .then_some(ShellJobActivity {
         state: ShellJobActivityState::Working,
         phase: ShellJobActivityPhase::ProcessRunning,
         source: ShellJobActivitySource::RunnerExecution,
@@ -1371,7 +1378,7 @@ pub(crate) fn snapshot_from_detached_record(
     Ok(ShellJobSnapshot {
         job_id: record.job_id.clone(),
         request_id: record.request_id.clone(),
-        status: status.to_string(),
+        status: status.as_wire().to_string(),
         update_seq: record.update_seq,
         created_at: record.created_at_unix_ms.div_euclid(1000),
         started_at: record
@@ -1898,30 +1905,46 @@ fn handoff_first_platform(
 ) -> Result<DetachedHandoffOutcome, String> {
     let job_dir = store.job_dir(&prepared.job_id);
     let supervisor_birth = format!("birth_{}", Uuid::new_v4().simple());
-    let mut command = match internal_mode_command(
-        DETACHED_INTERNAL_SUPERVISOR,
-        &[
-            job_dir.to_string_lossy().into_owned(),
-            prepared.execution_id.clone(),
-            supervisor_birth,
-        ],
-    ) {
+    let supervisor_args = [
+        job_dir.to_string_lossy().into_owned(),
+        prepared.execution_id.clone(),
+        supervisor_birth,
+    ];
+    let mut command = match detached_supervisor_command(&supervisor_args, true) {
         Ok(command) => command,
         Err(error) => {
             mark_pre_accept_failure(store, &prepared, &error)?;
             return Err(error);
         }
     };
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    make_new_session(&mut command);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
     let mut child = match command.spawn() {
         Ok(child) => child,
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            // Some host-owned Job Objects (including GitHub-hosted Windows
+            // runners) forbid CREATE_BREAKAWAY_FROM_JOB. Access denied is a
+            // pre-start CreateProcess failure, so no child exists to reconcile.
+            // Retry exactly once without breakaway; the supervisor remains in
+            // the host Job Object while retaining its own durable ownership and
+            // nested payload Job Object semantics.
+            let mut fallback = match detached_supervisor_command(&supervisor_args, false) {
+                Ok(command) => command,
+                Err(error) => {
+                    mark_pre_accept_failure(store, &prepared, &error)?;
+                    return Err(error);
+                }
+            };
+            match fallback.spawn() {
+                Ok(child) => child,
+                Err(fallback_error) => {
+                    let message = format!(
+                        "failed to spawn detached Job supervisor after Windows breakaway fallback: {fallback_error}"
+                    );
+                    mark_pre_accept_failure(store, &prepared, &message)?;
+                    return Err(message);
+                }
+            }
+        }
         Err(error) => {
             let message = format!("failed to spawn detached Job supervisor: {error}");
             mark_pre_accept_failure(store, &prepared, &message)?;
@@ -2622,8 +2645,12 @@ fn run_accepted_payload(
     launch: DetachedLaunchSpec,
 ) -> Result<DetachedJobRecord, String> {
     let tree_birth = format!("birth_{}", Uuid::new_v4().simple());
-    let mut payload_command = Command::new(&launch.process.executable);
-    payload_command.args(&launch.process.args).env_clear();
+    let mut payload_command = super::shell::structured_process_command(
+        std::ffi::OsStr::new(&launch.process.executable),
+        &launch.process.args,
+        launch.cwd.as_deref().map(Path::new),
+    )?;
+    payload_command.env_clear();
     for (key, value) in &launch.env {
         payload_command.env(key, value);
     }
@@ -3086,6 +3113,25 @@ fn read_line_with_timeout(
             Err(error) => return Err(format!("failed to read detached child ack: {error}")),
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+fn detached_supervisor_command(
+    args: &[String],
+    _windows_breakaway: bool,
+) -> Result<Command, String> {
+    let mut command = internal_mode_command(DETACHED_INTERNAL_SUPERVISOR, args)?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    make_new_session(&mut command);
+    #[cfg(windows)]
+    if _windows_breakaway {
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+    }
+    Ok(command)
 }
 
 #[cfg(any(unix, windows))]

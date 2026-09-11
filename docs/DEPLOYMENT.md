@@ -13,6 +13,13 @@ This guide is for **production and advanced self-hosting**: long-lived Servers, 
 - `webcodex-runner` — the long-lived worker on the machine that owns the
   repositories.
 
+Execution configuration belongs to the Runner that performs the work. The
+retired Server `CODEX_*` settings do not select a coding-agent executable,
+approval mode, timeout, or argument allowlist. Configure coding-agent providers
+in the Runner's `[acp]` / `[[acp.agents]]` settings instead; see the
+[ACP coding-agent guide](agent/acp-coding-agent-run.md). The Server needs its
+writable data directory, not a separate legacy `uploads` directory.
+
 ## Build and install
 
 The documented distribution path is the npm thin installer/wrapper:
@@ -354,6 +361,7 @@ Client enrollment generates the Runner config. Important settings in
 | `transport` | Prefer `auto` with `[quic]` configured. |
 | `project_registry_dir` | Directory of project registry files. |
 | `[policy]` | Local execution boundary (`allowed_roots`, etc.). |
+| `[skills].roots` | Optional absolute Runner-local read-only Skill roots; live files are discovered without copying into the managed Skill Store. |
 | `[shell]` | Optional shell profile definitions and bounded persistent-shell limits. |
 | `[ssh.resources.<name>]` | Optional named SSH target for Session-bound `run_shell` / `run_job`. |
 
@@ -500,8 +508,9 @@ auto-execute or require human approval:
 
 Hard safety boundaries (project roots, read-only sessions, path policy,
 credential redaction, job cancel semantics) are never relaxed by
-`trusted_agent`. `WEBCODEX_PERMISSION_MODE` is removed; if set, configuration
-is invalid.
+`trusted_agent`. Legacy `WEBCODEX_PERMISSION_MODE` supports the unambiguous
+`dev_auto_approve` → `trusted_agent` and `require_approval` → `restricted` mappings.
+Unknown or conflicting old/new settings remain invalid.
 
 ### Operator checks
 

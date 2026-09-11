@@ -11,6 +11,8 @@
   Runner endpoint。
 - `webcodex-runner` —— 运行在持有仓库机器上的长驻 worker。
 
+执行配置属于实际工作的 Runner。旧 Server 的 `CODEX_*` 设置不再用于选择编码代理的可执行文件、审批模式、超时或参数白名单；编码代理应通过 Runner 的 `[acp]` / `[[acp.agents]]` 配置，参见 [ACP 编码代理指南](agent/acp-coding-agent-run.md)。Server 需要可写的数据目录，不需要单独的旧 `uploads` 目录。
+
 ## 构建与安装
 
 官方分发路径是 npm 薄安装器/包装器：
@@ -314,6 +316,7 @@ package 时默认将其设为 private；维护者
 | `transport` | 配置 `[quic]` 时优先用 `auto`。 |
 | `project_registry_dir` | 项目注册文件目录。 |
 | `[policy]` | 本地执行边界（`allowed_roots` 等）。 |
+| `[skills].roots` | 可选的 Runner 本机绝对只读 Skill roots；直接 live discovery，不复制进 managed Skill Store。 |
 | `[shell]` | 可选 shell profile 定义与有界 persistent-shell 限制。 |
 | `[ssh.resources.<name>]` | 可选命名 SSH 目标，用于 Session 绑定的 `run_shell` / `run_job`。 |
 
@@ -448,7 +451,8 @@ MCP 与 GPT Actions 见 [MCP.md](MCP.zh-CN.md) 与客户端特定设置
 | `restricted` | 有后果的工具在人工批准前被拒绝（`webcodex task approve/deny`）。 |
 
 `trusted_agent` 永不放松硬安全边界（项目根、只读会话、路径策略、凭据脱敏、
-job 取消语义）。`WEBCODEX_PERMISSION_MODE` 已移除；若设置，配置视为无效。
+job 取消语义）。`WEBCODEX_PERMISSION_MODE` 支持明确映射：`dev_auto_approve` → `trusted_agent`，
+`require_approval` → `restricted`；未知值及新旧配置冲突仍拒绝。
 
 ### 运维检查
 

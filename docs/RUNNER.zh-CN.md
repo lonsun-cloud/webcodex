@@ -108,6 +108,52 @@ allowed_roots = ["/root/git"]
 runtime 工具 `register_project` 与 `create_project` 让客户端在在线 Runner 上
 注册已有目录或创建新目录，受 Runner 的 `allowed_roots` policy 约束。
 
+## Skill 来源
+
+`skill_list` 继续只暴露一个 catalog，但其中保留三种彼此独立的 ownership / lifecycle：
+
+| 来源 | 位置 / owner | Trust | 版本语义 |
+| --- | --- | --- | --- |
+| Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Project live content；没有 package revision。 |
+| Configured live Runner Skill roots | Runner 主机上由 operator 配置的绝对目录 | `operator_configured_guidance` | 直接读取的只读 live filesystem content；没有 install、activation、rollback 或 package revision。 |
+| Managed Runner Skill Store | Runner state 下的 `runner-skills-v1` | `operator_installed_guidance` | immutable package revision，并保留 install、activation、remove 与 rollback-oriented Store 语义。 |
+
+Configured live roots 默认不存在，需要在 Runner 的 `runner.toml` 中显式配置：
+
+```toml
+[skills]
+roots = [
+    "/home/alice/.codex/skills",
+    "/home/alice/.agents/skills",
+    "/opt/company/agent-skills",
+]
+```
+
+Windows 使用等价的本机绝对路径；包含反斜杠时可以使用 TOML literal string：
+
+```toml
+[skills]
+roots = [
+    'C:\Users\alice\.codex\skills',
+    'C:\Users\alice\.agents\skills',
+]
+```
+
+每个 root 直接包含 `<root>/<package>/SKILL.md`，package 内可以有 `references/`
+等 resource。WebCodex 不会把它们复制到 managed Store；`skill_install`、
+`skill_activate` 与 `skill_remove_revision` 仍然只修改 managed Store。
+
+这些路径始终属于 **Runner 主机**；Server 与 Runner 不在同一台机器时也不会改用
+Server 的 filesystem。Configured roots 不会加入 `[policy].allowed_roots`，因此不会给普通
+Project file/shell/process 工具扩大文件系统 authority，native root path 也不会投影到
+model-facing Skill catalog。Skill read 只提交 opaque `skill_id` 与 package-relative resource
+path，由 Runner 根据 trusted config 解析 root，并拒绝 traversal 与 link escape。
+
+Skill 文件本身是 live 的：修改 `SKILL.md` 或 resource 后，下一次 discovery/read 会直接
+看到新内容，不需要 reload。只有修改 `roots` 配置列表时才需要按正式流程先执行
+`runner_config_check`，再携带当前 generation 执行 `runner_config_reload`；该字段支持 hot
+reload，不需要重启 Runner 进程。
+
 ## 本地 MCP provider
 
 Runner 可以直接托管供 WebCodex 内建 MCP gateway 使用的 persistent stdio MCP provider：
@@ -147,13 +193,21 @@ Runner 到 configured local provider 的内建 gateway 有意限制为 bounded s
 
 ## Shell profile
 
-默认情况下 `run_shell` 与 `run_job` 不保留持久 shell 会话。它们会为每个
-项目/profile 对准备一次环境快照，然后让每条命令以应用了该快照的独立进程运行。
-快照的生成方式是：以清空的环境启动 profile 程序，应用 profile 的 `env`，执行
-profile 的 `init_script`（如果有），再捕获最终环境。
+普通 Project Shell/Process 默认使用 `[shell] environment_mode = "inherit"`，继承
+启动 Runner 的 PATH、HOME/USERPROFILE 和工具链环境，继续过滤 WebCodex 内部凭据。
+Shell env 覆盖继承值，profile env 再覆盖 Shell env；未配置 init_script 时不执行
+启动脚本，也不会自动 source `.bashrc` / `.profile`。
 
-WebCodex 默认不 source `~/.bashrc` 或 `~/.profile`：它们可能很慢、面向交互、
-污染环境且不可复现。请改用显式 profile。
+可显式选择 `environment_mode = "isolated"`：Unix 仅提供 `/usr/bin:/bin` PATH，
+Windows 提供 SystemRoot 与 System32 PATH，再应用配置 env/path_prepend。这不是文件系统沙箱。
+MCP 的显式 credential delegation 规则不变；Native Plugin 继续使用已有的凭据过滤。
+
+Windows structured process 支持 `.cmd`/`.bat`，由 Runner 内部转换 argv。支持空参数、
+空格、`&`、`|`、括号；双引号、`%`、`!`、`^`、控制字符和尾部反斜杠在启动前拒绝，
+命令上限为 8000 UTF-16 units；UNC cwd 会在启动前拒绝，避免 cmd.exe 静默切换工作目录。这些参数应改用 native runtime。进程树和 Job 契约不变。
+
+精确 read_file 可读取 node_modules/target，普通搜索仍跳过它们，structured edit 仍拒绝。
+`.env*`、凭据、Runner 配置及 `.git` 控制数据继续保护。
 
 `runner.toml` 中的 Rust/Cargo 示例：
 
@@ -201,6 +255,44 @@ Profile 的安全要点：
 - status 与 runtime API 只暴露脱敏的 profile 元数据（名称、`has_init_script`、
   env 键数量、program、dialect）——绝不暴露 `init_script` 正文或环境值。
 - Profile 以清空环境 + 显式白名单运行；请声明所需 env。
+
+### `run_script` 的 typed 脚本语言
+
+`run_script` 接受 `sh`、`bash`、`powershell`、`javascript` 和 `typescript`。
+JavaScript 与 TypeScript 都由 Runner 上的外部 Node.js 执行。WebCodex 从准备好的
+shell/profile PATH 解析 `node`（仅当已配置的 shell/profile program 本身是
+`node`/`node.exe` 时也可直接使用）。JavaScript 正文写入 Runner-owned `.mjs`
+临时文件，并以 `node <temporary.mjs> <args...>` 的 native argv 形式启动；`.mjs`
+固定 ESM 语义，不受项目 `package.json` 或临时目录 metadata 影响。
+
+TypeScript 的定位是 typed-script runtime，不是项目编译器。Runner 将正文写入
+Runner-owned `.mts` 文件，因此入口始终采用 ESM，并使用 Node 原生的 erasable type
+stripping。最低支持 Node.js 22.6.0。创建或启动用户脚本之前，Runner 只执行一次有界的
+`node --version` capability probe：Node 22.6–22.17 与 Node 23.0–23.5 由 Runner
+固定加入 `--experimental-strip-types`；Node 22.18+、23.6+ 以及后续支持版本使用默认的
+native stripping，不再附加该 flag。Node 缺失、版本无法解析或低于 22.6 时返回
+`not_started` / `interpreter_unavailable`，用户脚本不会启动。如果版本 probe 已通过、
+但实际脚本进程之后拒绝某项 runtime semantics，则以实际已启动进程的 lifecycle 为准。
+
+该 TypeScript contract 覆盖 Node 能直接擦除的语法，例如 type annotations、interface /
+type alias、generics，以及普通 JavaScript 的 async/await、ESM、Node builtins。WebCodex
+不会执行 type checking，不会调用 `tsc`，不会把 `tsconfig.json` 当作项目构建配置，
+不会实现 tsconfig path alias，也不承诺 enum、parameter properties、runtime namespace、
+import alias 等需要 transform 的 TypeScript 语法。本 contract 也不使用
+`--experimental-transform-types`。在仍把 type stripping 标为 experimental 的旧版 Node
+上，Node 自己的 `ExperimentalWarning` 可能进入 stderr；WebCodex 不做 suppress/filter，
+以免同时吞掉用户脚本产生的 warning。
+
+滚动升级时，JavaScript 独立要求 `structured_script_javascript`，TypeScript 独立要求
+`structured_script_typescript`。这些 capability 只表示当前运行的 Runner binary 理解
+对应 typed-script wire semantics，并不表示本机一定有兼容 Node。脚本 args 继续作为
+literal native argv，stdin 继续独立传递，两种语言继续复用相同的 resolved project cwd、
+timeout/cancellation、Runner policy 和 Job lifecycle。
+
+WebCodex 不会安装或 bootstrap npm dependencies，不会注入 `node_modules` / `NODE_PATH`，
+不会选择 package manager，也不会 fallback 到 Bun、Deno、`tsx`、`npx` 或其他 runtime。
+由于 `.mjs` / `.mts` 入口位于 Runner-owned 临时目录，相对 ESM import 会相对于该临时
+module 解析，而不是 project cwd；导入项目代码时应使用 Node builtin 或显式项目路径/file URL。
 
 ## Job 与并发
 
@@ -371,7 +463,7 @@ User scope 使用 `systemctl --user`；system scope 使用 `/etc/systemd/system`
 4. reload 后调用 `runtime_status(client_id=...)`（或 `list_runners`）检查当前运行状态。
 
 `runner_config_reload` 不写 `runner.toml`，只激活磁盘上已经存在的 candidate。policy、
-shell、Native Plugin 与静态 SSH resource 中可热加载的字段可以立即生效；`restart_required_fields`
+shell、configured Skill roots、Native Plugin 与静态 SSH resource 中可热加载的字段可以立即生效；`restart_required_fields`
 报告的字段仍保持 startup-only，重启前不会假装已在线生效。无效 candidate 保留旧 active
 snapshot 与 generation。`ssh_resource` managed mutation 不同：它使用 frozen startup
 snapshot，且只在工具返回 `restart_required=true` 时要求重启 Runner。

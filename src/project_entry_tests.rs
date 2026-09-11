@@ -158,6 +158,29 @@ fn npm_wrapper_network_credentials_are_removed_from_runtime_children() {
     }));
 }
 
+#[test]
+fn runner_parent_credentials_are_removed_before_spawn() {
+    let mut command = tokio::process::Command::new("webcodex-runner");
+    for key in ["WEBCODEX_TOKEN", "WEBCODEX_PAT", "WEBCODEX_AGENT_TOKEN"] {
+        command.env(key, "credential-like-value");
+    }
+    command.env("WEBCODEX_TEST_UNRELATED_ENV", "preserved");
+
+    remove_runner_parent_credentials(&mut command);
+    let envs: Vec<_> = command.as_std().get_envs().collect();
+    for key in ["WEBCODEX_TOKEN", "WEBCODEX_PAT", "WEBCODEX_AGENT_TOKEN"] {
+        assert!(
+            envs.iter()
+                .any(|(candidate, value)| { candidate.to_str() == Some(key) && value.is_none() }),
+            "Runner parent credential was not removed before spawn: {key}"
+        );
+    }
+    assert!(envs.iter().any(|(key, value)| {
+        key.to_str() == Some("WEBCODEX_TEST_UNRELATED_ENV")
+            && value.and_then(|value| value.to_str()) == Some("preserved")
+    }));
+}
+
 fn fact<'a>(readiness: &'a ProjectReadiness, code: &str) -> &'a ReadinessFact {
     readiness
         .findings
@@ -340,8 +363,6 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
         data_dir: state.join("data"),
         token: Some(bootstrap_key.clone()),
         max_text_size: 2 * 1024 * 1024,
-        max_file_size: 100 * 1024 * 1024,
-        codex: crate::CodexConfig::default(),
         oauth2: crate::OAuth2Config::default(),
     });
     let router = Router::new()
@@ -2156,7 +2177,10 @@ async fn console_accept_requires_result_id_and_stale_identity_has_no_effect() {
         .db
         .local_connector_task(&task_id, &fixture.connector.context().project_id)
         .unwrap();
-    assert_eq!(task.task_status, "ready_for_review");
+    assert_eq!(
+        task.task_status,
+        webcodex_store::ConnectorTaskState::ReadyForReview
+    );
 }
 
 #[test]

@@ -15,6 +15,8 @@ mod model_ergonomics_tests;
 mod project_files_tests;
 #[path = "runtime_http/tests/projects_tests.rs"]
 mod projects_tests;
+#[path = "runtime_http/tests/runner_config_tests.rs"]
+mod runner_config_tests;
 
 #[test]
 fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
@@ -249,6 +251,7 @@ fn build_projects_router(
                     Router::with_path("projects/git_diff_summary").post(projects_git_diff_summary),
                 )
                 .push(Router::with_path("jobs/list").post(jobs_list))
+                .push(Router::with_path("jobs/stop").post(job_stop))
                 .push(Router::with_path("jobs/tail").post(job_tail))
                 .push(Router::with_path("runtime/status").post(runtime_status)),
         )
@@ -777,7 +780,7 @@ async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn http_start_coding_task_retirement_precedes_flattened_legacy_params() {
+async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_tool() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
@@ -804,16 +807,15 @@ async fn http_start_coding_task_retirement_precedes_flattened_legacy_params() {
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["status"], 400);
     let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("no longer supported"), "{body}");
-    assert!(error.contains("work_on_project"), "{body}");
+    assert!(error.contains("unknown tool 'start_coding_task'"), "{body}");
 }
 
 // =========================================================================
-// Retired compatibility tool entry
+// Removed tool identity
 // =========================================================================
 
 #[tokio::test]
-async fn http_start_coding_task_is_retired() {
+async fn http_start_coding_task_uses_ordinary_unknown_tool_path() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
@@ -826,8 +828,10 @@ async fn http_start_coding_task_is_retired() {
     assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
     let body: Value = resp.take_json().await.unwrap();
     let error = body["error"].as_str().unwrap();
-    assert!(error.contains("no longer supported"), "{error}");
-    assert!(error.contains("work_on_project"), "{error}");
+    assert!(
+        error.contains("unknown tool 'start_coding_task'"),
+        "{error}"
+    );
 }
 
 #[test]

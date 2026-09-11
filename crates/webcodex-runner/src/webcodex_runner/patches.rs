@@ -1,13 +1,14 @@
 use super::config::RunnerPolicy;
 use super::files::{resolve_requested_path, sha256_hex_bytes};
 use super::output::{line_edit_stdout, CommandResult};
-use crate::runner_protocol::RunnerRequest;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use webcodex_core::runner_operation::RunnerFilePayload;
 
+#[cfg(test)]
 pub(crate) fn is_structured_edit_request_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -36,6 +37,34 @@ pub(crate) fn validate_structured_edit_runner_path(path: &str) -> Result<(), Str
         return Err("refusing to edit sensitive path".to_string());
     }
     Ok(())
+}
+
+fn checked_structured_edit_target(cwd: Option<&str>, resolved: &Path) -> Result<PathBuf, String> {
+    let root = cwd.ok_or_else(|| "structured edit request missing project root".to_string())?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("project root does not exist: {error}"))?;
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| "target path has no parent directory".to_string())?;
+    let name = resolved
+        .file_name()
+        .ok_or_else(|| "target path has no file name".to_string())?;
+    // Resolve parent aliases before planning or creating directories, including
+    // any not-yet-created suffix. Keep the final component so batch operations
+    // retain their existing rejection of symlink files.
+    let target = canonical_batch_identity(parent)?.join(name);
+    let identity = canonical_batch_identity(&target)?;
+    // Check both the directory entry that will be changed and the target that
+    // a content/hash read would follow if the final component is a symlink.
+    for candidate in [&target, &identity] {
+        let relative = candidate
+            .strip_prefix(&root)
+            .map_err(|_| "structured edit path escapes project root".to_string())?;
+        if is_sensitive_edit_path(&relative.to_string_lossy()) {
+            return Err("refusing to edit sensitive path".to_string());
+        }
+    }
+    Ok(target)
 }
 
 fn write_file_atomic_strict(path: &Path, content: &str, tmp_prefix: &str) -> Result<(), String> {
@@ -91,7 +120,19 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), String> {
     write_file_atomic_strict(path, content, ".pd-line")
 }
 
-fn parse_json_payload(request: &RunnerRequest) -> Result<serde_json::Value, String> {
+fn write_project_file_atomic(
+    path: &Path,
+    content: &str,
+    overwrite_existing: bool,
+) -> Result<(), String> {
+    if overwrite_existing {
+        write_file_atomic_strict(path, content, ".pd-write")
+    } else {
+        write_new_file_atomic(path, content)
+    }
+}
+
+fn parse_json_payload(request: &RunnerFilePayload) -> Result<serde_json::Value, String> {
     serde_json::from_str(request.content.as_deref().unwrap_or_default())
         .map_err(|e| format!("invalid json: {}", e))
 }
@@ -159,11 +200,11 @@ fn write_project_file_apply_error(
 }
 
 pub(crate) fn handle_write_project_file_request(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => {
@@ -221,6 +262,16 @@ pub(crate) fn handle_write_project_file_request(
             )
         }
     };
+    let target = match checked_structured_edit_target(request.cwd.as_deref(), resolved) {
+        Ok(target) => target,
+        Err(error) => {
+            return line_edit_stdout(
+                write_project_file_error(serde_json::json!(path), error),
+                start,
+            )
+        }
+    };
+    let resolved = target.as_path();
     let exists = std::fs::symlink_metadata(resolved).is_ok();
     if exists && !overwrite {
         return line_edit_stdout(
@@ -292,7 +343,7 @@ pub(crate) fn handle_write_project_file_request(
     let changed = current.as_deref() != Some(content);
     if changed {
         if let Err(failure) = apply_write_project_file_change(resolved, content, |path, content| {
-            write_file_atomic_strict(path, content, ".pd-write")
+            write_project_file_atomic(path, content, exists)
         }) {
             return line_edit_stdout(
                 write_project_file_apply_error(serde_json::json!(path), failure),
@@ -919,6 +970,9 @@ fn write_new_file_atomic(path: &Path, content: &str) -> Result<(), String> {
         match std::fs::hard_link(&temporary, path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temporary);
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -1166,7 +1220,7 @@ fn execute_planned_file_changes(
 
 fn resolve_unique_patch_path(
     policy: &RunnerPolicy,
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     touched: &mut HashSet<PathBuf>,
     index: usize,
     kind: &str,
@@ -1183,8 +1237,9 @@ fn resolve_unique_patch_path(
             start,
         ));
     }
-    let resolved =
-        resolve_requested_path(policy, request.cwd.as_deref(), path).map_err(|error| {
+    let resolved = resolve_requested_path(policy, request.cwd.as_deref(), path)
+        .and_then(|resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved))
+        .map_err(|error| {
             batch_error(
                 Some(index),
                 Some(kind),
@@ -1316,7 +1371,7 @@ fn apply_patch_matching_mode_rejection(
 
 pub(crate) fn handle_apply_patch_file_request(
     policy: &RunnerPolicy,
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     start: Instant,
 ) -> CommandResult {
     let payload: ApplyPatchPayload =
@@ -1585,7 +1640,7 @@ pub(crate) fn handle_apply_patch_file_request(
 
 pub(crate) fn handle_apply_text_edits_file_request(
     policy: &RunnerPolicy,
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     start: Instant,
 ) -> CommandResult {
     let payload: ApplyTextEditsPayload =
@@ -1626,7 +1681,9 @@ pub(crate) fn handle_apply_text_edits_file_request(
                 start,
             );
         }
-        let resolved = match resolve_requested_path(policy, request.cwd.as_deref(), &change.path) {
+        let resolved = match resolve_requested_path(policy, request.cwd.as_deref(), &change.path)
+            .and_then(|resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved))
+        {
             Ok(path) => path,
             Err(error) => {
                 return batch_error(
@@ -1673,7 +1730,9 @@ pub(crate) fn handle_apply_text_edits_file_request(
                     start,
                 );
             }
-            match resolve_requested_path(policy, request.cwd.as_deref(), to_path) {
+            match resolve_requested_path(policy, request.cwd.as_deref(), to_path).and_then(
+                |resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved),
+            ) {
                 Ok(path) => {
                     let identity = match canonical_batch_identity(&path) {
                         Ok(identity) => identity,
@@ -1977,6 +2036,33 @@ pub(crate) fn handle_apply_text_edits_file_request(
 #[cfg(test)]
 mod write_project_file_effect_tests {
     use super::*;
+
+    #[test]
+    fn file_write_project_file_create_commit_preserves_concurrent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new.txt");
+        let existed_at_preflight = std::fs::symlink_metadata(&target).is_ok();
+        assert!(!existed_at_preflight);
+
+        // Another writer creates the target after the request's absence check.
+        std::fs::write(&target, "concurrent content").unwrap();
+        let failure =
+            apply_write_project_file_change(&target, "request content", |path, content| {
+                write_project_file_atomic(path, content, existed_at_preflight)
+            })
+            .unwrap_err();
+
+        assert!(failure.rollback_complete);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "concurrent content"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        let output = write_project_file_apply_error(serde_json::json!("new.txt"), failure);
+        assert_eq!(output["created"], false);
+        assert_eq!(output["changed"], false);
+        assert_eq!(output["state_changed"], false);
+    }
 
     #[test]
     fn parent_creation_write_failure_reports_rollback_truth() {

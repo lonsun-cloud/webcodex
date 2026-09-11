@@ -15,6 +15,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
                 def(
                 "apply_patch",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_PATCH,
                 Some(ApplyPatch),
@@ -30,8 +31,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 Patch,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE.changed_paths(super::ToolChangedPathEvidence::ResultField("changed_paths")),
                 ),
-                "Contextual patch path for model-generated changes awkward as guarded exact edits, especially large or multi-hunk rewrites. Prefer read_file/read_files -> apply_text_edits when current text and SHA are available. Transactional with SHA rechecks, rollback, dry_run. matching_mode=unique tolerates bounded whitespace/Unicode drift but writes only to one target; pure additions need a unique anchor. For repetitive targets add a stable parent/function/test/module anchor. matching_mode=exact_unique is only for a stale-context fence after rereading exact source; never relax it after rejection. matching_mode=first_match is permissive compatibility. Keep multiple chunks for one file in one Update File; duplicate file operations reject. Ambiguity may return read_files recovery. outcome_unknown requires workspace inspection before retry. apply_unified_diff is only for external diffs.",
+                "Contextual patch path for guarded exact edits when contextual or multi-hunk form is clearer; line count alone is not a reason to patch. Prefer read_file/read_files -> apply_text_edits with current SHA. Repetitive targets need stable unique context (function/impl/type/test/module), not repeated lines/short fragments. Transactional: SHA rechecks, rollback, dry_run. matching_mode=unique default. matching_mode_rejected: never weaken guard or switch to first_match; reread, use apply_text_edits if easy, else bounded read_files recovery. Patch retry preserves requested guard: unique stays unique; matching_mode=exact_unique stays exact_unique—never relax the stale-context/concurrency fence. context_mismatch: reread and regenerate from current source. Keep multiple chunks per file; duplicate file operations reject. first_match is compatibility, not recovery. outcome_unknown: inspect workspace.",
                 apply_patch_input_schema,
             ),
             PERMISSION_RISK_PATCH,
@@ -42,6 +44,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "apply_unified_diff",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_PATCH,
                 Some(Shell),
@@ -57,6 +60,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 Patch,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE.changed_paths(super::ToolChangedPathEvidence::ResultField("affected_files")),
             ),
             "External raw unified-diff mutation path. Use only when input is already a standard unified diff; ordinary model-generated edits should use read_file/read_files followed by apply_text_edits, while contextual or large patch-shaped changes use apply_patch. Performs bounded preflight before applying and never needs a separate validation call. Shell heredocs and Codex *** Begin Patch wrappers are rejected with recovery metadata.",
             apply_unified_diff_input_schema,

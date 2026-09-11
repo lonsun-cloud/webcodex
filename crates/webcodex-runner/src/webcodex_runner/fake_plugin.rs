@@ -37,7 +37,9 @@ fn main() -> io::Result<()> {
         )?;
         append(
             marker,
-            if env::var_os("WEBCODEX_AGENT_TOKEN").is_none() {
+            if env::var_os("WEBCODEX_AGENT_TOKEN").is_none()
+                && env::var_os("WEBCODEX_PAT").is_none()
+            {
                 "sensitive-env-cleared\n"
             } else {
                 "sensitive-env-leaked\n"
@@ -79,7 +81,13 @@ fn main() -> io::Result<()> {
         match method.as_str() {
             "initialize" => {
                 append(marker, "initialize\n")?;
-                if scenario == "init_crash" || scenario == "check_init_crash" {
+                if matches!(
+                    scenario,
+                    "init_crash" | "check_init_crash" | "check_init_crash_stderr"
+                ) {
+                    if scenario == "check_init_crash_stderr" {
+                        eprintln!("diagnostic-only-secret-looking-initialize-stderr");
+                    }
                     return Ok(());
                 }
                 if scenario == "check_init_timeout" {
@@ -241,6 +249,8 @@ fn main() -> io::Result<()> {
                 }
                 let output_schema = if scenario == "output_schema_invalid" {
                     r#","outputSchema":{"type":"object","properties":{"call":{"type":"string"}},"required":["call"],"additionalProperties":false}"#.to_string()
+                } else if scenario == "large_structured_result" {
+                    r#","outputSchema":{"type":"object","properties":{"payload":{"type":"string","maxLength":262144}},"required":["payload"],"additionalProperties":false}"#.to_string()
                 } else {
                     String::new()
                 };
@@ -294,6 +304,27 @@ fn main() -> io::Result<()> {
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32001,"message":"fixture error"}}}}"#
+                        ),
+                    )?,
+                    "large_text_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":false}}}}"#,
+                            "x".repeat(192 * 1024)
+                        ),
+                    )?,
+                    "large_structured_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[],"structuredContent":{{"payload":"{}"}},"isError":false}}}}"#,
+                            "x".repeat(192 * 1024)
+                        ),
+                    )?,
+                    "oversized_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":false}}}}"#,
+                            "x".repeat(520 * 1024)
                         ),
                     )?,
                     "bad_result" => send(

@@ -374,6 +374,8 @@ async fn register_agent_projects_for_auth(
                         structured_go_test_packages: true,
                         structured_process_argv: true,
                         structured_script_payload: false,
+                        structured_script_javascript: false,
+                        structured_script_typescript: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -382,6 +384,7 @@ async fn register_agent_projects_for_auth(
                         project_lifecycle: false,
                         project_path_registration: false,
                         managed_worktree: false,
+                        configured_skill_roots_read: false,
                         skill_store_read: false,
                         skill_store_manage: false,
                         computer_observe: false,
@@ -2120,6 +2123,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "discovery",
         "inspect",
         "edit",
+        "file_transfer",
         "validate",
         "review",
         "handoff",
@@ -2137,6 +2141,10 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     for tool in [
         "read_file",
         "search_project_text",
+        "search_project_texts",
+        "read_files",
+        "import_conversation_files_to_project",
+        "export_project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
@@ -2179,9 +2187,9 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     }
     assert!(
         serialized.contains("run_shell")
-            && serialized.contains("escape hatch")
-            && serialized.contains("not the primary validation path"),
-        "run_shell should be a bounded escape hatch in recommended_flows: {serialized}"
+            && serialized.contains("shell semantics or one tightly related observation goal")
+            && serialized.contains("do not combine validation, commit, push, deploy, restart"),
+        "recommended_flows should keep run_shell selection and effect-boundary guidance: {serialized}"
     );
 }
 
@@ -2403,10 +2411,15 @@ async fn runtime_status_reports_project_connector_exposure_when_configured() {
     );
 }
 
+// runtime_status reads the process-global compact-schema switch on each call.
+// Serialize this async assertion with tests that mutate that switch so the
+// value cannot change between dispatch and the matching expectation.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
     use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
 
+    let _env = crate::test_support::TestEnvGuard::new();
     let runtime = test_runtime();
     let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from(

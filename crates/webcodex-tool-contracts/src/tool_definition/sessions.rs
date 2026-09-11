@@ -22,6 +22,7 @@ use crate::registry::input_schemas::{
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     def(
         "start_session",
+        super::ToolAuditPolicy::TYPED_CANONICAL,
         ModelHidden,
         TOOL_CATEGORY_SESSION,
         None,
@@ -37,11 +38,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         NoPath,
         false,
         false,
+        super::ToolSessionEvidencePolicy::NONE,
     ),
     adaptive_runtime_direct(
         context_recovery_only(model_spec(
             def(
                 "work_on_project",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 "workflow",
                 Some(GitOrShell),
@@ -57,6 +60,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Canonical model entry for ordinary coding/review via an existing Project or Runner path; Git not required for checkout mode. Omitted/checkout preserves the existing path flow. mode=worktree with client_id + path asks the Runner to resolve an exact Git base, bootstrap or re-observe an isolated managed worktree, register it as an ordinary Project, and then start or exactly resume the Workflow Session. This hides registration/worktree plumbing without bypassing Project authority and returns compact workflow plus project instructions.",
             work_on_project_input_schema,
@@ -67,6 +71,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         requires_explicit_business_session(model_spec(
             def(
                 "finish_coding_task",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 "workflow",
                 Some(GitOrShell),
@@ -82,6 +87,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Return an optional deterministic evidence snapshot for model review, including workspace, validation, jobs, and recorded tool events. The result is advisory: it does not decide task completion, replace direct diff or test review, or generate the user-facing final report.",
             finish_coding_task_input_schema,
@@ -91,6 +97,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "session_summary",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -106,6 +113,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Return a bounded structured summary from the session ledger for an explicit session_id: recorded events, message-board summary, task mode, guards, and lifecycle. Uses durable ledger data where session persistence is configured.",
         session_summary_input_schema,
@@ -114,6 +122,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "update_session_context",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             Some(OwnerOnly),
@@ -129,6 +138,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
             "Update Session defaults. Binding execution_context.resource selects an already active Runner-local named SSH resource; for a new explicit target use ssh_resource list/register and restart the Runner first, then list and bind the active name. open_session_shell uses that Session binding. Requires an authorized project matching the exact Session project; cross-project escape is not supported. Context and event commit under the store lock; the background writer persists, so success does not mean disk flush. Never falls back and never creates unknown Sessions.",
             update_session_context_input_schema,
@@ -139,6 +149,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "close_session",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -154,6 +165,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE.persistent_shell(super::PersistentShellEvidenceAction::Close).lifecycle(super::ToolSessionLifecycleEffect::IdempotentClose),
             ),
             "Explicitly close a workflow session (Active to Closed) for a required session_id. Query remains available; write/shell/mutation tools are denied. Idempotent when already closed; unknown ids fail without create. finish_coding_task does not close.",
             close_session_input_schema,
@@ -163,6 +175,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "validation_summary",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_VALIDATION,
             Some(OwnerOnly),
@@ -178,6 +191,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Read bounded structured validation evidence already recorded in an explicit project-scoped session ledger. Does not run Cargo or shell commands, enqueue a Runner request, read project files, mutate the workspace, or replace finish_coding_task.",
         validation_summary_input_schema,
@@ -185,6 +199,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "post_session_message",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("message_id"),
+                super::ToolAuditResultField::pointer("kind", "/message/kind"),
+                super::ToolAuditResultField::pointer("status", "/message/status"),
+                super::ToolAuditResultField::pointer("requires_ack", "/message/requires_ack"),
+                super::ToolAuditResultField::pointer("author_session_id", "/message/author_session_id"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -200,6 +223,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
         ),
         "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). High-priority guidance may require request-scoped ACK; ACK neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
         post_session_message_input_schema,
@@ -207,6 +231,11 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "list_session_messages",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::array_len("message_count", "messages"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -222,6 +251,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Read bounded session-local messages with exact filters. For an executable todo, prefer get_session_assignment so the todo, all retained direct replies, and its completion fence come from one store snapshot.",
         list_session_messages_input_schema,
@@ -229,6 +259,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "get_session_assignment",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("message_id"),
+                super::ToolAuditResultField::array_len("direct_reply_count", "direct_replies"),
+                super::ToolAuditResultField::string_present("assignment_fence_present", "assignment_fence"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -244,6 +282,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Atomically read one exact open todo plus all retained direct replies and return the opaque assignment_fence required by complete_session_message. Unrelated Session traffic and ACK bookkeeping do not stale it; incomplete retained assignment history fails closed.",
         get_session_assignment_input_schema,
@@ -251,6 +290,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "observe_session_messages",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::array_len("message_count", "messages"),
+                super::ToolAuditResultField::value("changed"),
+                super::ToolAuditResultField::value("history_lost"),
+                super::ToolAuditResultField::value("has_more"),
+                super::ToolAuditResultField::value("wait_outcome"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -266,6 +314,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Observe Session message-state delta after an opaque durable cursor. No token establishes the current baseline and returns no history; token calls may wait once for change. Reports retention loss; never a subscription, delivery receipt, or model-context proof.",
         observe_session_messages_input_schema,
@@ -274,6 +323,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "resolve_session_message",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("message_id"),
+                super::ToolAuditResultField::pointer("status", "/message/status"),
+                super::ToolAuditResultField::pointer("resolved_by_message_id", "/message/resolved_by_message_id"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -289,6 +345,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
             "Mark a session-local ledger message resolved. Idempotent when the message is already resolved; metadata-only and never modifies project files.",
             resolve_session_message_input_schema,
@@ -299,6 +356,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
             "complete_session_message",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("success"),
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("message_id"),
+                super::ToolAuditResultField::value("answer_message_id"),
+                super::ToolAuditResultField::value("completion_id"),
+                super::ToolAuditResultField::value("replayed"),
+                super::ToolAuditResultField::pointer("author_session_id", "/answer/author_session_id"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -314,6 +380,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             true,
             false,
+            super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
             "Atomically answer and resolve one exact open todo. expected_assignment_fence is required and must be the exact opaque fence from get_session_assignment; completion_key separately keeps uncertain-result retries idempotent.",
             complete_session_message_input_schema,
@@ -324,6 +391,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         requires_explicit_business_session(model_spec(
             def(
                 "session_discussion_summary",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("success"),
+                    super::ToolAuditResultField::value("session_id"),
+                    super::ToolAuditResultField::value("counts"),
+                    super::ToolAuditResultField::array_len("open_todo_count", "open_todos"),
+                    super::ToolAuditResultField::array_len("recent_answer_count", "recent_answers"),
+                    super::ToolAuditResultField::array_len("recent_completion_count", "recent_completions"),
+                ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -339,6 +414,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Return a bounded structured aggregate of session-local discussion from the recorded session ledger. Does not call an LLM or generate natural-language summaries.",
             session_discussion_summary_input_schema,
@@ -348,6 +424,17 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     requires_explicit_business_session(model_spec(
         def(
             "session_handoff_summary",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("lifecycle"),
+                super::ToolAuditResultField::value("counts"),
+                super::ToolAuditResultField::array_len("open_todo_count", "open_todos"),
+                super::ToolAuditResultField::array_len("recent_answer_count", "recent_answers"),
+                super::ToolAuditResultField::array_len("recent_completion_count", "recent_completions"),
+                super::ToolAuditResultField::value("summary_only"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
             ModelVisible,
             TOOL_CATEGORY_SESSION,
             None,
@@ -363,6 +450,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             NoPath,
             false,
             false,
+            super::ToolSessionEvidencePolicy::NONE,
         ),
         "Read-only handoff for multi-step tasks, explicit session_id. Reads session ledger collaboration and ledger-derived validation. Diagnostics use bounded tails or safe result metadata; validation.parser.available is false if absent. Worker/coordinator read.",
         session_handoff_summary_input_schema,

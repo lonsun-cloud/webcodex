@@ -529,7 +529,7 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
     );
     assert_eq!(
         schema["properties"]["max_result_bytes"]["maximum"],
-        256 * 1024
+        512 * 1024
     );
     let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
@@ -552,7 +552,7 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
     assert!(!validates(&json!({
         "project": "demo",
         "queries": [{"pattern": "needle"}],
-        "max_result_bytes": 256 * 1024 + 1
+        "max_result_bytes": 512 * 1024 + 1
     })));
     assert!(
         schema["properties"].get("session_id").is_some(),
@@ -2290,7 +2290,7 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
         ToolProtocolCapabilities, ToolTransport,
     };
     use crate::tool_runtime::sessions::SessionContextRevisionAck;
-    use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
+    use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -2377,15 +2377,13 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
             .len(),
         20
     );
-    assert_eq!(result.output["output_truncated"], true);
-    assert_eq!(result.output["truncation_reason"], "hard_result_cap");
-    let returned_count = result.output["returned_count"].as_u64().unwrap();
-    let next_index = result.output["next_index"].as_u64().unwrap();
-    assert!(returned_count < 8);
-    assert_eq!(next_index, returned_count);
+    assert!(result.output.get("output_truncated").is_none());
+    assert!(result.output.get("next_index").is_none());
+    assert!(result.output.get("returned_count").is_none());
+    assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
-        "outer Session overlays pushed search_project_texts final response above the 256 KiB hard cap: {serialized_len} bytes"
+        "outer Session overlays pushed search_project_texts final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
 }

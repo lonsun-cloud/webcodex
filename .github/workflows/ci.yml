@@ -18,7 +18,7 @@ jobs:
     # Classify only trusted event metadata plus base...head Git data. For PRs the
     # classifier is loaded from the trusted base commit, so a PR cannot weaken its
     # own native gates. If the trusted base predates the classifier, fail safe to
-    # the full native matrix instead of executing classifier code from the PR head.
+    # the full daily native matrix instead of executing classifier code from the PR head.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -29,15 +29,14 @@ jobs:
       needs_windows_runner: ${{ steps.classify.outputs.needs_windows_runner }}
       needs_windows_package: ${{ steps.classify.outputs.needs_windows_package }}
       needs_windows_desktop: ${{ steps.classify.outputs.needs_windows_desktop }}
-      needs_windows_arm64: ${{ steps.classify.outputs.needs_windows_arm64 }}
       needs_macos: ${{ steps.classify.outputs.needs_macos }}
       needs_macos_desktop: ${{ steps.classify.outputs.needs_macos_desktop }}
-      needs_linux_arm64: ${{ steps.classify.outputs.needs_linux_arm64 }}
-      # PR classification executes the trusted base copy of ci_path_risk.py. During
-      # this one-field schema rollout, an older base has no dedicated output; only
-      # then inherit its existing native Runner/core/full signal so this PR can prove
-      # the new lane before the updated classifier reaches main.
-      needs_runner_real_process: ${{ steps.classify.outputs.needs_runner_real_process == 'true' || (steps.classify.outputs.needs_runner_real_process == '' && (steps.classify.outputs.needs_windows_runner == 'true' || steps.classify.outputs.needs_windows_core == 'true' || steps.classify.outputs.needs_full_native == 'true')) }}
+      # Older trusted PR bases do not expose the newer frontend/container/Plugin SDK outputs.
+      # A historical full-native result is the safe rollout fallback for those bases.
+      needs_frontend: ${{ steps.classify.outputs.needs_frontend == 'true' || (steps.classify.outputs.needs_frontend == '' && steps.classify.outputs.needs_full_native == 'true') }}
+      needs_desktop_frontend: ${{ steps.classify.outputs.needs_desktop_frontend == 'true' || (steps.classify.outputs.needs_desktop_frontend == '' && steps.classify.outputs.needs_full_native == 'true') }}
+      needs_plugin_sdk: ${{ steps.classify.outputs.needs_plugin_sdk == 'true' || (steps.classify.outputs.needs_plugin_sdk == '' && steps.classify.outputs.needs_full_native == 'true') }}
+      needs_docker: ${{ steps.classify.outputs.needs_docker == 'true' || (steps.classify.outputs.needs_docker == '' && steps.classify.outputs.needs_full_native == 'true') }}
       needs_desktop_package: ${{ steps.classify.outputs.needs_desktop_package }}
       needs_full_native: ${{ steps.classify.outputs.needs_full_native }}
       categories: ${{ steps.classify.outputs.categories }}
@@ -57,7 +56,7 @@ jobs:
           EVENT_NAME: push
           EXTERNAL_CONTRIBUTOR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login != github.repository_owner }}
           RUN_CI: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || '' }}
         run: |
@@ -72,11 +71,12 @@ jobs:
                 needs_windows_runner \
                 needs_windows_package \
                 needs_windows_desktop \
-                needs_windows_arm64 \
                 needs_macos \
                 needs_macos_desktop \
-                needs_linux_arm64 \
-                needs_runner_real_process \
+                needs_frontend \
+                needs_desktop_frontend \
+                needs_plugin_sdk \
+                needs_docker \
                 needs_desktop_package \
                 needs_full_native; do
                 echo "$key=true"
@@ -108,10 +108,10 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
   contract:
-    # Mandatory contract lane for every workflow invocation: pull requests and
-    # pushes to main. Heavy Rust/native jobs intentionally do not depend on this
-    # lane: they start in parallel, while the stable aggregate jobs below still
-    # require contract success before the workflow can pass.
+    # Mandatory contract lane for every workflow invocation. It waits only for the
+    # cheap path classifier so unrelated frontend dependency/install work can be
+    # skipped; Rust/schema/workspace contracts remain unconditional.
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -123,26 +123,51 @@ jobs:
         with:
           shared-key: linux-ci
       - uses: actions/setup-node@v4
+        if: needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true' || needs.changes.outputs.needs_plugin_sdk == 'true'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: |
             frontend/package-lock.json
             apps/desktop/package-lock.json
+            npm/plugin-sdk/package-lock.json
+            plugins/safe-delete/package-lock.json
+            plugins/repo-info/package-lock.json
       - name: Install frontend dependencies
+        if: needs.changes.outputs.needs_frontend == 'true'
         run: npm ci --prefix frontend
       - name: Check frontend contracts
+        if: needs.changes.outputs.needs_frontend == 'true'
         run: |
           npm --prefix frontend run typecheck
           npm --prefix frontend test
           npm --prefix frontend run check:dist
       - name: Install Desktop frontend dependencies
+        if: needs.changes.outputs.needs_desktop_frontend == 'true'
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend contracts
+        if: needs.changes.outputs.needs_desktop_frontend == 'true'
         run: |
           npm --prefix apps/desktop run typecheck
           npm --prefix apps/desktop test
           npm --prefix apps/desktop run build
+      - name: Install Plugin SDK dependencies
+        if: needs.changes.outputs.needs_plugin_sdk == 'true'
+        run: |
+          npm ci --prefix npm/plugin-sdk
+          npm ci --prefix plugins/safe-delete
+          npm ci --prefix plugins/repo-info
+      - name: Check Plugin SDK contracts and first-party dogfood
+        if: needs.changes.outputs.needs_plugin_sdk == 'true'
+        run: |
+          npm --prefix npm/plugin-sdk run typecheck
+          npm --prefix npm/plugin-sdk run build
+          npm --prefix npm/plugin-sdk test
+          npm --prefix npm/plugin-sdk run pack:dry-run
+          npm --prefix plugins/safe-delete run typecheck
+          npm --prefix plugins/safe-delete test
+          npm --prefix plugins/repo-info run typecheck
+          npm --prefix plugins/repo-info test
       - name: Verify workspace boundaries
         run: |
           bash scripts/workspace_boundary_check.sh --self-test
@@ -197,20 +222,6 @@ jobs:
       - name: Run ${{ matrix.shard }} Rust tests
         run: cargo test --locked ${{ matrix.packages }}
 
-  test-linux-runner-real-process:
-    needs: changes
-    if: needs.changes.outputs.needs_runner_real_process == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-ci
-      - name: Run Runner real-process lifecycle tests
-        run: cargo test --locked -p webcodex-runner runner_real_process -- --ignored --test-threads=2
-
   test-linux-tooling:
     # Release/tooling checks are mandatory on every PR, but do not need contract
     # output. Start them in parallel; the stable `test` aggregate joins the results.
@@ -235,33 +246,13 @@ jobs:
             sudo apt-get install --no-install-recommends -y ripgrep
           fi
       - name: Check complete workspace production/test targets
+        if: github.event_name == 'pull_request' && (github.event.pull_request.user.login != github.repository_owner || contains(github.event.pull_request.labels.*.name, 'run-ci'))
         run: cargo check --locked --workspace --all-targets
       - name: Test deterministic release contract and tooling
         run: bash scripts/release_check.sh --static-only
 
-  # Exact main CI is the pre-tag source of truth for platform correctness. Keep
-  # Linux arm64 cfg/target coverage here so release-readiness does not need a
-  # duplicate release-profile build merely to prove the native architecture.
-  test-linux-arm64:
-    needs: changes
-    if: needs.changes.outputs.needs_linux_arm64 == 'true'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-arm64-ci
-      - name: Verify native Linux arm64 production targets compile
-        run: |
-          test "$(uname -m)" = aarch64
-          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
-          test "$rust_host" = aarch64-unknown-linux-gnu
-          cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner
-
   test:
-    needs: [contract, changes, test-linux-rust, test-linux-runner-real-process, test-linux-tooling]
+    needs: [contract, changes, test-linux-rust, test-linux-tooling]
     # Preserve the historical aggregate status check and always evaluate upstream
     # results so a failed or unexpectedly skipped Linux lane cannot disappear.
     if: always()
@@ -272,13 +263,11 @@ jobs:
         env:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
-          NEEDS_REAL_PROCESS: ${{ needs.changes.outputs.needs_runner_real_process }}
           RUST_RESULT: ${{ needs.test-linux-rust.result }}
-          REAL_PROCESS_RESULT: ${{ needs.test-linux-runner-real-process.result }}
           TOOLING_RESULT: ${{ needs.test-linux-tooling.result }}
         run: |
           set -euo pipefail
-          echo "contract=$CONTRACT_RESULT changes=$CHANGES_RESULT rust=$RUST_RESULT real_process=$REAL_PROCESS_RESULT tooling=$TOOLING_RESULT needs_real_process=$NEEDS_REAL_PROCESS"
+          echo "contract=$CONTRACT_RESULT changes=$CHANGES_RESULT rust=$RUST_RESULT tooling=$TOOLING_RESULT"
           if [ "$CONTRACT_RESULT" != success ] || \
              [ "$CHANGES_RESULT" != success ] || \
              [ "$RUST_RESULT" != success ] || \
@@ -286,18 +275,85 @@ jobs:
             echo "required Linux CI lane did not succeed" >&2
             exit 1
           fi
-          expected_real_process=skipped
-          if [ "$NEEDS_REAL_PROCESS" = true ]; then expected_real_process=success; fi
-          if [ "$REAL_PROCESS_RESULT" != "$expected_real_process" ]; then
-            echo "Runner real-process Linux lane expected $expected_real_process, got $REAL_PROCESS_RESULT" >&2
-            exit 1
-          fi
+  test-docker-server:
+    needs: changes
+    if: needs.changes.outputs.needs_docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Resolve exact Server image build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./npm/webcodex/package.json').version")"
+          {
+            echo "WEBCODEX_CI_VERSION=$version"
+            echo "WEBCODEX_CI_SOURCE_SHORT=$(git rev-parse --short=12 HEAD)"
+            echo "WEBCODEX_CI_BUILT_AT=$(git show -s --format=%ct HEAD)"
+            echo "WEBCODEX_CI_IMAGE=webcodex-server-ci:${GITHUB_SHA}"
+          } >> "$GITHUB_ENV"
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Build amd64 Server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.WEBCODEX_CI_IMAGE }}
+          build-args: |
+            WEBCODEX_GIT_COMMIT=${{ env.WEBCODEX_CI_SOURCE_SHORT }}
+            WEBCODEX_GIT_DIRTY=false
+            WEBCODEX_BUILT_AT=${{ env.WEBCODEX_CI_BUILT_AT }}
+          cache-from: type=gha,scope=server-image-ci-amd64
+          cache-to: type=gha,mode=max,scope=server-image-ci-amd64
+          provenance: false
+          sbom: false
+      - name: Smoke amd64 Server image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$WEBCODEX_CI_IMAGE"
+          test "$(docker image inspect --format '{{.Architecture}}' "$image")" = amd64
+          test "$(docker image inspect --format '{{.Config.User}}' "$image")" = "webcodex:webcodex"
+          docker run --rm --entrypoint sh "$image" -ec '
+            test "$(id -u)" = 10001
+            test "$(id -g)" = 10001
+            test ! -e /usr/local/bin/webcodex-runner
+          '
+          expected_server="webcodex-server $WEBCODEX_CI_VERSION (commit $WEBCODEX_CI_SOURCE_SHORT, dirty=false, built_at=$WEBCODEX_CI_BUILT_AT)"
+          expected_cli="webcodex $WEBCODEX_CI_VERSION (commit $WEBCODEX_CI_SOURCE_SHORT, dirty=false, built_at=$WEBCODEX_CI_BUILT_AT)"
+          test "$(docker run --rm "$image" --version)" = "$expected_server"
+          test "$(docker run --rm --entrypoint /usr/local/bin/webcodex "$image" --version)" = "$expected_cli"
+          name="webcodex-server-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name "$name" \
+            -e WEBCODEX_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \
+            -e WEBCODEX_PUBLIC_URL=https://webcodex.invalid \
+            "$image" >/dev/null
+          for _ in $(seq 1 40); do
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$name")"
+            if [ "$health" = healthy ]; then break; fi
+            if [ "$health" = unhealthy ] || [ "$health" = missing ]; then
+              docker logs --tail 80 "$name" >&2 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$name")" = healthy
 
   test-macos-core:
     needs: changes
     if: needs.changes.outputs.needs_macos == 'true'
-    # Native macOS core gates cover both published architectures plus the Runner
-    # and Computer platform suites without mechanically building Desktop packages.
+    # Daily macOS coverage uses Apple Silicon. Intel is intentionally reserved for
+    # explicit/release-time extended-native validation.
     strategy:
       fail-fast: false
       matrix:
@@ -306,10 +362,6 @@ jobs:
             runner: macos-15
             host_arch: arm64
             rust_host: aarch64-apple-darwin
-          - platform: darwin-x64
-            runner: macos-15-intel
-            host_arch: x86_64
-            rust_host: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     steps:
@@ -331,45 +383,11 @@ jobs:
       - name: Run native macOS Runner and Computer tests
         run: cargo test --locked -p webcodex-runner -p webcodex-computer
 
-  test-macos-runner-real-process:
-    needs: changes
-    if: needs.changes.outputs.needs_runner_real_process == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: darwin-arm64
-            runner: macos-15
-            host_arch: arm64
-            rust_host: aarch64-apple-darwin
-          - platform: darwin-x64
-            runner: macos-15-intel
-            host_arch: x86_64
-            rust_host: x86_64-apple-darwin
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos-runner-real-process-${{ matrix.platform }}
-      - name: Verify native macOS host
-        env:
-          EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
-          EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
-        run: |
-          test "$(uname -m)" = "$EXPECTED_HOST_ARCH"
-          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
-          test "$rust_host" = "$EXPECTED_RUST_HOST"
-      - name: Run Runner real-process lifecycle tests
-        run: cargo test --locked -p webcodex-runner runner_real_process -- --ignored --test-threads=2
-
   test-macos-desktop:
     needs: changes
     if: needs.changes.outputs.needs_macos_desktop == 'true'
-    # Keep Desktop package validation separate so process/plugin changes receive
-    # native macOS coverage without paying the DMG build cost unless needed.
+    # Keep the common Apple-Silicon Desktop package validation path-aware. The
+    # corresponding Intel DMG build/smoke lives in extended-native CI.
     strategy:
       fail-fast: false
       matrix:
@@ -378,10 +396,6 @@ jobs:
             runner: macos-15
             host_arch: arm64
             rust_host: aarch64-apple-darwin
-          - platform: darwin-x64
-            runner: macos-15-intel
-            host_arch: x86_64
-            rust_host: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     steps:
@@ -491,7 +505,7 @@ jobs:
             --signing-mode adhoc
 
   test-macos:
-    needs: [contract, changes, test-macos-core, test-macos-runner-real-process, test-macos-desktop]
+    needs: [contract, changes, test-macos-core, test-macos-desktop]
     # Stable aggregate context: every configured macOS sublane must either succeed
     # when required by policy or be intentionally skipped when not required.
     if: always()
@@ -503,14 +517,12 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           NEEDS_CORE: ${{ needs.changes.outputs.needs_macos }}
-          NEEDS_REAL_PROCESS: ${{ needs.changes.outputs.needs_runner_real_process }}
           NEEDS_DESKTOP: ${{ needs.changes.outputs.needs_macos_desktop }}
           CORE_RESULT: ${{ needs.test-macos-core.result }}
-          REAL_PROCESS_RESULT: ${{ needs.test-macos-runner-real-process.result }}
           DESKTOP_RESULT: ${{ needs.test-macos-desktop.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT core=$CORE_RESULT real_process=$REAL_PROCESS_RESULT desktop=$DESKTOP_RESULT needs_core=$NEEDS_CORE needs_real_process=$NEEDS_REAL_PROCESS needs_desktop=$NEEDS_DESKTOP"
+          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT core=$CORE_RESULT desktop=$DESKTOP_RESULT needs_core=$NEEDS_CORE needs_desktop=$NEEDS_DESKTOP"
           if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ]; then
             echo "CI policy or contract classification did not succeed" >&2
             exit 1
@@ -527,14 +539,12 @@ jobs:
             fi
           }
           require_lane core "$NEEDS_CORE" "$CORE_RESULT"
-          require_lane real-process "$NEEDS_REAL_PROCESS" "$REAL_PROCESS_RESULT"
           require_lane desktop "$NEEDS_DESKTOP" "$DESKTOP_RESULT"
 
-  # Windows Runner process-tree ownership now has its own explicitly selected
-  # real-process job below. Keep the remaining Runner/Computer suite at two libtest
-  # threads for now because SSH/Plugin/LSP and other subprocess fixtures still share
-  # this default lane; raise concurrency only after those costs are measured/separated.
-  # Core/library, Runner real-process, and packaging coverage run independently.
+  # Keep the Runner/Computer suite at two libtest threads for now because a few
+  # ordinary subprocess fixtures still share this default lane. Timing-sensitive
+  # lifecycle/process-tree fixtures are ignored and run only by explicit local commands.
+  # Core/library, Runner, and packaging coverage run independently.
   test-windows-core:
     needs: changes
     if: needs.changes.outputs.needs_windows_core == 'true'
@@ -570,23 +580,11 @@ jobs:
         with:
           shared-key: windows-runner-ci
       - name: Run Windows Runner and Computer tests
-        # Keep process contention bounded without forcing all 700+ Runner tests
-        # through one test thread. Concurrency exercised inside each test is unchanged.
-        run: cargo test --locked -p webcodex-runner -p webcodex-computer -- --test-threads=2
-
-  test-windows-runner-real-process:
-    needs: changes
-    if: needs.changes.outputs.needs_runner_real_process == 'true'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-runner-real-process-ci
-      - name: Run Runner real-process lifecycle tests
-        run: cargo test --locked -p webcodex-runner runner_real_process -- --ignored --test-threads=2
+        # The Runner suite mixes timing-sensitive process, PowerShell, and cache tests.
+        # Even two concurrent test functions can starve bounded startup/timeout windows
+        # on loaded Windows hosts. Serialize test functions; concurrency exercised
+        # inside each individual test remains unchanged.
+        run: cargo test --locked -p webcodex-runner -p webcodex-computer -- --test-threads=1
 
   test-windows-package:
     needs: changes
@@ -708,32 +706,11 @@ jobs:
             -Installer $env:DESKTOP_CI_INSTALLER `
             -Version "${{ steps.runtime.outputs.version }}" `
             -SourceSha "${{ steps.runtime.outputs.source }}" `
-            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}")
-
-  # Keep native ARM64 compile coverage path-aware as well; full-native overrides
-  # and explicit aarch64 cfg/target changes still require it before merge.
-  test-windows-arm64:
-    needs: changes
-    if: needs.changes.outputs.needs_windows_arm64 == 'true'
-    runs-on: windows-11-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-arm64-ci
-      - name: Verify native Windows ARM64 production targets compile
-        shell: pwsh
-        run: |
-          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw "Expected native Windows ARM64 host" }
-          $hostLine = rustc -vV | Select-String '^host: '
-          if ($hostLine.Line -ne 'host: aarch64-pc-windows-msvc') { throw "Unexpected Rust host: $($hostLine.Line)" }
-          cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner
-          if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
+            -Platform win32-x64
 
   test-windows:
-    needs: [contract, changes, test-windows-core, test-windows-runner, test-windows-runner-real-process, test-windows-package, test-windows-desktop, test-windows-arm64]
+    needs: [contract, changes, test-windows-core, test-windows-runner, test-windows-package, test-windows-desktop]
     # Preserve the stable Windows aggregate while allowing each heavy lane to be
     # selected independently by the deterministic path-risk classifier.
     if: always()
@@ -746,19 +723,15 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           NEEDS_CORE: ${{ needs.changes.outputs.needs_windows_core }}
           NEEDS_RUNNER: ${{ needs.changes.outputs.needs_windows_runner }}
-          NEEDS_REAL_PROCESS: ${{ needs.changes.outputs.needs_runner_real_process }}
           NEEDS_PACKAGE: ${{ needs.changes.outputs.needs_windows_package }}
           NEEDS_DESKTOP: ${{ needs.changes.outputs.needs_windows_desktop }}
-          NEEDS_ARM64: ${{ needs.changes.outputs.needs_windows_arm64 }}
           CORE_RESULT: ${{ needs.test-windows-core.result }}
           RUNNER_RESULT: ${{ needs.test-windows-runner.result }}
-          REAL_PROCESS_RESULT: ${{ needs.test-windows-runner-real-process.result }}
           PACKAGE_RESULT: ${{ needs.test-windows-package.result }}
           DESKTOP_RESULT: ${{ needs.test-windows-desktop.result }}
-          ARM64_RESULT: ${{ needs.test-windows-arm64.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT core=$CORE_RESULT runner=$RUNNER_RESULT real_process=$REAL_PROCESS_RESULT package=$PACKAGE_RESULT desktop=$DESKTOP_RESULT arm64=$ARM64_RESULT"
+          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT core=$CORE_RESULT runner=$RUNNER_RESULT package=$PACKAGE_RESULT desktop=$DESKTOP_RESULT"
           if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ]; then
             echo "CI policy or contract classification did not succeed" >&2
             exit 1
@@ -776,15 +749,13 @@ jobs:
           }
           require_lane core "$NEEDS_CORE" "$CORE_RESULT"
           require_lane runner "$NEEDS_RUNNER" "$RUNNER_RESULT"
-          require_lane real-process "$NEEDS_REAL_PROCESS" "$REAL_PROCESS_RESULT"
           require_lane package "$NEEDS_PACKAGE" "$PACKAGE_RESULT"
           require_lane desktop "$NEEDS_DESKTOP" "$DESKTOP_RESULT"
-          require_lane arm64 "$NEEDS_ARM64" "$ARM64_RESULT"
 
   test-native:
-    needs: [contract, changes, test-linux-arm64, test-macos, test-windows]
-    # Stable branch-protection context: platform aggregates always resolve, while
-    # Linux arm64 must match the classifier's required-or-skipped decision.
+    needs: [contract, changes, test-docker-server, test-macos, test-windows]
+    # Stable branch-protection context: daily native aggregates and the path-aware
+    # Server image smoke must resolve according to classifier policy.
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -793,13 +764,13 @@ jobs:
         env:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
-          NEEDS_LINUX_ARM64: ${{ needs.changes.outputs.needs_linux_arm64 }}
-          LINUX_ARM64_RESULT: ${{ needs.test-linux-arm64.result }}
+          NEEDS_DOCKER: ${{ needs.changes.outputs.needs_docker }}
+          DOCKER_RESULT: ${{ needs.test-docker-server.result }}
           MACOS_RESULT: ${{ needs.test-macos.result }}
           WINDOWS_RESULT: ${{ needs.test-windows.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT linux_arm64=$LINUX_ARM64_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_linux_arm64=$NEEDS_LINUX_ARM64"
+          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT docker=$DOCKER_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_docker=$NEEDS_DOCKER"
           if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ]; then
             echo "CI policy or contract classification did not succeed" >&2
             exit 1
@@ -808,9 +779,9 @@ jobs:
             echo "native platform aggregate failed" >&2
             exit 1
           fi
-          expected_linux_arm64=skipped
-          if [ "$NEEDS_LINUX_ARM64" = true ]; then expected_linux_arm64=success; fi
-          if [ "$LINUX_ARM64_RESULT" != "$expected_linux_arm64" ]; then
-            echo "Linux arm64 lane expected $expected_linux_arm64, got $LINUX_ARM64_RESULT" >&2
+          expected_docker=skipped
+          if [ "$NEEDS_DOCKER" = true ]; then expected_docker=success; fi
+          if [ "$DOCKER_RESULT" != "$expected_docker" ]; then
+            echo "Server image lane expected $expected_docker, got $DOCKER_RESULT" >&2
             exit 1
           fi

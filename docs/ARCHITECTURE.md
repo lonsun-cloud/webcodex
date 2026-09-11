@@ -92,14 +92,22 @@ The Runner is the trust boundary closest to the repository:
 
 - Projects execute only inside registered project roots and the configured
   `allowed_roots` policy.
-- Shell and Job tools are bounded escape hatches, not the default coding loop.
-  Structured read, edit, and validation tools are preferred.
+- Shell and Job tools are bounded execution primitives, not replacements for
+  structured tools. Prefer structured read, edit, validation, and native argv
+  operations when they fit; use `run_shell` for real shell semantics or short,
+  tightly related command chains.
 - Shell profiles prepare a one-time environment snapshot per project/profile;
   `~/.bashrc` / `~/.profile` are not sourced by default.
 - The Runner connects out to the Server over QUIC, WebSocket, or polling, and
   reconnects automatically. A disconnect is a liveness fact, not a lost-work
   fact: active Jobs enter a bounded `recovering` state and are restored from
   the Runner's inventory when the same instance reconnects.
+
+Runner Job wire lifecycle vocabulary is interpreted once by the canonical typed
+contract in `webcodex-core`; the Runner, Registry, Store, Connector runtime, and
+Workflow Session then project that lifecycle into their own domain states. Server
+recovery remains an orthogonal Registry overlay, so `recovering` is an observed
+recovery state rather than a Runner wire lifecycle value.
 
 ## Security boundary
 
@@ -129,6 +137,8 @@ The Server persists managed accounts, OAuth state, project/task history, and dur
 
 Runner Jobs are reconciled when the same live Runner process reconnects. Ordinary child processes cannot be adopted by an unrelated replacement Runner; specialized detached execution has its own explicit durable ownership path. The stable Runner `client_id` and the current process lease are separate, but the exact lease field is an internal wire detail.
 
+Durable Store aggregates use closed typed Rust lifecycle/state contracts for business authority. SQLite `TEXT` values and `CHECK` constraints remain the persistence encoding, not a second semantic registry. In particular, a Connector Task's persisted lifecycle is distinct from its derived/effective state: cancellation, result decision, and Run interruption are projected from typed durable facts before the existing public strings are serialized. Connector Execution, result/approval, and durable communication lifecycles likewise decode fail-closed from their unchanged SQLite vocabularies.
+
 ## Module map
 
 ```text
@@ -139,6 +149,10 @@ MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runne
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
+- `route_metadata` — canonical HTTP route identity, security/surface metadata,
+  and OpenAPI exposure. Public Action operation policy is bound directly to its
+  route; Connector routes bind canonical capability identities. Handler mounting
+  stays explicit in the HTTP modules.
 - `runtime_http` — REST runtime routes.
 - `mcp` — the MCP adapter and surface selection.
 - `openapi` — the GPT Actions schema.
@@ -151,6 +165,75 @@ Runtime Console -----------------------> canonical Server HTTP/kernel paths abov
 - `webcodex-runner` crates — the Runner binary: config, transport, project
   registry, file/patch/artifact handling, shell execution, and LSP
   navigation.
+
+### Heterogeneous gateway governance
+
+The Kernel routes action-dependent gateways through
+`tool_runtime::specialized::try_dispatch_specialized_gateway` before the generic
+static ToolDefinition Session/permission lifecycle. This closed boundary
+classifies supported gateway names, uses the canonical typed `ToolCall` parser,
+and maps parse failures and shared governance denials to Kernel outcomes once.
+Ordinary tools fall through without specialized parsing or execution.
+
+`plugin_gateway` and `ssh_resource_gateway` own their action vocabulary, exact
+`SpecializedOperationPolicy`, execution protocols, uncertainty/recovery, and
+result conversion. They call the shared `govern_specialized_invocation` and
+`finish_specialized_invocation` lifecycle; the dispatcher does not repeat it.
+Static definitions retain their worst-case discovery policy. Trusted recording
+Session provenance is supported, while generic invocation continuity metadata
+receives no specialized semantics. Adding another heterogeneous gateway extends
+this closed dispatch boundary without adding a concrete Kernel policy branch.
+
+### Tool audit and privacy policy
+
+`ToolDefinition` is the canonical declaration point for Tool Audit privacy
+policy. Request audit first resolves the canonical definition, then parses the
+request through the typed `ToolCall` boundary and consumes its exhaustive
+bounded projection. Unknown tools, retired names without an explicit
+compatibility sanitizer, and requests that cannot be projected fail closed to
+an empty audit object; raw business arguments are never the fallback.
+
+Result audit follows the same definition-owned policy. Most privacy-sensitive
+results declare bounded field selectors directly in their ToolDefinition;
+projections that require derived semantics use a small semantic policy rather
+than a second tool-name registry. Ordinary tools that intentionally retain their
+established canonical audit evidence do so through an explicit policy, not an
+unknown-tool fallback. Missing/unknown policy therefore cannot widen persisted
+ActionAudit or Workflow Session evidence.
+
+Workflow Session's final persistence fence consumes the same definition-owned
+policy for its historical input redaction, bounded context-result projection,
+and execution excerpt eligibility. The typed `ToolCall` request projector remains
+the authoritative request sanitizer; Session does not duplicate that field
+registry. Context projections reuse declared bounded result fields where their
+shapes are identical, with semantic exceptions only where the persisted Session
+contract genuinely differs (for example Git working-tree status). Unknown
+runtime identities fail closed during final Session projection and restore.
+
+The audit projector is observational only. Its output is consumed by ActionAudit
+and bounded Workflow Session ledger extraction, but audit policy never feeds
+ToolCall parsing for execution, OAuth/scope checks, permission decisions,
+Runner authority, retry identity, or protocol/model-facing results. Adding a
+runtime ToolDefinition requires an audit policy at construction time, and the
+registry invariant tests reject incomplete declarations.
+
+### Workflow Session evidence policy
+
+`ToolDefinition` owns static Workflow Session/evidence semantics through a closed,
+structured policy: exploration class, trusted result-side changed-path fields,
+persistent-shell evidence action, review/diff classification, Session lifecycle
+effect, proven-no-state-change failure classification, and structured validation
+identity kind. Workflow Session consumes those
+semantic declarations but retains the typed, bounded projectors that decode tool
+results, normalize paths, enforce privacy limits, and persist durable evidence.
+Dynamic request conditions such as `show_changes(include_diff=true)` remain in the
+projector rather than becoming declaration-time request parsing.
+
+`ToolCall` remains the exhaustive typed authority for business requests and audit
+request sanitization. Validation target canonicalization and hashing remain in
+`webcodex-core`; ToolDefinition declares only the closed identity kind, so policy
+ownership does not move runtime decoders, Store types, callbacks, or request schema
+parsing into the contracts crate.
 
 ### Cargo workspace ownership layers
 

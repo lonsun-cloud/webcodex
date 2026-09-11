@@ -40,6 +40,7 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
     // environment; Windows removal must be case-insensitive like the OS.
     for spelling in [
         "WEBCODEX_TOKEN",
+        "WebCodex_Pat",
         "WebCodex_User_Token",
         "Authorization",
         "webcodex_agent_token",
@@ -61,7 +62,12 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
     // A configured shell env must not be able to re-insert a secret after the
     // inherited environment was scrubbed. Exercise canonical and mixed-case
     // spellings because Windows environment names are case-insensitive.
-    for spelling in ["WEBCODEX_TOKEN", "WebCodex_User_Token", "authorization"] {
+    for spelling in [
+        "WEBCODEX_TOKEN",
+        "webcodex_pat",
+        "WebCodex_User_Token",
+        "authorization",
+    ] {
         let shell = ShellConfig {
             env: HashMap::from([(spelling.to_string(), "configured-secret".to_string())]),
             ..ShellConfig::default()
@@ -81,6 +87,13 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
             Some("absent"),
             "configured sensitive env leaked: {result:?}"
         );
+    }
+}
+
+fn decoded_job_operation(request: RunnerRequest) -> RunnerJobOperation {
+    match request.decode_operation().expect("valid typed Job fixture") {
+        RunnerOperation::Job(operation) => operation,
+        _ => panic!("expected Job operation"),
     }
 }
 
@@ -110,23 +123,35 @@ fn raw_shell_job_lifecycle_distinguishes_terminal_truth_without_error_text_match
 
 #[test]
 fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let operation = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
     assert_eq!(
-        job_prestart_lifecycle_for_kind("start_job"),
+        job_prestart_lifecycle(&operation),
         Some(ShellCommandExecutionState::NotStarted)
     );
-    assert_eq!(job_prestart_lifecycle_for_kind("run_shell"), None);
 }
 
 #[test]
 fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
     assert_eq!(
-        post_spawn_interruption_lifecycle_for_kind("start_job"),
+        post_spawn_interruption_lifecycle(&shell),
         Some(ShellCommandExecutionState::OutcomeUnknown)
     );
-    assert_eq!(
-        post_spawn_interruption_lifecycle_for_kind("start_validation_job"),
-        None
-    );
+
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string(), "--all-targets".to_string()],
+        env: Vec::new(),
+    };
+    let mut validation = shell_job_request(temp.path(), "");
+    validation.kind = "start_validation_job".to_string();
+    validation.command = serde_json::to_string(&[step]).unwrap();
+    validation.job_context.as_mut().unwrap().validation_steps = vec!["check".to_string()];
+    let validation = decoded_job_operation(validation);
+    assert_eq!(post_spawn_interruption_lifecycle(&validation), None);
 }
 
 #[test]

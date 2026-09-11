@@ -50,15 +50,15 @@ pub use super::tool_catalog::{
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_policy::is_known_tool_name;
 pub use super::tool_policy::{
-    adaptive_runtime_direct_tool_definitions, is_adaptive_runtime_direct_tool,
-    is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
-    model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
+    adaptive_runtime_direct_tool_definitions, exploration_tool_names,
+    is_adaptive_runtime_direct_tool, is_model_visible_tool_name, lookup_tool_definition,
+    model_visible_tool_definitions, model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
     runtime_tool_advances_context_checkpoint, runtime_tool_approval_policy,
-    runtime_tool_captures_validation_output, runtime_tool_category, runtime_tool_disabled_message,
-    runtime_tool_effect_annotations, runtime_tool_extra_accepted_flattened_args,
-    runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
-    runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
-    runtime_tool_permission_risk, runtime_tool_requires_permission, runtime_tool_runner_capability,
+    runtime_tool_captures_validation_output, runtime_tool_category,
+    runtime_tool_effect_annotations, runtime_tool_is_change_summary_like, runtime_tool_is_git_like,
+    runtime_tool_is_read_like, runtime_tool_is_shell_like, runtime_tool_is_write_like,
+    runtime_tool_metadata, runtime_tool_permission_risk, runtime_tool_requires_permission,
+    runtime_tool_runner_capability, runtime_tool_session_evidence_policy,
     runtime_tool_session_risk_class,
 };
 #[cfg(any(test, feature = "root-test-support"))]
@@ -286,15 +286,424 @@ impl ToolModelSurfaceDeclaration {
     };
 }
 
+/// Declarative privacy contract for the bounded Tool Audit / Session-ledger
+/// projection. Tool identity lives in `ToolDefinition`; audit code consumes
+/// this policy and must never infer a missing policy from the raw tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolAuditPolicy {
+    pub request: ToolAuditRequestPolicy,
+    pub result: ToolAuditResultPolicy,
+    /// Final Workflow Session input projection. Runtime request auditing remains
+    /// the authoritative typed boundary; this is defense-in-depth for direct
+    /// SessionStore callers and persisted restore sanitization.
+    pub session_input: ToolAuditSessionInputPolicy,
+    /// Bounded result facts allowed to contribute to durable Session context.
+    pub context: ToolAuditContextPolicy,
+    /// Bounded execution stdout/stderr evidence eligibility and shape.
+    pub execution: ToolAuditExecutionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditSessionInputPolicy {
+    /// Apply only the generic bounded/redacted Session value projection. This is
+    /// safe for an already-audited typed request and preserves historical shapes.
+    Bounded,
+    /// Remove explicit top-level fields if an internal caller bypasses the typed
+    /// ToolCall audit boundary.
+    OmitTopLevel(&'static [&'static str]),
+    /// Remove nested search patterns while retaining bounded query metadata.
+    SearchProjectTexts,
+    /// Remove opaque Job observation tokens from nested items.
+    ObserveJobs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditContextPolicy {
+    Omit,
+    /// Reuse this ToolDefinition's already-declared bounded result projection.
+    /// This is valid only for a non-canonical result policy.
+    ResultProjection,
+    Fields(&'static [ToolAuditResultField]),
+    /// Preserve the historical bounded porcelain-derived working-tree summary.
+    WorkingTreeStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditExecutionDetail {
+    Omit,
+    Text,
+    TestCounts,
+    TestAssertions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditExecutionShell {
+    /// Use the bounded shell/executor metadata already present in the result.
+    Output,
+    /// Structured argv execution has no shell; record the established marker.
+    DirectArgv,
+    /// Structured script execution uses the bounded language as shell identity.
+    ScriptLanguage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolAuditExecutionPolicy {
+    pub detail: ToolAuditExecutionDetail,
+    pub shell: ToolAuditExecutionShell,
+}
+
+impl ToolAuditExecutionPolicy {
+    pub const OMIT: Self = Self {
+        detail: ToolAuditExecutionDetail::Omit,
+        shell: ToolAuditExecutionShell::Output,
+    };
+    pub const TEXT: Self = Self {
+        detail: ToolAuditExecutionDetail::Text,
+        shell: ToolAuditExecutionShell::Output,
+    };
+    pub const TEST_COUNTS: Self = Self {
+        detail: ToolAuditExecutionDetail::TestCounts,
+        shell: ToolAuditExecutionShell::Output,
+    };
+    pub const TEST_ASSERTIONS: Self = Self {
+        detail: ToolAuditExecutionDetail::TestAssertions,
+        shell: ToolAuditExecutionShell::Output,
+    };
+    pub const DIRECT_ARGV_TEST_COUNTS: Self = Self {
+        detail: ToolAuditExecutionDetail::TestCounts,
+        shell: ToolAuditExecutionShell::DirectArgv,
+    };
+    pub const SCRIPT_TEST_COUNTS: Self = Self {
+        detail: ToolAuditExecutionDetail::TestCounts,
+        shell: ToolAuditExecutionShell::ScriptLanguage,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditRequestPolicy {
+    /// Parse the concrete request into the canonical typed `ToolCall` and use
+    /// its bounded audit projection. Parse/projection failure is fail-closed.
+    Typed,
+    /// Use the same typed projection, then omit null-valued audit fields. This
+    /// preserves legacy validity-bit + optional-normalized-value contracts
+    /// without teaching the projector which tool emitted those fields.
+    TypedDropNullValues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditResultPolicy {
+    /// Preserve the established canonical result as audit evidence for tools
+    /// whose result contract is intentionally audit-safe. This is an explicit
+    /// declaration, never the fallback for an unknown or missing policy.
+    CanonicalLedgerEvidence,
+    /// Project only the declared bounded fields. Missing inputs become null so
+    /// the persisted shape stays stable without admitting undeclared content.
+    Fields(&'static [ToolAuditResultField]),
+    /// A genuinely semantic projection that cannot be expressed as independent
+    /// field selectors.
+    Semantic(ToolAuditSemanticResultPolicy),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditResultField {
+    Value {
+        output: &'static str,
+        source: &'static str,
+    },
+    Pointer {
+        output: &'static str,
+        pointer: &'static str,
+    },
+    ArrayLen {
+        output: &'static str,
+        source: &'static str,
+    },
+    PointerArrayLen {
+        output: &'static str,
+        pointer: &'static str,
+    },
+    StringBytes {
+        output: &'static str,
+        source: &'static str,
+    },
+    Presence {
+        output: &'static str,
+        source: &'static str,
+    },
+    StringPresent {
+        output: &'static str,
+        source: &'static str,
+    },
+    PointerNonNull {
+        output: &'static str,
+        pointer: &'static str,
+    },
+}
+
+impl ToolAuditResultField {
+    pub const fn value(key: &'static str) -> Self {
+        Self::Value {
+            output: key,
+            source: key,
+        }
+    }
+
+    pub const fn renamed_value(output: &'static str, source: &'static str) -> Self {
+        Self::Value { output, source }
+    }
+
+    pub const fn pointer(output: &'static str, pointer: &'static str) -> Self {
+        Self::Pointer { output, pointer }
+    }
+
+    pub const fn array_len(output: &'static str, source: &'static str) -> Self {
+        Self::ArrayLen { output, source }
+    }
+
+    pub const fn pointer_array_len(output: &'static str, pointer: &'static str) -> Self {
+        Self::PointerArrayLen { output, pointer }
+    }
+
+    pub const fn string_bytes(output: &'static str, source: &'static str) -> Self {
+        Self::StringBytes { output, source }
+    }
+
+    pub const fn presence(output: &'static str, source: &'static str) -> Self {
+        Self::Presence { output, source }
+    }
+
+    pub const fn string_present(output: &'static str, source: &'static str) -> Self {
+        Self::StringPresent { output, source }
+    }
+
+    pub const fn pointer_non_null(output: &'static str, pointer: &'static str) -> Self {
+        Self::PointerNonNull { output, pointer }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuditSemanticResultPolicy {
+    /// Summarize coding-agent event kinds and body byte counts without retaining
+    /// any event body or provider message content.
+    CodingAgentObservation,
+}
+
+impl ToolAuditPolicy {
+    /// Existing audit-safe behavior for tools without a narrower result
+    /// projection. Every ToolDefinition must opt in explicitly through `def(...)`;
+    /// there is intentionally no implicit/missing-policy default.
+    pub const TYPED_CANONICAL: Self = Self {
+        request: ToolAuditRequestPolicy::Typed,
+        result: ToolAuditResultPolicy::CanonicalLedgerEvidence,
+        session_input: ToolAuditSessionInputPolicy::Bounded,
+        context: ToolAuditContextPolicy::Omit,
+        execution: ToolAuditExecutionPolicy::OMIT,
+    };
+
+    pub const fn typed_fields(fields: &'static [ToolAuditResultField]) -> Self {
+        Self {
+            request: ToolAuditRequestPolicy::Typed,
+            result: ToolAuditResultPolicy::Fields(fields),
+            session_input: ToolAuditSessionInputPolicy::Bounded,
+            context: ToolAuditContextPolicy::Omit,
+            execution: ToolAuditExecutionPolicy::OMIT,
+        }
+    }
+
+    pub const fn drop_null_request_values(mut self) -> Self {
+        self.request = ToolAuditRequestPolicy::TypedDropNullValues;
+        self
+    }
+
+    pub const fn typed_semantic(result: ToolAuditSemanticResultPolicy) -> Self {
+        Self {
+            request: ToolAuditRequestPolicy::Typed,
+            result: ToolAuditResultPolicy::Semantic(result),
+            session_input: ToolAuditSessionInputPolicy::Bounded,
+            context: ToolAuditContextPolicy::Omit,
+            execution: ToolAuditExecutionPolicy::OMIT,
+        }
+    }
+
+    pub const fn session_input(mut self, policy: ToolAuditSessionInputPolicy) -> Self {
+        self.session_input = policy;
+        self
+    }
+
+    pub const fn context(mut self, policy: ToolAuditContextPolicy) -> Self {
+        self.context = policy;
+        self
+    }
+
+    pub const fn context_from_result(self) -> Self {
+        self.context(ToolAuditContextPolicy::ResultProjection)
+    }
+
+    pub const fn execution(mut self, policy: ToolAuditExecutionPolicy) -> Self {
+        self.execution = policy;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolNavigationEvidenceKind {
+    DocumentSymbols,
+    DocumentDiagnostics,
+    Hover,
+    WorkspaceSymbols,
+    Locations,
+    CallHierarchy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExplorationEvidence {
+    None,
+    Read,
+    ReadBatch,
+    Search,
+    SearchBatch,
+    Navigation(ToolNavigationEvidenceKind),
+}
+
+impl ToolExplorationEvidence {
+    pub const fn is_exploration(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChangedPathEvidence {
+    None,
+    ResultField(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentShellEvidenceAction {
+    Open,
+    Exec,
+    Status,
+    Close,
+}
+
+impl PersistentShellEvidenceAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Exec => "exec",
+            Self::Status => "status",
+            Self::Close => "close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDiffReviewEvidence {
+    None,
+    Always,
+    ArgumentBool(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolReviewEvidence {
+    None,
+    ReadOnlyInspection,
+    Search,
+    DiffReview,
+    WorkspaceReview,
+    HygieneReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFailureEvidence {
+    Default,
+    ProvenNoStateChangeNonActionable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSessionLifecycleEffect {
+    None,
+    Mutation,
+    IdempotentClose,
+}
+
+pub use webcodex_core::validation_identity::ToolValidationIdentityKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolSessionEvidencePolicy {
+    pub exploration: ToolExplorationEvidence,
+    pub changed_paths: ToolChangedPathEvidence,
+    pub persistent_shell: Option<PersistentShellEvidenceAction>,
+    pub diff_review: ToolDiffReviewEvidence,
+    pub review: ToolReviewEvidence,
+    pub failure: ToolFailureEvidence,
+    pub lifecycle: ToolSessionLifecycleEffect,
+    pub validation_identity: ToolValidationIdentityKind,
+}
+
+impl ToolSessionEvidencePolicy {
+    pub const NONE: Self = Self {
+        exploration: ToolExplorationEvidence::None,
+        changed_paths: ToolChangedPathEvidence::None,
+        persistent_shell: None,
+        diff_review: ToolDiffReviewEvidence::None,
+        review: ToolReviewEvidence::None,
+        failure: ToolFailureEvidence::Default,
+        lifecycle: ToolSessionLifecycleEffect::None,
+        validation_identity: ToolValidationIdentityKind::None,
+    };
+
+    pub const fn exploration(mut self, evidence: ToolExplorationEvidence) -> Self {
+        self.exploration = evidence;
+        self
+    }
+
+    pub const fn changed_paths(mut self, evidence: ToolChangedPathEvidence) -> Self {
+        self.changed_paths = evidence;
+        self
+    }
+
+    pub const fn persistent_shell(mut self, action: PersistentShellEvidenceAction) -> Self {
+        self.persistent_shell = Some(action);
+        self
+    }
+
+    pub const fn diff_review(mut self, evidence: ToolDiffReviewEvidence) -> Self {
+        self.diff_review = evidence;
+        self
+    }
+
+    pub const fn review(mut self, evidence: ToolReviewEvidence) -> Self {
+        self.review = evidence;
+        self
+    }
+
+    pub const fn failure(mut self, evidence: ToolFailureEvidence) -> Self {
+        self.failure = evidence;
+        self
+    }
+
+    pub const fn lifecycle(mut self, effect: ToolSessionLifecycleEffect) -> Self {
+        self.lifecycle = effect;
+        self
+    }
+
+    pub const fn validation_identity(mut self, kind: ToolValidationIdentityKind) -> Self {
+        self.validation_identity = kind;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDefinition {
     pub name: &'static str,
+    pub audit: ToolAuditPolicy,
     pub model_spec: Option<ToolModelSpecDeclaration>,
     pub model_surface: ToolModelSurfaceDeclaration,
     pub visibility: ToolVisibility,
     pub category: &'static str,
     pub metadata: ToolMetadata,
     pub policy: ToolDefinitionPolicy,
+    pub session_evidence: ToolSessionEvidencePolicy,
     /// Runner capability/owner requirement before dispatch reaches a Runner-backed
     /// Project. `None` means the tool is not Runner-dispatched or enforces its
     /// ownership boundary inside a specialized handler.
@@ -371,8 +780,6 @@ pub struct ToolDefinitionPolicy {
     pub context_continuity: ToolContextContinuityPolicy,
     pub change_summary_like: bool,
     pub captures_validation_output: bool,
-    pub disabled_message: Option<&'static str>,
-    pub extra_accepted_flattened_args: &'static [&'static str],
     pub git_like: bool,
     pub permission_risk: Option<&'static str>,
     pub requires_artifact_upload_path_binding: bool,
@@ -385,8 +792,6 @@ impl ToolDefinitionPolicy {
         context_continuity: ToolContextContinuityPolicy::CONSERVATIVE,
         change_summary_like: false,
         captures_validation_output: false,
-        disabled_message: None,
-        extra_accepted_flattened_args: &[],
         git_like: false,
         permission_risk: None,
         requires_artifact_upload_path_binding: false,
@@ -420,6 +825,7 @@ pub struct ToolManifestIntent {
 
 const fn def(
     name: &'static str,
+    audit: ToolAuditPolicy,
     visibility: ToolVisibility,
     category: &'static str,
     runner_capability: Option<RunnerCapabilityRequirement>,
@@ -430,9 +836,11 @@ const fn def(
     path_hint: ToolPathHint,
     destructive: bool,
     shell_like: bool,
+    session_evidence: ToolSessionEvidencePolicy,
 ) -> ToolDefinition {
     ToolDefinition {
         name,
+        audit,
         model_spec: None,
         model_surface: ToolModelSurfaceDeclaration::DEFAULT,
         visibility,
@@ -448,6 +856,7 @@ const fn def(
             shell_like,
         ),
         policy: ToolDefinitionPolicy::DEFAULT,
+        session_evidence,
         runner_capability,
     }
 }
@@ -606,6 +1015,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
 const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_recovery_only(model_spec(
     def(
         "list_tools",
+        ToolAuditPolicy::TYPED_CANONICAL,
         ModelVisible,
         TOOL_CATEGORY_RUNTIME,
         None,
@@ -621,6 +1031,7 @@ const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_recovery_only(model_sp
         NoPath,
         false,
         false,
+        ToolSessionEvidencePolicy::NONE,
     ),
     "List runtime tools. Full output includes schemas and may be large; use summary_only with category, features, or limit for bounded GPT Action discovery.",
     list_tools_input_schema,

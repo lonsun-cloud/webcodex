@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn registry_lifecycle_alias_consumes_core_contract_without_absorbing_recovery() {
+    use crate::state::JobLifecycleState;
+    use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+
+    let runner_queued = JobLifecycleState::from_wire("agent_queued").unwrap();
+    let started = JobLifecycleState::from_wire("started").unwrap();
+    assert_eq!(runner_queued, RunnerJobLifecycle::RunnerQueued);
+    assert!(runner_queued.is_runner_active());
+    assert_eq!(started, RunnerJobLifecycle::StartedLegacy);
+    assert!(started.is_active());
+    assert!(!started.is_runner_active());
+
+    assert!(JobLifecycleState::from_wire("recovering").is_err());
+    assert!(crate::job_status_is_active("recovering"));
+    assert!(JobLifecycleState::from_wire("mystery").is_err());
+    assert!(!crate::job_status_is_active("mystery"));
+}
+
 #[tokio::test]
 async fn terminal_observed_poll_complete_and_log() {
     let registry = RunnerRegistry::default();
@@ -89,8 +108,8 @@ async fn terminal_observed_poll_complete_and_log() {
     {
         let inner = registry.inner.lock().await;
         let record = inner.jobs_by_id.get(&job.job_id).unwrap();
-        assert!(record.terminal_observed_at.is_some());
-        assert_eq!(record.terminal_observed_at, record.ended_at);
+        assert!(record.observation.terminal_observed_at.is_some());
+        assert_eq!(record.observation.terminal_observed_at, record.ended_at);
     }
     assert_eq!(
         done.codex
@@ -193,6 +212,16 @@ async fn job_update_rejects_mismatched_request_id_without_mutating_target_job() 
         "queued"
     );
 
+    let mut invalid = update(request_b.clone());
+    invalid.status = "mystery".to_string();
+    let error = registry.update_job(invalid).await.unwrap_err();
+    assert!(error.contains("job update status 'mystery' is invalid"));
+    assert_eq!(
+        registry.get_job(&job_b.job_id).await.unwrap().status,
+        "queued",
+        "unknown legacy wire status must fail closed without mutating the job"
+    );
+
     let accepted = registry.update_job(update(request_b)).await.unwrap();
     assert_eq!(accepted.status, "running");
 }
@@ -247,8 +276,8 @@ async fn terminal_observed_queued_stop_records_server_time() {
     {
         let inner = registry.inner.lock().await;
         let record = inner.jobs_by_id.get(&job.job_id).unwrap();
-        assert!(record.terminal_observed_at.is_some());
-        assert_eq!(record.terminal_observed_at, record.ended_at);
+        assert!(record.observation.terminal_observed_at.is_some());
+        assert_eq!(record.observation.terminal_observed_at, record.ended_at);
     }
     let polled = registry
         .poll(RunnerPollRequest {
@@ -317,6 +346,11 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
         .await
         .unwrap();
     assert_eq!(stop_requested.status, "stop_requested");
+    let duplicate = registry
+        .stop_job(&job.job_id, "test".to_string())
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status, "stop_requested");
     let stop = registry
         .poll(RunnerPollRequest {
             client_id: "oe".to_string(),
@@ -327,6 +361,17 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
         .unwrap();
     assert_eq!(stop.kind, "stop_job");
     assert_eq!(stop.job_id.as_deref(), Some(job.job_id.as_str()));
+    assert!(
+        registry
+            .poll(RunnerPollRequest {
+                client_id: "oe".to_string(),
+                runner_instance_id: "inst".to_string(),
+            })
+            .await
+            .unwrap()
+            .is_none(),
+        "duplicate stop must not enqueue a second Runner operation"
+    );
 }
 
 #[tokio::test]

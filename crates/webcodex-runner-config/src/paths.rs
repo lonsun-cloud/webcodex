@@ -288,63 +288,107 @@ fn normalized_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// True when `path` is a Windows absolute path rooted on a local disk drive:
-/// `C:\...` or its canonicalized `\\?\C:\...` form. Every other Windows prefix
-/// — `\\server\share` (UNC), `\\?\UNC\server\share` (verbatim UNC),
-/// `\\.\device` (device namespace) and arbitrary `\\?\` verbatim paths — is
-/// `false`.
-///
-/// This is the Windows **path prefix** rule, not a string prefix check:
-/// `std::path` parses the path grammar, so `\\server\share\repo` is
-/// classified by its `Prefix::UNC` component rather than by text matching.
+/// Windows project-path prefix classes used by ingress, canonical policy, and
+/// user-facing adapters. This is grammar-based classification through
+/// `std::path::Prefix`, never a textual prefix check.
 #[cfg(windows)]
-pub fn is_windows_local_disk_path(path: &Path) -> bool {
-    let mut components = path.components();
-    match components.next() {
-        Some(std::path::Component::Prefix(prefix)) => matches!(
-            prefix.kind(),
-            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
-        ),
-        _ => false,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsProjectPathKind {
+    LocalDisk,
+    NetworkShare,
+    UnsupportedNamespace,
+}
+
+/// Classify an explicit Windows path prefix. Paths without a prefix return
+/// `None` so raw relative/no-prefix inputs can continue to canonicalization.
+#[cfg(windows)]
+pub fn windows_project_path_kind(path: &Path) -> Option<WindowsProjectPathKind> {
+    let std::path::Component::Prefix(prefix) = path.components().next()? else {
+        return None;
+    };
+    Some(match prefix.kind() {
+        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_) => {
+            WindowsProjectPathKind::LocalDisk
+        }
+        std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _) => {
+            WindowsProjectPathKind::NetworkShare
+        }
+        std::path::Prefix::DeviceNS(_) | std::path::Prefix::Verbatim(_) => {
+            WindowsProjectPathKind::UnsupportedNamespace
+        }
+    })
 }
 
 #[cfg(windows)]
-fn windows_non_local_project_path_error(path: &Path) -> String {
+pub fn is_windows_local_disk_path(path: &Path) -> bool {
+    windows_project_path_kind(path) == Some(WindowsProjectPathKind::LocalDisk)
+}
+
+#[cfg(windows)]
+pub fn is_windows_network_share_path(path: &Path) -> bool {
+    windows_project_path_kind(path) == Some(WindowsProjectPathKind::NetworkShare)
+}
+
+#[cfg(windows)]
+fn windows_unsupported_project_path_error(path: &Path) -> String {
     format!(
-        "path {} is not on a local disk drive; UNC and other Windows network/device paths are not supported for projects",
+        "path {} uses an unsupported Windows project namespace; device and generic verbatim namespaces are not supported for projects",
         path.to_string_lossy()
     )
 }
 
-/// Validate the raw project path before any canonicalization or filesystem I/O.
+/// Detect an explicit parent component in the raw project path spelling.
 ///
-/// On Windows an explicit local-disk prefix (`Disk` / `VerbatimDisk`) may
-/// proceed, while explicit UNC, verbatim UNC, device namespace, and other
-/// unsupported prefixes fail closed. Paths with no prefix (including relative
-/// paths) proceed to canonicalization, where the canonical path policy requires
-/// a local disk. Non-Windows platforms have no corresponding raw-prefix fence.
-pub fn validate_project_path_ingress(path: &Path) -> Result<(), String> {
+/// Windows verbatim paths need the raw-string fallback because `Path::components`
+/// may normalize `..` before an authority caller can classify the request.
+pub fn project_path_has_parent_traversal(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+
     #[cfg(windows)]
-    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
-        if !matches!(
-            prefix.kind(),
-            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
-        ) {
-            return Err(windows_non_local_project_path_error(path));
-        }
+    {
+        // `Path::components` intentionally treats the Win32 verbatim namespace
+        // specially and can normalize an explicit `..` away before callers see
+        // it. Inspect the raw spelling too so authority is never granted to a
+        // different directory merely because canonicalization collapsed it.
+        return path
+            .to_string_lossy()
+            .split(['\\', '/'])
+            .any(|component| component == "..");
     }
 
     #[cfg(not(windows))]
-    let _ = path;
+    false
+}
+
+/// Validate the raw project path before any canonicalization or filesystem I/O.
+///
+/// Explicit parent traversal is rejected on every platform before it can be
+/// normalized away. On Windows explicit local disks and network shares
+/// (`UNC` / `VerbatimUNC`) may proceed, while device namespaces and generic
+/// verbatim namespaces fail closed. Other relative/no-prefix inputs continue to
+/// canonicalization, where the canonical project policy applies.
+pub fn validate_project_path_ingress(path: &Path) -> Result<(), String> {
+    if project_path_has_parent_traversal(path) {
+        return Err("project path must not contain parent traversal".to_string());
+    }
+
+    #[cfg(windows)]
+    if windows_project_path_kind(path) == Some(WindowsProjectPathKind::UnsupportedNamespace) {
+        return Err(windows_unsupported_project_path_error(path));
+    }
 
     Ok(())
 }
 
 /// System directories that must never become project roots through the broad
 /// `allow_cwd_anywhere` relaxation. An explicit allowed root still authorizes
-/// these paths intentionally. Windows non-local-disk paths are rejected before
-/// this list is considered, so a UNC allowed root cannot bypass that boundary.
+/// these paths intentionally. Windows network shares require explicit allowed-root
+/// authority and never inherit authority from `allow_cwd_anywhere`.
 const DANGEROUS_PROJECT_ROOTS: &[&str] = &[
     "/",
     "/etc",
@@ -406,9 +450,9 @@ pub fn canonicalize_usable_allowed_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// Authoritative pure path-policy check for Runner project registration.
 ///
 /// `canonical_path` and `canonical_allowed_roots` must already be canonicalized
-/// by the caller. Windows non-local-disk paths always fail. Explicit local roots
-/// authorize first; otherwise `allow_cwd_anywhere` relaxes only ordinary paths,
-/// never dangerous system roots or Windows drive roots.
+/// by the caller. Explicit roots authorize local-disk and network-share projects.
+/// `allow_cwd_anywhere` relaxes only ordinary local-disk paths: it never grants
+/// authority to a Windows network share, dangerous system root, or drive root.
 pub fn validate_project_path_policy(
     canonical_path: &Path,
     canonical_allowed_roots: &[PathBuf],
@@ -417,15 +461,27 @@ pub fn validate_project_path_policy(
     let path_str = canonical_path.to_string_lossy();
 
     #[cfg(windows)]
-    if !is_windows_local_disk_path(canonical_path) {
-        return Err(windows_non_local_project_path_error(canonical_path));
-    }
+    let windows_kind = match windows_project_path_kind(canonical_path) {
+        Some(WindowsProjectPathKind::LocalDisk) => WindowsProjectPathKind::LocalDisk,
+        Some(WindowsProjectPathKind::NetworkShare) => WindowsProjectPathKind::NetworkShare,
+        Some(WindowsProjectPathKind::UnsupportedNamespace) | None => {
+            return Err(windows_unsupported_project_path_error(canonical_path));
+        }
+    };
 
     if canonical_allowed_roots
         .iter()
         .any(|root| path_is_within(canonical_path, root))
     {
         return Ok(());
+    }
+
+    #[cfg(windows)]
+    if windows_kind == WindowsProjectPathKind::NetworkShare {
+        return Err(format!(
+            "path {} is outside allowed_roots; allow_cwd_anywhere does not authorize Windows network shares",
+            path_str
+        ));
     }
 
     if !allow_cwd_anywhere {
@@ -868,41 +924,64 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_local_disk_prefix_classification_is_strict_for_canonical_paths() {
-        for accepted in [
+    fn windows_project_prefix_classification_distinguishes_disk_network_and_namespace() {
+        for local in [
             r"C:\repo",
             r"c:\repo",
             r"\\?\C:\repo",
             r"C:\Users\alice\proj\",
         ] {
-            assert!(
-                is_windows_local_disk_path(Path::new(accepted)),
-                "{accepted} must be accepted as a local disk path"
+            assert_eq!(
+                windows_project_path_kind(Path::new(local)),
+                Some(WindowsProjectPathKind::LocalDisk),
+                "{local} must be classified as a local disk"
+            );
+            assert!(is_windows_local_disk_path(Path::new(local)));
+        }
+
+        for network in [r"\\server\share\repo", r"\\?\UNC\server\share\repo"] {
+            assert_eq!(
+                windows_project_path_kind(Path::new(network)),
+                Some(WindowsProjectPathKind::NetworkShare),
+                "{network} must be classified as a network share"
+            );
+            assert!(is_windows_network_share_path(Path::new(network)));
+        }
+
+        for unsupported in [
+            r"\\.\device\repo",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+        ] {
+            assert_eq!(
+                windows_project_path_kind(Path::new(unsupported)),
+                Some(WindowsProjectPathKind::UnsupportedNamespace),
+                "{unsupported} must fail closed as an unsupported namespace"
             );
         }
 
-        for non_local_or_uncanonical in [
-            r"\\server\share\repo",
-            r"\\?\UNC\server\share\repo",
-            r"\\.\device\repo",
-            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
-            r"\repo",
-            r"repo",
-            ".",
-        ] {
-            assert!(
-                !is_windows_local_disk_path(Path::new(non_local_or_uncanonical)),
-                "{non_local_or_uncanonical} must not satisfy the strict canonical local-disk predicate"
-            );
+        for unprefixed in [r"\repo", r"repo", "."] {
+            assert_eq!(windows_project_path_kind(Path::new(unprefixed)), None);
         }
+    }
+
+    #[test]
+    fn raw_project_ingress_rejects_parent_traversal_before_canonicalization() {
+        for rejected in ["repo/../other", "../repo"] {
+            let error = validate_project_path_ingress(Path::new(rejected)).unwrap_err();
+            assert!(error.contains("parent traversal"), "{rejected}: {error}");
+        }
+        validate_project_path_ingress(Path::new("repo/.../child"))
+            .expect("three dots are an ordinary path component");
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_raw_project_ingress_rejects_only_explicit_non_local_prefixes() {
+    fn windows_raw_project_ingress_allows_disk_and_network_share_prefixes() {
         for allowed in [
             r"C:\repo",
             r"\\?\C:\repo",
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo",
             ".",
             r"repo",
             r"some\repo",
@@ -914,13 +993,31 @@ mod tests {
         }
 
         for rejected in [
-            r"\\server\share\repo",
-            r"\\?\UNC\server\share\repo",
             r"\\.\device\repo",
             r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
         ] {
             let error = validate_project_path_ingress(Path::new(rejected)).unwrap_err();
-            assert!(error.contains("not on a local disk drive"), "{error}");
+            assert!(
+                error.contains("unsupported Windows project namespace"),
+                "{error}"
+            );
+        }
+
+        for rejected in [
+            r"C:\repo\..\other",
+            r"\\?\C:\repo\..\other",
+            r"\\server\share\repo\..\other",
+            r"\\?\UNC\server\share\repo\..\other",
+            r"repo\..\other",
+            "repo/../other",
+        ] {
+            let error = validate_project_path_ingress(Path::new(rejected)).unwrap_err();
+            assert!(error.contains("parent traversal"), "{rejected}: {error}");
+        }
+
+        for allowed in [r"C:\repo\..name", r"repo\...\child"] {
+            validate_project_path_ingress(Path::new(allowed))
+                .unwrap_or_else(|error| panic!("{allowed} is not traversal: {error}"));
         }
     }
 
@@ -939,22 +1036,48 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn project_path_policy_preserves_windows_local_disk_and_drive_root_fences() {
-        for non_local in [
-            r"\\server\share\repo",
-            r"\\?\UNC\server\share\repo",
+    fn project_path_policy_requires_explicit_network_authority_and_keeps_namespace_fences() {
+        let network = Path::new(r"\\?\UNC\SERVER\Share\Repo");
+        validate_project_path_policy(network, &[PathBuf::from(r"\\server\share")], false)
+            .expect("a matching explicit network root must authorize the project");
+        validate_project_path_policy(
+            Path::new(r"\\server\SHARE\Repo\Child"),
+            &[PathBuf::from(r"\\?\UNC\server\share\repo")],
+            false,
+        )
+        .expect("network containment must use Windows case-insensitive identity semantics");
+
+        for allow_cwd_anywhere in [false, true] {
+            let error = validate_project_path_policy(network, &[], allow_cwd_anywhere).unwrap_err();
+            assert!(error.contains("outside allowed_roots"), "{error}");
+            if allow_cwd_anywhere {
+                assert!(
+                    error.contains("does not authorize Windows network shares"),
+                    "{error}"
+                );
+            }
+        }
+
+        for unsupported in [
             r"\\.\device\repo",
             r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
         ] {
             let error = validate_project_path_policy(
-                Path::new(non_local),
-                &[PathBuf::from(non_local)],
+                Path::new(unsupported),
+                &[PathBuf::from(unsupported)],
                 true,
             )
             .unwrap_err();
-            assert!(error.contains("not on a local disk drive"), "{error}");
+            assert!(
+                error.contains("unsupported Windows project namespace"),
+                "{error}"
+            );
         }
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn project_path_policy_preserves_windows_local_disk_and_drive_root_fences() {
         let drive_root = Path::new(r"C:\");
         let error = validate_project_path_policy(drive_root, &[], true).unwrap_err();
         assert!(error.contains("Windows drive root"), "{error}");
@@ -1025,9 +1148,21 @@ mod tests {
                 Path::new(r"c:\users\alice")
             ));
             assert_eq!(
-                normalize_path_identity(Path::new(r"\\server\share\dir")),
-                normalize_path_identity(Path::new(r"\\?\UNC\server\share\dir")),
+                normalize_path_identity(Path::new(r"\\SERVER\Share\Repo\")),
+                normalize_path_identity(Path::new(r"\\?\UNC\server\share\repo")),
             );
+            assert!(paths_equal(
+                Path::new(r"\\SERVER\Share\Repo\"),
+                Path::new(r"\\?\UNC\server\share\repo")
+            ));
+            assert!(path_is_within(
+                Path::new(r"\\?\UNC\SERVER\Share\Repo\Child"),
+                Path::new(r"\\server\share\repo")
+            ));
+            assert!(!path_is_within(
+                Path::new(r"\\server\share2\repo"),
+                Path::new(r"\\server\share")
+            ));
         }
         #[cfg(unix)]
         {

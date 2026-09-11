@@ -24,6 +24,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "create_agent_identity",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("agent_id", "/agent/agent_id"),
+                    super::ToolAuditResultField::pointer("profile_revision", "/agent/profile_revision"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -39,6 +48,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Create a durable Server-owned Agent identity and mutable self-description card. The canonical wc_dagent_* id is independent from windows, Endpoints, Workflow Sessions, Projects, and execution authority. Exact idempotency-key replay returns the original Agent; changed reuse is rejected.",
             create_agent_identity_input_schema,
@@ -49,6 +59,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "list_agent_identities",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("total_count"),
+                    super::ToolAuditResultField::array_len("returned_count", "agents"),
+                    super::ToolAuditResultField::value("offset"),
+                    super::ToolAuditResultField::value("next_offset"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -64,6 +83,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "List bounded durable Agent cards owned by the current communication principal, or read one exact Agent. Handles, names, descriptions, labels, and Endpoint counts are metadata only and never grant Project, filesystem, Runner, or Workflow Session authority.",
             list_agent_identities_input_schema,
@@ -75,6 +95,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
             def(
                 "update_agent_identity",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("agent_id", "/agent/agent_id"),
+                    super::ToolAuditResultField::pointer("profile_revision", "/agent/profile_revision"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -90,6 +119,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Update an owned Agent Card behind expected_profile_revision. Canonical agent_id never changes, and handle/display-name collisions remain allowed. On uncertain outcome, re-read the Agent instead of changing the revision fence blindly.",
             update_agent_identity_input_schema,
@@ -103,6 +133,23 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
             def(
                 "attach_agent_endpoint",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("endpoint_id", "/endpoint/endpoint_id"),
+                    super::ToolAuditResultField::pointer("agent_id", "/endpoint/agent_id"),
+                    super::ToolAuditResultField::pointer_non_null("detached", "/endpoint/detached_at_unix_ms"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context(super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::pointer("endpoint_id", "/endpoint/endpoint_id"),
+                    super::ToolAuditResultField::pointer("agent_id", "/endpoint/agent_id"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -118,6 +165,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Attach a replacement Host/Client Endpoint to an owned durable Agent. The Server assigns a new monotonic controller generation and fences every older attachment. Public attachment is not wake-capable; only callable process-local Host adapter registration may enable continuation. Exact idempotency replay returns the original Endpoint.",
             attach_agent_endpoint_input_schema,
@@ -130,6 +178,19 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "bootstrap_agent_conversation",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("agent_id", "/acting_agent/agent_id"),
+                    super::ToolAuditResultField::pointer("endpoint_id", "/endpoint/endpoint_id"),
+                    super::ToolAuditResultField::pointer("controller_generation", "/endpoint/controller_generation"),
+                    super::ToolAuditResultField::pointer("conversation_id", "/selected_conversation/conversation_id"),
+                    super::ToolAuditResultField::pointer("queued_delivery_count", "/inbox/queued_delivery_count"),
+                    super::ToolAuditResultField::pointer("wake_id", "/wake/wake_id"),
+                    super::ToolAuditResultField::pointer("wake_state", "/wake/state"),
+                    super::ToolAuditResultField::pointer("adapter_kind", "/host_binding/adapter_kind"),
+                    super::ToolAuditResultField::pointer("runtime_wake_capable", "/host_binding/runtime_wake_capable"),
+                    super::ToolAuditResultField::pointer("production_auto_resume_available", "/host_binding/production_auto_resume_available"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -145,6 +206,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Verify an exact Agent/Endpoint generation and return bounded turn context without Message bodies. With an activation idempotency key, accept one pending Wake into this already-active explicit turn and return a replayable consume token; this does not request a new model turn.",
             bootstrap_agent_conversation_input_schema,
@@ -156,6 +218,23 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
             def(
                 "detach_agent_endpoint",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("endpoint_id", "/endpoint/endpoint_id"),
+                    super::ToolAuditResultField::pointer("agent_id", "/endpoint/agent_id"),
+                    super::ToolAuditResultField::pointer_non_null("detached", "/endpoint/detached_at_unix_ms"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context(super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::pointer("endpoint_id", "/endpoint/endpoint_id"),
+                    super::ToolAuditResultField::pointer("agent_id", "/endpoint/agent_id"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -171,6 +250,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Detach a principal-bound Agent Endpoint without deleting the durable Agent, Conversation transcript, or Inbox. Repeating the same detach is a safe desired-state retry; a new Endpoint may later attach the same agent_id.",
             detach_agent_endpoint_input_schema,
@@ -183,6 +263,29 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "create_conversation",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("conversation_id", "/conversation/conversation/conversation_id"),
+                    super::ToolAuditResultField::pointer_array_len("participant_count", "/conversation/participants"),
+                    super::ToolAuditResultField::pointer_array_len("message_count", "/conversation/messages"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context(super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::pointer(
+                        "conversation_id",
+                        "/conversation/conversation/conversation_id",
+                    ),
+                    super::ToolAuditResultField::pointer_array_len(
+                        "participant_count",
+                        "/conversation/participants",
+                    ),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -198,6 +301,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Create a durable Conversation containing the current Human principal and one or more owned Agents. Participation authorizes communication only, never Project, filesystem, Runner, Task, or Workflow Session execution. Exact idempotency-key replay returns the original Conversation.",
             create_conversation_input_schema,
@@ -208,6 +312,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "list_conversations",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("total_count"),
+                    super::ToolAuditResultField::array_len("returned_count", "conversations"),
+                    super::ToolAuditResultField::value("offset"),
+                    super::ToolAuditResultField::value("next_offset"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -223,6 +336,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "List bounded Conversations visible to the current Human principal, or to an Agent proven by an active principal-bound Endpoint. Agent views include queued-delivery counts; listing never consumes Inbox state or invokes a model.",
             list_conversations_input_schema,
@@ -233,6 +347,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "read_conversation",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("conversation_id", "/conversation/conversation_id"),
+                    super::ToolAuditResultField::array_len("participant_count", "participants"),
+                    super::ToolAuditResultField::array_len("message_count", "messages"),
+                    super::ToolAuditResultField::value("after_seq"),
+                    super::ToolAuditResultField::value("next_after_seq"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -248,6 +372,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Read a bounded ordered page from an append-only durable Conversation transcript, with participant and author provenance. Use after_seq for deterministic continuation. Reading does not consume recipient-specific Inbox deliveries or wake a model.",
             read_conversation_input_schema,
@@ -258,6 +383,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "post_conversation_message",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("message_id", "/message/message_id"),
+                    super::ToolAuditResultField::pointer("conversation_id", "/message/conversation_id"),
+                    super::ToolAuditResultField::pointer("seq", "/message/seq"),
+                    super::ToolAuditResultField::pointer_array_len("delivery_count", "/message/deliveries"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -273,6 +408,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Atomically append one Message, recipient Deliveries, and a coalesced Wake. Exact replay cannot duplicate them; Agent authors require the current Endpoint generation. After commit, a registered exact Host adapter may receive one bounded continuation; otherwise the Wake stays pending.",
             post_conversation_message_input_schema,
@@ -283,6 +419,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         model_spec(
             def(
                 "list_agent_inbox",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("agent_id"),
+                    super::ToolAuditResultField::value("total_queued_count"),
+                    super::ToolAuditResultField::array_len("returned_count", "deliveries"),
+                    super::ToolAuditResultField::value("after_delivery_order"),
+                    super::ToolAuditResultField::value("next_after_delivery_order"),
+                    super::ToolAuditResultField::value("truncated"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -298,6 +444,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 false,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "List queued recipient-specific deliveries for an Agent proven by an active principal-bound Endpoint. Use after_delivery_order for bounded continuation. Offline Agents retain deliveries; reading does not consume them or invoke a model.",
             list_agent_inbox_input_schema,
@@ -309,6 +456,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
             def(
                 "consume_agent_deliveries",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("agent_id"),
+                    super::ToolAuditResultField::array_len("consumed_count", "consumed_delivery_ids"),
+                    super::ToolAuditResultField::array_len("already_consumed_count", "already_consumed_delivery_ids"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -324,6 +479,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Mark exact deliveries consumed in an Agent Inbox proven by an active principal-bound Endpoint. This mutates recipient state only, never the append-only Message or Wake state. Repeating already-consumed ids is a safe desired-state retry.",
             consume_agent_deliveries_input_schema,
@@ -337,6 +493,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             model_spec(
             def(
                 "consume_agent_wake",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("wake_id"),
+                    super::ToolAuditResultField::value("target_agent_id"),
+                    super::ToolAuditResultField::value("state"),
+                    super::ToolAuditResultField::value("already_consumed"),
+                    super::ToolAuditResultField::value("consumed_at_unix_ms"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ])
+                .context_from_result(),
                 ModelVisible,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
@@ -352,6 +518,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 NoPath,
                 true,
                 false,
+                super::ToolSessionEvidencePolicy::NONE,
             ),
             "Consume one exact durable Agent Wake continuation after accepting the resumed model turn. wake_id and consume_token identify the exact continuation, while endpoint_id and expected_controller_generation fence stale attachments. Repeating the same exact consume returns already_consumed without another state change. This operation never consumes Agent Inbox deliveries and grants no Project, filesystem, Runner, Task, or Workflow Session authority.",
             consume_agent_wake_input_schema,

@@ -5,9 +5,8 @@ use super::{permissions, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_protocol::{RunnerView, ShellJobInfo};
 use serde_json::{json, Value};
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 
-const RUNNING_JOB_STATUSES: &[&str] = &["running", "started"];
-const RUNNER_QUEUED_JOB_STATUSES: &[&str] = &["queued", "agent_queued"];
 const LIST_RUNNERS_MAX_CLIENT_IDS: usize = 8;
 const TARGET_CLIENT_ID_MAX_CHARS: usize = 128;
 
@@ -242,7 +241,7 @@ impl ToolRuntime {
                 .filter(|client| client.status == "stale")
                 .count();
             return ToolResult::ok(json!({
-                // `agents` is a stable pre-0.4 serialized compatibility key.
+                // Runtime Console, admin/ops, and status projections consume this established key.
                 "agents": runners,
                 "summary": {
                     "count": clients.len(),
@@ -254,7 +253,7 @@ impl ToolRuntime {
             }));
         }
         ToolResult::ok(json!({
-            // `agents` is a stable pre-0.4 serialized compatibility key.
+            // Runtime Console, admin/ops, and status projections consume this established key.
             "agents": runners,
             "clients": runner_health_clients(&clients, &runner_jobs, now),
             "summary": runner_health_summary(&clients, &runner_jobs, now),
@@ -418,8 +417,7 @@ impl ToolRuntime {
             })
             .count();
         let jobs = json!({
-            // `agent_known_count` is a stable pre-0.4 runtime_status compatibility key.
-            "agent_known_count": runner_known_count,
+            "count": runner_known_count,
             "active_count": active_count,
             "running_count": running_count,
             "queued_count": queued_count,
@@ -460,7 +458,7 @@ impl ToolRuntime {
             "auth_enabled": self.runtime_info.auth_enabled,
             "configured_public_url": self.runtime_info.configured_public_url,
             "projects": projects,
-            // `agents` remains the stable runtime_status JSON compatibility key.
+            // Runtime Console, admin HTTP, and CLI ops consume this established key.
             "agents": runners,
             "connection_layers": connection_layers,
             "version_compatibility": version_compatibility,
@@ -632,8 +630,7 @@ impl ToolRuntime {
             "summary": runner_health_summary(&clients, &selected_jobs, now),
         });
         let jobs = json!({
-            // `agent_known_count` is a stable pre-0.4 runtime_status compatibility key.
-            "agent_known_count": selected_jobs.len(),
+            "count": selected_jobs.len(),
             "active_count": runner_active,
             "running_count": running_count,
             "queued_count": queued_count,
@@ -1326,11 +1323,17 @@ fn active_jobs_for_client(runner_jobs: &[ShellJobInfo], client_id: &str) -> usiz
 }
 
 fn job_status_is_running(status: &str) -> bool {
-    RUNNING_JOB_STATUSES.contains(&status)
+    matches!(
+        RunnerJobLifecycle::from_wire(status),
+        Ok(RunnerJobLifecycle::Running | RunnerJobLifecycle::StartedLegacy)
+    )
 }
 
 fn job_status_is_runner_queued(status: &str) -> bool {
-    RUNNER_QUEUED_JOB_STATUSES.contains(&status)
+    matches!(
+        RunnerJobLifecycle::from_wire(status),
+        Ok(RunnerJobLifecycle::Queued | RunnerJobLifecycle::RunnerQueued)
+    )
 }
 
 fn job_concurrency_for_client(client: &RunnerView, runner_jobs: &[ShellJobInfo]) -> Value {

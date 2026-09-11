@@ -1,4 +1,4 @@
-// WebCodex Safe Delete Native Tool Plugin.
+// WebCodex Safe Delete Native Tool Plugin domain logic.
 //
 // Moves one file or directory under the configured Plugin cwd to the operating
 // system Trash/Recycle Bin. It never permanently deletes the requested path as a fallback.
@@ -8,83 +8,120 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
-import { pathToFileURL } from "node:url";
 
-export const PROTOCOL_VERSION = "webcodex-plugin-v1";
-const MAX_PATH_CHARS = 4096;
+import { errorResult, textResult } from "@yyjeqhc/webcodex-plugin-sdk";
+import type { ToolResult } from "@yyjeqhc/webcodex-plugin-sdk";
+
+export const MAX_PATH_CHARS = 4096;
 const BACKEND_TIMEOUT_MS = 10_000;
 const BACKEND_MAX_BUFFER = 64 * 1024;
 
-export const SAFE_DELETE_TOOL = {
-  name: "safe_delete",
-  title: "Safe delete",
-  description:
-    "Move exactly one ordinary file or directory under this Plugin provider's configured cwd to the operating system Trash/Recycle Bin. Use this instead of permanent deletion when recovery may be needed. The path must be relative to the provider cwd. The provider cwd itself, paths that escape it, symlinks/junctions, and unsupported file types are rejected. This tool never permanently deletes the requested path through rm, unlink, Remove-Item, or another fallback.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      path: {
-        type: "string",
-        minLength: 1,
-        maxLength: MAX_PATH_CHARS,
-        description:
-          "One file or directory path relative to the Plugin provider cwd. Absolute paths and parent traversal are rejected.",
-      },
-    },
-    required: ["path"],
-    additionalProperties: false,
-  },
-  outputSchema: {
-    type: "object",
-    properties: {
-      outcome: {
-        type: "string",
-        enum: ["trashed", "already_absent", "rejected", "failed", "unknown"],
-      },
-      path: { type: "string", maxLength: MAX_PATH_CHARS },
-      backend: {
-        type: "string",
-        enum: ["none", "freedesktop", "gio", "trash-put", "foundation", "powershell"],
-      },
-      errorCode: { type: "string", maxLength: 128 },
-    },
-    required: ["outcome", "path", "backend", "errorCode"],
-    additionalProperties: false,
-  },
-  annotations: {
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: true,
-  },
-};
+export type SafeDeleteOutcome = "trashed" | "already_absent" | "rejected" | "failed" | "unknown";
+export type TrashBackend = "none" | "freedesktop" | "gio" | "trash-put" | "foundation" | "powershell";
 
-function result(id, value) {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result: value })}\n`);
+export interface SafeDeleteStructured {
+  outcome: SafeDeleteOutcome;
+  path: string;
+  backend: TrashBackend;
+  errorCode: string;
 }
 
-function rpcError(id, code, message) {
-  process.stdout.write(
-    `${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`,
+interface RejectedTarget {
+  ok: false;
+  code: string;
+  message: string;
+}
+
+interface AbsentTarget {
+  ok: true;
+  absent: true;
+  root: string;
+  target: string;
+  displayPath: string;
+}
+
+interface PresentTarget {
+  ok: true;
+  absent: false;
+  root: string;
+  target: string;
+  displayPath: string;
+  kind: "directory" | "file";
+}
+
+export type AuthorizedTarget = RejectedTarget | AbsentTarget | PresentTarget;
+
+type SpawnState = "missing" | "timeout" | "failed" | "success";
+
+interface SpawnStateResult {
+  readonly state: SpawnState;
+}
+
+interface SpawnResult {
+  readonly error?: { readonly code?: string };
+  readonly status?: number | null;
+}
+
+interface SpawnOptions {
+  readonly shell: false;
+  readonly windowsHide: true;
+  readonly timeout: number;
+  readonly maxBuffer: number;
+  readonly encoding: "utf8";
+  readonly stdio: readonly ["ignore", "pipe", "pipe"];
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+type SpawnSyncLike = (command: string, args: string[], options: SpawnOptions) => SpawnResult;
+const defaultSpawnSync = nodeSpawnSync as unknown as SpawnSyncLike;
+
+interface FreedesktopOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly home?: string;
+  readonly now?: Date;
+}
+
+export type FreedesktopTrashResult =
+  | { readonly state: "success" }
+  | { readonly state: "unknown" }
+  | { readonly state: "unavailable" };
+
+interface BackendOptions {
+  readonly platform?: string;
+  readonly spawnSync?: SpawnSyncLike;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export interface TrashBackendResult {
+  readonly backend: TrashBackend;
+  readonly state: SpawnState | "unknown";
+}
+
+interface SafeDeleteOptions extends BackendOptions {
+  readonly root?: string;
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === code
   );
 }
 
-function toolResult(text, structuredContent, isError = false) {
-  return {
-    content: [{ type: "text", text }],
-    structuredContent,
-    isError,
-  };
-}
-
-function safeRelativeDisplay(value) {
+function safeRelativeDisplay(value: unknown): string {
   if (typeof value !== "string") return "[invalid path]";
   const withoutControls = value.replace(/[\u0000-\u001f\u007f]/gu, "?");
   return withoutControls.slice(0, MAX_PATH_CHARS);
 }
 
-function structured(outcome, relativePath, backend = "none", errorCode = "") {
+function structured(
+  outcome: SafeDeleteOutcome,
+  relativePath: unknown,
+  backend: TrashBackend = "none",
+  errorCode = "",
+): SafeDeleteStructured {
   return {
     outcome,
     path: safeRelativeDisplay(relativePath),
@@ -93,15 +130,21 @@ function structured(outcome, relativePath, backend = "none", errorCode = "") {
   };
 }
 
-function rejected(relativePath, code, message) {
-  return toolResult(message, structured("rejected", relativePath, "none", code), true);
+function rejected(relativePath: unknown, code: string, message: string): ToolResult<SafeDeleteStructured, true> {
+  return errorResult(message, structured("rejected", relativePath, "none", code));
 }
 
-function failed(relativePath, backend, code, message, outcome = "failed") {
-  return toolResult(message, structured(outcome, relativePath, backend, code), true);
+function failed(
+  relativePath: unknown,
+  backend: TrashBackend,
+  code: string,
+  message: string,
+  outcome: "failed" | "unknown" = "failed",
+): ToolResult<SafeDeleteStructured, true> {
+  return errorResult(message, structured(outcome, relativePath, backend, code));
 }
 
-function isWithinOrEqual(root, candidate) {
+function isWithinOrEqual(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return (
     relative === "" ||
@@ -109,25 +152,25 @@ function isWithinOrEqual(root, candidate) {
   );
 }
 
-function isStrictlyWithin(root, candidate) {
+function isStrictlyWithin(root: string, candidate: string): boolean {
   return candidate !== root && isWithinOrEqual(root, candidate);
 }
 
-function hasParentTraversal(value) {
+function hasParentTraversal(value: string): boolean {
   return value.split(/[\\/]+/u).some((component) => component === "..");
 }
 
-function realpathNative(value) {
+function realpathNative(value: string): string {
   return fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value);
 }
 
-function nearestExistingAncestor(value) {
+function nearestExistingAncestor(value: string): string {
   let current = path.dirname(value);
   for (;;) {
     try {
       return realpathNative(current);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+    } catch (error: unknown) {
+      if (!isErrnoCode(error, "ENOENT")) throw error;
     }
     const parent = path.dirname(current);
     if (parent === current) throw new Error("no existing ancestor");
@@ -135,7 +178,7 @@ function nearestExistingAncestor(value) {
   }
 }
 
-export function resolveAuthorizedTarget(relativePath, root = process.cwd()) {
+export function resolveAuthorizedTarget(relativePath: unknown, root = process.cwd()): AuthorizedTarget {
   if (typeof relativePath !== "string") {
     return { ok: false, code: "invalid_path", message: "safe_delete requires a string path" };
   }
@@ -165,7 +208,7 @@ export function resolveAuthorizedTarget(relativePath, root = process.cwd()) {
     };
   }
 
-  let canonicalRoot;
+  let canonicalRoot: string;
   try {
     canonicalRoot = realpathNative(root);
   } catch {
@@ -192,11 +235,11 @@ export function resolveAuthorizedTarget(relativePath, root = process.cwd()) {
     };
   }
 
-  let metadata;
+  let metadata: fs.Stats;
   try {
     metadata = fs.lstatSync(lexicalTarget);
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
+  } catch (error: unknown) {
+    if (!isErrnoCode(error, "ENOENT")) {
       return {
         ok: false,
         code: "path_inspection_failed",
@@ -244,7 +287,7 @@ export function resolveAuthorizedTarget(relativePath, root = process.cwd()) {
     };
   }
 
-  let canonicalTarget;
+  let canonicalTarget: string;
   try {
     canonicalTarget = realpathNative(lexicalTarget);
   } catch {
@@ -272,26 +315,30 @@ export function resolveAuthorizedTarget(relativePath, root = process.cwd()) {
   };
 }
 
-function normalizeSpawnResult(value) {
-  if (value?.error?.code === "ENOENT") return { state: "missing" };
-  if (value?.error?.code === "ETIMEDOUT") return { state: "timeout" };
-  if (value?.error) return { state: "failed" };
-  if (value?.status === 0) return { state: "success" };
+function normalizeSpawnResult(value: SpawnResult): SpawnStateResult {
+  if (value.error?.code === "ENOENT") return { state: "missing" };
+  if (value.error?.code === "ETIMEDOUT") return { state: "timeout" };
+  if (value.error) return { state: "failed" };
+  if (value.status === 0) return { state: "success" };
   return { state: "failed" };
 }
 
-function spawnBackend(spawnSync, command, args, options = {}) {
-  return normalizeSpawnResult(
-    spawnSync(command, args, {
-      shell: false,
-      windowsHide: true,
-      timeout: BACKEND_TIMEOUT_MS,
-      maxBuffer: BACKEND_MAX_BUFFER,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      ...options,
-    }),
-  );
+function spawnBackend(
+  spawnSync: SpawnSyncLike,
+  command: string,
+  args: string[],
+  overrides: { readonly env?: NodeJS.ProcessEnv } = {},
+): SpawnStateResult {
+  const options: SpawnOptions = {
+    shell: false,
+    windowsHide: true,
+    timeout: BACKEND_TIMEOUT_MS,
+    maxBuffer: BACKEND_MAX_BUFFER,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    ...overrides,
+  };
+  return normalizeSpawnResult(spawnSync(command, args, options));
 }
 
 const MACOS_TRASH_JXA = String.raw`
@@ -325,7 +372,7 @@ if ($item.PSIsContainer) {
 }
 `.trim();
 
-function ensureRealDirectory(directory) {
+function ensureRealDirectory(directory: string): boolean {
   try {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const metadata = fs.lstatSync(directory);
@@ -335,19 +382,22 @@ function ensureRealDirectory(directory) {
   }
 }
 
-function trashDeletionDate(now = new Date()) {
-  const pad = (value) => String(value).padStart(2, "0");
+function trashDeletionDate(now = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 }
 
-function trashInfoPathValue(target) {
+function trashInfoPathValue(target: string): string {
   return target.split("/").map((component) => encodeURIComponent(component)).join("/");
 }
 
 export function moveToFreedesktopTrash(
-  target,
-  { env = process.env, home = os.homedir(), now = new Date() } = {},
-) {
+  target: string,
+  options: FreedesktopOptions = {},
+): FreedesktopTrashResult {
+  const env = options.env ?? process.env;
+  const home = options.home ?? os.homedir();
+  const now = options.now ?? new Date();
   const dataHome = env.XDG_DATA_HOME?.trim() || (home ? path.join(home, ".local", "share") : "");
   if (!dataHome || !path.isAbsolute(dataHome)) return { state: "unavailable" };
 
@@ -359,9 +409,9 @@ export function moveToFreedesktopTrash(
   }
 
   const base = path.basename(target) || "item";
-  let destination;
-  let infoPath;
-  let tempInfo;
+  let destination: string | undefined;
+  let infoPath: string | undefined;
+  let tempInfo: string | undefined;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const suffix = randomBytes(8).toString("hex");
     const name = `${base}.${suffix}`;
@@ -412,14 +462,15 @@ export function moveToFreedesktopTrash(
   return { state: "success" };
 }
 
-export function runTrashBackend(
-  target,
-  { platform = process.platform, spawnSync = nodeSpawnSync, env = process.env } = {},
-) {
+export function runTrashBackend(target: string, options: BackendOptions = {}): TrashBackendResult {
+  const platform = options.platform ?? process.platform;
+  const spawnSync = options.spawnSync ?? defaultSpawnSync;
+  const env = options.env ?? process.env;
+
   if (platform === "linux") {
     const freedesktop = moveToFreedesktopTrash(target, { env });
     if (freedesktop.state === "success" || freedesktop.state === "unknown") {
-      return { backend: "freedesktop", ...freedesktop };
+      return { backend: "freedesktop", state: freedesktop.state };
     }
     const gio = spawnBackend(spawnSync, "gio", ["trash", target]);
     if (gio.state !== "missing") return { backend: "gio", ...gio };
@@ -455,31 +506,30 @@ export function runTrashBackend(
   return { backend: "none", state: "missing" };
 }
 
-function targetStillExists(target) {
+function targetStillExists(target: string): boolean {
   try {
     fs.lstatSync(target);
     return true;
-  } catch (error) {
-    if (error?.code === "ENOENT") return false;
+  } catch (error: unknown) {
+    if (isErrnoCode(error, "ENOENT")) return false;
     throw error;
   }
 }
 
 export function safeDelete(
-  argumentsValue,
-  {
-    root = process.cwd(),
-    platform = process.platform,
-    spawnSync = nodeSpawnSync,
-    env = process.env,
-  } = {},
-) {
+  argumentsValue: { readonly path?: unknown } | null | undefined,
+  options: SafeDeleteOptions = {},
+): ToolResult<SafeDeleteStructured> {
+  const root = options.root ?? process.cwd();
+  const platform = options.platform ?? process.platform;
+  const spawnSync = options.spawnSync ?? defaultSpawnSync;
+  const env = options.env ?? process.env;
   const requestedPath = argumentsValue?.path;
   const displayPath = safeRelativeDisplay(requestedPath);
   const target = resolveAuthorizedTarget(requestedPath, root);
   if (!target.ok) return rejected(displayPath, target.code, target.message);
   if (target.absent) {
-    return toolResult(
+    return textResult(
       `Nothing was deleted: ${displayPath} is already absent.`,
       structured("already_absent", displayPath),
     );
@@ -560,75 +610,8 @@ export function safeDelete(
     );
   }
 
-  return toolResult(
+  return textResult(
     `Moved ${displayPath} to the system Trash/Recycle Bin.`,
     structured("trashed", displayPath, backendResult.backend),
   );
 }
-
-export function handleRequest(request, options = {}) {
-  const { id, method, params = {} } = request ?? {};
-  if (request?.jsonrpc !== "2.0" || id === undefined) {
-    return { kind: "rpc_error", id: id ?? null, code: -32600, message: "invalid request" };
-  }
-  if (method === "initialize") {
-    if (params.protocolVersion !== PROTOCOL_VERSION) {
-      return {
-        kind: "rpc_error",
-        id,
-        code: -32602,
-        message: "unsupported protocol version",
-      };
-    }
-    return { kind: "result", id, value: { protocolVersion: PROTOCOL_VERSION } };
-  }
-  if (method === "tools/list") {
-    return { kind: "result", id, value: { tools: [SAFE_DELETE_TOOL] } };
-  }
-  if (method === "tools/call") {
-    if (params.name !== SAFE_DELETE_TOOL.name) {
-      return {
-        kind: "result",
-        id,
-        value: toolResult(
-          "unknown tool",
-          structured("rejected", "[unknown]", "none", "unknown_tool"),
-          true,
-        ),
-      };
-    }
-    return { kind: "result", id, value: safeDelete(params.arguments ?? {}, options) };
-  }
-  return { kind: "rpc_error", id, code: -32601, message: "method not found" };
-}
-
-function sendHandled(handled) {
-  if (handled.kind === "rpc_error") {
-    rpcError(handled.id, handled.code, handled.message);
-  } else {
-    result(handled.id, handled.value);
-  }
-}
-
-export function runProtocolServer(options = {}) {
-  const input = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-    terminal: false,
-  });
-  input.on("line", (line) => {
-    let request;
-    try {
-      request = JSON.parse(line);
-    } catch {
-      // stdout is protocol-only. Local diagnostics belong on stderr.
-      console.error("safe-delete plugin received malformed JSON");
-      return;
-    }
-    sendHandled(handleRequest(request, options));
-  });
-}
-
-const invokedAsMain =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
-if (invokedAsMain) runProtocolServer();

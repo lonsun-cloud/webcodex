@@ -10,6 +10,8 @@ use webcodex_core::coding_agent::{
 };
 use webcodex_core::mcp_gateway::McpGatewayResponse;
 use webcodex_core::plugin::PluginGatewayResponse;
+pub(super) use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle as JobLifecycleState;
+use webcodex_core::runner_operation::RunnerOperation;
 use webcodex_core::runner_protocol::{
     PersistentShellResult, RunnerBuildInfo, RunnerHostContext, RunnerPolicySummary,
     RunnerProjectSummary, RunnerRequest, RunnerView, ShellCommandExecutionState, ShellJobActivity,
@@ -203,11 +205,16 @@ impl RunnerRecord {
 pub(super) struct SkillStoreDispatchFence {
     pub(super) runner_instance_id: String,
     pub(super) management: bool,
+    pub(super) configured_roots: bool,
 }
 
 #[derive(Debug)]
 pub(super) struct PendingShellRequest {
     pub(super) request: RunnerRequest,
+    /// Canonical semantic operation decoded exactly once when the V2 wire DTO is admitted.
+    /// Registry fencing/result correlation must use this field rather than reinterpreting
+    /// `request.kind + optional payloads`.
+    pub(super) operation: RunnerOperation,
     pub(super) waiter: Option<oneshot::Sender<ShellRunResponse>>,
     pub(super) job_id: Option<String>,
     /// Optional Control-side project-placement fence for synchronous requests
@@ -233,9 +240,9 @@ pub(super) struct PendingShellRequest {
     /// Revalidated at dequeue so neither check nor reload can silently retarget
     /// a replacement process using the same client_id.
     pub(super) expected_runner_config_runner_instance_id: Option<String>,
-    /// Exact Runner process lease plus read/manage mode captured for a
-    /// Runner-global Skill store request. Revalidated at dequeue so a
-    /// replacement process using the same client_id cannot inherit authority.
+    /// Exact Runner process lease plus source/read/manage mode captured for a
+    /// Runner-global Skill request. Revalidated at dequeue so a replacement
+    /// process using the same client_id cannot inherit authority.
     pub(super) skill_store_fence: Option<SkillStoreDispatchFence>,
     pub(super) dispatched: bool,
 }
@@ -259,6 +266,114 @@ pub enum ShellJobVisibility {
     Public,
     HiddenUntilHandoff,
     CleanupPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JobRecoveryPhase {
+    Recovering,
+    Reconciled,
+    LostAfterReconcile,
+}
+
+impl JobRecoveryPhase {
+    pub(super) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Recovering => "recovering",
+            Self::Reconciled => "reconciled",
+            Self::LostAfterReconcile => "lost_after_reconcile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JobRecoveryReason {
+    RunnerTransportDisconnected,
+    RunnerTransportStale,
+    RunnerRequestNotDispatched,
+    RunnerDisconnectedWithoutReconciliation,
+    SharedKeyRunnerExpired,
+    RunnerInventoryMissing,
+    RunnerInstanceReplaced,
+    RunnerRecoveryDeadlineExceeded,
+    ServerRestartReconciliation,
+    SameInstanceReconciliation,
+    SameInstanceUpdateReconciliation,
+    DetachedInstanceTransfer,
+}
+
+impl JobRecoveryReason {
+    pub(super) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::RunnerTransportDisconnected => "runner_transport_disconnected",
+            Self::RunnerTransportStale => "runner_transport_stale",
+            Self::RunnerRequestNotDispatched => "runner_request_not_dispatched",
+            Self::RunnerDisconnectedWithoutReconciliation => {
+                "runner_disconnected_without_reconciliation"
+            }
+            Self::SharedKeyRunnerExpired => "shared_key_runner_expired",
+            Self::RunnerInventoryMissing => "runner_inventory_missing",
+            Self::RunnerInstanceReplaced => "runner_instance_replaced",
+            Self::RunnerRecoveryDeadlineExceeded => "runner_recovery_deadline_exceeded",
+            Self::ServerRestartReconciliation => "server_restart_reconciliation",
+            Self::SameInstanceReconciliation => "same_instance_reconciliation",
+            Self::SameInstanceUpdateReconciliation => "same_instance_update_reconciliation",
+            Self::DetachedInstanceTransfer => "detached_instance_transfer",
+        }
+    }
+
+    pub(super) const fn implies_lost_after_reconcile(self) -> bool {
+        matches!(
+            self,
+            Self::RunnerInventoryMissing
+                | Self::RunnerInstanceReplaced
+                | Self::RunnerRecoveryDeadlineExceeded
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct JobRecoveryState {
+    pub(super) phase: Option<JobRecoveryPhase>,
+    pub(super) recovered_after_server_restart: bool,
+    pub(super) reconciled_at: Option<i64>,
+    pub(super) reason: Option<JobRecoveryReason>,
+    pub(super) recovering_since: Option<i64>,
+}
+
+impl JobRecoveryState {
+    pub(super) fn recovering(&self) -> bool {
+        self.phase == Some(JobRecoveryPhase::Recovering)
+    }
+
+    pub(super) fn public_state(&self) -> Option<&'static str> {
+        self.phase.map(JobRecoveryPhase::as_wire)
+    }
+
+    pub(super) fn public_reason(&self) -> Option<&'static str> {
+        self.reason.map(JobRecoveryReason::as_wire)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct JobObservationState {
+    pub(super) epoch: Arc<str>,
+    pub(super) revision: Arc<AtomicU64>,
+    pub(super) notify: Arc<Notify>,
+    /// First time this Server process observed the Job in a terminal execution
+    /// lifecycle. Runner-reported `ended_at` remains the public execution time
+    /// and never controls Server registry retention.
+    pub(super) terminal_observed_at: Option<i64>,
+}
+
+impl JobObservationState {
+    pub(super) fn new(epoch: Arc<str>) -> Self {
+        Self {
+            epoch,
+            revision: Arc::new(AtomicU64::new(0)),
+            notify: Arc::new(Notify::new()),
+            terminal_observed_at: None,
+        }
+    }
 }
 
 /// Server-process-local exact intent retained only to prove same-key detached
@@ -302,15 +417,10 @@ pub(super) struct ShellJobRecord {
     /// keep this `None`, forcing exact logical-Job recovery instead of guessing
     /// that a resent body matches after Server restart.
     pub(super) detached_idempotency_intent: Option<DetachedIdempotencyIntent>,
-    pub(super) status: String,
+    pub(super) lifecycle: JobLifecycleState,
     pub(super) created_at: i64,
     pub(super) started_at: Option<i64>,
     pub(super) ended_at: Option<i64>,
-    /// Server-process-local lifecycle clock: the first time this Server
-    /// observed the Job in a terminal state. Runner-reported execution
-    /// timestamps remain in `ended_at` for public results and diagnostics,
-    /// but never control Server registry retention.
-    pub(super) terminal_observed_at: Option<i64>,
     pub(super) exit_code: Option<i32>,
     pub(super) duration_ms: Option<u64>,
     pub(super) stdout: ShellJobLogState,
@@ -327,28 +437,28 @@ pub(super) struct ShellJobRecord {
     pub(super) activity: Option<ShellJobActivity>,
     pub(super) visibility: ShellJobVisibility,
     pub(super) last_update_seq: u64,
-    pub(super) recovery_state: Option<String>,
-    pub(super) recovered_after_server_restart: bool,
-    pub(super) reconciled_at: Option<i64>,
-    pub(super) recovery_reason_code: Option<String>,
-    pub(super) recovering_since: Option<i64>,
-    pub(super) recovery_original_status: Option<String>,
-    /// Server-owned generation for the complete public Job snapshot. Unlike
-    /// `last_update_seq`, this also advances for accepted legacy/unsequenced
-    /// updates and server-side recovery/status changes. It is intentionally
-    /// process-local: waiters use it only while this record is alive, while the
-    /// Runner-owned sequence retains its protocol and restart semantics.
-    /// Process-local server epoch used to invalidate observation tokens after restart.
-    pub(super) observation_epoch: Arc<str>,
-    pub(super) public_revision: Arc<AtomicU64>,
-    /// Observer update notifier. Shared with every snapshot of the record and
-    /// notified (broadcast) whenever anything that changes the public Job
-    /// snapshot or `last_update_seq` happens: an accepted `agent:job_update`,
-    /// log/validation progress, terminal transitions, disconnect/recovery,
-    /// reconciliation, or a stop request that changed status. Bounded
-    /// `job_log`/`job_tail` waiters re-check the authoritative snapshot after
-    /// every wake, so spurious wakes are harmless. Never persisted.
-    pub(super) update_notify: Arc<Notify>,
+    pub(super) recovery: JobRecoveryState,
+    /// Process-local observation ownership. It can wake readers but never grants
+    /// execution authority or mutates lifecycle state.
+    pub(super) observation: JobObservationState,
+}
+
+impl ShellJobRecord {
+    /// Recovery is an orthogonal provenance/availability dimension, but it only
+    /// controls active-Job behavior while the underlying execution lifecycle is
+    /// still Runner-owned. A terminal lifecycle remains authoritative even when
+    /// compatibility recovery metadata from the preceding disconnect is retained.
+    pub(super) fn recovery_active(&self) -> bool {
+        self.lifecycle.is_runner_active() && self.recovery.recovering()
+    }
+
+    pub(super) fn public_status(&self) -> &'static str {
+        if self.recovery_active() {
+            "recovering"
+        } else {
+            self.lifecycle.as_wire()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

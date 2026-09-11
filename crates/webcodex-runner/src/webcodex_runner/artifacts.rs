@@ -5,6 +5,7 @@ use crate::artifact_policy::{
     has_safe_octet_stream_artifact_extension, octet_stream_safe_extension_error, DOCX_MIME,
     MAX_MCP_IMAGE_BYTES, PPTX_MIME, XLSX_MIME,
 };
+#[cfg(test)]
 use crate::runner_protocol::RunnerRequest;
 use base64::{engine::general_purpose, Engine as _};
 use flate2::read::DeflateDecoder;
@@ -17,6 +18,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use webcodex_core::runner_operation::RunnerOperation;
+use webcodex_core::runner_operation::{RunnerFileOperation, RunnerFilePayload};
 use xml::reader::{EventReader, XmlEvent};
 
 const DEFAULT_MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
@@ -40,6 +44,7 @@ const MAX_OOXML_CONTENT_TYPE_EVENTS: usize = 4096;
 const OOXML_CONTENT_TYPES_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/package/2006/content-types";
 
+#[cfg(test)]
 pub(crate) fn is_artifact_request_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -81,7 +86,7 @@ fn is_sensitive_artifact_path(path: &str) -> bool {
     webcodex_core::sensitive_paths::is_bulk_skipped_path(path)
 }
 
-fn parse_json_payload(request: &RunnerRequest) -> Result<Value, String> {
+fn parse_json_payload(request: &RunnerFilePayload) -> Result<Value, String> {
     let Some(content) = request.content.as_deref() else {
         return Err("invalid json: missing file-op payload".to_string());
     };
@@ -172,19 +177,25 @@ fn validate_upload_id(upload_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn project_root(request: &RunnerRequest) -> Result<std::path::PathBuf, String> {
+fn project_root(request: &RunnerFilePayload) -> Result<std::path::PathBuf, String> {
     let Some(cwd) = request.cwd.as_deref() else {
         return Err("artifact request missing project root".to_string());
     };
     std::fs::canonicalize(cwd).map_err(|e| format!("project root does not exist: {}", e))
 }
 
-fn ensure_existing_target_in_project_root(resolved: &Path, root: &Path) -> Result<(), String> {
+fn resolve_existing_target_in_project_root(
+    resolved: &Path,
+    root: &Path,
+) -> Result<PathBuf, String> {
     let target = std::fs::canonicalize(resolved).map_err(|e| format!("read failed: {}", e))?;
-    if target != root && !target.starts_with(root) {
-        return Err("artifact path escapes project root".to_string());
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| "artifact path escapes project root".to_string())?;
+    if is_sensitive_artifact_path(&relative.to_string_lossy()) {
+        return Err("refusing sensitive artifact target".to_string());
     }
-    Ok(())
+    Ok(target)
 }
 
 fn ensure_parent_in_project_root(resolved: &Path, root: &Path) -> Result<(), String> {
@@ -1162,6 +1173,10 @@ fn extension_mime(path: &str) -> Option<&'static str> {
         Some("image/jpeg")
     } else if lower.ends_with(".webp") {
         Some("image/webp")
+    } else if lower.ends_with(".mp3") {
+        Some("audio/mpeg")
+    } else if lower.ends_with(".mp4") {
+        Some("video/mp4")
     } else if lower.ends_with(".pdf") {
         Some("application/pdf")
     } else if lower.ends_with(".zip") {
@@ -1347,30 +1362,35 @@ fn read_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-pub(crate) fn handle_artifact_file_request(
-    request: &RunnerRequest,
+pub(crate) fn handle_artifact_file_operation(
+    operation: &RunnerFileOperation,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    match request.kind.as_str() {
-        "file_save_project_artifact" => handle_save_project_artifact(request, resolved, start),
-        "file_read_project_artifact_metadata" => {
+    let request = operation.payload();
+    match operation {
+        RunnerFileOperation::SaveProjectArtifact(_) => {
+            handle_save_project_artifact(request, resolved, start)
+        }
+        RunnerFileOperation::ReadProjectArtifactMetadata(_) => {
             handle_read_project_artifact_metadata(request, resolved, start)
         }
-        "file_read_project_artifact" => handle_read_project_artifact(request, resolved, start),
-        "file_read_project_artifact_export_chunk" => {
+        RunnerFileOperation::ReadProjectArtifact(_) => {
+            handle_read_project_artifact(request, resolved, start)
+        }
+        RunnerFileOperation::ReadProjectArtifactExportChunk(_) => {
             handle_read_project_artifact_export_chunk(request, resolved, start)
         }
-        "file_artifact_upload_begin"
-        | "file_artifact_upload_chunk"
-        | "file_artifact_upload_finish"
-        | "file_artifact_upload_abort" => {
+        RunnerFileOperation::ArtifactUploadBegin(_)
+        | RunnerFileOperation::ArtifactUploadChunk(_)
+        | RunnerFileOperation::ArtifactUploadFinish(_)
+        | RunnerFileOperation::ArtifactUploadAbort(_) => {
             let _upload_guard = match ARTIFACT_UPLOAD_STATE_LOCK.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     return line_edit_stdout(
                         upload_error(
-                            request.path.as_deref(),
+                            Some(request.path.as_str()),
                             None,
                             "artifact upload state lock unavailable",
                         ),
@@ -1378,20 +1398,20 @@ pub(crate) fn handle_artifact_file_request(
                     )
                 }
             };
-            match request.kind.as_str() {
-                "file_artifact_upload_begin" => {
+            match operation {
+                RunnerFileOperation::ArtifactUploadBegin(_) => {
                     handle_artifact_upload_begin(request, resolved, start)
                 }
-                "file_artifact_upload_chunk" => {
+                RunnerFileOperation::ArtifactUploadChunk(_) => {
                     handle_artifact_upload_chunk(request, resolved, start)
                 }
-                "file_artifact_upload_finish" => {
+                RunnerFileOperation::ArtifactUploadFinish(_) => {
                     handle_artifact_upload_finish(request, resolved, start)
                 }
-                "file_artifact_upload_abort" => {
+                RunnerFileOperation::ArtifactUploadAbort(_) => {
                     handle_artifact_upload_abort(request, resolved, start)
                 }
-                _ => unreachable!("upload request kind already matched"),
+                _ => unreachable!("upload operation already typed"),
             }
         }
         _ => CommandResult {
@@ -1399,17 +1419,37 @@ pub(crate) fn handle_artifact_file_request(
             stdout: None,
             stderr: None,
             duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(format!("unknown artifact request kind: {}", request.kind)),
+            error: Some("file operation is not an artifact request".to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn handle_artifact_file_request(
+    request: &RunnerRequest,
+    resolved: &Path,
+    start: Instant,
+) -> CommandResult {
+    match request.decode_operation() {
+        Ok(RunnerOperation::File(operation)) => {
+            handle_artifact_file_operation(&operation, resolved, start)
+        }
+        _ => CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            error: Some("invalid artifact wire request".to_string()),
         },
     }
 }
 
 fn handle_save_project_artifact(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(save_error(None, e), start),
@@ -1503,11 +1543,11 @@ fn handle_save_project_artifact(
 }
 
 fn handle_artifact_upload_begin(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(upload_error(None, None, e), start),
@@ -1714,11 +1754,11 @@ fn handle_artifact_upload_begin(
 }
 
 fn handle_artifact_upload_chunk(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(upload_error(None, None, e), start),
@@ -1936,11 +1976,11 @@ fn handle_artifact_upload_chunk(
 }
 
 fn handle_artifact_upload_finish(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(upload_error(None, None, e), start),
@@ -2077,11 +2117,11 @@ fn handle_artifact_upload_finish(
 }
 
 fn handle_artifact_upload_abort(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(upload_error(None, None, e), start),
@@ -2159,11 +2199,11 @@ fn handle_artifact_upload_abort(
 }
 
 fn handle_read_project_artifact_metadata(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(metadata_error(None, e), start),
@@ -2179,23 +2219,27 @@ fn handle_read_project_artifact_metadata(
         Ok(value) => value,
         Err(e) => return line_edit_stdout(metadata_error(Some(path), e), start),
     };
-    if let Err(e) = ensure_existing_target_in_project_root(resolved, &root) {
-        let target_missing = matches!(
-            std::fs::symlink_metadata(resolved),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound
-        );
-        if allow_missing && target_missing {
-            return line_edit_stdout(
-                json!({
-                    "path": path,
-                    "exists": false,
-                    "missing": true,
-                }),
-                start,
+    let target = match resolve_existing_target_in_project_root(resolved, &root) {
+        Ok(target) => target,
+        Err(e) => {
+            let target_missing = matches!(
+                std::fs::symlink_metadata(resolved),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound
             );
+            if allow_missing && target_missing {
+                return line_edit_stdout(
+                    json!({
+                        "path": path,
+                        "exists": false,
+                        "missing": true,
+                    }),
+                    start,
+                );
+            }
+            return line_edit_stdout(metadata_error(Some(path), e), start);
         }
-        return line_edit_stdout(metadata_error(Some(path), e), start);
-    }
+    };
+    let resolved = target.as_path();
     let max_bytes = match parse_usize_field(&payload, "max_bytes", DEFAULT_MAX_ARTIFACT_BYTES) {
         Ok(value) => value,
         Err(e) => return line_edit_stdout(metadata_error(Some(path), e), start),
@@ -2311,11 +2355,11 @@ fn handle_read_project_artifact_metadata(
 }
 
 fn handle_read_project_artifact_export_chunk(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(read_error(None, e), start),
@@ -2327,10 +2371,14 @@ fn handle_read_project_artifact_export_chunk(
         Ok(root) => root,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
     };
-    if let Err(e) = ensure_existing_target_in_project_root(resolved, &root) {
-        let msg = e.replacen("read failed", "stat failed", 1);
-        return line_edit_stdout(read_error(Some(path), msg), start);
-    }
+    let target = match resolve_existing_target_in_project_root(resolved, &root) {
+        Ok(target) => target,
+        Err(e) => {
+            let msg = e.replacen("read failed", "stat failed", 1);
+            return line_edit_stdout(read_error(Some(path), msg), start);
+        }
+    };
+    let resolved = target.as_path();
     if payload.get("expected_file_bytes").is_none() {
         return line_edit_stdout(
             read_error(Some(path), "expected_file_bytes is required"),
@@ -2452,11 +2500,11 @@ fn handle_read_project_artifact_export_chunk(
 }
 
 fn handle_read_project_artifact(
-    request: &RunnerRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => return line_edit_stdout(read_error(None, e), start),
@@ -2468,10 +2516,14 @@ fn handle_read_project_artifact(
         Ok(root) => root,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
     };
-    if let Err(e) = ensure_existing_target_in_project_root(resolved, &root) {
-        let msg = e.replacen("read failed", "stat failed", 1);
-        return line_edit_stdout(read_error(Some(path), msg), start);
-    }
+    let target = match resolve_existing_target_in_project_root(resolved, &root) {
+        Ok(target) => target,
+        Err(e) => {
+            let msg = e.replacen("read failed", "stat failed", 1);
+            return line_edit_stdout(read_error(Some(path), msg), start);
+        }
+    };
+    let resolved = target.as_path();
     let offset = match parse_usize_field(&payload, "offset", 0) {
         Ok(value) => value,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
@@ -3329,26 +3381,36 @@ mod tests {
 
     #[test]
     fn artifact_upload_begin_octet_stream_safe_extension_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = "artifacts/smoke/raw.artifact";
+        for path in [
+            "artifacts/smoke/raw.artifact",
+            "artifacts/smoke/audio.mp3",
+            "artifacts/smoke/video.mp4",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let output = run_artifact_request(
+                tmp.path(),
+                "file_artifact_upload_begin",
+                path,
+                json!({
+                    "path": path,
+                    "mime_type": "application/octet-stream",
+                    "max_bytes": DEFAULT_MAX_ARTIFACT_BYTES,
+                }),
+            );
 
-        let output = run_artifact_request(
-            tmp.path(),
-            "file_artifact_upload_begin",
-            path,
-            json!({
-                "path": path,
-                "mime_type": "application/octet-stream",
-                "max_bytes": DEFAULT_MAX_ARTIFACT_BYTES,
-            }),
-        );
+            assert!(output["error"].is_null() || output.get("error").is_none());
+            assert_eq!(output["path"], path);
+            assert_eq!(output["committed"], false);
+            assert!(output["upload_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("wc_upload_"));
+        }
+    }
 
-        assert!(output["error"].is_null() || output.get("error").is_none());
-        assert_eq!(output["path"], path);
-        assert_eq!(output["committed"], false);
-        assert!(output["upload_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("wc_upload_"));
+    #[test]
+    fn common_media_extensions_have_export_mime_types() {
+        assert_eq!(extension_mime("artifacts/audio.mp3"), Some("audio/mpeg"));
+        assert_eq!(extension_mime("artifacts/video.mp4"), Some("video/mp4"));
     }
 }

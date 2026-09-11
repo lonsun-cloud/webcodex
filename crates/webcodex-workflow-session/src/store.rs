@@ -8,10 +8,12 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::validation_identity::{
     assertion_validation_identity, is_validation_execution_identity,
 };
 use webcodex_core::workflow_session_contract::{is_safe_job_id, PermissionDecision, SessionMode};
+use webcodex_tool_contracts::{runtime_tool_session_evidence_policy, ToolSessionLifecycleEffect};
 
 use super::assignment::{
     assignment_fence_fingerprint, assignment_fence_from_state, current_assignment_state,
@@ -1092,10 +1094,11 @@ impl SessionStore {
         if lifecycle.allows_mutation() {
             return None;
         }
-        if tool_name == "close_session" {
+        let lifecycle_effect = runtime_tool_session_evidence_policy(tool_name).lifecycle;
+        if lifecycle_effect == ToolSessionLifecycleEffect::IdempotentClose {
             return None;
         }
-        if lifecycle_blocks_tool(tool_name, contract) {
+        if lifecycle_blocks_tool(contract, lifecycle_effect) {
             return Some(SessionLifecycleDenial { lifecycle });
         }
         None
@@ -1180,7 +1183,7 @@ impl SessionStore {
         let call_id = format!("{CALL_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let classification = contract;
         let risk_class = classification.risk_class.to_string();
-        let changed_paths = changed_paths_for_tool_call(tool_name, contract, arguments);
+        let changed_paths = changed_paths_for_tool_call(contract, arguments);
         let observed_paths = observed_input_paths_for_tool(tool_name, contract, arguments);
         let diff_review_like = diff_review_like_for_tool(tool_name, arguments);
         let input_summary = Some(session_input_summary_for_tool(tool_name, arguments));
@@ -1652,6 +1655,9 @@ impl SessionStore {
             // authoritative execution activity.
             return false;
         };
+        let Ok(job_lifecycle) = RunnerJobLifecycle::from_wire(job_status) else {
+            return false;
+        };
         if !is_valid_session_id(session_id)
             || !is_safe_job_id(job_id)
             || retained_terminal_job_ids.len() > MAX_MATERIALIZED_VALIDATION_JOB_IDS
@@ -1673,10 +1679,7 @@ impl SessionStore {
                     | "run_job"
             )
             || !valid_target
-            || !matches!(
-                job_status,
-                "completed" | "failed" | "timeout" | "timed_out" | "stopped" | "cancelled" | "lost"
-            )
+            || !job_lifecycle.is_terminal()
         {
             return false;
         }
@@ -1706,27 +1709,31 @@ impl SessionStore {
                     })
             })
             .unwrap_or_default();
-        let process_succeeded = job_status == "completed" && exit_code == Some(0);
+        let process_succeeded =
+            job_lifecycle == RunnerJobLifecycle::Completed && exit_code == Some(0);
         let succeeded = process_succeeded && validation_passed.unwrap_or(true);
-        let failure_kind = (!succeeded).then(|| match job_status {
-            "timeout" | "timed_out" => "timeout".to_string(),
-            "stopped" | "cancelled" => "cancelled".to_string(),
-            "lost" => "execution_lost".to_string(),
+        let failure_kind = (!succeeded).then(|| match job_lifecycle {
+            RunnerJobLifecycle::Timeout | RunnerJobLifecycle::TimedOut => "timeout".to_string(),
+            RunnerJobLifecycle::Stopped | RunnerJobLifecycle::Cancelled => "cancelled".to_string(),
+            RunnerJobLifecycle::Lost => "execution_lost".to_string(),
             _ if process_succeeded => "validation_failed".to_string(),
             _ => "command_exit_nonzero".to_string(),
         });
-        let terminal_execution_state = match job_status {
-            "completed" | "failed" => "completed",
-            "timeout" | "timed_out" => "timed_out",
-            "stopped" | "cancelled" => "cancelled",
-            "lost" => "outcome_unknown",
+        let terminal_execution_state = match job_lifecycle {
+            RunnerJobLifecycle::Completed | RunnerJobLifecycle::Failed => "completed",
+            RunnerJobLifecycle::Timeout | RunnerJobLifecycle::TimedOut => "timed_out",
+            RunnerJobLifecycle::Stopped | RunnerJobLifecycle::Cancelled => "cancelled",
+            RunnerJobLifecycle::Lost => "outcome_unknown",
             _ => "outcome_unknown",
         };
         let expectation_output = serde_json::json!({
             "job_id": job_id,
             "exit_code": exit_code,
             "execution_state": terminal_execution_state,
-            "command_completed": matches!(job_status, "completed" | "failed") && exit_code.is_some(),
+            "command_completed": matches!(
+                job_lifecycle,
+                RunnerJobLifecycle::Completed | RunnerJobLifecycle::Failed
+            ) && exit_code.is_some(),
         });
         let failure_expectation_result = classify_failure_expectation(
             succeeded,
@@ -2239,20 +2246,13 @@ impl SessionStore {
 /// Query and pure-read tools remain allowed. Message-board mutations and
 /// session-scoped checkpoint mutations are blocked even when metadata marks
 /// them read-only (they still change durable session/project evidence).
-fn lifecycle_blocks_tool(tool_name: &str, classification: SessionToolContract) -> bool {
-    if classification.write_like || classification.shell_like {
-        return true;
-    }
-    matches!(
-        tool_name,
-        "post_session_message"
-            | "resolve_session_message"
-            | "complete_session_message"
-            | "update_session_context"
-            | "workspace_checkpoint_create"
-            | "workspace_checkpoint_restore"
-            | "workspace_checkpoint_delete"
-    )
+fn lifecycle_blocks_tool(
+    classification: SessionToolContract,
+    lifecycle_effect: ToolSessionLifecycleEffect,
+) -> bool {
+    classification.write_like
+        || classification.shell_like
+        || lifecycle_effect == ToolSessionLifecycleEffect::Mutation
 }
 
 #[allow(clippy::too_many_arguments)]

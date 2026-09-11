@@ -78,12 +78,12 @@ fn test_config(project_registry_dir: PathBuf) -> RunnerConfig {
         host_context: None,
         project_registry_dir: Some(project_registry_dir),
         legacy_projects_dir: None,
-        deprecated_temporary_projects_root: None,
         poll_interval_ms: 1000,
         capabilities: None,
         max_concurrent_jobs: None,
         policy: unrestricted_test_policy(),
         shell: ShellConfig::default(),
+        skills: crate::webcodex_runner::config::SkillsConfig::default(),
         ssh: SshConfig::default(),
         transport: None,
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
@@ -177,6 +177,9 @@ mod shell_job_tree;
 mod shell_profiles;
 #[path = "main_tests/structured_delete.rs"]
 mod structured_delete;
+#[cfg(unix)]
+#[path = "main_tests/structured_write_paths.rs"]
+mod structured_write_paths;
 #[path = "main_tests/write_project_file.rs"]
 mod write_project_file;
 
@@ -455,6 +458,85 @@ fn runner_recovery_context_accepts_server_validation_identity_metadata() {
         !structured.is_valid(),
         "assertion identities must remain closed to model-facing process/script Jobs"
     );
+}
+
+#[test]
+fn runner_recovery_context_accepts_javascript_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Javascript,
+        script: "console.log('recovered');\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("javascript".to_string());
+    context.command_preview = format!(
+        "javascript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Javascript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context;
+    invalid.shell = Some("node".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(error.contains("shell is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Typescript,
+        script: "const recovered: string = 'ok';\nvoid recovered;\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("typescript".to_string());
+    context.command_preview = format!(
+        "typescript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Typescript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    for concrete_runtime in ["node", "tsx"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
 }
 
 fn wait_for_job_envelope(
@@ -1220,14 +1302,14 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
 
     jobs.enqueue(
         sink,
-        PendingJobStart {
-            generation: 1,
-            policy: cfg.policy.clone(),
-            shell: cfg.shell.clone(),
-            ssh: cfg.ssh.clone(),
-            project_registry_dir: project_registry_dir(&cfg).unwrap(),
+        PendingJobStart::from_wire(
+            1,
+            cfg.policy.clone(),
+            cfg.shell.clone(),
+            cfg.ssh.clone(),
+            project_registry_dir(&cfg).unwrap(),
             request,
-        },
+        ),
     );
     match wait_for_job_envelope(&mut rx, "queued status was sent") {
         RunnerEnvelope::JobUpdate { payload } => {
@@ -1252,14 +1334,14 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
     jobs.enqueue(
         rejected_sink,
-        PendingJobStart {
-            generation: 1,
-            policy: cfg.policy.clone(),
-            shell: cfg.shell.clone(),
-            ssh: cfg.ssh.clone(),
-            project_registry_dir: project_registry_dir(&cfg).unwrap(),
-            request: rejected_request,
-        },
+        PendingJobStart::from_wire(
+            1,
+            cfg.policy.clone(),
+            cfg.shell.clone(),
+            cfg.ssh.clone(),
+            project_registry_dir(&cfg).unwrap(),
+            rejected_request,
+        ),
     );
     assert!(jobs.queued.lock().unwrap().is_empty());
     let rejected = (0..2)
@@ -1403,6 +1485,29 @@ fn managed_worktree_request(
             "resume_project_id": resume_project_id,
         }),
     )
+}
+
+#[cfg(windows)]
+#[test]
+fn managed_worktree_network_source_requires_runner_authority_before_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("project-registry");
+    let source = Path::new(r"\\untrusted-host\share\webcodex-unreachable-repo");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
+        ..RunnerPolicy::default()
+    };
+    let request = managed_worktree_request(
+        source,
+        serde_json::Value::Null,
+        "77777777-7777-4777-8777-777777777777",
+        None,
+    );
+
+    let result = handle_prepare_managed_worktree(&policy, &registry, &request);
+    assert_eq!(project_err(result), "path_outside_allowed_roots");
+    assert!(!registry.exists());
 }
 
 #[test]

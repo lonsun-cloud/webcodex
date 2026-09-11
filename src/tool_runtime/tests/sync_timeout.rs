@@ -17,6 +17,7 @@ use crate::tool_runtime::helpers::{
 };
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{SessionMode, ToolCall, ToolResult};
+use serde_json::json;
 
 fn assert_timeout_rejected(result: &ToolResult, tool_name: &str) {
     assert!(
@@ -86,13 +87,25 @@ fn structured_validation_sync_grace_is_sixty_seconds() {
     assert_eq!(SYNC_VALIDATION_WAIT_SECS, 60);
 }
 
+fn assert_sync_wait_rejected(result: &ToolResult, tool_name: &str) {
+    assert!(!result.success, "{tool_name} sync wait should reject");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "invalid_arguments");
+    assert_eq!(result.output["tool_failure"], true);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(error.contains(tool_name), "{error}");
+    assert!(error.contains("sync_wait_secs"), "{error}");
+}
+
 #[tokio::test]
-async fn cargo_fmt_check_accepts_long_total_runtime_budget_and_hands_off() {
+async fn cargo_fmt_check_short_grace_hands_off_within_short_total_budget() {
     // cargo_check and cargo_test long-budget promotion lifecycles are owned by
     // validation_handoff.rs. Keep only cargo_fmt(check=true)'s distinct branch.
     let client_id = "sync-timeout-cargo-fmt-long";
-    let runtime = runtime_with_agent_project(client_id)
-        .with_validation_sync_wait(std::time::Duration::from_millis(10));
+    // Keep the production grace: an internal test override would mask a
+    // regression that ignores the caller's shorter sync_wait_secs.
+    let runtime = runtime_with_agent_project(client_id);
     let caps = RunnerCapabilities {
         async_shell_jobs: true,
         structured_validation_argv: true,
@@ -100,18 +113,35 @@ async fn cargo_fmt_check_accepts_long_total_runtime_budget_and_hands_off() {
     };
     register_agent(&runtime, client_id, None, caps).await;
     let project = agent_test_project_id(client_id);
-    let timeout = 300u64;
+    // A total budget below the default grace must still use the Job path
+    // when the explicit grace leaves runtime headroom.
+    let timeout = 30u64;
 
-    let result = runtime
-        .cargo_fmt(project, None, Some(true), Some(timeout))
-        .await;
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.cargo_fmt_with_context(
+            project,
+            None,
+            Some(true),
+            Some(timeout),
+            Some(1),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("explicit one-second grace must hand off before the default sixty-second wait");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     assert!(
         result.success,
-        "cargo_fmt(check=true) long budget should be accepted: {:?}",
+        "cargo_fmt(check=true) short grace should hand off: {:?}",
         result.error
     );
     assert!(result.output["promoted_to_job"].as_bool().unwrap_or(false));
     assert_eq!(result.output["effective_timeout_secs"], timeout);
+    assert_eq!(result.output["sync_wait_secs"], 1);
     let job_id = result.output["job_id"].as_str().unwrap().to_string();
     let status = runtime.job_status_for_auth(job_id, false, None).await;
     assert!(status.success, "{:?}", status.error);
@@ -177,6 +207,105 @@ async fn cargo_validation_tools_reject_timeout_outside_1_3600() {
         assert_eq!(result.output["failure_kind"], "invalid_arguments");
         assert_no_pending_shell_request(&runtime, "sync-timeout-cargo-range").await;
     }
+}
+
+#[tokio::test]
+async fn structured_validation_sync_wait_rejects_invalid_or_over_budget_values_before_enqueue() {
+    let client_id = "sync-wait-validation-range";
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    for (tool_name, sync_wait_secs, timeout_secs, extra) in [
+        ("cargo_check", 0u64, 600u64, json!({})),
+        ("cargo_check", 61, 600, json!({})),
+        ("cargo_check", 31, 30, json!({})),
+        ("cargo_test", 0, 600, json!({})),
+        ("cargo_test", 61, 600, json!({})),
+        ("cargo_test", 31, 30, json!({})),
+        ("go_test", 0, 600, json!({})),
+        ("go_test", 61, 600, json!({})),
+        ("go_test", 31, 30, json!({})),
+        ("cargo_fmt", 0, 600, json!({"check": true})),
+        ("cargo_fmt", 61, 600, json!({"check": true})),
+        ("cargo_fmt", 31, 30, json!({"check": true})),
+    ] {
+        let mut args = json!({
+            "project": project,
+            "timeout_secs": timeout_secs,
+            "sync_wait_secs": sync_wait_secs,
+        });
+        if let Some(extra) = extra.as_object() {
+            args.as_object_mut().unwrap().extend(extra.clone());
+        }
+        let error = ToolCall::from_tool_name(tool_name, args).expect_err(
+            "invalid structured validation sync_wait_secs must fail in the typed parser",
+        );
+        assert!(error.contains("sync_wait_secs"), "{tool_name}: {error}");
+        assert_no_pending_shell_request(&runtime, client_id).await;
+    }
+
+    // The runtime keeps the same fail-closed bound even if an internal caller
+    // bypasses model-facing ToolCall parsing.
+    for (sync_wait_secs, timeout_secs) in [(0u64, 600u64), (61, 600), (31, 30)] {
+        let result = runtime
+            .cargo_check_with_context(
+                project.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(timeout_secs),
+                Some(sync_wait_secs),
+                None,
+                None,
+                Some(&auth),
+            )
+            .await;
+        assert_sync_wait_rejected(&result, "cargo_check");
+        assert_no_pending_shell_request(&runtime, client_id).await;
+    }
+}
+
+#[tokio::test]
+async fn cargo_fmt_mutating_rejects_sync_wait_before_enqueue_or_job_creation() {
+    let client_id = "sync-wait-fmt-mutating";
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    for args in [
+        json!({"project": project, "check": false, "timeout_secs": 120, "sync_wait_secs": 1}),
+        json!({"project": project, "timeout_secs": 120, "sync_wait_secs": 1}),
+    ] {
+        let error = ToolCall::from_tool_name("cargo_fmt", args)
+            .expect_err("mutating cargo_fmt sync_wait_secs must fail in the typed parser");
+        assert!(error.contains("check=true"), "{error}");
+        assert_no_pending_shell_request(&runtime, client_id).await;
+        assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    }
+
+    // Runtime callers cannot background a mutating formatter even when they do
+    // not pass through the model-facing parser.
+    let result = runtime
+        .cargo_fmt_with_context(
+            project,
+            None,
+            Some(false),
+            Some(120),
+            Some(1),
+            None,
+            None,
+            Some(&auth),
+        )
+        .await;
+    assert_sync_wait_rejected(&result, "cargo_fmt");
+    assert_no_pending_shell_request(&runtime, client_id).await;
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -253,6 +382,7 @@ async fn dispatched_shared_capture_wait_timeout_reports_outcome_unknown_without_
                         require_tests: None,
                         min_tests: None,
                         timeout_secs: Some(1),
+                        sync_wait_secs: None,
                     },
                     Some(&auth),
                 )
@@ -435,6 +565,7 @@ async fn timeout_rejection_does_not_pollute_validation_summary() {
                 features: None,
                 package: None,
                 timeout_secs: Some(0),
+                sync_wait_secs: None,
             },
             Some(&auth),
         )
@@ -471,6 +602,7 @@ async fn timeout_rejection_does_not_pollute_validation_summary() {
                         features: None,
                         package: None,
                         timeout_secs: Some(60),
+                        sync_wait_secs: None,
                     },
                     Some(&auth),
                 )

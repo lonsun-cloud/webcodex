@@ -234,6 +234,17 @@ pub const RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV: &str = "structured_process_
 /// older Runners must fail closed rather than interpreting script text through
 /// the legacy command channel.
 pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD: &str = "structured_script_payload";
+/// The Runner understands the additive `javascript` semantic language in typed
+/// `run_script` payloads. Older generation-2 Runners already advertise
+/// `structured_script_payload` while accepting only sh/bash/PowerShell, so this
+/// remains a separate rolling-upgrade fence. It describes script protocol
+/// semantics, not local Node.js executable availability.
+pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT: &str = "structured_script_javascript";
+/// The Runner understands the additive `typescript` semantic language in typed
+/// `run_script` payloads. Older Runners may understand generic typed scripts or
+/// JavaScript without understanding this newer wire enum variant. This bit
+/// describes protocol semantics, not local Node.js executable/version support.
+pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT: &str = "structured_script_typescript";
 /// Runner-owned WebCodex-generated POSIX programs execute through an explicit
 /// internal runtime instead of the configured interactive shell. Missing on
 /// older Runners is false so Control never sends the dedicated request kind to
@@ -264,6 +275,10 @@ pub const RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION: &str = "project_path_regi
 /// source/ref and owns the filesystem destination; missing on older Runners is
 /// false and is never inferred from generic Git or path-registration support.
 pub const RUNNER_CAPABILITY_MANAGED_WORKTREE: &str = "managed_worktree";
+/// Runner-global read-only discovery/read for operator-configured live Skill roots.
+/// Missing on older Runners is false and is never inferred from generic file_read,
+/// project lifecycle support, or managed Skill Store support.
+pub const RUNNER_CAPABILITY_CONFIGURED_SKILL_ROOTS_READ: &str = "configured_skill_roots_read";
 /// Runner-global read-only operator-installed Skill store discovery/read.
 /// Missing on older Runners is false and is never inferred from file_read or
 /// project lifecycle support.
@@ -429,6 +444,8 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT,
     RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
     RUNNER_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
     RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS,
@@ -437,6 +454,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_PROJECT_LIFECYCLE,
     RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION,
     RUNNER_CAPABILITY_MANAGED_WORKTREE,
+    RUNNER_CAPABILITY_CONFIGURED_SKILL_ROOTS_READ,
     RUNNER_CAPABILITY_SKILL_STORE_READ,
     RUNNER_CAPABILITY_SKILL_STORE_MANAGE,
     RUNNER_CAPABILITY_COMPUTER_OBSERVE,
@@ -603,6 +621,18 @@ pub struct RunnerCapabilities {
     /// inferred from shell, validation argv, or process argv support.
     #[serde(default)]
     pub structured_script_payload: bool,
+    /// Additive typed-script support for the canonical `javascript` language.
+    /// Missing on older Runners is false and is never inferred from
+    /// `structured_script_payload` or protocol generation. Node availability is
+    /// resolved separately at execution time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_script_javascript: bool,
+    /// Additive typed-script support for the canonical `typescript` language.
+    /// Missing on older Runners is false and is never inferred from the generic
+    /// typed-script/JavaScript bits or protocol generation. Node availability
+    /// and native TypeScript support are resolved separately at execution time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_script_typescript: bool,
     /// Dedicated server-generated POSIX script request kind. Missing on older
     /// Runners is false and is never inferred from raw shell or typed public
     /// script support.
@@ -638,6 +668,10 @@ pub struct RunnerCapabilities {
     /// Runners fail closed instead of falling back to Server-side Git/path work.
     #[serde(default, skip_serializing_if = "is_false")]
     pub managed_worktree: bool,
+    /// Read-only operator-configured live Skill root support. Paths remain
+    /// Runner-local trusted configuration and are never accepted on this wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub configured_skill_roots_read: bool,
     /// Read-only operator-installed Skill store support. Missing on older
     /// Runners is false and never follows from generic file_read.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -841,12 +875,14 @@ impl RunnerConfigOperationResponse {
                 if matches!(
                     field,
                     "max_concurrent_jobs"
+                        | "skills.roots"
                         | "shell.max_persistent_shells"
                         | "shell.persistent_shell_idle_timeout_secs"
                         | "acp.max_concurrent_runs"
                         | "acp.permission_timeout_secs"
                         | "mcp.request_timeout_secs"
                 ) => {}
+            (Some("skills.roots"), Some("invalid_path")) => {}
             _ => return Err("invalid config error diagnostic"),
         }
         if let Some(code) = self.error_code.as_deref() {
@@ -929,6 +965,8 @@ impl Default for RunnerCapabilities {
             structured_go_test_packages: false,
             structured_process_argv: false,
             structured_script_payload: false,
+            structured_script_javascript: false,
+            structured_script_typescript: false,
             internal_posix_script: false,
             structured_execution_jobs: false,
             detached_process_jobs: false,
@@ -937,6 +975,7 @@ impl Default for RunnerCapabilities {
             project_lifecycle: false,
             project_path_registration: false,
             managed_worktree: false,
+            configured_skill_roots_read: false,
             skill_store_read: false,
             skill_store_manage: false,
             computer_observe: false,
@@ -1524,6 +1563,8 @@ pub enum ShellScriptLanguage {
     Sh,
     Bash,
     Powershell,
+    Javascript,
+    Typescript,
 }
 
 impl ShellScriptLanguage {
@@ -1532,6 +1573,8 @@ impl ShellScriptLanguage {
             Self::Sh => "sh",
             Self::Bash => "bash",
             Self::Powershell => "powershell",
+            Self::Javascript => "javascript",
+            Self::Typescript => "typescript",
         }
     }
 
@@ -1539,6 +1582,8 @@ impl ShellScriptLanguage {
         match self {
             Self::Sh | Self::Bash => ".sh",
             Self::Powershell => ".ps1",
+            Self::Javascript => ".mjs",
+            Self::Typescript => ".mts",
         }
     }
 }
@@ -3687,6 +3732,8 @@ mod envelope_tests {
                 structured_go_test_packages: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
+                structured_script_javascript: true,
+                structured_script_typescript: true,
                 internal_posix_script: true,
                 structured_execution_jobs: true,
                 detached_process_jobs: true,
@@ -3695,6 +3742,7 @@ mod envelope_tests {
                 project_lifecycle: false,
                 project_path_registration: false,
                 managed_worktree: false,
+                configured_skill_roots_read: false,
                 skill_store_read: false,
                 skill_store_manage: false,
                 computer_observe: false,
@@ -4365,6 +4413,8 @@ mod envelope_tests {
         assert!(!capabilities.structured_go_test_json);
         assert!(capabilities.structured_process_argv);
         assert!(capabilities.structured_script_payload);
+        assert!(!capabilities.structured_script_javascript);
+        assert!(!capabilities.structured_script_typescript);
         assert!(capabilities.async_jobs);
         assert!(!capabilities.structured_execution_jobs);
         assert!(!RunnerCapabilities::default().structured_script_payload);
@@ -4379,6 +4429,8 @@ mod envelope_tests {
         assert!(!capabilities.structured_go_test_json);
         assert!(!capabilities.structured_process_argv);
         assert!(!capabilities.structured_script_payload);
+        assert!(!capabilities.structured_script_javascript);
+        assert!(!capabilities.structured_script_typescript);
         assert!(!capabilities.structured_execution_jobs);
     }
 
@@ -4453,6 +4505,36 @@ mod envelope_tests {
             .unwrap_err()
             .contains("shell command mode"));
         }
+    }
+
+    #[test]
+    fn javascript_script_language_is_canonical_and_uses_mjs() {
+        assert_eq!(ShellScriptLanguage::Javascript.as_str(), "javascript");
+        assert_eq!(ShellScriptLanguage::Javascript.file_extension(), ".mjs");
+        assert_eq!(
+            serde_json::to_string(&ShellScriptLanguage::Javascript).unwrap(),
+            "\"javascript\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ShellScriptLanguage>("\"javascript\"").unwrap(),
+            ShellScriptLanguage::Javascript
+        );
+        assert!(serde_json::from_str::<ShellScriptLanguage>("\"js\"").is_err());
+    }
+
+    #[test]
+    fn typescript_script_language_is_canonical_and_uses_mts() {
+        assert_eq!(ShellScriptLanguage::Typescript.as_str(), "typescript");
+        assert_eq!(ShellScriptLanguage::Typescript.file_extension(), ".mts");
+        assert_eq!(
+            serde_json::to_string(&ShellScriptLanguage::Typescript).unwrap(),
+            "\"typescript\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ShellScriptLanguage>("\"typescript\"").unwrap(),
+            ShellScriptLanguage::Typescript
+        );
+        assert!(serde_json::from_str::<ShellScriptLanguage>("\"ts\"").is_err());
     }
 
     #[test]
@@ -4865,6 +4947,8 @@ mod envelope_tests {
                 "structured_go_test_packages",
                 "structured_process_argv",
                 "structured_script_payload",
+                "structured_script_javascript",
+                "structured_script_typescript",
                 "internal_posix_script",
                 "structured_execution_jobs",
                 "detached_process_jobs",
@@ -4873,6 +4957,7 @@ mod envelope_tests {
                 "project_lifecycle",
                 "project_path_registration",
                 "managed_worktree",
+                "configured_skill_roots_read",
                 "skill_store_read",
                 "skill_store_manage",
                 "computer_observe",

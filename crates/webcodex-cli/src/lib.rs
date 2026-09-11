@@ -40,10 +40,13 @@ use webcodex_cli::{
     client_profile_user_token_file_for_scope, connect_usage, current_user_home,
     default_device_name, default_server_paths, disconnect_usage, discover_internal_binary,
     is_effective_root, login_usage, logout_usage, ops_projects_usage, ops_runner_usage,
-    ops_runners_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
-    pairing_create_usage, pairing_usage, project_register_usage, read_env_file_value,
-    render_token_generate, run_connect, run_disconnect, run_hosted_log_writer, run_internal_binary,
-    run_login, run_logout, run_ops_command, run_pairing_create, run_project_register,
+    ops_runners_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage, ops_windows_usage,
+    pairing_create_usage, pairing_usage, parse_plugin_command, parse_plugin_init,
+    plugin_check_usage, plugin_describe_usage, plugin_init_usage, plugin_list_usage,
+    plugin_reload_usage, plugin_usage, project_activate_usage, project_register_usage,
+    read_env_file_value, render_token_generate, run_connect, run_disconnect, run_hosted_log_writer,
+    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
+    run_plugin_command, run_plugin_init, run_project_activate, run_project_register,
     run_runner_install_service, run_runner_service, run_runner_status,
     run_runner_token_create_local, run_server_init, run_server_install_service, run_server_service,
     run_server_status, run_server_tunnel, run_status, run_token_create_local,
@@ -53,7 +56,8 @@ use webcodex_cli::{
     service_unit_name, status_usage, system_user_home, system_user_is_root, usage,
     validate_client_profile, validate_service_file_scope, write_connect_result, ConnectAuth,
     ConnectOptions, DisconnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
-    OpsRunnerOptions, OpsSmokePreflightOptions, ProjectRegisterOptions, ServerStatusOptions,
+    OpsRunnerOptions, OpsSmokePreflightOptions, OpsWindowsOptions, PluginCommand,
+    PluginInitOptions, ProjectActivateOptions, ProjectRegisterOptions, ServerStatusOptions,
     ServiceControl, StatusOptions, DEFAULT_LOG_LINES, RUNNER_SERVICE_UNIT, SERVER_SERVICE_FILE,
     SERVER_SERVICE_UNIT,
 };
@@ -106,6 +110,7 @@ fn default_runner_service_scope(effective_root: bool) -> ServiceScope {
 enum CliAction {
     Project(Vec<String>),
     ProjectRegister(ProjectRegisterOptions),
+    ProjectActivate(ProjectActivateOptions),
     Connect(ConnectOptions),
     Disconnect(DisconnectOptions),
     HostedLogWriter(PathBuf),
@@ -119,6 +124,8 @@ enum CliAction {
     Logout(LogoutOptions),
     Status(StatusOptions),
     Ops(OpsCommand),
+    Plugin(PluginCommand),
+    PluginInit(PluginInitOptions),
     RunnerInstall(RunnerInstallServiceOptions),
     RunnerStatus(RunnerStatusOptions),
     RunnerRun(InternalRunOptions),
@@ -354,6 +361,7 @@ where
         "logout" => parse_logout(&args[1..]),
         "auth" => parse_auth_subcommand(&args[1..]),
         "ops" => parse_ops_subcommand(&args[1..]),
+        "plugin" => parse_plugin_subcommand(&args[1..]),
         "runner" => parse_runner_subcommand(&args[1..]),
         "agent-token" => cli_parse_error(
             "`webcodex agent-token` was removed; use `webcodex runner-tokens ...`".to_string(),
@@ -655,6 +663,67 @@ fn parse_disconnect(args: &[String]) -> CliAction {
 
 fn parse_project_subcommand(args: &[String]) -> CliAction {
     match args.first().map(String::as_str) {
+        Some("activate") => {
+            if args[1..]
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+            {
+                return CliAction::Exit {
+                    code: 0,
+                    stdout: project_activate_usage().to_string(),
+                    stderr: String::new(),
+                };
+            }
+            let mut config = None;
+            let mut user_token_file = None;
+            let mut project = None;
+            let mut json = false;
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--config" => {
+                        index += 1;
+                        match args.get(index) {
+                            Some(value) => config = Some(PathBuf::from(value)),
+                            None => return cli_parse_error("--config requires a value".to_string()),
+                        }
+                    }
+                    "--user-token-file" => {
+                        index += 1;
+                        match args.get(index) {
+                            Some(value) => user_token_file = Some(PathBuf::from(value)),
+                            None => return cli_parse_error("--user-token-file requires a value".to_string()),
+                        }
+                    }
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return cli_parse_error(format!("unknown project activate option: {other}"))
+                    }
+                    value => {
+                        if project.is_some() {
+                            return cli_parse_error(format!("unexpected project activate argument: {value}"));
+                        }
+                        project = Some(PathBuf::from(value));
+                    }
+                }
+                index += 1;
+            }
+            let Some(config) = config else {
+                return cli_parse_error("project activate requires --config PATH".to_string());
+            };
+            let Some(user_token_file) = user_token_file else {
+                return cli_parse_error("project activate requires --user-token-file PATH".to_string());
+            };
+            let Some(project) = project else {
+                return cli_parse_error("project activate requires an existing workspace path".to_string());
+            };
+            CliAction::ProjectActivate(ProjectActivateOptions {
+                config,
+                user_token_file,
+                project,
+                json,
+            })
+        }
         Some("register") => {
             if args[1..]
                 .iter()
@@ -712,12 +781,12 @@ fn parse_project_subcommand(args: &[String]) -> CliAction {
         }
         Some("--help" | "-h") => CliAction::Exit {
             code: 0,
-            stdout: project_register_usage().to_string(),
+            stdout: "Usage: webcodex project <COMMAND>\n\nCommands:\n  activate    Activate a project on the current Runner without restarting it\n  register    Add a project for a stopped/legacy Runner\n".to_string(),
             stderr: String::new(),
         },
         Some(other) => cli_parse_error(format!("unknown project subcommand: {other}")),
         None => cli_parse_error(
-            "missing project subcommand; try `webcodex project register --help`".to_string(),
+            "missing project subcommand; try `webcodex project --help`".to_string(),
         ),
     }
 }
@@ -1056,10 +1125,6 @@ fn parse_token_generate(args: &[String]) -> Result<TokenGenerateOptions, String>
             _ => return Err(format!("unknown tokens generate flag: {}", flag)),
         }
     }
-    if kind == "agent" {
-        // Pre-0.4 compatibility alias; new help only teaches Runner terminology.
-        kind = "runner".to_string();
-    }
     if kind != "api" && kind != "runner" {
         return Err("--kind must be 'api' or 'runner'".to_string());
     }
@@ -1313,6 +1378,66 @@ fn parse_pairing_subcommand(args: &[String]) -> CliAction {
     }
 }
 
+fn parse_plugin_subcommand(args: &[String]) -> CliAction {
+    if args.is_empty() {
+        return CliAction::Exit {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("{}\n", plugin_usage()),
+        };
+    }
+    if matches!(args[0].as_str(), "--help" | "-h") {
+        return CliAction::Exit {
+            code: 0,
+            stdout: plugin_usage().to_string(),
+            stderr: String::new(),
+        };
+    }
+    let command = args[0].as_str();
+    let usage = match command {
+        "init" => plugin_init_usage().to_string(),
+        "list" => plugin_list_usage(),
+        "describe" => plugin_describe_usage(),
+        "check" => plugin_check_usage(),
+        "reload" => plugin_reload_usage(),
+        other => {
+            return CliAction::Exit {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("unknown plugin subcommand: {other}\n"),
+            }
+        }
+    };
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        return CliAction::Exit {
+            code: 0,
+            stdout: usage,
+            stderr: String::new(),
+        };
+    }
+    if command == "init" {
+        return match parse_plugin_init(&args[1..]) {
+            Ok(opts) => CliAction::PluginInit(opts),
+            Err(error) => CliAction::Exit {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            },
+        };
+    }
+    match parse_plugin_command(command, &args[1..]) {
+        Ok(command) => CliAction::Plugin(command),
+        Err(error) => CliAction::Exit {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
+        },
+    }
+}
+
 fn parse_ops_subcommand(args: &[String]) -> CliAction {
     if args.is_empty() {
         return CliAction::Exit {
@@ -1344,7 +1469,7 @@ fn parse_ops_subcommand(args: &[String]) -> CliAction {
                 },
             }
         }
-        "runners" | "agents" => {
+        "runners" => {
             if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
                 return CliAction::Exit {
                     code: 0,
@@ -1388,6 +1513,23 @@ fn parse_ops_subcommand(args: &[String]) -> CliAction {
             }
             match parse_ops_common(&args[1..], "projects") {
                 Ok(opts) => CliAction::Ops(OpsCommand::Projects(opts)),
+                Err(e) => CliAction::Exit {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: format!("{}\n", e),
+                },
+            }
+        }
+        "windows" => {
+            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
+                return CliAction::Exit {
+                    code: 0,
+                    stdout: ops_windows_usage().to_string(),
+                    stderr: String::new(),
+                };
+            }
+            match parse_ops_windows(&args[1..]) {
+                Ok(opts) => CliAction::Ops(OpsCommand::Windows(opts)),
                 Err(e) => CliAction::Exit {
                     code: 2,
                     stdout: String::new(),
@@ -1505,6 +1647,45 @@ fn parse_ops_runner(args: &[String]) -> Result<OpsRunnerOptions, String> {
         common,
         client_id,
         request_timeout_ms,
+    })
+}
+
+fn parse_ops_windows(args: &[String]) -> Result<OpsWindowsOptions, String> {
+    let mut common = default_ops_common_options();
+    let mut project = String::new();
+    let mut limit = 64usize;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--project" => project = next_value(&mut iter, arg)?,
+            "--limit" => {
+                limit = next_value(&mut iter, arg)?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be an integer".to_string())?;
+            }
+            "--server-url" => common.server_url = next_value(&mut iter, arg)?,
+            "--proxy" => common.server_http.proxy = Some(next_value(&mut iter, arg)?),
+            "--no-system-proxy" => common.server_http.no_system_proxy = true,
+            "--env-file" => common.env_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--token-file" => common.token_file = Some(PathBuf::from(next_value(&mut iter, arg)?)),
+            "--token" => common.token = Some(next_value(&mut iter, arg)?),
+            "--json" => common.json = true,
+            "--strict" => common.strict = true,
+            other => return Err(format!("unknown ops windows flag: {}", other)),
+        }
+    }
+    common = validate_ops_common(&common)?;
+    let project = project.trim().to_string();
+    if project.is_empty() {
+        return Err("--project is required".to_string());
+    }
+    if !(1..=64).contains(&limit) {
+        return Err("--limit must be within 1..=64".to_string());
+    }
+    Ok(OpsWindowsOptions {
+        common,
+        project,
+        limit,
     })
 }
 
@@ -2575,6 +2756,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         },
+        CliAction::ProjectActivate(opts) => match run_project_activate(opts).await {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
         CliAction::Connect(opts) => match run_connect(opts).await {
             Ok(result) => {
                 let stdout = std::io::stdout();
@@ -2720,6 +2914,32 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        CliAction::Plugin(command) => match run_plugin_command(command).await {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                if !output.stdout.ends_with('\n') {
+                    println!();
+                }
+                std::process::exit(output.exit_code);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::PluginInit(opts) => match run_plugin_init(opts) {
+            Ok(stdout) => {
+                print!("{}", stdout);
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
         CliAction::RunnerInstall(opts) => match run_runner_install_service(opts) {
             Ok(stdout) => {
                 print!("{}", stdout);

@@ -1,17 +1,19 @@
 {
   "name": "@webcodex/desktop",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
-    "test": "vitest run",
+    "test": "vitest run && node ./scripts/check-form-control-css.mjs",
+    "icons": "node ./scripts/generate-icons.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

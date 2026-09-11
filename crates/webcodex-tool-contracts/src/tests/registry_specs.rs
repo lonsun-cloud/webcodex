@@ -8,8 +8,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let read_file_desc = desc("read_file");
     for phrase in [
-        "default inspect tool",
-        "targeted source reading",
+        "simple single-range utf-8 read primitive",
+        "local-coding contract",
+        "adaptive runtime prefer batch-capable read_files even for one known range",
         "line numbers",
         "read_range",
         "not snapshot-stable",
@@ -25,8 +26,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let read_files_desc = desc("read_files");
     for phrase in [
-        "batch inspect tool",
-        "use read_file for one targeted range",
+        "adaptive runtime preferred batch-capable inspect tool",
+        "only one known range",
         "read_range",
         "batch_items",
         "next_index",
@@ -34,7 +35,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "increase_result_budget",
         "no fake continuation",
         "complete a current partial item",
-        "256 kib",
+        "512 kib",
         "exact resolved project",
         "business session_id",
     ] {
@@ -46,7 +47,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let search_desc = desc("search_project_text");
     for phrase in [
-        "default inspect/search tool",
+        "simple single-query project-text search primitive",
+        "local-coding contract",
+        "adaptive runtime prefer batch-capable search_project_texts even for one query",
         "rg-first",
         "grep fallback",
         "pattern_mode=literal",
@@ -76,6 +79,103 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "search_project_texts description should mention {phrase}: {batch_search_desc}"
         );
     }
+    for phrase in [
+        "adaptive runtime preferred batch-capable project-text search",
+        "only one query",
+    ] {
+        assert!(
+            batch_search_desc.contains(phrase),
+            "search_project_texts description should mention {phrase}: {batch_search_desc}"
+        );
+    }
+
+    let save_artifact_desc = desc("save_project_artifact");
+    for phrase in [
+        "already holds the bounded binary/base64 content",
+        "do not read a current chatgpt/host attachment",
+        "import_conversation_files_to_project",
+    ] {
+        assert!(
+            save_artifact_desc.contains(phrase),
+            "save_project_artifact: {phrase}"
+        );
+    }
+    let import_artifact_desc = desc("import_conversation_files_to_project");
+    for phrase in [
+        "preferred host-native attachment-to-project transfer path",
+        "do not base64-transfer files",
+        "trusted mcp host/oauth client",
+    ] {
+        assert!(
+            import_artifact_desc.contains(phrase),
+            "import_conversation_files_to_project: {phrase}"
+        );
+    }
+    let export_artifact_desc = desc("export_project_artifact");
+    for phrase in [
+        "resourcelink",
+        "without routing base64 through model output",
+        "preferred project-to-host/user transfer path",
+        "stateless/operator-capable mcp surfaces",
+    ] {
+        assert!(
+            export_artifact_desc.contains(phrase),
+            "export_project_artifact: {phrase}"
+        );
+    }
+    let read_artifact_desc = desc("read_project_artifact");
+    for phrase in [
+        "bounded chunk inspection api",
+        "do not loop over base64 chunks",
+        "export_project_artifact",
+    ] {
+        assert!(
+            read_artifact_desc.contains(phrase),
+            "read_project_artifact: {phrase}"
+        );
+    }
+    let upload_begin_desc = desc("artifact_upload_begin");
+    for phrase in [
+        "low-level chunked binary artifact upload",
+        "not the preferred path for a current chatgpt/host attachment",
+        "import_conversation_files_to_project",
+    ] {
+        assert!(
+            upload_begin_desc.contains(phrase),
+            "artifact_upload_begin: {phrase}"
+        );
+    }
+
+    let git_log_desc = desc("git_log");
+    for phrase in ["next_skip", "parser-ready", "10000 skip bound"] {
+        assert!(git_log_desc.contains(phrase), "git_log: {phrase}");
+    }
+    let list_files_desc = desc("list_project_files");
+    for phrase in [
+        "deterministic page",
+        "next_offset",
+        "complete directory source",
+        "retained-tail truncation fails closed",
+    ] {
+        assert!(
+            list_files_desc.contains(phrase),
+            "list_project_files: {phrase}"
+        );
+    }
+    let tracked_files_desc = desc("list_project_tracked_files");
+    for phrase in [
+        "bounded producer source",
+        "source acquisition is complete",
+        "list_truncated=true",
+        "next_offset is null",
+        "narrow path",
+        "retained-tail source truncation fails closed",
+    ] {
+        assert!(
+            tracked_files_desc.contains(phrase),
+            "list_project_tracked_files: {phrase}"
+        );
+    }
 
     let show_changes_desc = desc("show_changes");
     for phrase in [
@@ -100,6 +200,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "scope",
         "paging inputs",
         "later records",
+        "max_page_bytes",
+        "raw producer page",
+        "512 kib",
+        "final model-facing",
         "hunk_line_limit",
         "larger max_hunk_lines",
         "narrower paths",
@@ -121,6 +225,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "paths",
         "max_hunks",
         "max_hunk_lines",
+        "max_page_bytes",
+        "later records",
         "scope-bound",
         "does not reconstruct",
     ] {
@@ -130,37 +236,48 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Contextual patch path remains the larger-change alternative.
+    // Contextual patch remains a guarded alternative, not a line-count heuristic.
     let apply_patch_desc = desc("apply_patch");
     for phrase in [
         "contextual patch path",
         "guarded exact edits",
-        "large or multi-hunk rewrites",
-        "prefer read_file/read_files -> apply_text_edits",
+        "line count alone is not a reason to patch",
+        "contextual or multi-hunk form is clearer",
+        "stable unique context",
+        "function/impl/type/test/module",
+        "not repeated lines/short fragments",
         "transactional",
         "sha rechecks",
         "rollback",
         "dry_run",
-        "matching_mode=unique",
-        "stable parent/function/test/module",
+        "matching_mode=unique default",
+        "matching_mode_rejected",
+        "never weaken guard",
+        "switch to first_match",
+        "use apply_text_edits if easy",
+        "bounded read_files recovery",
+        "context_mismatch",
+        "regenerate from current source",
         "matching_mode=exact_unique",
-        "stale-context",
-        "matching_mode=first_match",
-        "external diffs",
+        "stale-context/concurrency fence",
+        "first_match is compatibility, not recovery",
+        "outcome_unknown",
     ] {
         assert!(
             apply_patch_desc.contains(phrase),
             "apply_patch description should mention {phrase}: {apply_patch_desc}"
         );
     }
+    assert!(!apply_patch_desc.contains("retry with matching_mode=first_match"));
 
     // Default read-paired guarded edit path.
     let apply_text_edits_desc = desc("apply_text_edits");
     for phrase in [
-        "default guarded edit path",
+        "canonical default guarded edit path",
         "after read_file/read_files",
         "current worktree",
         "ordinary model-generated changes",
+        "many changed lines alone are not a reason to choose apply_patch",
         "transactional",
         "sha-guarded",
         "expected_sha256",
@@ -168,7 +285,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "occurrence",
         "line_scope",
         "transactional multi-file edits",
-        "use apply_patch",
+        "use apply_patch only when",
         "contextual",
         "large multi-hunk",
         "external raw diff",
@@ -205,8 +322,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "after read_file/read_files",
         "prefer apply_text_edits",
         "returned current sha",
-        "use apply_patch",
-        "contextual or large multi-hunk patch",
+        "use apply_patch only when",
+        "not merely because many lines change",
+        "contextual or multi-hunk patch form",
         "inspect current content",
         "expected_sha256",
     ] {
@@ -254,14 +372,15 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command",
-        "escape hatch",
-        "structured validation",
-        "edit tools",
-        "longer work",
-        "persistent shell",
-        "ssh_resource",
-        "runner restart",
+        "bounded shell command or short tightly related shell command chain",
+        "shell semantics",
+        "model/tool round trips",
+        "run_process preferred for one native executable with literal argv",
+        "independent effects or failure/permission boundaries",
+        "validation, commit, push, deploy, or restart",
+        "run_script for program-like loops",
+        "same-process cwd/env/export/function/umask state",
+        "one named ssh resource",
         "runner-owned",
         "outlive the current runner process",
         "run_detached_process",
@@ -274,13 +393,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_process_desc = desc("run_process");
     for phrase in [
-        "isolated one-shot native executable",
-        "literal argv",
-        "persistent shell",
-        "ssh_resource",
+        "one-shot executable with structured argv",
+        "preferred route for one native executable with literal argv",
+        "windows batch shims",
+        "bounded runner-owned quoting contract",
+        "run_shell only when shell semantics or a short tightly related command chain",
+        "do not open a persistent shell merely to run several commands",
+        "same-process cwd/env/exports/functions/umask state",
+        "one named ssh resource",
+        "ssh_resource onboarding",
         "one-shot/no-persistence ssh",
-        "owned by the current runner",
-        "outlive the current runner process",
+        "runner-owned",
+        "outlive the runner",
         "run_detached_process",
     ] {
         assert!(
@@ -291,8 +415,27 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_script_desc = desc("run_script");
     for phrase in [
-        "owned by the current runner",
-        "outlive the current runner process",
+        "sh, bash, powershell, javascript, or typescript",
+        "node.js-backed",
+        ".mjs",
+        "native erasable type stripping",
+        ".mts",
+        "node.js 22.6+",
+        "does not type-check",
+        "enum",
+        "runner owns runtime selection/flags",
+        "does not install npm dependencies",
+        "relative esm imports resolve from the runner-owned temporary module",
+        "bun",
+        "deno",
+        "tsx",
+        "run tsc",
+        "run_process for native argv",
+        "run_script for program-like scripts",
+        "run_shell when shell grammar is required",
+        "same execution / same job",
+        "never restarted",
+        "outlive the runner",
         "run_detached_process",
     ] {
         assert!(
@@ -334,12 +477,19 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let open_shell_desc = desc("open_session_shell");
     for phrase in [
+        "primary use",
+        "repeated commands",
+        "active named ssh resource",
         "execution_context.resource",
+        "remote cwd/env/exports/functions/umask",
+        "local sh/bash or windows powershell remains supported",
+        "same local shell-process state",
+        "not merely for several commands",
         "update_session_context",
         "no per-shell host/resource parameter",
         "does not need webcodex runner",
         "ssh_resource",
-        "restart the runner",
+        "runner restart",
     ] {
         assert!(
             open_shell_desc.contains(phrase),
@@ -357,6 +507,24 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         assert!(
             update_context_desc.contains(phrase),
             "update_session_context description should mention {phrase}: {update_context_desc}"
+        );
+    }
+
+    let session_shell_exec_desc = desc("session_shell_exec");
+    for phrase in [
+        "primary route",
+        "same named ssh resource",
+        "remote cwd/env/exports/functions/umask",
+        "local persistent execution remains supported",
+        "same local shell process must retain state",
+        "ordinary one-shot work",
+        "run_shell for shell semantics or short tightly related chains",
+        "run_script for program-like shell content",
+        "several commands alone are not a reason to open persistent shell",
+    ] {
+        assert!(
+            session_shell_exec_desc.contains(phrase),
+            "session_shell_exec description should mention {phrase}: {session_shell_exec_desc}"
         );
     }
 
@@ -464,11 +632,28 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
         codex_patch["matching_mode"]["enum"],
         json!(["first_match", "unique", "exact_unique"])
     );
+    let matching_mode_desc = codex_patch["matching_mode"]["description"]
+        .as_str()
+        .expect("matching_mode description")
+        .to_lowercase();
+    assert!(matching_mode_desc.contains("unique (default)"));
+    assert!(matching_mode_desc.contains("exact_unique"));
+    assert!(matching_mode_desc.contains("stale-context/concurrency fence"));
+    assert!(matching_mode_desc
+        .contains("first_match is only for explicitly requested permissive compatibility"));
     assert!(
         codex_patch.get("strict_matching").is_none(),
         "legacy strict_matching must not remain model-facing"
     );
     let patch_spec = spec_named(&specs, "apply_patch");
+    assert!(patch_spec.description.contains("preserves requested guard"));
+    assert!(patch_spec.description.contains("unique stays unique"));
+    assert!(patch_spec
+        .description
+        .contains("exact_unique stays exact_unique"));
+    assert!(patch_spec
+        .description
+        .contains("never relax the stale-context/concurrency fence"));
     let patch_output = &patch_spec.output_schema["properties"]["output"]["properties"];
     assert!(
         patch_output.get("match_diagnostic").is_some(),

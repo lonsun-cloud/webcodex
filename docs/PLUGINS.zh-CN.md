@@ -202,6 +202,153 @@ reload` 则提供更窄、只需要 `plugin:manage` 的专门入口。Plugin man
 需要检查 executable resolution 以及 Plugin `initialize -> tools/list` protocol/admission 时，
 使用 `plugin_tool check(runner, plugin)`。
 
+## Plugin authoring/operator CLI
+
+`webcodex plugin` 现在明确分成两条路径：`plugin init` 是纯本地 scaffold generator，不使用
+Server auth、Runner、`plugin_tool` 或 `/api/tools/call`；另外四个 inspect/manage 命令仍是
+同一条 canonical `plugin_tool` 链路的 operator-friendly adapter，不新增 Plugin endpoint、
+Runtime、supervisor 或 admission implementation。每个网络命令都只向现有
+`POST /api/tools/call` 发一次 authenticated request，外层固定为 `tool="plugin_tool"`，
+`params` 严格映射已有 action：
+
+```text
+webcodex plugin list
+    -> {"action":"list"}
+webcodex plugin list --runner special
+    -> {"action":"list","runner":"special"}
+webcodex plugin list --runner special --plugin safe-delete
+    -> {"action":"list","runner":"special","plugin":"safe-delete"}
+webcodex plugin describe --runner special --plugin safe-delete --tool safe_delete
+    -> {"action":"describe","runner":"special","plugin":"safe-delete","tool":"safe_delete"}
+webcodex plugin check --runner special --plugin safe-delete
+    -> {"action":"check","runner":"special","plugin":"safe-delete"}
+webcodex plugin reload --runner special
+    -> {"action":"reload","runner":"special"}
+```
+
+本地创建一个可独立使用的 authoring project：
+
+```text
+webcodex plugin init ./my-plugin
+webcodex plugin init ./MyPlugin --id my-plugin
+```
+
+生成目录只包含 `.gitignore`、`package.json`、`tsconfig.json`、`src/plugin.ts`、`README.md`。
+其中 `@yyjeqhc/webcodex-plugin-sdk` **精确固定**为公开 npm 版本 `0.1.0`，不会生成
+`file:`、workspace、Git、源码 checkout 或 floating version dependency。`plugin init` 不会
+安装依赖、执行生成代码、修改 `runner.toml`、注册 provider、reload Runner 或创建 credential。
+目标目录只能不存在或是空的 ordinary directory；任何已有用户数据都不会被覆盖。
+
+scaffold 创建成功后，human output 还会打印一个可以复制的 `[[plugins.providers]]` block，
+其中 `args` 指向这次生成项目真实的 absolute `dist/plugin.js`。路径值通过 TOML serializer
+生成，而不是字符串拼接，因此空格、Windows 反斜杠、引号及其它 TOML-sensitive character
+都会正确 escape。这仍然只是 onboarding guidance：operator 必须在目标 Runner 主机上把该
+block 复制到这个 Runner 启动时绑定的 `runner.toml`。portable scaffold README 继续保留
+absolute-path placeholder，不会永久写入作者机器的真实路径。如果不确定本机 Runner 实际
+使用哪个配置，应在 Runner 主机上检查对应 profile/service，例如
+`webcodex runner status --profile <profile>`；Server 不会为此发现或返回 Runner-local config
+path / executable path。
+
+实际 author loop 可以直接写成：
+
+```text
+webcodex plugin init ./my-plugin
+    -> npm install
+    -> npm run build
+    -> 把输出的 provider block 复制到 Runner-local startup config
+    -> webcodex plugin check --runner special --plugin my-plugin --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin reload --runner special --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin list --runner special --plugin my-plugin --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin describe --runner special --plugin my-plugin --tool echo --token-file /path/to/plugin-authoring-pat
+```
+
+identity/lifecycle 语义没有变化。Runner id 必须精确提供，CLI 不做 fuzzy match，也不会从
+provider/project 推断 Runner。`list` 不会偷偷 check/reload；`describe` 直接消费 canonical
+describe response，不额外 list。`check` 仍由 Runner 启动并销毁 disposable candidate，且不
+commit。`reload` 仍由 exact Runner 重新读取自己的 `runner.toml`，准备**完整 provider set**，
+只有全部 admission 成功才原子替换；因此刻意不存在 `reload --plugin`。describe 返回的
+binding 只作为 opaque observation 输出，不缓存、不提升为 credential；reload retire provider
+后，旧 binding 仍按原 contract fail closed。
+
+网络参数沿用现有 CLI Server conventions：`--server-url`、`--proxy`、
+`--no-system-proxy`、`--env-file`、`--token-file`、`--token`、`--json`。Plugin authoring
+长期使用时优先推荐显式 token file，例如 `--token-file /path/to/plugin-authoring-pat`。共享
+user/API resolver 保持向后兼容的优先级：显式 `--token`；`--token-file`；指定 env file 中的
+`WEBCODEX_TOKEN`，再 `WEBCODEX_PAT`；当前进程 `WEBCODEX_TOKEN`，再 `WEBCODEX_PAT`。
+`WEBCODEX_PAT` 只是 additive user/API CLI input alias，不改变 Server bootstrap
+`WEBCODEX_TOKEN` 的配置语义；两个环境变量同时存在时仍优先原有 `WEBCODEX_TOKEN`。如果需要
+专用 authoring PAT，复用已有 `webcodex tokens create-local` / Server token management flow，
+不要建立 Plugin-specific credential path。
+
+Runner transport token 会在发起 user/API HTTP request 前被拒绝。`list` / `describe` 要求
+`plugin:inspect`；canonical `plugin_tool` call 要求 `plugin:invoke`；`check` / `reload` 必须由
+用户显式提供具有 `plugin:manage` 的 credential。现有 `--oauth-local-plugins` 仍然只表示
+`plugin:inspect + plugin:invoke`，**不会**授予 manage。401/403 会正常 non-zero 失败；CLI
+不会为了通过请求自动 mint、升级或修改 credential。
+
+`--json` 直接打印 canonical `plugin_tool` output object，不再设计第二套 CLI Plugin JSON
+模型；human output 只渲染有界 canonical fields。`check` 只有在 `ready=true` 时 exit 0；
+`ready=false` non-zero，但仍保留 phase/code/detail/diagnostic。reload 只有 canonical
+`failures` 为空时 exit 0；known rejection non-zero。
+
+如果 `check` 返回 `phase=initialize`、`code=plugin_eof`，表示 provider 的 protocol
+output 在 initialize 完成前已经结束；进程可能已经退出，也可能只是关闭了 stdout。应先检查
+配置的 command 与 arguments。对于由 `webcodex plugin init` 创建的 Plugin，还应确认已执行
+`npm run build`，并且 Runner 主机上已经生成 `dist/plugin.js`，再重试。这里是条件性的 author
+guidance，不是 root-cause 分类：任何在 initialize 阶段结束 protocol output 的 provider 都
+可能产生 `plugin_eof`，WebCodex 不会根据 raw stderr 或 opaque argv 推断具体原因。
+
+CLI 不会自动 retry `check` 或 `reload`。请求开始后如果遇到 HTTP timeout、connection reset、
+post-send malformed response 或 response lost，CLI 无法证明 management operation 没有到达
+Server/Runner，因此会保守报告 outcome may be unknown，并要求先观察当前 Plugin state 再决定
+是否 retry。`check` 也遵循这一点，因为 arbitrary Plugin startup/initialize/list 本身仍可能
+有外部副作用。
+
+本阶段刻意没有 `webcodex plugin call`。raw `plugin_tool describe -> call` 仍是 canonical
+invocation path，并继续拥有原有 binding、effect、retry 和 `OutcomeUnknown` 语义。
+
+Phase 1 曾有意暂缓 `webcodex plugin init`，直到 SDK 建立真实 external dependency contract。
+这个前置条件现在已经满足：`@yyjeqhc/webcodex-plugin-sdk@0.1.0` 已通过 npm 公开分发，Phase 3
+因此加入使用该**精确兼容版本**的本地 scaffold。生成项目不依赖 WebCodex 源码 checkout。
+仓库内 first-party dogfood（例如 `plugins/safe-delete` 和
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)）仍有意使用同 checkout 的 local
+SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用 published package。
+
+## TypeScript Plugin SDK
+
+`@yyjeqhc/webcodex-plugin-sdk` 是 Native Tool Plugin 的可选 TypeScript authoring layer。
+`0.1.0` 已通过 npm 公开分发；由于 SDK 仍处于 pre-1.0，`plugin init` 生成项目使用 exact
+compatibility pin，而不是允许自动跨 minor 的版本范围：
+
+```text
+raw executable protocol
+    -> @yyjeqhc/webcodex-plugin-sdk
+    -> 仍然是 webcodex-plugin-v1
+    -> Runner-authoritative check / reload / call
+```
+
+SDK 提供小型 v1 schema builder、`defineTool`、`definePlugin`、result helper，以及严格
+串行的 newline-delimited JSON-RPC stdio runtime，让 Plugin 作者不用重复手写 framing 和
+dispatch 样板代码。它**不是** MCP SDK，不会改变 Plugin authority，也不会 sandbox 受信任
+executable。WebCodex Server / Runner 不会因为 SDK 而要求 Node；只有主动选择这个 SDK 的
+Plugin 自己需要 Runner 机器提供 Node。TypeScript 只用于 authoring/build，生产环境执行编译
+后的 ESM JavaScript，不要求 TypeScript runtime。
+
+SDK 类型只是 authoring assistance，并不是第二套 admission authority。Rust Runner 继续权威
+拥有 protocol/schema admission、frozen catalog、bounds、timeout/process lifecycle、output
+validation 与 `OutcomeUnknown`。`plugin_tool check` 仍然是 authoritative admission check。
+其中显式 `errorResult(...)` 表示确定的 completed application result；未处理的 handler
+throw/rejection 会终止 provider，并且不会伪造 ToolResult，因此 effectful call 的 send
+ambiguity 仍可由 Runner 正确保留。
+
+完整 SDK 说明见 [`../npm/plugin-sdk/README.zh-CN.md`](../npm/plugin-sdk/README.zh-CN.md)，
+TypeScript 示例见 [`echo-plugin.ts`](../npm/plugin-sdk/examples/echo-plugin.ts)。原有无 SDK
+依赖的 raw [`native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs) 继续作为 protocol
+reference 保留。
+
+Plugin 的架构边界、开发阶段兼容策略和后续 authoring roadmap 见
+[`architecture/native-tool-plugins.md`](architecture/native-tool-plugins.md)。
+
 ## WebCodex Plugin Protocol v1
 
 Native protocol 使用 newline-delimited JSON-RPC 2.0 framing，protocol version 是
@@ -261,10 +408,12 @@ keyword 会在 provider admission 时明确拒绝，不会 silently ignore。v1 
 `oneOf`、`allOf`、`not` 或任意 draft-specific keyword。
 
 最小无依赖 Node 示例见
-[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供可选的
-[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)：它把删除权限限制在配置的
-项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，不会把永久删除能力加入
-WebCodex 内建工具面。
+[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供两个
+first-party SDK dogfood Plugin：[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)
+把删除权限限制在配置的项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，
+不会把永久删除能力加入 WebCodex 内建工具面；
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 是只读 authoring 示例，它唯一的
+`git_summary` 只观察 provider 配置的 repository `cwd`。
 
 ## 调用与失败语义
 
