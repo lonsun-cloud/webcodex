@@ -407,14 +407,87 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FdSlotState {
+        Closed,
+        Reused,
+        SameObject,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FdWitness(std::os::fd::OwnedFd);
+
+    #[cfg(target_os = "linux")]
+    impl FdWitness {
+        fn duplicate(fd: i32) -> Self {
+            use std::os::fd::FromRawFd;
+
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 1001) };
+            assert!(
+                duplicate >= 1001,
+                "failed to duplicate fd for ownership witness"
+            );
+            Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) })
+        }
+
+        fn slot_state(&self, fd: i32) -> FdSlotState {
+            use std::os::fd::AsRawFd;
+
+            let expected =
+                fd_identity(self.0.as_raw_fd()).expect("ownership witness fd must remain valid");
+            match fd_identity(fd) {
+                Ok(actual) if actual == expected => FdSlotState::SameObject,
+                Ok(_) => FdSlotState::Reused,
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => FdSlotState::Closed,
+                Err(error) => panic!("failed to inspect fd {fd} identity: {error}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fd_identity(fd: i32) -> std::io::Result<(u64, u64)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_witness_classifies_same_closed_and_different_fd_slots() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let raw_fd = move_to_isolated_test_fd(listener.into_raw_fd());
+        let witness = FdWitness::duplicate(raw_fd);
+        assert_eq!(witness.slot_state(raw_fd), FdSlotState::SameObject);
+        assert_eq!(witness.slot_state(-1), FdSlotState::Closed);
+
+        let replacement = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            witness.slot_state(replacement.as_raw_fd()),
+            FdSlotState::Reused
+        );
+
+        unsafe { libc::close(raw_fd) };
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn inherited_fd_rejects_non_socket_without_taking_ownership() {
         use std::os::fd::RawFd;
         let mut fds: [RawFd; 2] = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let witness = FdWitness::duplicate(fds[0]);
         let error = take_inherited_listener(fds[0], "127.0.0.1:1").unwrap_err();
         assert!(error.contains("not a valid socket"), "{error}");
-        assert_ne!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, -1);
+        assert_eq!(
+            witness.slot_state(fds[0]),
+            FdSlotState::SameObject,
+            "pre-validation failure replaced or closed the caller-owned pipe fd"
+        );
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
@@ -434,9 +507,14 @@ mod tests {
         })
         .unwrap();
         let raw_fd = stream.into_raw_fd();
+        let witness = FdWitness::duplicate(raw_fd);
         let error = take_inherited_listener(raw_fd, "127.0.0.1:1").unwrap_err();
         assert!(error.contains("not in listening state"), "{error}");
-        assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            witness.slot_state(raw_fd),
+            FdSlotState::SameObject,
+            "pre-validation failure replaced or closed the caller-owned stream fd"
+        );
         unsafe { libc::close(raw_fd) };
     }
 
@@ -449,12 +527,17 @@ mod tests {
         let listener =
             std::os::unix::net::UnixListener::bind(tmp.path().join("listener.sock")).unwrap();
         let raw_fd = listener.into_raw_fd();
+        let witness = FdWitness::duplicate(raw_fd);
         let error = take_inherited_listener(raw_fd, "127.0.0.1:1").unwrap_err();
         assert!(
             error.contains("not an IPv4/IPv6 TCP listening socket"),
             "{error}"
         );
-        assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            witness.slot_state(raw_fd),
+            FdSlotState::SameObject,
+            "pre-validation failure replaced or closed the caller-owned Unix listener fd"
+        );
         unsafe { libc::close(raw_fd) };
     }
 
@@ -484,12 +567,20 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let actual = listener.local_addr().unwrap();
         let raw_fd = move_to_isolated_test_fd(listener.into_raw_fd());
+        let witness = FdWitness::duplicate(raw_fd);
+        assert_eq!(witness.slot_state(raw_fd), FdSlotState::SameObject);
+
         let listener = take_inherited_listener(raw_fd, &actual.to_string()).unwrap();
         let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let acceptor = TcpAcceptor::try_from(tokio_listener).unwrap();
         assert_eq!(acceptor.local_addr().unwrap(), actual);
         drop(acceptor);
-        assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+
+        assert_ne!(
+            witness.slot_state(raw_fd),
+            FdSlotState::SameObject,
+            "dropping the acceptor left the original inherited socket owned by the raw fd"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -499,11 +590,18 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let raw_fd = move_to_isolated_test_fd(listener.into_raw_fd());
+        let witness = FdWitness::duplicate(raw_fd);
+        assert_eq!(witness.slot_state(raw_fd), FdSlotState::SameObject);
+
         let error = take_inherited_listener(raw_fd, "127.0.0.1:1").unwrap_err();
         assert!(
             error.contains("does not match configured WEBCODEX_ADDR"),
             "{error}"
         );
-        assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        assert_ne!(
+            witness.slot_state(raw_fd),
+            FdSlotState::SameObject,
+            "address-mismatch cleanup left the original inherited socket owned by the raw fd"
+        );
     }
 }

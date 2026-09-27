@@ -1,4 +1,5 @@
 use super::activity::{ActivityRecorder, NoopActivityRecorder};
+#[cfg(feature = "workspace-checkpoints")]
 use super::checkpoint;
 use super::observations::RuntimeObservations;
 use super::permissions::PermissionEvaluator;
@@ -109,19 +110,30 @@ pub struct ToolRuntime {
     pub(crate) ssh_resource_gateway: Arc<crate::ssh_resource_gateway::SshResourceGatewayRuntime>,
     pub(crate) coding_agent_runs: Arc<super::coding_agent::CodingAgentServerState>,
     pub runtime_info: Arc<RuntimeInfo>,
-    runtime_exposure: crate::model_surface::RuntimeExposure,
+    #[cfg(feature = "workspace-checkpoints")]
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
     pub(crate) sessions: sessions::SessionStore,
     pub(crate) session_shells: SessionShellRegistry,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     pub(crate) repository_overview_probe_timeout: Duration,
+    /// Process-local model-facing handles for exact full-file read snapshots.
+    /// Clones share the registry; a Server runtime restart creates a new epoch.
+    pub(crate) read_revisions: Arc<super::read_revisions::ReadRevisionRegistry>,
+    pub(crate) read_cache: Arc<super::read_cache::ReadCache>,
+    pub(crate) validation_sources: Arc<super::validation_source::ValidationSourceRegistry>,
+    /// Process-local Project mutation serialization used only by orchestration
+    /// frontends. Direct first-class mutations deliberately bypass this registry.
+    #[cfg(feature = "experimental-code-mode")]
+    pub(crate) orchestration_mutation_fences:
+        Arc<super::orchestration_host::OrchestrationMutationFenceRegistry>,
     /// One deadline shared by every item in a `read_files` batch.
     pub(crate) read_files_deadline: Duration,
     /// One deadline shared by every query in a `search_project_texts` batch.
     pub(crate) search_project_texts_deadline: Duration,
-    /// Internal synchronous wait window for a read-only structured validation
-    /// before it promotes to a Job. Defaults to `SYNC_VALIDATION_WAIT_SECS`;
-    /// tests shrink it so the handoff path can be exercised without sleeping.
+    /// Runtime cap for the effective synchronous grace before a read-only
+    /// structured validation promotes to a Job. Production permits the public
+    /// maximum; the validation budget selects the canonical default or explicit
+    /// caller preference. Tests shrink this cap to exercise handoff without sleeping.
     pub(crate) validation_sync_wait: Duration,
     /// Orders authoritative terminal-Job snapshot acquisition through Session
     /// marker/evidence materialization. Marker eviction interprets absence from
@@ -148,9 +160,8 @@ pub struct ToolRuntime {
     /// Sink for the workspace activity ledger (mutating tool executions).
     /// No-op unless the host injects a durable recorder.
     pub(crate) activity: Arc<dyn ActivityRecorder>,
-    /// Cross-surface connection observations (connector endpoint activity,
-    /// last successful meaningful tool call). Shared with the connector
-    /// runtime; never stores payloads or secrets.
+    /// Bounded connection/runtime observations such as endpoint activity and
+    /// last successful meaningful tool call. Never stores payloads or secrets.
     pub(crate) observations: Arc<RuntimeObservations>,
     /// Process-local payload-free view of currently in-flight MCP Window
     /// requests. It is observability only and intentionally resets on restart.
@@ -165,13 +176,34 @@ pub struct ToolRuntime {
     /// the server from the existing webcodex.db handle; Runner-native project
     /// filesystems never own Memory v1 persistence.
     pub(crate) memory_db: Option<Arc<crate::Database>>,
-    /// Optional Control-owned durable Agent and Conversation store. It shares
-    /// the Server SQLite handle with other durable domains but owns independent tables.
+    /// Durable Server-owned mapping from authenticated caller + short Project ref
+    /// to one exact canonical Project incarnation. It grants no authority.
+    pub(crate) project_reference_db: Option<Arc<crate::Database>>,
+    /// Optional Control-owned durable user-domain store. Durable Agent, Conversation,
+    /// AgentTask, and Goal state share this Server SQLite handle while remaining
+    /// independent tables, lifecycles, and authority domains.
     pub(crate) communication_db: Option<Arc<crate::Database>>,
+    /// Dedicated generic Job-terminal-attention store. This is intentionally
+    /// independent of Durable Agent communication identity.
+    pub(crate) job_terminal_db: Option<Arc<crate::Database>>,
+    /// Process-local Host delivery seam for already-durable terminal events.
+    pub(crate) job_terminal_continuations:
+        Option<crate::job_terminal_attention::JobTerminalContinuationController>,
+    #[cfg(test)]
+    pub(crate) job_terminal_registration_test_hook:
+        Option<crate::tool_runtime::job_terminal_wait::JobTerminalRegistrationTestHook>,
     /// Optional process-local Host continuation registry/controller. It is
     /// created only when the durable communication database is injected and is
     /// intentionally empty again after process restart.
     pub(crate) agent_continuations: Option<crate::agent_wake::AgentContinuationController>,
+    /// Process-local LRU registry of compact observation refs (e.g. `~j4`).
+    /// Each ref pins one exact (job_id, observation_token) pair for a specific
+    /// principal. Intentionally empty after server restart — the model falls back
+    /// to raw job_id + after_observation_token on unknown refs.
+    pub(crate) observation_ref_registry:
+        Arc<webcodex_core::job_observation::ObservationRefRegistry>,
+    /// Process-local, bounded, non-authoritative passive Job attention cursor.
+    pub(crate) job_attention_cursor: Arc<super::job_attention::JobAttentionCursor>,
 }
 
 impl ToolRuntime {
@@ -185,9 +217,7 @@ impl ToolRuntime {
             ),
             coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
-            runtime_exposure: crate::model_surface::RuntimeExposure::Runtime(
-                crate::model_surface::ModelSurface::LocalCoding,
-            ),
+            #[cfg(feature = "workspace-checkpoints")]
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
             session_shells: SessionShellRegistry::default(),
@@ -195,10 +225,21 @@ impl ToolRuntime {
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
+            read_revisions: Arc::new(super::read_revisions::ReadRevisionRegistry::new()),
+            read_cache: Arc::new(super::read_cache::ReadCache::default()),
+            validation_sources: Arc::new(
+                super::validation_source::ValidationSourceRegistry::default(),
+            ),
+            #[cfg(feature = "experimental-code-mode")]
+            orchestration_mutation_fences: Arc::new(
+                super::orchestration_host::OrchestrationMutationFenceRegistry::default(),
+            ),
             read_files_deadline: super::read_files::DEFAULT_READ_FILES_DEADLINE,
             search_project_texts_deadline:
                 super::search_project_texts::DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE,
-            validation_sync_wait: Duration::from_secs(super::helpers::SYNC_VALIDATION_WAIT_SECS),
+            validation_sync_wait: Duration::from_secs(
+                super::structured_execution::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS,
+            ),
             validation_terminal_reconciliation: Arc::new(Mutex::new(())),
             #[cfg(test)]
             validation_terminal_reconciliation_test_hook: Arc::new(
@@ -215,35 +256,18 @@ impl ToolRuntime {
             metrics: Arc::new(super::runtime_metrics::TracingRuntimeMetrics),
             window_activity_db: None,
             memory_db: None,
+            project_reference_db: None,
             communication_db: None,
+            job_terminal_db: None,
+            job_terminal_continuations: None,
+            #[cfg(test)]
+            job_terminal_registration_test_hook: None,
             agent_continuations: None,
+            observation_ref_registry: Arc::new(
+                webcodex_core::job_observation::ObservationRefRegistry::default(),
+            ),
+            job_attention_cursor: Arc::new(super::job_attention::JobAttentionCursor::default()),
         }
-    }
-
-    pub(crate) fn with_runtime_exposure(
-        mut self,
-        runtime_exposure: crate::model_surface::RuntimeExposure,
-    ) -> Self {
-        self.runtime_exposure = runtime_exposure;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_model_surface(
-        self,
-        model_surface: crate::model_surface::ModelSurface,
-    ) -> Self {
-        self.with_runtime_exposure(crate::model_surface::RuntimeExposure::Runtime(
-            model_surface,
-        ))
-    }
-
-    pub(crate) fn runtime_exposure(&self) -> crate::model_surface::RuntimeExposure {
-        self.runtime_exposure
-    }
-
-    pub(crate) fn model_surface(&self) -> Option<crate::model_surface::ModelSurface> {
-        self.runtime_exposure.model_surface()
     }
 
     /// Attach a durable workspace-activity recorder (server wiring).
@@ -268,11 +292,35 @@ impl ToolRuntime {
         self
     }
 
+    pub(crate) fn with_project_reference_database(mut self, db: Arc<crate::Database>) -> Self {
+        self.project_reference_db = Some(db);
+        self
+    }
+
     pub(crate) fn with_communication_database(mut self, db: Arc<crate::Database>) -> Self {
         self.agent_continuations = Some(crate::agent_wake::AgentContinuationController::new(
             db.clone(),
         ));
         self.communication_db = Some(db);
+        self
+    }
+
+    pub(crate) fn with_job_terminal_attention(
+        mut self,
+        db: Arc<crate::Database>,
+        controller: crate::job_terminal_attention::JobTerminalContinuationController,
+    ) -> Self {
+        self.job_terminal_db = Some(db);
+        self.job_terminal_continuations = Some(controller);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_job_terminal_registration_test_hook(
+        mut self,
+        hook: crate::tool_runtime::job_terminal_wait::JobTerminalRegistrationTestHook,
+    ) -> Self {
+        self.job_terminal_registration_test_hook = Some(hook);
         self
     }
 

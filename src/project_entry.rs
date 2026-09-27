@@ -1,7 +1,7 @@
 //! Canonical project onboarding and readiness application service.
 //!
-//! Configuration lives outside the Git checkout. CLI, Connector HTTP, and the
-//! Browser console project the same structured readiness facts; none parse
+//! Configuration lives outside the Git checkout. CLI readiness is derived from
+//! canonical Runtime/Runner/Project observations; it never parses
 //! human-formatted output to decide whether coding is ready.
 
 #[path = "project_entry_client_handoff.rs"]
@@ -21,13 +21,13 @@ mod share_service;
 mod windows_private_state;
 
 pub(crate) use regular_tunnel_service::{run_regular_server_tunnel, RegularServerTunnelOptions};
+pub(crate) use setup_service::setup;
 use setup_service::{
     create_private_dir, local_readiness, prepare_runtime_private_state, read_private_value,
     read_project_agent_token, read_project_credential, read_toml_optional,
     validate_agent_authentication, validate_existing_registration, validate_existing_runner,
     validate_product_config, validate_profile, ProjectConfig,
 };
-pub(crate) use setup_service::{resolve_local_task_state, setup};
 #[cfg(test)]
 pub(crate) use share_service::TunnelProvider;
 pub(crate) use share_service::{parse_share_options, share, ShareCommandOptions};
@@ -42,8 +42,6 @@ use tokio::process::{Child, Command};
 
 const DEFAULT_PROFILE: &str = "personal";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECTOR_PROJECT_REGISTRY_DIR_ENV: &str = "WEBCODEX_CONNECTOR_PROJECT_REGISTRY_DIR";
-const LEGACY_CONNECTOR_PROJECTS_DIR_ENV: &str = "WEBCODEX_CONNECTOR_PROJECTS_DIR";
 
 const NPM_WRAPPER_NETWORK_ENV_KEYS: [&str; 8] = [
     "npm_config_https_proxy",
@@ -66,15 +64,6 @@ fn remove_runner_parent_credentials(command: &mut Command) {
     for key in ["WEBCODEX_TOKEN", "WEBCODEX_PAT", "WEBCODEX_AGENT_TOKEN"] {
         command.env_remove(key);
     }
-}
-
-fn configure_connector_project_registry_environment(command: &mut Command, path: &Path) {
-    // `Command` inherits the parent environment. Clear the pre-0.4 alias before
-    // setting the canonical variable so a stale shell/service environment cannot
-    // make the child Server observe both names and fail its dual-alias fence.
-    command
-        .env_remove(LEGACY_CONNECTOR_PROJECTS_DIR_ENV)
-        .env(CONNECTOR_PROJECT_REGISTRY_DIR_ENV, path);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,19 +184,6 @@ pub(crate) enum RemoteProbe {
     Ready,
     RunnerOffline,
     ProjectMissing,
-    RequiredCapabilityMissing,
-    StructuredValidationMissing,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocalTaskState {
-    pub root: PathBuf,
-    pub state: PathBuf,
-    pub data: PathBuf,
-    pub runs: PathBuf,
-    pub project_registry: PathBuf,
-    pub cargo_target: PathBuf,
-    pub logical_project_id: String,
 }
 
 pub(crate) fn parse_options(
@@ -300,7 +276,7 @@ pub(crate) fn readiness_with_probe(
             paths
                 .resolved_runner_config()
                 .is_ok_and(|config| config.is_file())
-                && paths.connector_key.is_file()
+                && paths.project_credential.is_file()
                 && paths.agent_token.is_file()
                 && paths.bootstrap_key.is_file()
         })
@@ -396,24 +372,6 @@ pub(crate) fn runtime_readiness(project: Option<String>, probe: RemoteProbe) -> 
             ));
             ("connected", "online", "not_ready")
         }
-        RemoteProbe::RequiredCapabilityMissing => {
-            findings.push(ReadinessFact::fail(
-                "Capabilities",
-                "required_capability_unavailable",
-                "The local Runner is missing a required coding capability.",
-                "Upgrade the WebCodex Runner and restart it.",
-            ));
-            ("connected", "online", "not_ready")
-        }
-        RemoteProbe::StructuredValidationMissing => {
-            findings.push(ReadinessFact::fail(
-                "Capabilities",
-                "structured_validation_unavailable",
-                "Structured validation is unavailable.",
-                "Upgrade the WebCodex Runner and restart it.",
-            ));
-            ("connected", "online", "not_ready")
-        }
         RemoteProbe::Ready => {
             findings.push(ReadinessFact::pass(
                 "Runner",
@@ -429,11 +387,6 @@ pub(crate) fn runtime_readiness(project: Option<String>, probe: RemoteProbe) -> 
                 "Capabilities",
                 "required_capabilities_available",
                 "Required coding capabilities are available.",
-            ));
-            findings.push(ReadinessFact::pass(
-                "Structured validation",
-                "structured_validation_available",
-                "Structured validation is available.",
             ));
             ("connected", "online", "ready")
         }
@@ -521,7 +474,7 @@ pub(crate) async fn collect_readiness(options: &ProjectCommandOptions) -> Projec
     let (Some(config), Some(paths)) = (local.config, local.paths) else {
         return readiness_with_probe(options, RemoteProbe::Unreachable);
     };
-    let key = match read_project_credential(&paths.connector_key) {
+    let key = match read_project_credential(&paths.project_credential) {
         Ok(key) => key,
         Err(_) => return readiness_with_probe(options, RemoteProbe::Unreachable),
     };
@@ -531,22 +484,21 @@ pub(crate) async fn collect_readiness(options: &ProjectCommandOptions) -> Projec
 async fn collect_readiness_from_remote(
     options: &ProjectCommandOptions,
     config: &ProjectConfig,
-    key: &str,
+    credential: &str,
 ) -> ProjectReadiness {
-    let url = format!("{}/api/connector/readiness", config.server_url());
-    let response = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(3))
         .build()
-        .ok();
-    let Some(client) = response else {
-        return readiness_with_probe(options, RemoteProbe::Unreachable);
+    {
+        Ok(client) => client,
+        Err(_) => return readiness_with_probe(options, RemoteProbe::Unreachable),
     };
-    let remote = match client
-        .post(url)
-        .bearer_auth(key)
-        .json(&serde_json::json!({}))
+    let status = match client
+        .post(format!("{}/api/runtime/status", config.server_url()))
+        .bearer_auth(credential)
+        .json(&serde_json::json!({"client_id": config.executor_client_id}))
         .send()
         .await
     {
@@ -556,20 +508,82 @@ async fn collect_readiness_from_remote(
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
             ) =>
         {
-            return readiness_with_probe(options, RemoteProbe::CredentialRejected);
+            return readiness_with_probe(options, RemoteProbe::CredentialRejected)
         }
         Ok(response) if response.status().is_success() => {
-            response.json::<ProjectReadiness>().await.ok()
+            response.json::<serde_json::Value>().await.ok()
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::BAD_REQUEST => None,
+        _ => return readiness_with_probe(options, RemoteProbe::Unreachable),
+    };
+    let Some(status) = status else {
+        return readiness_with_probe(options, RemoteProbe::RunnerOffline);
+    };
+    if status.get("success").and_then(serde_json::Value::as_bool) != Some(true)
+        || status
+            .pointer("/output/focus/client_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(config.executor_client_id.as_str())
+        || status
+            .pointer("/output/focus/connected")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return readiness_with_probe(options, RemoteProbe::RunnerOffline);
+    }
+    let runtime_project_id = config.runtime_project_id();
+    let projects = match client
+        .post(format!("{}/api/tools/call", config.server_url()))
+        .bearer_auth(credential)
+        .json(&serde_json::json!({
+            "tool": "list_projects",
+            "params": {
+                "client_id": config.executor_client_id,
+                "project": runtime_project_id,
+                "limit": 1,
+                "summary_only": true,
+            }
+        }))
+        .send()
+        .await
+    {
+        Ok(response)
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) =>
+        {
+            return readiness_with_probe(options, RemoteProbe::CredentialRejected)
+        }
+        Ok(response) if response.status().is_success() => {
+            response.json::<serde_json::Value>().await.ok()
         }
         _ => None,
     };
-    match remote {
-        Some(remote) => {
-            let probe = remote_probe_from_readiness(&remote);
-            readiness_with_probe(options, probe)
-        }
-        None => readiness_with_probe(options, RemoteProbe::Unreachable),
-    }
+    let visible = projects
+        .as_ref()
+        .and_then(|value| value.pointer("/output/projects"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| {
+            projects.iter().any(|project| {
+                project.get("id").and_then(serde_json::Value::as_str)
+                    == Some(runtime_project_id.as_str())
+                    && project.get("client_id").and_then(serde_json::Value::as_str)
+                        == Some(config.executor_client_id.as_str())
+                    && project
+                        .get("connected")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+        });
+    readiness_with_probe(
+        options,
+        if visible {
+            RemoteProbe::Ready
+        } else {
+            RemoteProbe::ProjectMissing
+        },
+    )
 }
 
 pub(crate) fn render_setup_text(report: &SetupReport) -> String {
@@ -655,7 +669,7 @@ pub(super) struct ProjectShareOAuthRuntimeOptions {
 #[derive(Debug, Clone)]
 pub(super) struct LocalRuntimeOptions {
     pub(super) public_url: Option<String>,
-    pub(super) connector_credential_file: Option<PathBuf>,
+    pub(super) project_credential_file: Option<PathBuf>,
     pub(super) mcp_query_token_auth: bool,
     pub(super) project_share_oauth: Option<ProjectShareOAuthRuntimeOptions>,
     pub(super) child_environment_remove: Vec<&'static str>,
@@ -667,7 +681,7 @@ impl Default for LocalRuntimeOptions {
     fn default() -> Self {
         Self {
             public_url: None,
-            connector_credential_file: None,
+            project_credential_file: None,
             mcp_query_token_auth: false,
             project_share_oauth: None,
             child_environment_remove: Vec::new(),
@@ -763,9 +777,9 @@ pub(super) async fn start_local_runtime(
     })?;
     let bootstrap = read_private_value(&paths.bootstrap_key)?;
     let credential_file = runtime_options
-        .connector_credential_file
-        .unwrap_or_else(|| paths.connector_key.clone());
-    let connector_key = read_project_credential(&credential_file)?;
+        .project_credential_file
+        .unwrap_or_else(|| paths.project_credential.clone());
+    let project_credential = read_project_credential(&credential_file)?;
     let _agent_token = read_project_agent_token(&paths.agent_token)?;
     validate_agent_authentication(&config, &paths)?;
     let server_binary = locate_companion_binary("webcodex-server").ok_or_else(|| {
@@ -786,7 +800,6 @@ pub(super) async fn start_local_runtime(
     for name in &runtime_options.child_environment_remove {
         server_command.env_remove(name);
     }
-    configure_connector_project_registry_environment(&mut server_command, &paths.project_registry);
     server_command
         .current_dir(&paths.state)
         .env_remove("WEBCODEX_ENV_FILE")
@@ -803,12 +816,11 @@ pub(super) async fn start_local_runtime(
         .env("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS", "300")
         .env("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS", "")
         .env("WEBCODEX_QUIC_ENABLED", "false")
-        .env("WEBCODEX_CONNECTOR_SURFACE", "task-v1")
         .env(
-            "WEBCODEX_CONNECTOR_PROJECT_GRANT_ID",
+            crate::auth::PROJECT_GRANT_ID_ENV,
             config.project_grant_id(&paths),
         )
-        .env("WEBCODEX_PROJECT_CREDENTIAL_FILE", &credential_file)
+        .env(crate::auth::PROJECT_CREDENTIAL_FILE_ENV, &credential_file)
         .env(
             "WEBCODEX_PROJECT_SHARE_MCP_QUERY_TOKEN_ENABLED",
             if mcp_query_token_auth {
@@ -817,18 +829,14 @@ pub(super) async fn start_local_runtime(
                 "false"
             },
         )
-        .env("WEBCODEX_PROJECT_AGENT_TOKEN_FILE", &paths.agent_token)
-        .env("WEBCODEX_CONNECTOR_PROJECT_ID", &config.logical_project_id)
-        .env("WEBCODEX_CONNECTOR_PROJECT_NAME", &config.project_name)
-        .env("WEBCODEX_CONNECTOR_WORKSPACE_ID", &config.workspace_id)
         .env(
-            "WEBCODEX_CONNECTOR_EXECUTOR_PROJECT",
-            config.runtime_project_id(),
+            crate::auth::PROJECT_AGENT_TOKEN_FILE_ENV,
+            &paths.agent_token,
         )
-        .env("WEBCODEX_CONNECTOR_EXECUTOR_ROOT", &config.root)
-        .env("WEBCODEX_CONNECTOR_RUNS_ROOT", &paths.runs)
-        .env("WEBCODEX_CONNECTOR_RESULTS_ROOT", &paths.results)
-        .env("WEBCODEX_CONNECTOR_PROFILE", &config.profile)
+        .env(
+            crate::auth::PROJECT_RUNNER_CLIENT_ID_ENV,
+            &config.executor_client_id,
+        )
         .stdout(Stdio::from(server_log))
         .stderr(Stdio::from(server_error))
         .kill_on_drop(true);
@@ -856,8 +864,13 @@ pub(super) async fn start_local_runtime(
             Some("Run webcodex doctor."),
         )
     })?;
-    if let Err(error) =
-        wait_for_server(&mut server, &local_url, &connector_key, readiness_deadline).await
+    if let Err(error) = wait_for_server(
+        &mut server,
+        &local_url,
+        &project_credential,
+        readiness_deadline,
+    )
+    .await
     {
         stop_child(&mut server).await;
         return Err(error);
@@ -895,7 +908,7 @@ pub(super) async fn start_local_runtime(
         &mut runner,
         options,
         &config,
-        &connector_key,
+        &project_credential,
         readiness_deadline,
     )
     .await
@@ -917,7 +930,7 @@ pub(super) async fn start_local_runtime(
 pub(crate) async fn start_runner(options: &ProjectCommandOptions) -> Result<(), ProductError> {
     let mut runtime = start_local_runtime(options, LocalRuntimeOptions::default()).await?;
     let mut started = format!(
-        "Project: {}\nConnection: connected at {}\nConsole: {}/console\nConsole assets: {}",
+        "Project: {}\nConnection: connected at {}\nConsole: {}/runtime\nConsole assets: {}",
         runtime.project_name,
         runtime.local_url,
         runtime.local_url,
@@ -981,34 +994,6 @@ fn configure_console_assets_environment(command: &mut Command, directory: Option
     command.env_remove(crate::console_web::CONSOLE_ASSETS_DIR_ENV);
     if let Some(directory) = directory {
         command.env(crate::console_web::CONSOLE_ASSETS_DIR_ENV, directory);
-    }
-}
-
-fn remote_probe_from_readiness(readiness: &ProjectReadiness) -> RemoteProbe {
-    for (code, probe) in [
-        (
-            "structured_validation_unavailable",
-            RemoteProbe::StructuredValidationMissing,
-        ),
-        (
-            "required_capability_unavailable",
-            RemoteProbe::RequiredCapabilityMissing,
-        ),
-        ("project_registration_invalid", RemoteProbe::ProjectMissing),
-        ("agent_offline", RemoteProbe::RunnerOffline),
-    ] {
-        if readiness
-            .findings
-            .iter()
-            .any(|finding| finding.code == code && finding.status == ReadinessStatus::Fail)
-        {
-            return probe;
-        }
-    }
-    if readiness.ready {
-        RemoteProbe::Ready
-    } else {
-        RemoteProbe::Unreachable
     }
 }
 
@@ -1116,9 +1101,9 @@ async fn wait_for_server(
         let response = tokio::time::timeout(
             remaining,
             client
-                .post(format!("{base_url}/api/connector/readiness"))
+                .post(format!("{base_url}/api/runtime/status"))
                 .bearer_auth(key)
-                .json(&serde_json::json!({}))
+                .json(&serde_json::json!({"summary_only": true}))
                 .send(),
         )
         .await
@@ -1146,7 +1131,7 @@ async fn wait_for_ready(
     runner: &mut Child,
     options: &ProjectCommandOptions,
     config: &ProjectConfig,
-    connector_key: &str,
+    project_credential: &str,
     deadline: Instant,
 ) -> Result<(), ProductError> {
     while Instant::now() < deadline {
@@ -1167,7 +1152,7 @@ async fn wait_for_ready(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if tokio::time::timeout(
             remaining,
-            collect_readiness_from_remote(options, config, connector_key),
+            collect_readiness_from_remote(options, config, project_credential),
         )
         .await
         .is_ok_and(|readiness| readiness.ready)

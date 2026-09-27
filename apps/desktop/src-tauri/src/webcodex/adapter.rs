@@ -1,4 +1,6 @@
-use super::cli::{run_json, run_json_until, run_project_activation_json, ResolvedBinaries};
+use super::cli::{
+    run_json, run_json_until, run_project_activation_json, CliCommandContext, ResolvedBinaries,
+};
 use super::models::{
     LegacyProjectRegisterOutput, LoginOutput, OpsProjectsOutput, OpsWindowsOutput,
     PairingCreateOutput, ProjectActivationOutput, RunnerStatusOutput, ServerStatusOutput,
@@ -17,6 +19,19 @@ pub struct ProjectRuntimeIdentity {
     pub project_id: String,
     pub runtime_project_id: String,
     pub project_path: String,
+    pub runner: RunnerRuntimeIdentity,
+}
+
+impl std::ops::Deref for ProjectRuntimeIdentity {
+    type Target = RunnerRuntimeIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.runner
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRuntimeIdentity {
+    pub client_id: String,
     pub runner_config: PathBuf,
     pub user_token_file: PathBuf,
     pub server_url: String,
@@ -31,6 +46,8 @@ pub struct RunnerConnectionObservation {
 pub struct WebCodexAdapter {
     binaries: Option<ResolvedBinaries>,
     bundled_runtime_dir: Option<PathBuf>,
+    runtime_source: crate::runtime_selection::RuntimeSource,
+    approved_custom_fingerprint: Option<String>,
 }
 
 impl WebCodexAdapter {
@@ -38,7 +55,51 @@ impl WebCodexAdapter {
         Self {
             binaries: None,
             bundled_runtime_dir,
+            runtime_source: Default::default(),
+            approved_custom_fingerprint: None,
         }
+    }
+
+    pub(crate) fn set_runtime_source(&mut self, source: crate::runtime_selection::RuntimeSource) {
+        self.runtime_source = source;
+        self.binaries = None;
+    }
+
+    pub(crate) fn set_runtime_approval(&mut self, fingerprint: Option<String>) {
+        self.approved_custom_fingerprint = fingerprint;
+    }
+
+    fn validate_runtime_approval(&self, binaries: &ResolvedBinaries) -> DesktopResult<()> {
+        if matches!(
+            self.runtime_source,
+            crate::runtime_selection::RuntimeSource::Custom { .. }
+        ) {
+            let expected = self.approved_custom_fingerprint.as_deref().ok_or_else(|| {
+                crate::runtime_selection::error("runtime_custom_approval_required")
+            })?;
+            if expected != binaries.fingerprint {
+                return Err(crate::runtime_selection::error("runtime_candidate_changed"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn activate_binaries(
+        &mut self,
+        source: crate::runtime_selection::RuntimeSource,
+        binaries: ResolvedBinaries,
+    ) {
+        self.approved_custom_fingerprint = matches!(
+            source,
+            crate::runtime_selection::RuntimeSource::Custom { .. }
+        )
+        .then(|| binaries.fingerprint.clone());
+        self.runtime_source = source;
+        self.binaries = Some(binaries);
+    }
+
+    pub(crate) fn bundled_runtime_dir(&self) -> Option<&Path> {
+        self.bundled_runtime_dir.as_deref()
     }
 
     pub async fn ensure_binaries(
@@ -46,10 +107,15 @@ impl WebCodexAdapter {
         cancellation: &CancellationContext,
     ) -> DesktopResult<&ResolvedBinaries> {
         if self.binaries.is_none() {
-            self.binaries = Some(
-                ResolvedBinaries::resolve(self.bundled_runtime_dir.as_deref(), cancellation)
-                    .await?,
-            );
+            let binaries = ResolvedBinaries::resolve_source_until(
+                &self.runtime_source,
+                self.bundled_runtime_dir.as_deref(),
+                cancellation,
+                Deadline::after(std::time::Duration::from_secs(30)),
+            )
+            .await?;
+            self.validate_runtime_approval(&binaries)?;
+            self.binaries = Some(binaries);
         }
         Ok(self.binaries.as_ref().expect("resolved above"))
     }
@@ -60,14 +126,15 @@ impl WebCodexAdapter {
         deadline: Deadline,
     ) -> DesktopResult<&ResolvedBinaries> {
         if self.binaries.is_none() {
-            self.binaries = Some(
-                ResolvedBinaries::resolve_until(
-                    self.bundled_runtime_dir.as_deref(),
-                    cancellation,
-                    deadline,
-                )
-                .await?,
-            );
+            let binaries = ResolvedBinaries::resolve_source_until(
+                &self.runtime_source,
+                self.bundled_runtime_dir.as_deref(),
+                cancellation,
+                deadline,
+            )
+            .await?;
+            self.validate_runtime_approval(&binaries)?;
+            self.binaries = Some(binaries);
         }
         Ok(self.binaries.as_ref().expect("resolved above"))
     }
@@ -122,6 +189,7 @@ impl WebCodexAdapter {
             ],
             None,
             false,
+            CliCommandContext::new("server_init", "server init"),
             cancellation,
         )
         .await?;
@@ -202,23 +270,45 @@ impl WebCodexAdapter {
         args.push("--json".into());
         let output: ServerStatusOutput = match deadline {
             Some(deadline) => {
-                run_json_until(&webcodex, &args, None, false, cancellation, deadline).await?
+                run_json_until(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("server_status", "server status"),
+                    cancellation,
+                    deadline,
+                )
+                .await?
             }
-            None => run_json(&webcodex, &args, None, false, cancellation).await?,
+            None => {
+                run_json(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("server_status", "server status"),
+                    cancellation,
+                )
+                .await?
+            }
         };
         if output.probe_url.trim().is_empty() {
             return Err(invalid_contract("server status"));
         }
-        if output
-            .revision_check
-            .as_deref()
-            .is_some_and(|value| value.starts_with("warning:"))
-        {
-            return Err(DesktopError::new(
-                "binary_version_mismatch",
-                "The running Server does not match this Desktop WebCodex CLI build",
-                "Stop the old Server or point Desktop at a matching Server before continuing.",
-            ));
+        // Source mismatch is advisory. A reachable peer must explicitly advertise
+        // a supported management contract; local executable metadata is not a
+        // substitute for the identity of the Server answering this request.
+        if output.http_reachable {
+            let contract = output
+                .desktop_runtime_contract
+                .ok_or_else(|| crate::runtime_selection::error("server_contract_unverifiable"))?;
+            if !contract.overlaps(webcodex_core::desktop_runtime_contract::DESKTOP_RUNTIME_CONTRACT)
+            {
+                return Err(crate::runtime_selection::error(
+                    "server_contract_incompatible",
+                ));
+            }
         }
         Ok(output)
     }
@@ -324,11 +414,21 @@ impl WebCodexAdapter {
             username,
             "--ttl-secs".into(),
             "600".into(),
+            // Local Desktop setup has operator authority. Remote codes retain
+            // the scopes explicitly granted by their Server operator.
+            "--runner-capabilities".into(),
             "--json".into(),
         ];
         args.push("--no-system-proxy".into());
-        let output: PairingCreateOutput =
-            run_json(&webcodex, &args, None, true, cancellation).await?;
+        let output: PairingCreateOutput = run_json(
+            &webcodex,
+            &args,
+            None,
+            true,
+            CliCommandContext::new("pairing_create", "pairing create"),
+            cancellation,
+        )
+        .await?;
         if !output.pairing_code.starts_with("wc_pair_") {
             return Err(invalid_contract("pairing create"));
         }
@@ -388,6 +488,7 @@ impl WebCodexAdapter {
             &args,
             Some(pairing_code.as_bytes()),
             true,
+            CliCommandContext::new("login", "login"),
             cancellation,
         )
         .await?;
@@ -396,7 +497,7 @@ impl WebCodexAdapter {
 
     pub async fn runner_ready(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         cancellation: &CancellationContext,
     ) -> DesktopResult<bool> {
         self.runner_ready_with_deadline(identity, cancellation, None)
@@ -405,7 +506,7 @@ impl WebCodexAdapter {
 
     pub async fn runner_ready_until(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         cancellation: &CancellationContext,
         deadline: Deadline,
     ) -> DesktopResult<bool> {
@@ -415,7 +516,7 @@ impl WebCodexAdapter {
 
     pub async fn observe_runner_connection(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         expected_client_id: Option<&str>,
         cancellation: &CancellationContext,
     ) -> DesktopResult<RunnerConnectionObservation> {
@@ -430,7 +531,7 @@ impl WebCodexAdapter {
 
     async fn observe_runner_connection_with_deadline(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         expected_client_id: Option<&str>,
         cancellation: &CancellationContext,
         deadline: Option<Deadline>,
@@ -459,9 +560,28 @@ impl WebCodexAdapter {
         }
         let output: RunnerStatusOutput = match deadline {
             Some(deadline) => {
-                run_json_until(&webcodex, &args, None, false, cancellation, deadline).await?
+                run_json_until(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("runner_status", "runner status"),
+                    cancellation,
+                    deadline,
+                )
+                .await?
             }
-            None => run_json(&webcodex, &args, None, false, cancellation).await?,
+            None => {
+                run_json(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("runner_status", "runner status"),
+                    cancellation,
+                )
+                .await?
+            }
         };
         if output.config.path.trim().is_empty()
             || output.config.client_id.trim().is_empty()
@@ -471,6 +591,7 @@ impl WebCodexAdapter {
         }
         if !same_existing_file(Path::new(&output.config.path), &identity.runner_config)
             || !same_server(&output.config.server_url, &identity.server_url)
+            || output.config.client_id != identity.client_id
             || expected_client_id.is_some_and(|expected| expected != output.config.client_id)
         {
             return Err(DesktopError::new(
@@ -496,7 +617,7 @@ impl WebCodexAdapter {
 
     async fn runner_ready_with_deadline(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         cancellation: &CancellationContext,
         deadline: Option<Deadline>,
     ) -> DesktopResult<bool> {
@@ -507,7 +628,7 @@ impl WebCodexAdapter {
 
     pub async fn activate_project(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         expected_client_id: &str,
         project: &ProjectSelection,
         cancellation: &CancellationContext,
@@ -536,15 +657,18 @@ impl WebCodexAdapter {
             project_id: output.project.id,
             runtime_project_id: output.project.runtime_project,
             project_path: output.project.path,
-            runner_config: identity.runner_config.clone(),
-            user_token_file: identity.user_token_file.clone(),
-            server_url: identity.server_url.clone(),
+            runner: RunnerRuntimeIdentity {
+                client_id: expected_client_id.to_string(),
+                runner_config: identity.runner_config.clone(),
+                user_token_file: identity.user_token_file.clone(),
+                server_url: identity.server_url.clone(),
+            },
         })
     }
 
     pub async fn legacy_register_project(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         client_id: &str,
         project: &ProjectSelection,
         cancellation: &CancellationContext,
@@ -558,8 +682,15 @@ impl WebCodexAdapter {
             project.path.clone(),
             "--json".into(),
         ];
-        let output: LegacyProjectRegisterOutput =
-            run_json(&webcodex, &args, None, false, cancellation).await?;
+        let output: LegacyProjectRegisterOutput = run_json(
+            &webcodex,
+            &args,
+            None,
+            false,
+            CliCommandContext::new("project_register", "project register"),
+            cancellation,
+        )
+        .await?;
         if output.project.id.trim().is_empty() || !same_path(&output.project.path, &project.path) {
             return Err(invalid_contract("legacy project registration"));
         }
@@ -567,9 +698,12 @@ impl WebCodexAdapter {
             runtime_project_id: format!("agent:{client_id}:{}", output.project.id),
             project_id: output.project.id,
             project_path: output.project.path,
-            runner_config: identity.runner_config.clone(),
-            user_token_file: identity.user_token_file.clone(),
-            server_url: identity.server_url.clone(),
+            runner: RunnerRuntimeIdentity {
+                client_id: client_id.to_string(),
+                runner_config: identity.runner_config.clone(),
+                user_token_file: identity.user_token_file.clone(),
+                server_url: identity.server_url.clone(),
+            },
         })
     }
 
@@ -603,7 +737,15 @@ impl WebCodexAdapter {
         if server_url_is_loopback(&identity.server_url) {
             args.push("--no-system-proxy".into());
         }
-        let output: OpsWindowsOutput = run_json(webcodex, &args, None, false, cancellation).await?;
+        let output: OpsWindowsOutput = run_json(
+            webcodex,
+            &args,
+            None,
+            false,
+            CliCommandContext::new("window_activity", "ops windows"),
+            cancellation,
+        )
+        .await?;
         Ok(latest_chatgpt_activity(&output))
     }
 
@@ -654,9 +796,28 @@ impl WebCodexAdapter {
         }
         let output: OpsProjectsOutput = match deadline {
             Some(deadline) => {
-                run_json_until(&webcodex, &args, None, false, cancellation, deadline).await?
+                run_json_until(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("project_readiness", "ops projects"),
+                    cancellation,
+                    deadline,
+                )
+                .await?
             }
-            None => run_json(&webcodex, &args, None, false, cancellation).await?,
+            None => {
+                run_json(
+                    &webcodex,
+                    &args,
+                    None,
+                    false,
+                    CliCommandContext::new("project_readiness", "ops projects"),
+                    cancellation,
+                )
+                .await?
+            }
         };
         Ok(output
             .summary
@@ -768,9 +929,18 @@ fn validate_login_output(
         project_id: registered.id.clone(),
         runtime_project_id: registered.runtime_project.clone(),
         project_path: registered.path.clone(),
-        runner_config: PathBuf::from(&output.runner_config),
-        user_token_file: PathBuf::from(&output.user_token_file),
-        server_url: output.server_url.clone(),
+        runner: RunnerRuntimeIdentity {
+            client_id: registered
+                .runtime_project
+                .strip_prefix("agent:")
+                .and_then(|id| id.strip_suffix(&format!(":{}", registered.id)))
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| invalid_contract("login Runner identity"))?
+                .to_string(),
+            runner_config: PathBuf::from(&output.runner_config),
+            user_token_file: PathBuf::from(&output.user_token_file),
+            server_url: output.server_url.clone(),
+        },
     })
 }
 
@@ -868,17 +1038,12 @@ fn same_server(left: &str, right: &str) -> bool {
 fn same_existing_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
-        _ if cfg!(windows) => display_path(left).eq_ignore_ascii_case(&display_path(right)),
-        _ => left == right,
+        _ => webcodex_runner_config::paths::paths_equal(left, right),
     }
 }
 
 fn same_path(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        display_path(Path::new(left)).eq_ignore_ascii_case(&display_path(Path::new(right)))
-    } else {
-        left == right
-    }
+    webcodex_runner_config::paths::paths_equal(Path::new(left), Path::new(right))
 }
 
 fn display_path(path: &Path) -> String {
@@ -956,10 +1121,14 @@ mod tests {
             version: "0.3.9".to_string(),
             git_commit: "0123456789abcdef".to_string(),
             source: super::super::cli::ResolvedBinarySource::Environment,
+            builds: Vec::new(),
+            fingerprint: String::new(),
         };
         let adapter = WebCodexAdapter {
             binaries: Some(binaries),
             bundled_runtime_dir: None,
+            runtime_source: Default::default(),
+            approved_custom_fingerprint: None,
         };
         let local = adapter
             .quick_share_command(Path::new("repo"), "none", None)
@@ -1012,10 +1181,14 @@ mod tests {
             version: "0.4.1".to_string(),
             git_commit: "0123456789abcdef".to_string(),
             source: super::super::cli::ResolvedBinarySource::Environment,
+            builds: Vec::new(),
+            fingerprint: String::new(),
         };
         let adapter = WebCodexAdapter {
             binaries: Some(binaries),
             bundled_runtime_dir: None,
+            runtime_source: Default::default(),
+            approved_custom_fingerprint: None,
         };
         let command = adapter
             .local_runner_command(Path::new("runner.toml"))
@@ -1062,10 +1235,14 @@ mod tests {
             version: "0.3.9".to_string(),
             git_commit: "0123456789abcdef".to_string(),
             source: super::super::cli::ResolvedBinarySource::Environment,
+            builds: Vec::new(),
+            fingerprint: String::new(),
         };
         let adapter = WebCodexAdapter {
             binaries: Some(binaries),
             bundled_runtime_dir: None,
+            runtime_source: Default::default(),
+            approved_custom_fingerprint: None,
         };
         let command = adapter
             .regular_tunnel_command(Path::new("server.env"), Some("http://127.0.0.1:7890"))
@@ -1108,9 +1285,12 @@ mod tests {
             project_id: "repo".to_string(),
             runtime_project_id: "agent:desktop:repo".to_string(),
             project_path: r"C:\repo".to_string(),
-            runner_config: PathBuf::from("runner.toml"),
-            user_token_file: PathBuf::from("user-token"),
-            server_url: "https://example.test".to_string(),
+            runner: RunnerRuntimeIdentity {
+                client_id: "desktop".to_string(),
+                runner_config: PathBuf::from("runner.toml"),
+                user_token_file: PathBuf::from("user-token"),
+                server_url: "https://example.test".to_string(),
+            },
         };
         let ready = super::super::models::OpsProject {
             id: "agent:desktop:repo".to_string(),
@@ -1192,10 +1372,16 @@ mod tests {
     #[test]
     fn windows_extended_and_display_paths_match_the_same_project() {
         if cfg!(windows) {
-            assert!(same_path(
-                r"\\?\C:\Users\example\repo",
-                r"C:\Users\example\repo"
-            ));
+            for (left, right) in [
+                (r"\\?\C:\Users\example\repo", r"c:/users/example/repo/"),
+                (r"C:\", r"\\?\C:\"),
+                (r"D:\", r"\\?\D:\"),
+                (r"\\SERVER\Share\Repo", r"\\?\UNC\server\share\repo\"),
+                (r"\\server\share", r"\\?\UNC\SERVER\Share\"),
+            ] {
+                assert!(same_path(left, right), "{left} != {right}");
+            }
+            assert!(!same_path(r"C:\repo", r"D:\repo"));
         }
     }
 

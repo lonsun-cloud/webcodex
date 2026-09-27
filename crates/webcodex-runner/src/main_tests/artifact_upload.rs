@@ -305,6 +305,84 @@ fn file_artifact_upload_finish_detects_ooxml_mime_from_file() {
 }
 
 #[test]
+fn file_artifact_upload_finish_rejects_claimed_ooxml_mime_when_package_differs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = "artifacts/imports/claimed.pptx";
+    let bytes = fake_ooxml_zip(
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        false,
+    );
+
+    let begin = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            serde_json::json!({
+                "path": path,
+                "expected_bytes": bytes.len(),
+                "expected_sha256": sha256_hex_bytes(&bytes),
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "overwrite": false,
+                "max_bytes": bytes.len(),
+            }),
+        ),
+    ));
+    let upload_id = begin["upload_id"].as_str().unwrap().to_string();
+    let chunk = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            serde_json::json!({
+                "path": path,
+                "upload_id": upload_id.clone(),
+                "offset": 0,
+                "content_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &bytes
+                ),
+                "max_chunk_bytes": bytes.len(),
+            }),
+        ),
+    ));
+    assert_eq!(chunk["received_bytes"], bytes.len());
+
+    let finish = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_finish",
+            path,
+            serde_json::json!({"path": path, "upload_id": upload_id.clone()}),
+        ),
+    ));
+    assert_eq!(finish["committed"], false);
+    assert!(finish["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not match uploaded package content"));
+    assert!(!tmp.path().join(path).exists());
+    assert_upload_temp_files_exist(tmp.path(), path, &upload_id);
+
+    let abort = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_abort",
+            path,
+            serde_json::json!({"path": path, "upload_id": upload_id}),
+        ),
+    ));
+    assert_eq!(abort["aborted"], true);
+    assert_no_upload_temp_files(tmp.path(), path);
+}
+
+#[test]
 fn file_artifact_upload_begin_rejects_validation_and_targets() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -371,15 +449,15 @@ fn file_artifact_upload_begin_rejects_validation_and_targets() {
     ));
     assert_eq!(too_large["error"], "expected_bytes exceeds max_bytes");
 
-    let unsafe_octet_path = "artifacts/imports/raw.bin";
-    let unsafe_octet = line_edit_json(handle_file_request(
+    let generic_binary_path = "artifacts/imports/raw.bin";
+    let generic_binary = line_edit_json(handle_file_request(
         &policy,
         &json_file_op_request(
             tmp.path(),
             "file_artifact_upload_begin",
-            unsafe_octet_path,
+            generic_binary_path,
             serde_json::json!({
-                "path": unsafe_octet_path,
+                "path": generic_binary_path,
                 "expected_bytes": 1,
                 "expected_sha256": null,
                 "mime_type": "application/octet-stream",
@@ -388,11 +466,9 @@ fn file_artifact_upload_begin_rejects_validation_and_targets() {
             }),
         ),
     ));
-    let unsafe_octet_error = unsafe_octet["error"].as_str().unwrap();
-    assert!(unsafe_octet_error.contains(".artifact"));
-    assert!(unsafe_octet_error.contains(".txt"));
-    assert!(unsafe_octet_error.contains("artifacts/smoke/<name>.artifact"));
-    assert_eq!(unsafe_octet["failure_kind"], "policy_rejected");
+    assert!(generic_binary.get("error").is_none(), "{generic_binary}");
+    assert_eq!(generic_binary["mime_type"], "application/octet-stream");
+    assert_eq!(generic_binary["committed"], false);
 
     let existing_path = "artifacts/imports/existing.txt";
     std::fs::create_dir_all(tmp.path().join("artifacts/imports")).unwrap();

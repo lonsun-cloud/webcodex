@@ -216,7 +216,7 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
         &unrestricted_test_policy(),
         &shell,
         &project_registry_dir,
-        &jobs.prepared_profiles,
+        jobs.prepared_profiles(),
         &project_dir,
         &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );

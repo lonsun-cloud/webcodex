@@ -46,6 +46,8 @@ pub struct ActivityEntry {
     pub sequence: u64,
     pub timestamp_ms: u64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_profile_id: Option<crate::connection_id::TunnelProfileId>,
     pub level: ActivityLevel,
     pub event_kind: ActivityEventKind,
     pub message: String,
@@ -70,6 +72,17 @@ impl ActivityLog {
         level: ActivityLevel,
         message: impl AsRef<str>,
     ) {
+        self.push_for_profile(None, event_kind, source, level, message);
+    }
+
+    pub fn push_for_profile(
+        &self,
+        tunnel_profile_id: Option<crate::connection_id::TunnelProfileId>,
+        event_kind: ActivityEventKind,
+        source: impl Into<String>,
+        level: ActivityLevel,
+        message: impl AsRef<str>,
+    ) {
         let mut inner = self
             .inner
             .lock()
@@ -84,6 +97,7 @@ impl ActivityLog {
                 .try_into()
                 .unwrap_or(u64::MAX),
             source: source.into(),
+            tunnel_profile_id,
             level,
             event_kind,
             message: sanitize_message(message.as_ref()),

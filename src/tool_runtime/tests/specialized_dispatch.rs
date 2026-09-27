@@ -56,7 +56,7 @@ async fn specialized_dispatch_maps_each_gateway_action_scope_without_static_poli
         ),
         (
             "plugin_tool",
-            json!({"action":"call", "binding":"wc_pbind_00000000000000000000000000000000", "arguments":{}}),
+            json!({"action":"call", "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA", "arguments":{}}),
             SCOPE_PLUGIN_INVOKE,
         ),
         (

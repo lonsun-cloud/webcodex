@@ -4,8 +4,8 @@ use super::model::{
     SessionMessage, SessionMessageCompletionSummary, SessionMessageError, SessionMessageKind,
     SessionMessagePriority, SessionMessageStatus, SessionMessagesSummary, SessionRecord,
     MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS, MAX_MESSAGE_SUMMARY_CHARS, MAX_MESSAGE_TAGS,
-    MAX_MESSAGE_TAG_CHARS, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION,
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON, SUMMARY_MESSAGE_GROUP_LIMIT,
+    MAX_MESSAGE_TAG_CHARS, SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON, SUMMARY_MESSAGE_GROUP_LIMIT,
 };
 use super::util::bound_chars;
 
@@ -118,26 +118,36 @@ pub(super) fn build_discussion_summary(
 pub(super) fn build_inbox_hint(record: &SessionRecord) -> Option<SessionInboxHint> {
     let mut counts = SessionInboxOpenCounts::default();
     let mut highest_priority = None;
-    let mut high_guidance_requires_ack = false;
+    let mut ack_required_message = false;
 
     for message in record
         .messages
         .iter()
         .filter(|message| message.status == SessionMessageStatus::Open)
     {
-        match message.kind {
+        ack_required_message |= message.requires_ack;
+        let counted = match message.kind {
             SessionMessageKind::Guidance => {
                 counts.guidance += 1;
-                high_guidance_requires_ack |=
-                    message.priority == SessionMessagePriority::High && message.requires_ack;
+                true
             }
-            SessionMessageKind::Question => counts.question += 1,
-            SessionMessageKind::Todo => counts.todo += 1,
-            SessionMessageKind::Risk => counts.risk += 1,
-            _ => continue,
-        }
-        if highest_priority
-            .is_none_or(|priority| priority_rank(message.priority) > priority_rank(priority))
+            SessionMessageKind::Question => {
+                counts.question += 1;
+                true
+            }
+            SessionMessageKind::Todo => {
+                counts.todo += 1;
+                true
+            }
+            SessionMessageKind::Risk => {
+                counts.risk += 1;
+                true
+            }
+            _ => false,
+        };
+        if (counted || message.requires_ack)
+            && highest_priority
+                .is_none_or(|priority| priority_rank(message.priority) > priority_rank(priority))
         {
             highest_priority = Some(message.priority);
         }
@@ -147,11 +157,11 @@ pub(super) fn build_inbox_hint(record: &SessionRecord) -> Option<SessionInboxHin
         has_open_messages: true,
         open_counts: counts,
         highest_priority: priority,
-        attention_required: high_guidance_requires_ack.then_some(true),
-        attention_reason: high_guidance_requires_ack
-            .then_some(SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON),
-        attention_instruction: high_guidance_requires_ack
-            .then_some(SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION),
+        attention_required: ack_required_message.then_some(true),
+        attention_reason: ack_required_message
+            .then_some(SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON),
+        attention_instruction: ack_required_message
+            .then_some(SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION),
         suggested_next_tool: "session_discussion_summary",
     })
 }

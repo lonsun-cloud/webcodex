@@ -2,118 +2,95 @@
 
 [English](GPT_ACTIONS.md) | [简体中文](GPT_ACTIONS.zh-CN.md)
 
-Custom GPT 需要通过 Server 的 OpenAPI surface 调用 WebCodex 时使用 GPT Actions；客户端直接支持 MCP 时请用 [MCP](MCP.zh-CN.md)。导入的 schema 由当前 Server 配置决定：project-first 部署暴露 project-bound actions，普通 Server 暴露其 runtime actions。普通用户不需要理解内部 surface type 名称。
+Custom GPT 需要通过 Server 的 OpenAPI 兼容集成调用 WebCodex 时使用 GPT Actions。客户端直接支持 MCP 时优先使用 [MCP](MCP.zh-CN.md)；MCP 仍然是 ChatGPT 的主要接入方式。
 
-## 什么是 GPT Action
+`/openapi.json` 使用同一套 canonical Adaptive Runtime routing policy：
 
-WebCodex 提供基于 OpenAPI 的 **Custom GPT Action** 集成。它不是已发布的
-ChatGPT plugin。在当前的 OpenAI 术语里，app、Custom GPT 与 Action 是不同层；
-plugin 是 ChatGPT/Codex plugin 目录中可安装的包。参见 OpenAI 的
-[GPT Actions 介绍](https://developers.openai.com/api/docs/actions/introduction)。
+- runtime Server 投影 canonical Adaptive Runtime model contract；
+- project-scoped `share` / `run` credential 只收窄 authority/visibility，不定义第二套 Action surface。
 
 ## 导入 schema
 
-把 OpenAPI schema 导入你的 Custom GPT：
+导入：
 
 ```text
 https://your-domain.example/openapi.json
 ```
 
-不要预设导入后的 operation 集合；直接检查当前 Server 返回的 operation names。Project-first 与普通 runtime 部署会有意暴露不同的 operation set。
+ChatGPT 需要公网 HTTPS。API-key 认证配置为 HTTP Bearer，使用生成的 user token（`wc_pat_*`）。Runner token（`wc_agent_*`）只用于 Runner transport，不能放进 GPT。
 
-ChatGPT 需要公网 HTTPS。把 API-key 认证配置为 HTTP Bearer。使用生成的
-`webcodex-user-token`（`wc_pat_*`）——它用于 GPT Actions、MCP 与普通 REST/项目
-API。Runner token（`wc_agent_*`）只被 Runner 传输 endpoint 接受；不要把
-bootstrap/admin token 或 account credential 粘贴到 GPT 中。
+如果 Server 以前使用过旧 generic GPT Actions schema，升级后请**重新导入 `/openapi.json`**。新的 generic operation 名称直接使用 WebCodex canonical runtime tool 的 snake_case 名称，不再使用旧 camelCase Action vocabulary。
 
-OpenAPI 管理 surface 有意排除 users、API token、Runner token、pairing/enrollment、
-setup、doctor、npm、server 管理与 audit endpoint。这些请用 `webcodex` CLI 完成。
+## 普通 Runtime Server
 
-## Connector surface
-
-Server 以 project-bound Connector 配置运行时，OpenAPI 从与 canonical MCP
-Connector 相同的十四个 capability 生成：
+Generic GPT Actions 不再拥有独立 tool registry。它只是 Adaptive Runtime MCP 所使用同一份 `ToolDefinition` authority 的受限 OpenAPI projection：
 
 ```text
-task_start
-task_list
-task_resume
-files_list
-files_read
-files_search
-code_navigate
-edits_apply
-checks_run
-commands_run
-task_review
-task_cancel
-task_finish
-code_impact
+ToolDefinition
+  -> Adaptive Runtime direct tools
+      -> direct GPT Action operations
+  -> Adaptive Runtime long tail
+      -> call_runtime_tool
 ```
 
-Connector 已经绑定项目。普通 coding 直接从 Connector actions 开始，不要先做 broader
-runtime/project discovery，也不要在 prompt 中放 Runner client ID 或 runtime project ID。
+一个工具被标记为 Adaptive Direct 后，默认会自动成为 direct GPT Action；只有 canonical definition 明确声明 GPT Actions 无法表达其协议语义时才排除。因此以后增删或重新排序 Adaptive Direct 工具时，GPT Actions 会自动跟随，不存在第二套 GPT Action rank 或 operation list。
 
-`task_start` 只接受 `normal`（默认）和 `read_only`。`normal` 在受管理的隔离 Git
-worktree 中执行可写工作；无法安全准备 workspace 时会 fail closed，模型不会直接写
-目标 checkout，也不能接受自己的结果。`read_only` 允许分析，但拒绝 edit、command 与
-check。
+Direct operation 直接使用 canonical snake_case 名称和 canonical input contract。例如 `work_on_project`、`runtime_status`、`tool_manifest`、`search_project_texts`、`read_files`、`apply_text_edits`、`run_process`、`run_script`、`run_detached_process`、`run_shell`、`observe_jobs`、`list_jobs`、`cargo_check`、`cargo_test`、`git_review_summary`、`git_diff_hunks`、`show_changes` 等会按当前定义自动投影；收尾辅助工具 `workspace_hygiene_check` 与 `finish_coding_task` 是 model-visible long-tail 工具，统一通过 `call_runtime_tool` 调用。
 
-## 建议的 GPT 指令
+Long-tail model-visible 工具统一通过：
+
+```json
+{
+  "tool": "apply_patch",
+  "arguments": {
+    "project": "agent:runner:project",
+    "patch": "..."
+  }
+}
+```
+
+operation 名就是 `call_runtime_tool`。它只接受 `tool` 与 `arguments`，不再有 `params`，也没有把所有 runtime tool 参数铺平到顶层的巨大 union。当前 direct tool 应优先调用自己的 direct Action。ModelHidden、未知工具以及显式 GPT-Action-unsupported 工具都会 fail closed。
+
+MCP-only presentation 不会伪装成 Action 能力。例如 Goal Plan / Agent continuation / Work Result App presentation、基于 MCP ResourceLink 的 artifact export，以及依赖另外授权 MCP Host binding 的 continuation Endpoint rotation 都不会出现在 GPT Actions 中。
+
+所有真实授权仍进入同一个 ToolRuntime kernel。Action adapter 不拥有 OAuth/PAT scope、Project authority、permission/approval、Runner capability、path policy、Session fence、retry 或 destructive semantics。`x-openai-isConsequential` 只是从 canonical approval metadata 派生出的 ChatGPT host UX hint，不是权限来源。
+
+### 300 字符 description 约束
+
+Custom GPT Actions 对 operation/tool description 有 300 characters 硬上限。WebCodex 保持 canonical MCP description 的更大预算不变：canonical description 不超过 300 时直接复用；超过时只在同一个 `ToolDefinition` 上提供简短 Action presentation override。Schema/property description 使用 presentation-only bounded projector，只改变 description 文本，不改变 JSON Schema 的 type、required、enum、oneOf/anyOf、约束或对象形状。
+
+### OpenAPI 导入体积
+
+Custom GPT importer 还会拒绝达到 1 MB 的 OpenAPI schema。WebCodex 因此为 generic Action document 保留内部 800,000-byte JSON 预算，并在 CI 中同时检查 compact 与 pretty-printed serialization。Direct Action request schema 继续完整使用 canonical `ToolSpec.input_schema`；response schema 只描述真实的 compact `ToolResult` envelope，并把 `output` 保持为 generic，而不再为每个 operation 内联可能很大的 canonical output schema。这只改变 OpenAPI presentation contract；实际 runtime JSON result 以及 canonical/MCP output schema 都不变。
+
+### 对话文件导入
+
+`import_conversation_files_to_project` 在它属于 Adaptive Direct 时仍是 direct generic Action。ChatGPT 提供 `openaiFileIdRefs`；HTTP adapter 把 Action host file-reference shape 转为 canonical 内部 shape，并附加私有 GPT Action host provenance。模型 JSON 自己不能设置这个 provenance。
+
+MCP host-file import 保留独立的 trusted provenance 路径。普通 network-accessible Server 继续要求配置过的 trusted OAuth MCP client；显式 opt in 的 loopback-only OpenAI Secure Tunnel 部署可以改为信任允许的本地 tunnel credential（普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential）。Action 与 MCP 两种 provenance 模式共享 canonical authorization，但不能互相伪造。
+
+## Project-scoped local `share` / `run`
+
+`webcodex share` 或 `webcodex run` 启动的 Server 使用与普通 Server 相同的 generic Adaptive Runtime OpenAPI projection。Project-scoped authentication 只把调用方限制在自己的 ProjectGrant，不会切换到单独的 Connector capability registry。
+
+Custom GPT 可以使用 canonical runtime workflow：
 
 ```text
-使用配置好的 WebCodex 项目。
-每次用户指令用 task_start 开始或延续。
-让 task_start 复用当前项目上下文；不要向用户询问 ID。
-只有 WebCodex 明确要求恢复或继续已有 task 时才使用 task_list 与 task_resume。
-猜测路径前先用 files_list 查看项目内容。
-在 edits_apply 前使用 files_read/files_search。
-使用 code_navigate 进行只读的语义状态、symbols、definition、references、
-diagnostics 与 hover；只提供项目相对路径。
-使用 code_impact 做有界 incoming/outgoing call hierarchy 与变更影响检查；只提供
-项目相对路径和源码位置。
-在 task_finish 前运行 checks_run。
-用 task_review 查看执行进度与结果审查。
-仅当结构化能力不足且有人工审批时使用 commands_run。
-永远不要向用户询问 WebCodex 内部 ID；后续调用需要时直接使用工具返回的值。
+使用 work_on_project 建立精确 Project 与 Workflow Session。
+先 read/search 再 edit；使用 discovery 返回的 canonical runtime tool 名称。
+只有用户需要隔离 managed worktree 时才使用 work_on_project(mode=worktree)。
+validation 或 command 继续异步运行时观察同一个 Job。
+使用 show_changes 审查，并用 finish_coding_task 收尾。
+不要从 chat、credential 或猜测的 id 推导 Project/Session authority。
 ```
 
-## 校验
+旧 ProjectConnector Action 名称与 host-side `webcodex task` review workflow 不再作为 compatibility alias 投影。
 
-`checks_run` 是唯一的结构化校验 Action。它接受可选 `recipe` 枚举（`rust`、
-`node`、`python`、`go`）；省略时做确定性的最近 manifest 解析。Recipe 不安装
-依赖、不修改 lockfile、不使用网络。缺少工具是 executor 失败；已启动 validator
-的非零判定是断言失败。recipe 表格见 [MCP](MCP.zh-CN.md#校验-recipe)。
+## 管理与安全
 
-## 人工决策
+OpenAPI model surface 有意排除 users、API token、Runner token、pairing/enrollment、setup、doctor、npm、server 管理与 audit endpoint。这些请使用 `webcodex` CLI。
 
-`task_finish` 生成稳定结果；它不会静默地把变更应用到目标 checkout。由宿主用户
-在本地审查并决策：
-
-```bash
-webcodex task show <task-id>
-webcodex task accept <task-id>
-# 或：webcodex task reject <task-id>
-```
-
-即使模型是 hosted 的，接受权也保留在本地。
-
-## 常见错误
-
-- 复制 `wc_agent_*` 后出现认证错误，说明选错了凭据类型。请改用生成的
-  `webcodex-user-token`；不要把完整令牌值粘贴到日志或 bug 报告。
-- `project_not_configured`：运行 `webcodex setup`。
-- `project_credential_invalid` / `project_credential_rejected`：解决报告的
-  私有状态问题，然后恢复匹配的凭据。
-- `server_unreachable` / `agent_offline`：运行 `webcodex doctor`，再执行报告的
-  next action。
-- `required_capability_unavailable` / `structured_validation_unavailable`：
-  升级所有 WebCodex 二进制。
-- `checks_required`：调用 `checks_run`。
-- `checks_stale`：针对当前 task state 重新运行要求的检查。
-
-每个错误都带稳定 code、人类可读消息、可重试性与建议的下一步。控制流应使用
-code，而不是匹配任意英文消息。
+MCP 与 GPT Actions 使用同一个 ToolRuntime authority model。GPT Actions 只改变 model presentation 和 HTTP transport，不会获得同一个 canonical tool 在 MCP/runtime 执行路径中没有的权限。
 
 ## 相关文档
 

@@ -111,7 +111,7 @@ wait_for_project() {
     local attempt body
     for attempt in $(seq 1 80); do
         deadline_ok || return 1
-        body="$(post "$token" /api/projects/list '{}' 2>/dev/null || true)"
+        body="$(post "$token" /api/tools/call '{"tool":"list_projects","params":{}}' 2>/dev/null || true)"
         if printf '%s' "$body" | python3 -c '
 import json, sys
 expected = sys.argv[1]
@@ -241,34 +241,34 @@ wait_for_project "$MANAGED_PAT" "agent:managed-runner:project-m" \
     || die "managed project did not become visible"
 log "same-key and managed projects registered"
 
-READ_RESPONSE="$(post "$SHARED_KEY_A" /api/projects/read_file \
-    '{"project":"agent:shared-runner:project-a","path":"README.md"}')"
+READ_RESPONSE="$(post "$SHARED_KEY_A" /api/tools/call \
+    '{"tool":"read_files","params":{"project":"agent:shared-runner:project-a","items":[{"path":"README.md"}]}}')"
 [ "$(printf '%s' "$READ_RESPONSE" | json_field success)" = "True" ] \
-    || die "same-key read_file failed"
+    || die "same-key read_files failed"
 printf '%s' "$READ_RESPONSE" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
-raise SystemExit(0 if "transport smoke" in data.get("output", {}).get("text", "") else 1)
-' || die "same-key read_file returned unexpected content"
+raise SystemExit(0 if "transport smoke" in data.get("output", {}).get("items", [{}])[0].get("output", {}).get("text", "") else 1)
+' || die "same-key read_files returned unexpected content"
 
-KEY_B_PROJECTS="$(post "$SHARED_KEY_B" /api/projects/list '{}')"
+KEY_B_PROJECTS="$(post "$SHARED_KEY_B" /api/tools/call '{"tool":"list_projects","params":{}}')"
 [ "$(printf '%s' "$KEY_B_PROJECTS" | json_field output.count)" = "0" ] \
     || die "Key B discovered Key A project"
 KEY_B_AGENTS="$(post "$SHARED_KEY_B" /api/runtime/status '{}')"
 [ "$(printf '%s' "$KEY_B_AGENTS" | json_field output.agents.count)" = "0" ] \
     || die "Key B discovered Key A Runner"
 
-GUESSED_RESPONSE="$(post "$SHARED_KEY_B" /api/projects/git_status \
-    '{"project":"agent:shared-runner:project-a"}')"
+GUESSED_RESPONSE="$(post "$SHARED_KEY_B" /api/tools/call \
+    '{"tool":"git_status","params":{"project":"agent:shared-runner:project-a"}}')"
 [ "$(printf '%s' "$GUESSED_RESPONSE" | json_field success)" = "False" ] \
     || die "Key B operated on guessed Key A project id"
 [ "$(printf '%s' "$GUESSED_RESPONSE" | json_field output.error_kind)" = "unknown_project" ] \
     || die "guessed project rejection did not preserve non-disclosure"
 
-SHARED_PROJECTS="$(post "$SHARED_KEY_A" /api/projects/list '{}')"
+SHARED_PROJECTS="$(post "$SHARED_KEY_A" /api/tools/call '{"tool":"list_projects","params":{}}')"
 printf '%s' "$SHARED_PROJECTS" | grep -q 'agent:managed-runner:project-m' \
     && die "shared key discovered managed project"
-MANAGED_PROJECTS="$(post "$MANAGED_PAT" /api/projects/list '{}')"
+MANAGED_PROJECTS="$(post "$MANAGED_PAT" /api/tools/call '{"tool":"list_projects","params":{}}')"
 printf '%s' "$MANAGED_PROJECTS" | grep -q 'agent:shared-runner:project-a' \
     && die "managed identity discovered shared-key project"
 log "cross-key and managed/shared isolation verified"

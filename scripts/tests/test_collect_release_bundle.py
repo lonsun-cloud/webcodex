@@ -15,7 +15,7 @@ from scripts import collect_release_bundle as collector
 
 SOURCE_SHA = "a" * 40
 RUN_ID = 123456
-VERSION = "0.4.0"
+VERSION = "0.4.3"
 
 
 def _archive_bytes(platform: str) -> bytes:
@@ -49,7 +49,7 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         checksum_lines.append(f"{digest}  {filename}")
 
     desktop_artifacts: dict[str, dict[str, str]] = {}
-    for platform in collector.DESKTOP_PLATFORMS:
+    for platform in collector.primary_desktop_platforms_for_version(VERSION):
         desktop_name = collector.desktop_artifact_filename(
             VERSION,
             platform,
@@ -181,10 +181,7 @@ class BundleTests(unittest.TestCase):
             )
             self.assertEqual(summary["artifacts"], hashes)
             self.assertEqual(summary["build_kind"], "release")
-            self.assertEqual(
-                summary["desktop_artifacts"]["darwin-x64"]["filename"],
-                f"webcodex-desktop-v{VERSION}-darwin-x64.dmg",
-            )
+            self.assertNotIn("darwin-x64", summary["desktop_artifacts"])
             self.assertEqual(
                 summary["desktop_artifacts"]["darwin-arm64"]["filename"],
                 f"webcodex-desktop-v{VERSION}-darwin-arm64.dmg",
@@ -220,7 +217,7 @@ class BundleTests(unittest.TestCase):
             root = Path(temp)
             stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
             metadata = json.loads((root / "release-build.json").read_text(encoding="utf-8"))
-            desktop_name = metadata["desktop_artifacts"]["darwin-x64"]["filename"]
+            desktop_name = metadata["desktop_artifacts"]["darwin-arm64"]["filename"]
             (root / desktop_name).write_bytes(b"drifted-dmg")
             with self.assertRaises(collector.CollectionError):
                 collector.verify_bundle_directory(
@@ -238,9 +235,9 @@ class BundleTests(unittest.TestCase):
             stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
             metadata_path = root / "release-build.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            item = metadata["desktop_artifacts"]["darwin-x64"]
+            item = metadata["desktop_artifacts"]["darwin-arm64"]
             old_name = item["filename"]
-            bad_name = "webcodex-desktop-v0.4.0-macos-x64.dmg"
+            bad_name = f"webcodex-desktop-v{VERSION}-macos-arm64.dmg"
             (root / old_name).rename(root / bad_name)
             item["filename"] = bad_name
             metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
@@ -318,6 +315,70 @@ class BundleTests(unittest.TestCase):
                 collector.safe_extract_zip(path, root / "extract")
             self.assertFalse((root / "escape").exists())
 
+
+
+class RuntimeManifestBundleTests(unittest.TestCase):
+    def add_manifest(self, directory: Path, *, corrupt: bool = False) -> None:
+        path = directory / "webcodex-release-manifest.json"
+        value = {
+            "schema_version": 1,
+            "release_version": VERSION,
+            "runtime_version": VERSION,
+            "desktop_runtime_contract": {"min_generation": 1, "max_generation": 1},
+        }
+        if corrupt:
+            value["desktop_runtime_contract"]["min_generation"] = 0
+        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        metadata_path = directory / "release-build.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["runtime_manifest"] = {"filename": path.name, "sha256": digest}
+        metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        sums = directory / "SHA256SUMS"
+        sums.write_text(
+            sums.read_text(encoding="ascii") + f"{digest}  {path.name}\n",
+            encoding="ascii",
+        )
+
+    def verify(self, directory: Path) -> dict:
+        return collector.verify_bundle_directory(
+            directory,
+            repo=collector.DEFAULT_REPO,
+            run_id=RUN_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_tag=f"v{VERSION}",
+            artifact_name=f"webcodex-v{VERSION}-bundle",
+        )
+
+    def test_valid_manifest_is_collected_with_strict_digest_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            self.add_manifest(root)
+            summary = self.verify(root)
+            self.assertEqual(
+                summary["runtime_manifest"]["filename"],
+                "webcodex-release-manifest.json",
+            )
+
+    def test_invalid_contract_rejected_even_when_checksums_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            self.add_manifest(root, corrupt=True)
+            with self.assertRaises(collector.CollectionError):
+                self.verify(root)
+
+    def test_present_but_null_manifest_is_not_legacy_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            path = root / "release-build.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["runtime_manifest"] = None
+            path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            with self.assertRaises(collector.CollectionError):
+                self.verify(root)
 
 if __name__ == "__main__":
     unittest.main()

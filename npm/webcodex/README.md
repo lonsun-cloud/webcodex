@@ -27,7 +27,7 @@ cd /path/to/your/repository
 npx --yes @yyjeqhc/webcodex share
 ```
 
-`share` is a temporary, single-project, more restricted experience. The endpoint and temporary credential stop working when the command exits. See the [Quick Trial](https://github.com/yyjeqhc/webcodex/blob/main/docs/QUICK_START.md) for the ChatGPT steps and authentication fallback.
+`share` is a temporary, single-project launch of the ordinary Adaptive Runtime with project-scoped authentication. The endpoint and temporary credential stop working when the command exits. See the [Quick Trial](https://github.com/yyjeqhc/webcodex/blob/main/docs/QUICK_START.md) for the ChatGPT steps and authentication fallback.
 
 ### Platforms
 

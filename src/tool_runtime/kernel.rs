@@ -1,10 +1,14 @@
 use super::model_ergonomics_telemetry::{ModelErgonomicsCompletion, ModelErgonomicsTimer};
 use super::sessions::{
-    strip_tool_call_expectation_metadata, SessionContextRevisionAck, SessionTransport,
-    ToolCallRecorderMetadata, ToolCallSessionMessageResolution,
+    strip_tool_call_expectation_metadata, SessionTransport, ToolCallRecorderMetadata,
+    ToolCallSessionMessageResolution,
 };
-use super::tool_audit::{session_log_arguments_for_tool_request, session_log_result_for_tool};
-use super::{session_context, ToolCall, ToolResult, ToolRuntime};
+use super::tool_audit::{
+    session_log_arguments_for_tool_request, session_log_arguments_for_typed_call,
+    session_log_result_for_tool,
+};
+use super::tool_definition::{runtime_tool_operator_extension_family, ToolOperatorExtensionFamily};
+use super::{session_context, HostFileImportProvenance, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::scopes::OAuthToolScopePolicy;
 use crate::auth::AuthContext;
 use serde_json::Value;
@@ -24,18 +28,7 @@ impl From<ToolTransport> for SessionTransport {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum HostFileImportTrust {
-    #[default]
-    Untrusted,
-    TrustedOAuthClient,
-}
-
-impl HostFileImportTrust {
-    pub(crate) fn is_trusted(self) -> bool {
-        matches!(self, Self::TrustedOAuthClient)
-    }
-}
+pub(crate) use super::HostFileImportProvenance as HostFileImportTrust;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolCallContext<'a> {
@@ -49,7 +42,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) record_oauth_scope_denials: bool,
     /// Server-derived provenance for ChatGPT host file references. Raw tool
     /// arguments cannot set this value.
-    pub(crate) host_file_import_trust: HostFileImportTrust,
+    pub(crate) host_file_import_trust: HostFileImportProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -62,40 +55,18 @@ pub(crate) struct ToolCallRequest {
 /// None of these fields are concrete tool business arguments or execution
 /// authority. Trusted protocol capabilities remain a separate adapter-derived
 /// input and the kernel continues to own all authority checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolInvocationMetadata {
+    pub(crate) control: Option<super::control_sidecar::ControlSidecars>,
     pub(crate) ack_session_message_ids: Vec<String>,
     pub(crate) session_message_resolution: Option<ToolCallSessionMessageResolution>,
     pub(crate) context_request: Vec<String>,
-    pub(crate) ack_session_context_revision: SessionContextRevisionAck,
-}
-
-impl Default for ToolInvocationMetadata {
-    fn default() -> Self {
-        Self {
-            ack_session_message_ids: Vec::new(),
-            session_message_resolution: None,
-            context_request: Vec::new(),
-            // Missing is the adapter-level default. A protocol/tool that is not
-            // continuity-capable is normalized to Unsupported inside the kernel.
-            ack_session_context_revision: SessionContextRevisionAck::Unacknowledged,
-        }
-    }
-}
-
-impl ToolInvocationMetadata {
-    fn effective_context_ack(&self, context_continuity_capable: bool) -> SessionContextRevisionAck {
-        if context_continuity_capable {
-            self.ack_session_context_revision
-        } else {
-            SessionContextRevisionAck::Unsupported
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ToolProtocolCapabilities {
-    pub(crate) context_continuity: bool,
+    /// Explicit model-facing control wrapper support; internal/App calls default off.
+    pub(crate) control_sidecars: bool,
     pub(crate) context_sidecar: bool,
     pub(crate) skill_runtime: bool,
     pub(crate) skill_management: bool,
@@ -106,6 +77,17 @@ pub(crate) struct ToolProtocolCapabilities {
     /// Protocol-surface support for privileged forensic trace retrieval. Caller
     /// authority is still derived only from the canonical ToolDefinition.
     pub(crate) trace_diagnostics: bool,
+    /// Protocol-surface support for the ModelHidden Goal Plan App polling read.
+    /// This never replaces canonical communication/Goal authorization.
+    pub(crate) goal_plan_app: bool,
+    /// Protocol-surface support for Work Result App live refresh and frozen
+    /// lazy diff reads. Exact Project + Session authority is checked per call;
+    /// lazy reads additionally fence caller, snapshot, and advertised path.
+    pub(crate) work_result_app: bool,
+    /// Protocol-surface support for ModelHidden MCP App Host-continuation
+    /// coordination. Canonical communication authorization and exact
+    /// process-local Host binding validation remain mandatory in the runtime.
+    pub(crate) agent_continuation_app: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,10 +126,21 @@ pub(crate) fn check_runtime_tool_scope(
         // authority policy; it is not a tool-name registry.
         let required_explicit_scope = match policy {
             OAuthToolScopePolicy::RequireAny(scopes) => {
-                return Err(ToolCallErrorStatus::InsufficientScope {
-                    required_scope: None,
-                    description: format!("missing any required scope: {}", scopes.join(", ")),
-                });
+                // RequireAny used to be exclusive to explicit-only Plugin
+                // authority. Computer consolidation also needs an OR policy for
+                // control-vs-launch discovery without changing the legacy
+                // unauthenticated compatibility of the underlying operations.
+                if scopes
+                    .iter()
+                    .copied()
+                    .all(crate::auth::scopes::scope_requires_explicit_unauthenticated_authority)
+                {
+                    return Err(ToolCallErrorStatus::InsufficientScope {
+                        required_scope: None,
+                        description: format!("missing any required scope: {}", scopes.join(", ")),
+                    });
+                }
+                None
             }
             OAuthToolScopePolicy::Require(scope)
                 if matches!(
@@ -237,17 +230,23 @@ fn check_session_message_resolution_scope(
 }
 
 impl ToolRuntime {
-    pub(crate) async fn call_tool_with_context(
-        &self,
+    pub(crate) fn call_tool_with_context<'a>(
+        &'a self,
         request: ToolCallRequest,
-        context: ToolCallContext<'_>,
-    ) -> ToolCallOutcome {
-        self.call_tool_with_protocol_capabilities(
-            request,
-            context,
-            ToolProtocolCapabilities::default(),
-        )
-        .await
+        context: ToolCallContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        // Keep the large canonical kernel/dispatch future off adapter thread
+        // stacks. Workspace-wide dependency feature unification can enlarge
+        // serde-backed state enough for ordinary REST/Host calls to overflow the
+        // default libtest/worker stack even though the selected tool is bounded.
+        Box::pin(async move {
+            self.call_tool_with_protocol_capabilities(
+                request,
+                context,
+                ToolProtocolCapabilities::default(),
+            )
+            .await
+        })
     }
 
     /// Test-only compatibility shim for Phase-2/3 fixtures that predate the
@@ -260,19 +259,21 @@ impl ToolRuntime {
         &self,
         request: ToolCallRequest,
         context: ToolCallContext<'_>,
-        context_continuity_capable: bool,
         context_sidecar_capable: bool,
     ) -> ToolCallOutcome {
         self.call_tool_with_protocol_capabilities(
             request,
             context,
             ToolProtocolCapabilities {
-                context_continuity: context_continuity_capable,
                 context_sidecar: context_sidecar_capable,
+                control_sidecars: false,
                 skill_runtime: context_sidecar_capable,
                 skill_management: false,
                 memory_surface: false,
                 trace_diagnostics: false,
+                goal_plan_app: false,
+                work_result_app: false,
+                agent_continuation_app: false,
             },
         )
         .await
@@ -293,26 +294,37 @@ impl ToolRuntime {
         .await
     }
 
-    pub(crate) async fn call_tool_with_invocation_metadata(
-        &self,
+    pub(crate) fn call_tool_with_invocation_metadata<'a>(
+        &'a self,
         request: ToolCallRequest,
-        context: ToolCallContext<'_>,
-        invocation_metadata: ToolInvocationMetadata,
+        context: ToolCallContext<'a>,
+        mut invocation_metadata: ToolInvocationMetadata,
         capabilities: ToolProtocolCapabilities,
-    ) -> ToolCallOutcome {
-        let context_continuity_capable = capabilities.context_continuity
-            && super::tool_definition::runtime_tool_accepts_context_ack(&request.tool_name);
-        let context_ack = invocation_metadata.effective_context_ack(context_continuity_capable);
-        let telemetry = ModelErgonomicsTimer::start_with_protocol(
-            &request.tool_name,
-            &request.arguments,
-            context_ack,
-        );
-        let mut outcome = self
-            .call_tool_with_context_inner(request, context, invocation_metadata, capabilities)
-            .await;
-        outcome.model_ergonomics = telemetry.map(ModelErgonomicsTimer::finish);
-        outcome
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        // MCP enters the kernel here directly rather than through
+        // call_tool_with_context, so give it the same bounded adapter future.
+        Box::pin(async move {
+            let telemetry =
+                ModelErgonomicsTimer::start_with_arguments(&request.tool_name, &request.arguments);
+            let mut control = invocation_metadata
+                .control
+                .take()
+                .map(super::control_sidecar::ControlExecution::new);
+            let mut outcome = self
+                .call_tool_with_context_inner(
+                    request,
+                    context,
+                    invocation_metadata,
+                    capabilities,
+                    &mut control,
+                )
+                .await;
+            if let Some(control) = control {
+                control.decorate(&mut outcome);
+            }
+            outcome.model_ergonomics = telemetry.map(ModelErgonomicsTimer::finish);
+            outcome
+        })
     }
 
     async fn call_tool_with_context_inner(
@@ -321,26 +333,125 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         invocation_metadata: ToolInvocationMetadata,
         capabilities: ToolProtocolCapabilities,
+        control: &mut Option<super::control_sidecar::ControlExecution>,
     ) -> ToolCallOutcome {
-        let context_continuity_capable = capabilities.context_continuity
-            && super::tool_definition::runtime_tool_accepts_context_ack(&request.tool_name);
-        let ack_session_context_revision =
-            invocation_metadata.effective_context_ack(context_continuity_capable);
+        if let Some(control) = control.as_ref() {
+            if let Err(outcome) = control.validate(
+                &request.tool_name,
+                context,
+                capabilities,
+                invocation_metadata.session_message_resolution.is_some(),
+            ) {
+                return outcome;
+            }
+        }
         let mut recorder_metadata =
             ToolCallRecorderMetadata::from_business_arguments(&request.arguments);
         recorder_metadata.ack_session_message_ids = invocation_metadata.ack_session_message_ids;
         recorder_metadata.session_message_resolution =
             invocation_metadata.session_message_resolution;
-        recorder_metadata.ack_session_context_revision = ack_session_context_revision;
         // One trusted identity per real kernel request. The outer recorder and
         // inner business ledger pairs inherit it, but it never affects execution.
         recorder_metadata.assign_logical_invocation();
-        if request.tool_name == "read_tool_trace" && !capabilities.trace_diagnostics {
+        let operator_extension_family = runtime_tool_operator_extension_family(&request.tool_name);
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::TraceDiagnostics)
+        ) && !capabilities.trace_diagnostics
+        {
             return ToolCallOutcome {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Tool trace diagnostics are available only on Stateless MCP 2026 operator surfaces"
+                    message: "Tool trace diagnostics are available only on Stateless MCP 2026"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if request.tool_name == "goal_plan_sync" && !capabilities.goal_plan_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Goal Plan App state is available only on Stateless MCP 2026 requests with Goal Plan App capability"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if matches!(
+            request.tool_name.as_str(),
+            "work_result_state" | "work_result_send_message"
+        ) && !capabilities.work_result_app
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Work Result App operations are available only on Stateless MCP 2026 requests with Work Result App capability"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if request.tool_name == "changes_file_diff" && !capabilities.work_result_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Work Result App lazy diff is available only on Stateless MCP 2026 requests with Work Result App capability"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if matches!(
+            request.tool_name.as_str(),
+            "agent_continuation_bind"
+                | "agent_continuation_recover_endpoint"
+                | "agent_continuation_state"
+                | "agent_continuation_wake_acquire"
+                | "agent_continuation_wake_prepare"
+                | "agent_continuation_wake_finish"
+                | "agent_continuation_unbind"
+                | "agent_wait_state"
+        ) && !capabilities.agent_continuation_app
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Agent continuation App coordination is available only on Stateless MCP 2026 requests with Agent Continuation App capability"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if matches!(
+            request.tool_name.as_str(),
+            "job_terminal_continuation_bind"
+                | "job_terminal_continuation_state"
+                | "job_terminal_continuation_prepare"
+                | "job_terminal_continuation_finish"
+                | "job_terminal_continuation_unbind"
+        ) && !capabilities.agent_continuation_app
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Job terminal continuation App coordination is available only on Stateless MCP 2026 requests with MCP App continuation capability"
                         .to_string(),
                 }),
                 project: None,
@@ -349,18 +460,21 @@ impl ToolRuntime {
             };
         }
         // Project Memory tools are kernel-known but globally model-hidden. One
-        // explicit protocol-surface capability gates all six fixed tools; their
+        // explicit protocol capability gates all six fixed tools; their
         // canonical ToolDefinition authority decides caller access below.
-        if (super::memory::is_memory_runtime_tool_name(&request.tool_name)
-            || super::memory::is_memory_management_tool_name(&request.tool_name))
-            && !capabilities.memory_surface
+        if matches!(
+            operator_extension_family,
+            Some(
+                ToolOperatorExtensionFamily::MemoryRuntime
+                    | ToolOperatorExtensionFamily::MemoryManagement
+            )
+        ) && !capabilities.memory_surface
         {
             return ToolCallOutcome {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Memory tools are available only on Stateless MCP 2026 Full Operator"
-                        .to_string(),
+                    message: "Memory tools are available only on Stateless MCP 2026".to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
@@ -368,45 +482,48 @@ impl ToolRuntime {
             };
         }
         // Phase-3 Skill tools are kernel-known only so ToolCall parsing stays
-        // typed, but execution is authoritative-surface-gated. A private tool
-        // name from REST, legacy MCP, Local Coding, or Connector cannot enable
-        // this runtime.
-        if super::skills::is_skill_runtime_tool_name(&request.tool_name)
-            && !capabilities.skill_runtime
+        // typed, but execution is gated by explicit protocol capability. A private
+        // tool name from REST or legacy MCP cannot enable this runtime.
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillRuntime)
+        ) && !capabilities.skill_runtime
         {
             return ToolCallOutcome {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message:
-                        "Skill runtime tools are available only on Stateless MCP 2026 Full Operator"
-                            .to_string(),
+                    message: "Skill runtime tools are available only on Stateless MCP 2026"
+                        .to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
                 correlation: Default::default(),
             };
         }
-        if super::skills::is_skill_management_tool_name(&request.tool_name)
-            && !capabilities.skill_management
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillManagement)
+        ) && !capabilities.skill_management
         {
             return ToolCallOutcome {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message:
-                        "Skill management tools are available only on Stateless MCP 2026 Full Operator"
-                            .to_string(),
+                    message: "Skill management tools are available only on Stateless MCP 2026"
+                        .to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
                 correlation: Default::default(),
             };
         }
-        if super::skills::is_skill_management_tool_name(&request.tool_name)
-            && !context
-                .auth
-                .is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillManagement)
+        ) && !context
+            .auth
+            .is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
         {
             return ToolCallOutcome {
                 success: false,
@@ -422,9 +539,21 @@ impl ToolRuntime {
         }
         // Action-dependent gateways resolve exact policy before the generic
         // static Session/permission lifecycle and own one specialized ledger.
-        if let Some(outcome) =
+        if let Some(mut outcome) =
             super::specialized::try_dispatch_specialized_gateway(self, &request, context).await
         {
+            if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
+                let peer_project = outcome.project.clone();
+                if let Some(result) = outcome.result.as_mut() {
+                    self.add_peer_collaboration_projection(
+                        result,
+                        context.auth,
+                        context.window,
+                        peer_project.as_deref(),
+                        &recorder_metadata.ack_session_message_ids,
+                    );
+                }
+            }
             return outcome;
         }
         let concrete_arguments = strip_tool_call_expectation_metadata(request.arguments.clone());
@@ -588,7 +717,7 @@ impl ToolRuntime {
                 &mut result,
                 session_context::SESSION_PROJECT_MISMATCH_KIND,
             );
-            let recording = self.sessions.record_model_facing_tool_call_finished(
+            self.sessions.record_tool_call_finished(
                 session_event,
                 false,
                 &result.output,
@@ -596,16 +725,11 @@ impl ToolRuntime {
                 Some(session_context::SESSION_PROJECT_MISMATCH_KIND),
             );
             super::add_session_hint(&mut result, &self.sessions, session_id);
-            if let Some(recorded) = recording.as_ref() {
-                if session_context::add_session_context_continuity(&mut result, recorded) {
-                    self.add_session_history_recovery(&mut result, recorded, context.auth)
-                        .await;
-                }
-            }
             session_context::add_session_attention_projection(
                 &mut result,
                 &self.sessions,
                 session_id,
+                "recording_session",
                 outer_ack_observation
                     .as_ref()
                     .expect("authorized outer recorder must have ACK observation"),
@@ -639,8 +763,16 @@ impl ToolRuntime {
             }
         }
 
-        let session_log_arguments =
-            session_log_arguments_for_tool_request(&request.tool_name, &concrete_arguments);
+        // Parse the business request once. Successful typed input drives both
+        // pre-execution audit projection and later dispatch. Malformed input is
+        // recorded with an empty request projection rather than reparsed through
+        // a schema-filter fallback.
+        let parsed_call =
+            ToolCall::from_tool_name_with_normalization(&request.tool_name, concrete_arguments);
+        let session_log_arguments = parsed_call
+            .as_ref()
+            .map(|(call, _)| session_log_arguments_for_typed_call(&request.tool_name, call))
+            .unwrap_or_else(|_| Value::Object(Default::default()));
         let mut session_event = self.sessions.record_tool_call_started_with_metadata(
             context.session_id,
             context.transport.into(),
@@ -677,8 +809,8 @@ impl ToolRuntime {
             }
         }
 
-        let mut call = match ToolCall::from_tool_name(&request.tool_name, concrete_arguments) {
-            Ok(call) => call,
+        let (mut call, input_normalization) = match parsed_call {
+            Ok(parsed) => parsed,
             Err(message) => {
                 self.sessions.record_tool_call_finished(
                     session_event,
@@ -719,7 +851,7 @@ impl ToolRuntime {
                     &mut result,
                     "session_message_resolution_failed",
                 );
-                let recording = self.sessions.record_model_facing_tool_call_finished(
+                self.sessions.record_tool_call_finished(
                     session_event,
                     false,
                     &result.output,
@@ -727,16 +859,11 @@ impl ToolRuntime {
                     Some("session_message_resolution_failed"),
                 );
                 super::add_session_hint(&mut result, &self.sessions, session_id);
-                if let Some(recorded) = recording.as_ref() {
-                    if session_context::add_session_context_continuity(&mut result, recorded) {
-                        self.add_session_history_recovery(&mut result, recorded, context.auth)
-                            .await;
-                    }
-                }
                 session_context::add_session_attention_projection(
                     &mut result,
                     &self.sessions,
                     session_id,
+                    "recording_session",
                     outer_ack_observation
                         .as_ref()
                         .expect("authorized outer recorder must have ACK observation"),
@@ -753,11 +880,11 @@ impl ToolRuntime {
             }
         }
         if let ToolCall::ImportConversationFilesToProject {
-            trusted_mcp_host_file_import,
+            host_file_import_provenance,
             ..
         } = &mut call
         {
-            *trusted_mcp_host_file_import = context.host_file_import_trust.is_trusted();
+            *host_file_import_provenance = context.host_file_import_trust;
         }
         if let ToolCall::CompleteSessionMessage {
             trusted_recording_session_id,
@@ -770,6 +897,25 @@ impl ToolRuntime {
         }
 
         let project = tool_project(&call);
+        if let Some(control) = control.as_mut() {
+            if let Err(outcome) = control.before(self, &call, context).await {
+                if let Some(result) = outcome.result.as_ref() {
+                    self.sessions.record_tool_call_finished(
+                        session_event,
+                        false,
+                        &result.output,
+                        result.error.as_deref(),
+                        Some("control_before_failed"),
+                    );
+                }
+                return outcome;
+            }
+            control.main_dispatched = true;
+        }
+        // Preserve the concrete business Session for final presentation and
+        // bounded ActionAudit evidence. The generic recorder remains independent
+        // provenance and Window affinity never becomes execution or Session authority.
+        let business_session_id = call.session_id().map(str::to_string);
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
         // never re-evaluate (no second request id / inconsistent outcome).
@@ -789,6 +935,27 @@ impl ToolRuntime {
                 capabilities,
             )
             .await;
+        if result.success {
+            if let Some(code) = input_normalization {
+                let hint = match code {
+                    "argv_to_args" => "normalized argv→args",
+                    _ => unreachable!("parser returns only stable known normalization codes"),
+                };
+                result.output["input_normalization"] =
+                    serde_json::json!({"code": code, "hint": hint});
+            }
+        }
+        if let Some(control) = control.as_mut() {
+            control
+                .after(self, &request.tool_name, &result, context)
+                .await;
+        }
+        if result.success {
+            // The concrete ToolCall has already passed canonical business Session
+            // lifecycle/authority checks. Retain only its exact identity as bounded
+            // audit evidence; it never becomes recorder or execution authority.
+            correlation.business_session_id = business_session_id.clone();
+        }
         if let Some(session_id) = context.session_id {
             correlation.add_workflow_session(super::window_activity::WorkflowSessionCorrelation {
                 session_id: session_id.to_string(),
@@ -796,15 +963,19 @@ impl ToolRuntime {
                 relation: super::window_activity::WorkflowSessionCorrelationRelation::Recording,
             });
         }
-        if result.success && context.session_id.is_none() {
-            correlation.recorder_gap_session_id = self
-                .workflow_recording_gap_candidate(
-                    &request.tool_name,
-                    context.window,
-                    context.auth,
-                    &correlation,
-                )
-                .await;
+        let window_attention_session_id = if context.session_id.is_none() {
+            self.workflow_window_affinity_candidate(
+                &request.tool_name,
+                context.window,
+                context.auth,
+                &correlation,
+            )
+            .await
+        } else {
+            None
+        };
+        if result.success {
+            correlation.recorder_gap_session_id = window_attention_session_id.clone();
         }
         if let Some(start) = session_event.as_mut() {
             if let Some(permission) =
@@ -814,7 +985,7 @@ impl ToolRuntime {
             }
         }
         let session_log_result = session_log_result_for_tool(&request.tool_name, &result.output);
-        let outer_recording = self.sessions.record_model_facing_tool_call_finished(
+        self.sessions.record_tool_call_finished(
             session_event,
             result.success,
             &session_log_result,
@@ -826,19 +997,35 @@ impl ToolRuntime {
         // business `output.session_id` emitted by the concrete tool.
         if let Some(session_id) = context.session_id {
             super::add_session_hint(&mut result, &self.sessions, session_id);
-            if let Some(recorded) = outer_recording.as_ref() {
-                if session_context::add_session_context_continuity(&mut result, recorded) {
-                    self.add_session_history_recovery(&mut result, recorded, context.auth)
-                        .await;
-                }
-            }
             session_context::add_session_attention_projection(
                 &mut result,
                 &self.sessions,
                 session_id,
+                "recording_session",
                 outer_ack_observation
                     .as_ref()
                     .expect("authorized outer recorder must have ACK observation"),
+                recorder_ack_requested,
+            );
+        } else if let Some(session_id) = window_attention_session_id
+            .as_deref()
+            .filter(|_| result.output.get("session_attention").is_none())
+        {
+            // Window affinity is correlation evidence only. It may locate one
+            // authorized active Session message board for request-scoped ACK and
+            // delivery, but never becomes recorder, business input, execution
+            // context, or durable resolution authority.
+            let ack = session_context::observe_session_attention_acks(
+                &self.sessions,
+                session_id,
+                &recorder_metadata.ack_session_message_ids,
+            );
+            session_context::add_session_attention_projection(
+                &mut result,
+                &self.sessions,
+                session_id,
+                "window_affinity",
+                &ack,
                 recorder_ack_requested,
             );
         }
@@ -850,16 +1037,21 @@ impl ToolRuntime {
             correlation.recorder_gap_session_id.as_deref(),
             correlation.resolved_project.as_deref(),
         ) {
-            if let Some(output) = result.output.as_object_mut() {
-                output.insert(
-                    "workflow_recording_attention".to_string(),
-                    serde_json::json!({
-                        "status": "recording_session_missing",
-                        "candidate_session_id": session_id,
-                        "project": project,
-                        "reason": "same_window_recent_explicit_association"
-                    }),
-                );
+            // The gap remains correlation/audit truth. It is not actionable model
+            // guidance when this exact call already supplied the same authorized
+            // business Session for the same resolved Project.
+            if business_session_id.as_deref() != Some(session_id) {
+                if let Some(output) = result.output.as_object_mut() {
+                    output.insert(
+                        "workflow_recording_attention".to_string(),
+                        serde_json::json!({
+                            "status": "recording_session_missing",
+                            "candidate_session_id": session_id,
+                            "project": project,
+                            "reason": "same_window_recent_explicit_association"
+                        }),
+                    );
+                }
             }
         }
         if request.tool_name == "tool_manifest" {
@@ -891,17 +1083,39 @@ impl ToolRuntime {
             .output
             .as_object()
             .is_some_and(|output| output.contains_key("workflow_recording_attention"))
-            && serde_json::to_vec(&result).is_ok_and(|bytes| {
-                bytes.len() > webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES
+            && crate::json_measurement::serialized_json_len(&result).is_ok_and(|bytes| {
+                bytes > webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES
             })
         {
             if let Some(output) = result.output.as_object_mut() {
                 output.remove("workflow_recording_attention");
             }
         }
+        if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
+            let peer_project = correlation
+                .resolved_project
+                .as_deref()
+                .or(recorder_metadata.recording_session_project.as_deref());
+            self.add_peer_collaboration_projection(
+                &mut result,
+                context.auth,
+                context.window,
+                peer_project,
+                &recorder_metadata.ack_session_message_ids,
+            );
+        }
         if request.tool_name == "observe_jobs" {
             super::observe_jobs::sparsify_observe_jobs_model_result(&mut result);
         }
+        self.add_passive_job_attention(
+            &mut result,
+            &request.tool_name,
+            correlation.resolved_project.as_deref(),
+            correlation.business_session_id.as_deref(),
+            context.window,
+            context.auth,
+        )
+        .await;
         ToolCallOutcome {
             success: result.success,
             result: Some(result),
@@ -912,7 +1126,7 @@ impl ToolRuntime {
         }
     }
 
-    async fn workflow_recording_gap_candidate(
+    async fn workflow_window_affinity_candidate(
         &self,
         tool_name: &str,
         window: Option<&crate::client_window::ClientWindow>,
@@ -920,7 +1134,8 @@ impl ToolRuntime {
         correlation: &super::window_activity::ToolCallCorrelation,
     ) -> Option<String> {
         if tool_name == "work_on_project"
-            || !super::observations::is_meaningful_activity_tool(tool_name)
+            || !webcodex_tool_contracts::runtime_tool_activity_interaction(tool_name)
+                .is_meaningful()
         {
             return None;
         }
@@ -1049,10 +1264,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let ack_revision = runtime
-            .sessions
-            .context_revision(&session.session_id)
-            .expect("session context revision");
         let business_arguments = json!({});
         let business_object = business_arguments.as_object().unwrap();
         for wrapper in [
@@ -1060,7 +1271,6 @@ mod tests {
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
-            crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
         ] {
             assert!(!business_object.contains_key(wrapper));
         }
@@ -1073,19 +1283,9 @@ mod tests {
         let invocation_metadata = ToolInvocationMetadata {
             ack_session_message_ids: vec![guidance.message_id],
             context_request: vec!["webcodex.workflow".to_string()],
-            ack_session_context_revision: SessionContextRevisionAck::Revision(ack_revision),
+
             ..Default::default()
         };
-        assert_eq!(
-            invocation_metadata.effective_context_ack(true),
-            SessionContextRevisionAck::Revision(ack_revision)
-        );
-        assert_eq!(
-            invocation_metadata.effective_context_ack(false),
-            SessionContextRevisionAck::Unsupported,
-            "typed ACK metadata must not bypass trusted capability / ToolDefinition policy"
-        );
-
         let outcome = runtime
             .call_tool_with_invocation_metadata(
                 ToolCallRequest {
@@ -1102,7 +1302,6 @@ mod tests {
                 },
                 invocation_metadata,
                 ToolProtocolCapabilities {
-                    context_continuity: true,
                     context_sidecar: true,
                     ..Default::default()
                 },
@@ -1163,7 +1362,7 @@ mod tests {
         let outcome = runtime
             .call_tool_with_context(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
+                    tool_name: "read_files".to_string(),
                     arguments: json!({"project": "demo"}),
                 },
                 ToolCallContext {
@@ -1237,13 +1436,13 @@ mod tests {
             .unwrap();
         let arguments = json!({
             "project": "demo",
-            "path": "README.md"
+            "items": [{"path": "README.md"}]
         });
 
         let outcome = runtime
             .call_tool_with_invocation_metadata(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
+                    tool_name: "read_files".to_string(),
                     arguments,
                 },
                 ToolCallContext {
@@ -1296,7 +1495,7 @@ mod tests {
     fn session_message_resolution_reuses_dedicated_resolve_scope() {
         let project_read_only = oauth(&["project:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&project_read_only), "read_file"),
+            check_runtime_tool_scope(Some(&project_read_only), "read_files"),
             Ok(()),
             "main project read authority must remain independent"
         );
@@ -1427,275 +1626,45 @@ mod tests {
     }
 
     #[test]
-    fn computer_tools_require_independent_scope() {
+    fn computer_gateway_outer_scopes_are_minimal_and_action_neutral() {
+        assert_eq!(check_runtime_tool_scope(None, "computer_control"), Ok(()));
+        assert!(check_runtime_tool_scope(None, "plugin_tool").is_err());
+
         let denied = oauth(&["runtime:read", "project:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&denied), "computer_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let allowed = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_windows"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_applications"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_launch_application"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
-                description: "missing required scope: computer:launch".to_string(),
-            })
-        );
-        let control_only = oauth(&["computer:control"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&control_only), "computer_launch_application"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
-                ..
-            })
-        ));
-        let launch_only = oauth(&["computer:launch"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&launch_only), "computer_launch_application"),
-            Ok(())
-        );
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&launch_only), "computer_list_applications"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                ..
-            })
-        ));
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_targets"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_find_elements"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_element_state"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "list_runners"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_RUNTIME_READ),
-                description: "missing required scope: runtime:read".to_string(),
-            })
-        );
-    }
+        assert!(check_runtime_tool_scope(Some(&denied), "computer_observe").is_err());
+        assert!(check_runtime_tool_scope(Some(&denied), "computer_control").is_err());
 
-    #[test]
-    fn computer_display_observation_requires_read_and_display_read() {
-        let read_only = oauth(&["computer:read"]);
+        let observe = oauth(&["computer:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&read_only), "computer_list_displays"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_DISPLAY_READ),
-                description: "missing required scope: computer:display_read".to_string(),
-            })
-        );
-        let display_only = oauth(&["computer:display_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&display_only), "computer_snapshot_display"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let both = oauth(&["computer:read", "computer:display_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_list_displays"),
+            check_runtime_tool_scope(Some(&observe), "computer_observe"),
             Ok(())
         );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_snapshot_display"),
-            Ok(())
-        );
-    }
+        assert!(check_runtime_tool_scope(Some(&observe), "computer_control").is_err());
 
-    #[test]
-    fn computer_clipboard_tools_require_independent_dual_scopes() {
-        let read_base = oauth(&["computer:read"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&read_base), "computer_read_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_READ),
-                ..
-            })
-        ));
-        let clipboard_read_only = oauth(&["computer:clipboard_read"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&clipboard_read_only), "computer_read_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                ..
-            })
-        ));
-        let read_both = oauth(&["computer:read", "computer:clipboard_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&read_both), "computer_read_clipboard"),
-            Ok(())
-        );
-        assert!(check_runtime_tool_scope(Some(&read_both), "computer_write_clipboard").is_err());
-
-        let control_base = oauth(&["computer:control"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&control_base), "computer_write_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_WRITE),
-                ..
-            })
-        ));
-        let clipboard_write_only = oauth(&["computer:clipboard_write"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&clipboard_write_only), "computer_write_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                ..
-            })
-        ));
-        let write_both = oauth(&["computer:control", "computer:clipboard_write"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&write_both), "computer_write_clipboard"),
-            Ok(())
-        );
-        assert!(check_runtime_tool_scope(Some(&write_both), "computer_read_clipboard").is_err());
-    }
-
-    #[test]
-    fn computer_pointer_control_requires_all_four_independent_scopes() {
-        let cases = [
-            (
-                vec![
-                    "computer:display_read",
-                    "computer:control",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_READ,
-            ),
-            (
-                vec![
-                    "computer:read",
-                    "computer:control",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_DISPLAY_READ,
-            ),
-            (
-                vec![
-                    "computer:read",
-                    "computer:display_read",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_CONTROL,
-            ),
-            (
-                vec!["computer:read", "computer:display_read", "computer:control"],
-                crate::auth::SCOPE_COMPUTER_POINTER_CONTROL,
-            ),
-        ];
-        for tool in ["computer_pointer_move", "computer_pointer_click"] {
-            for (scopes, missing) in &cases {
-                let context = oauth(scopes);
-                assert_eq!(
-                    check_runtime_tool_scope(Some(&context), tool),
-                    Err(ToolCallErrorStatus::InsufficientScope {
-                        required_scope: Some(*missing),
-                        description: format!("missing required scope: {missing}"),
-                    }),
-                    "{tool} missing {missing}"
-                );
-            }
-            let all = oauth(&[
-                "computer:read",
-                "computer:display_read",
-                "computer:control",
-                "computer:pointer_control",
-            ]);
-            assert_eq!(check_runtime_tool_scope(Some(&all), tool), Ok(()));
-        }
-    }
-
-    #[test]
-    fn computer_save_snapshot_requires_project_write_and_computer_read() {
-        let read_only = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&read_only), "computer_save_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_PROJECT_WRITE),
-                description: "missing required scope: project:write".to_string(),
-            })
-        );
-        let write_only = oauth(&["project:write"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&write_only), "computer_save_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let both = oauth(&["project:write", "computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_save_snapshot"),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn computer_control_requires_its_own_scope() {
-        let observe_only = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_control"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_scroll_to_element"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_key_input"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_input_text"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
         let control = oauth(&["computer:control"]);
         assert_eq!(
             check_runtime_tool_scope(Some(&control), "computer_control"),
             Ok(())
         );
+        assert!(check_runtime_tool_scope(Some(&control), "computer_observe").is_err());
+
+        let launch = oauth(&["computer:launch"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_scroll_to_element"),
+            check_runtime_tool_scope(Some(&launch), "computer_control"),
             Ok(())
         );
+        assert!(check_runtime_tool_scope(Some(&launch), "computer_observe").is_err());
+    }
+
+    #[test]
+    fn computer_save_snapshot_requires_project_write_and_computer_read() {
+        let read_only = oauth(&["computer:read"]);
+        assert!(check_runtime_tool_scope(Some(&read_only), "computer_save_snapshot").is_err());
+        let write_only = oauth(&["project:write"]);
+        assert!(check_runtime_tool_scope(Some(&write_only), "computer_save_snapshot").is_err());
+        let both = oauth(&["project:write", "computer:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_key_input"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_input_text"),
+            check_runtime_tool_scope(Some(&both), "computer_save_snapshot"),
             Ok(())
         );
     }
@@ -1705,7 +1674,7 @@ mod tests {
         let mut pat = AuthContext::new(crate::auth::AuthKind::ApiToken);
         pat.scopes = vec![crate::auth::SCOPE_RUNTIME_READ.to_string()];
         assert_eq!(
-            check_runtime_tool_scope(Some(&pat), "read_file"),
+            check_runtime_tool_scope(Some(&pat), "read_files"),
             Err(ToolCallErrorStatus::InsufficientScope {
                 required_scope: Some(crate::auth::SCOPE_PROJECT_READ),
                 description: "missing required scope: project:read".to_string(),
@@ -1717,9 +1686,12 @@ mod tests {
         );
 
         let shared = crate::auth::shared_key_context("kernel-scope-matrix");
-        assert_eq!(check_runtime_tool_scope(Some(&shared), "read_file"), Ok(()));
         assert_eq!(
-            check_runtime_tool_scope(Some(&shared), "computer_snapshot"),
+            check_runtime_tool_scope(Some(&shared), "read_files"),
+            Ok(())
+        );
+        assert_eq!(
+            check_runtime_tool_scope(Some(&shared), "computer_observe"),
             Ok(())
         );
         assert_eq!(
@@ -1735,8 +1707,8 @@ mod tests {
         let outcome = runtime
             .call_tool_with_context(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
-                    arguments: json!({"project": "demo", "path": "README.md"}),
+                    tool_name: "read_files".to_string(),
+                    arguments: json!({"project": "demo", "items": [{"path": "README.md"}]}),
                 },
                 ToolCallContext {
                     transport: ToolTransport::Api,

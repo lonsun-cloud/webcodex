@@ -141,6 +141,7 @@ fn registration_wire_requires_generation_capabilities_and_explicit_shell() {
     assert!(!capabilities.async_jobs);
     assert!(!capabilities.async_shell_jobs);
     assert!(!capabilities.structured_validation_argv);
+    assert!(!capabilities.structured_cargo_test_lib);
     assert!(!capabilities.structured_go_test_json);
     assert!(!capabilities.structured_go_test_tool);
     assert!(!capabilities.structured_go_test_packages);
@@ -189,6 +190,7 @@ async fn runner_supports_reflects_registered_capabilities() {
         structured_go_test_json: true,
         structured_go_test_tool: true,
         structured_go_test_packages: true,
+        structured_cargo_test_lib: true,
         ..Default::default()
     });
     registry
@@ -228,6 +230,10 @@ async fn runner_supports_reflects_registered_capabilities() {
         .await
         .unwrap());
     assert!(registry
+        .runner_supports("oe", RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB)
+        .await
+        .unwrap());
+    assert!(registry
         .runner_supports("oe", RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON)
         .await
         .unwrap());
@@ -243,6 +249,7 @@ async fn runner_supports_reflects_registered_capabilities() {
     assert!(view.capabilities.structured_go_test_json);
     assert!(view.capabilities.structured_go_test_tool);
     assert!(view.capabilities.structured_go_test_packages);
+    assert!(view.capabilities.structured_cargo_test_lib);
     assert!(!registry
         .runner_supports("oe", RUNNER_CAPABILITY_GIT)
         .await
@@ -446,6 +453,8 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
             host_context: None,
             capabilities: RunnerCapabilities {
                 shell: true,
+                explicit_shell_selection: true,
+                bash_login_shell: true,
                 file_read: true,
                 file_write: true,
                 artifact_export_chunk_read: true,
@@ -453,10 +462,11 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 structured_file_delete: true,
                 apply_text_edit_occurrence: true,
                 apply_text_edit_line_scope: true,
+                apply_text_edit_expected_match_count: true,
+                apply_text_edit_local_guard_without_sha: true,
                 apply_patch: true,
                 apply_patch_match_metadata: true,
                 apply_patch_matching_mode: true,
-                apply_patch_strict_matching: true,
                 git: true,
                 jobs: true,
                 async_jobs: true,
@@ -467,6 +477,8 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 structured_validation_argv: true,
                 structured_cargo_test_count_assertion: true,
                 structured_cargo_test_execution_policy: true,
+                structured_cargo_test_lib: true,
+                structured_cargo_check_packages: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
@@ -474,6 +486,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 structured_script_payload: true,
                 structured_script_javascript: true,
                 structured_script_typescript: true,
+                structured_script_python: true,
                 internal_posix_script: true,
                 structured_execution_jobs: true,
                 detached_process_jobs: true,
@@ -482,9 +495,12 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 project_lifecycle: true,
                 project_path_registration: true,
                 managed_worktree: true,
-                configured_skill_roots_read: true,
-                skill_store_read: true,
-                skill_store_manage: true,
+                skill_runtime: true,
+                skill_resource_execution: true,
+                skill_management: true,
+                browser_observe: true,
+                browser_control: true,
+                browser_launch: true,
                 computer_observe: true,
                 computer_application_discovery: true,
                 computer_application_launch: true,
@@ -505,6 +521,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
                 native_tool_plugins: true,
                 managed_ssh_resources: true,
                 runner_config_control: true,
+                instruction_runtime: true,
             },
             policy: Some(crate::runner_protocol::RunnerPolicySummary {
                 ..Default::default()

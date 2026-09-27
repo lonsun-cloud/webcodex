@@ -71,7 +71,25 @@ pub fn session_input_summary_for_tool(tool_name: &str, arguments: &Value) -> Val
                 }
             }
         }
+        ToolAuditSessionInputPolicy::SearchAndRead => {
+            // Preserve the established single-query privacy contract while the
+            // batch form retains useful bounded query metadata without patterns.
+            object.remove("query");
+            if let Some(queries) = object.get_mut("queries").and_then(Value::as_array_mut) {
+                for query in queries.iter_mut().filter_map(Value::as_object_mut) {
+                    query.remove("pattern");
+                }
+            }
+        }
         ToolAuditSessionInputPolicy::ObserveJobs => {
+            // Raw/pre-parse input must not turn this enum into an arbitrary
+            // string channel in the Session ledger.
+            if !matches!(
+                object.get("wake_on").and_then(Value::as_str),
+                Some("change" | "terminal")
+            ) {
+                object.remove("wake_on");
+            }
             if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
                 for item in items.iter_mut().filter_map(Value::as_object_mut) {
                     item.remove("after_observation_token");
@@ -279,6 +297,45 @@ mod tests {
     }
 
     #[test]
+    fn search_and_read_session_audit_redacts_single_and_batched_patterns() {
+        let single = session_input_summary_for_tool(
+            "search_and_read",
+            &json!({
+                "project": "demo",
+                "query": {"pattern": "PRIVATE_SINGLE_PATTERN", "path": "src/lib.rs"},
+                "read_before": 12
+            }),
+        );
+        assert_eq!(single["project"], "demo");
+        assert_eq!(single["read_before"], 12);
+        assert!(single.get("query").is_none());
+        assert!(!single.to_string().contains("PRIVATE_SINGLE_PATTERN"));
+
+        let batched = session_input_summary_for_tool(
+            "search_and_read",
+            &json!({
+                "project": "demo",
+                "queries": [
+                    {"pattern": "PRIVATE_BATCH_A", "path": "src/a.rs", "pattern_mode": "literal"},
+                    {"pattern": "PRIVATE_BATCH_B", "path": "src/b.rs", "limit": 3}
+                ],
+                "max_reads": 4
+            }),
+        );
+        assert_eq!(batched["project"], "demo");
+        assert_eq!(batched["max_reads"], 4);
+        assert_eq!(batched["queries"][0]["path"], "src/a.rs");
+        assert_eq!(batched["queries"][0]["pattern_mode"], "literal");
+        assert_eq!(batched["queries"][1]["path"], "src/b.rs");
+        assert_eq!(batched["queries"][1]["limit"], 3);
+        assert!(batched["queries"][0].get("pattern").is_none());
+        assert!(batched["queries"][1].get("pattern").is_none());
+        let serialized = batched.to_string();
+        assert!(!serialized.contains("PRIVATE_BATCH_A"));
+        assert!(!serialized.contains("PRIVATE_BATCH_B"));
+    }
+
+    #[test]
     fn direct_session_store_execution_inputs_keep_the_existing_body_free_fence() {
         let process = session_input_summary_for_tool(
             "run_process",
@@ -295,6 +352,41 @@ mod tests {
         assert_eq!(process["arg_count"], 1);
         assert_eq!(process["stdin_present"], true);
         assert!(!process.to_string().contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn skill_load_session_audit_omits_private_name() {
+        let input = session_input_summary_for_tool(
+            "skill_load",
+            &json!({
+                "project": "demo",
+                "name": "PRIVATE SKILL NAME"
+            }),
+        );
+        assert_eq!(input["project"], "demo");
+        assert!(input.get("name").is_none());
+        assert!(!input.to_string().contains("PRIVATE SKILL NAME"));
+
+        let context = context_result_summary_for_tool_result(
+            "skill_load",
+            &json!({
+                "catalog_revision": "wc_skillcat_demo",
+                "skill_id": "wc_skill_demo",
+                "name": "PRIVATE SKILL NAME",
+                "source_scope": "runner",
+                "trust": "operator_configured_guidance",
+                "definition_revision": "definition-demo",
+                "path": "SKILL.md",
+                "sha256": "sha-demo",
+                "returned_lines": 12,
+                "has_more": false,
+                "next_start_line": null
+            }),
+        )
+        .unwrap();
+        assert_eq!(context["skill_id"], "wc_skill_demo");
+        assert!(context.get("name").is_none());
+        assert!(!context.to_string().contains("PRIVATE SKILL NAME"));
     }
 
     #[test]

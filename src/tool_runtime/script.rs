@@ -57,13 +57,13 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let budget =
-            match StructuredExecutionBudget::resolve_with_sync_wait(timeout_secs, sync_wait_secs) {
+            match StructuredExecutionBudget::resolve_script_with_sync_wait(timeout_secs, sync_wait_secs) {
             Ok(budget) => budget,
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
                         format!("run_script {error}"),
-                        "pass timeout_secs between 1 and 3600 and sync_wait_secs between 1 and 60 without exceeding timeout_secs; both may be omitted for their defaults.",
+                        "pass positive timeout_secs/sync_wait_secs values or omit them for defaults; oversized values are clamped to the supported runtime and synchronous-wait ceilings.",
                     ),
                     "invalid_arguments",
                     ShellCommandExecutionState::NotStarted,
@@ -151,6 +151,7 @@ impl ToolRuntime {
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),
@@ -252,8 +253,13 @@ impl ToolRuntime {
                             observation.job.exit_code.map(i64::from),
                             &observation.stdout_tail,
                             &observation.stderr_tail,
+                            observation.stdout_truncated || observation.stderr_truncated,
                             observation.job.activity.as_ref(),
                         );
+                    let continuation = crate::tool_runtime::jobs::observe_job_continuation(
+                        &observation.job.job_id,
+                        observation.job.observation_token.as_deref(),
+                    );
                     ToolResult::ok(json!({
                         "execution_state": execution_state,
                         "command_started": command_started,
@@ -267,6 +273,7 @@ impl ToolRuntime {
                         "job_id": observation.job.job_id,
                         "job_status": observation.job.status,
                         "observation_token": observation.job.observation_token,
+                        "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
                         "activity": observation.job.activity,
                         "effective_timeout_secs": timeout,
                         "sync_wait_secs": budget.sync_wait_secs,
@@ -278,11 +285,10 @@ impl ToolRuntime {
                         "stdout_truncated": observation.stdout_truncated,
                         "stderr_truncated": observation.stderr_truncated,
                         "detected_summary": detected_summary,
+                        "continuation": continuation,
                     }))
                 }
-                Err(error) => outcome_unknown_result(format!(
-                    "the durable script Job could not be observed during handoff: {error}"
-                )),
+                Err(failure) => return failure.into_tool_result(&project, budget),
             };
             if result.output["promoted_to_job"] != json!(true) {
                 add_structured_continuation_facts(
@@ -324,6 +330,7 @@ impl ToolRuntime {
                         match language {
                             ShellScriptLanguage::Javascript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_javascript, then retry only if target state proves no script started.",
                             ShellScriptLanguage::Typescript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_typescript, then retry only if target state proves no script started.",
+                            ShellScriptLanguage::Python => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_python, then retry only if target state proves no script started.",
                             _ => "confirm the Runner is connected and advertises structured_script_payload, then retry only if target state proves no script started.",
                         },
                     ),

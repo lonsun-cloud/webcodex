@@ -41,7 +41,8 @@ fn canonical_audit_policies_keep_private_payloads_out_of_durable_session_ledger(
         "events":[{"kind":"text", "text":"PRIVATE_CODING_EVENT"}],
         "messages":[{"body":"PRIVATE_MESSAGE_BODY"}],
         "entries":[{"value":"PRIVATE_MEMORY_VALUE"}],
-        "skills":[{"body":"PRIVATE_SKILL_BODY", "path":"PRIVATE_SKILL_PATH"}]
+        "skills":[{"body":"PRIVATE_SKILL_BODY", "path":"PRIVATE_SKILL_PATH"}],
+        "skill_name":"PRIVATE_SKILL_NAME"
     });
     for name in definitions
         .iter()
@@ -92,18 +93,18 @@ fn canonical_audit_policies_keep_private_payloads_out_of_durable_session_ledger(
 
 #[test]
 fn canonical_audit_evidence_preserves_only_existing_bounded_execution_excerpts() {
-    for name in ["read_file", "run_process"] {
+    for name in ["read_files", "run_process"] {
         let directory = tempfile::tempdir().unwrap();
         let ledger = directory.path().join("execution-audit.json");
         let store = persistent_store(ledger.clone());
         let project = "agent:test:audit";
         let session = store.start_session(Some(project.to_string()), None);
-        let input = session_log_arguments_for_tool_request(
-            name,
-            &json!({
-                "project":project, "path":"src/lib.rs", "executable":"printf", "purpose":"diagnostic"
-            }),
-        );
+        let raw_input = if name == "read_files" {
+            json!({"project": project, "items": [{"path": "src/lib.rs"}]})
+        } else {
+            json!({"project":project, "executable":"printf", "purpose":"diagnostic"})
+        };
+        let input = session_log_arguments_for_tool_request(name, &raw_input);
         let start = store.record_tool_call_started(
             Some(&session.session_id),
             SessionTransport::Api,

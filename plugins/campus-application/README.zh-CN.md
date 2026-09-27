@@ -1,0 +1,83 @@
+# campus-application Native Tool Plugin
+
+`campus-application` 是 WebCodex 的 first-party Native Tool Plugin，用于配合 Browser Use 规划安全的简历表单填写。它把 bounded Browser semantic snapshot 映射到结构化简历字段，支持重复经历、动态新增经历和明确的多步骤网申流程，并且**不会自动提交申请**。
+
+职责边界保持清晰：
+
+- Browser observation 提供语义控件和 opaque element identity；
+- `campus-application` 只负责把控件映射到结构化 Resume Profile，并输出 bounded action plan；
+- caller 使用普通 Browser action 执行计划；任何 DOM 结构变化或页面步骤变化之后都必须重新 snapshot；
+- 发现最终“提交申请”控件时进入 `ready_for_review`，不会生成提交 click。
+
+## 安装、构建与测试
+
+```bash
+npm ci
+npm run typecheck
+npm test
+```
+
+需要 Node.js 18 或更新版本。仓库内版本使用 `../../npm/plugin-sdk` 本地依赖，因此 CI 会持续验证当前 WebCodex checkout 的 SDK。
+
+## 配置简历
+
+仓库只保存虚构 example。把 `profile.example.json` 复制到 Runner 本机的私有目录，并命名为 `profile.json`，例如：
+
+```text
+~/.config/webcodex/campus-application/profile.json
+```
+
+`profile.json` 已被 Git ignore。默认情况下 Plugin 从 provider 配置的 `cwd` 读取它；也可以通过 `WEBCODEX_CAMPUS_APPLICATION_PROFILE` 显式指定其它 profile 文件。
+
+结构化 profile 覆盖身份/联系方式、个人链接、多段教育/实习/项目/校园经历、技能/语言、求职偏好、申请文案和附件。
+
+`attachments.resume_path` 最终会交给 Browser `upload_file`，它必须相对于 caller 为上传授权的 WebCodex Project 有效，而不是相对于 Plugin profile 目录解析。
+
+## 配置 Runner
+
+```toml
+[[plugins.providers]]
+id = "campus-application"
+name = "Campus Application"
+command = "node"
+args = ["/absolute/path/to/webcodex/plugins/campus-application/dist/plugin.js"]
+cwd = "/absolute/path/to/private/campus-application-data"
+timeout_secs = 30
+```
+
+Runner restart/reload 后可以检查：
+
+```text
+webcodex plugin check --runner <runner> --plugin campus-application
+webcodex plugin reload --runner <runner>
+webcodex plugin describe --runner <runner> --plugin campus-application --tool plan_fill
+```
+
+实际调用仍走 canonical `plugin_tool describe -> call` 路径。
+
+## 工具与流程
+
+`profile_get` 返回配置的结构化 Resume Resource 和当前 bounded canonical view；`analyze_form` 返回字段映射、indexed resume path、blocker 和 form-structure signature；`plan_fill` 返回下一步安全 phase：
+
+- `expand_sections`：只返回一个“新增经历” click，之后必须重新 snapshot；
+- `fill_fields`：返回 `input_text`、`select_option`、`set_value`、`upload_file` 或 grouped `click`；
+- `advance_step`：只有存在明确 step/progress 语义时才返回一个“下一步/继续” click，之后必须重新 snapshot；
+- `ready_for_review`：已经看到最终提交控件，不返回 submit click。
+
+重复经历映射到精确来源，例如 `education[1].school`、`experience[1].start_date`、`projects[1].technologies`。
+
+Plugin 使用最多 64 项的进程内 mapping cache。structure signature 有意忽略易变的 element/group identity、当前值、checked 状态、被动 AX 文本、submit button 和原生 picker affordance；Plugin reload 后 cache 自动清空。
+
+## 本地 fixtures
+
+运行：
+
+```bash
+npm run fixtures
+```
+
+然后访问 `http://127.0.0.1:32124/`。fixtures 覆盖单页、中文秋招、多段经历、动态新增经历和四步网申，所有 submit event 都会在本地拦截。
+
+## 安全边界
+
+这个 Plugin 是 planner，不是自动投递服务。它不会自己调用 Browser 工具，不访问外部招聘 API，也不会提交表单。Browser 权限仍由 WebCodex 和 caller 掌握，最终提交始终保留为人工 review boundary。

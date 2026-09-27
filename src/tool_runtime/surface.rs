@@ -4,26 +4,37 @@
 //! manifests, and bounded `list_tools` filtering close together while leaving
 //! dispatch and authorization flow in `mod.rs`.
 
+#[cfg(feature = "experimental-code-mode")]
+use super::code_mode::{
+    code_mode_callable_stage_for_entry_tool, code_mode_orchestration_policy, CodeModeCallableStage,
+};
 use super::kernel::ToolProtocolCapabilities;
 use super::metadata::ToolAuthorityPolicy;
-use super::registry::{
-    accepted_flattened_args_for_spec, operator_diagnostic_tool_specs, registered_tool_specs,
-    stateless_operator_extension_tool_specs,
-};
+#[cfg(feature = "experimental-code-mode")]
+use super::orchestration_host::is_server_owned_orchestration_argument;
+use super::registry::{registered_tool_specs, stateless_operator_extension_tool_specs};
 use super::runtime::ToolRuntime;
 use super::tool_definition::{
     available_tool_manifest_intent_names, is_model_visible_tool_name, resolve_tool_manifest_intent,
-    runtime_tool_category, runtime_tool_metadata, ToolManifestIntent, TOOL_CATEGORY_ARTIFACT,
-    TOOL_CATEGORY_EDIT, TOOL_CATEGORY_GIT, TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME,
-    TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION, TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
+    runtime_tool_category, runtime_tool_execution_contract, runtime_tool_host_orchestration_hint,
+    runtime_tool_metadata, runtime_tool_operator_extension_family, ToolExecutionContract,
+    ToolManifestIntent, ToolOperatorExtensionFamily, TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT,
+    TOOL_CATEGORY_GIT, TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_SESSION,
+    TOOL_CATEGORY_VALIDATION, TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
 };
 use super::tool_inputs::ListToolsOptions;
 use super::tool_result::ToolResult;
-use super::tool_spec::ToolSpec;
+#[cfg(feature = "experimental-code-mode")]
+use crate::json_measurement::serialized_json_len;
 use serde_json::{json, Value};
+#[cfg(feature = "experimental-code-mode")]
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
+use webcodex_tool_contracts::ToolSpec;
 
 const TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS: usize = 180;
+#[cfg(feature = "experimental-code-mode")]
+pub(crate) const CODE_MODE_CALLABLE_CONTRACT_HARD_MAX_BYTES: usize = 16 * 1024;
 const TOOL_MANIFEST_CANONICAL_KEYS: &[&str] = &[
     "schema_version",
     "tool_count",
@@ -49,6 +60,331 @@ const TOOL_MANIFEST_CANONICAL_KEYS: &[&str] = &[
     "recommended_flows",
 ];
 
+#[cfg(feature = "experimental-code-mode")]
+const CODE_MODE_USEFUL_OUTPUT_FIELD_NAMES: &[&str] = &[
+    "success",
+    "error",
+    "execution_state",
+    "terminal",
+    "passed",
+    "source_state",
+    "freshness",
+    "observed_mutation_fence",
+    "failure_kind",
+    "job_id",
+    "job_status",
+    "promoted_to_job",
+    "continuation",
+    "diagnostics",
+    "state_changed",
+    "error_kind",
+    "change_index",
+    "edit_index",
+    "conflicting_edit_indices",
+    "conflicting_edit_ranges",
+    "recovery",
+    "changed",
+    "items",
+    "matches",
+    "path",
+    "text",
+    "read_revision",
+    "returned_lines",
+    "has_more",
+    "line",
+    "preview",
+    "read_hint",
+    "output_truncated",
+    "truncation_reason",
+    "suggested_call",
+    "project_types",
+    "manifests",
+    "key_files",
+    "suggested_next_reads",
+    "entries",
+    "total_files",
+    "next_offset",
+    "list_truncated",
+    "exit_code",
+    "stdout",
+    "stderr",
+    "head_commit",
+    "commits",
+    "files",
+    "hunk_count",
+    "truncated",
+    "truncation_reasons",
+    "scope",
+    "stats",
+    "signals",
+    "warnings",
+    "reason_code",
+    "branch",
+    "head",
+    "clean",
+    "counts",
+    "files_truncated",
+    "diff_stat",
+];
+#[cfg(feature = "experimental-code-mode")]
+pub(crate) const CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX: usize = 20;
+#[cfg(feature = "experimental-code-mode")]
+const CODE_MODE_OUTPUT_PATH_DEPTH_MAX: usize = 7;
+
+#[cfg(feature = "experimental-code-mode")]
+fn strip_code_mode_schema_noise(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in ["description", "title", "examples", "$comment"] {
+                object.remove(key);
+            }
+            for (key, nested) in object.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "properties"
+                        | "patternProperties"
+                        | "dependentSchemas"
+                        | "dependentRequired"
+                        | "dependencies"
+                        | "$defs"
+                        | "definitions"
+                ) {
+                    if let Some(named) = nested.as_object_mut() {
+                        for schema in named.values_mut() {
+                            strip_code_mode_schema_noise(schema);
+                        }
+                    }
+                } else {
+                    strip_code_mode_schema_noise(nested);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                strip_code_mode_schema_noise(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn code_mode_input_schema_projection(
+    schema: &Value,
+    policy: super::orchestration_host::OrchestrationPolicy,
+) -> Value {
+    let mut projected = schema.clone();
+    strip_code_mode_schema_noise(&mut projected);
+    let Some(object) = projected.as_object_mut() else {
+        return projected;
+    };
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.retain(|field, _| {
+            !is_server_owned_orchestration_argument(field)
+                && !policy
+                    .additional_forbidden_argument_fields
+                    .contains(&field.as_str())
+        });
+    }
+    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|field| {
+            field.as_str().is_none_or(|field| {
+                !is_server_owned_orchestration_argument(field)
+                    && !policy.additional_forbidden_argument_fields.contains(&field)
+            })
+        });
+    }
+    projected
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn schema_can_be_array(schema: &Value) -> bool {
+    if schema.get("type").and_then(Value::as_str) == Some("array") {
+        return true;
+    }
+    ["anyOf", "oneOf", "allOf"].iter().any(|key| {
+        schema
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|branches| branches.iter().any(schema_can_be_array))
+    })
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn collect_code_mode_output_fields(
+    schema: &Value,
+    prefix: &str,
+    depth: usize,
+    fields: &mut BTreeSet<String>,
+) {
+    if depth >= CODE_MODE_OUTPUT_PATH_DEPTH_MAX {
+        return;
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                collect_code_mode_output_fields(branch, prefix, depth, fields);
+            }
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        collect_code_mode_output_fields(items, prefix, depth + 1, fields);
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, child) in properties {
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if CODE_MODE_USEFUL_OUTPUT_FIELD_NAMES.contains(&name.as_str()) {
+            fields.insert(path.clone());
+        }
+        let nested_prefix = if schema_can_be_array(child) {
+            format!("{path}[]")
+        } else {
+            path
+        };
+        collect_code_mode_output_fields(child, &nested_prefix, depth + 1, fields);
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn code_mode_output_fields(schema: &Value) -> Vec<String> {
+    let mut fields = BTreeSet::new();
+    collect_code_mode_output_fields(schema, "", 0, &mut fields);
+    let mut fields = fields.into_iter().collect::<Vec<_>>();
+    fields.sort_by(|left, right| {
+        let rank = |path: &str| {
+            let leaf = path
+                .rsplit('.')
+                .next()
+                .unwrap_or(path)
+                .trim_end_matches("[]");
+            CODE_MODE_USEFUL_OUTPUT_FIELD_NAMES
+                .iter()
+                .position(|candidate| *candidate == leaf)
+                .unwrap_or(CODE_MODE_USEFUL_OUTPUT_FIELD_NAMES.len())
+        };
+        rank(left).cmp(&rank(right)).then_with(|| left.cmp(right))
+    });
+    fields.truncate(CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX);
+    fields
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn code_mode_usage_examples(stage: CodeModeCallableStage) -> Vec<Value> {
+    let mut examples = vec![
+        json!({
+            "name": "adaptive_search_then_read",
+            "source": r#"const search = await tools.search_project_texts({queries:[{pattern:"CanonicalOrchestrationHost",pattern_mode:"literal",limit:8}]});
+const matches = search.output.items?.[0]?.output?.matches ?? [];
+const detail = await tools.read_files({items:matches.slice(0,3).map(m=>({path:m.path,start_line:m.read_hint.start_line,limit:m.read_hint.limit}))});
+text({matches:matches.map(m=>({path:m.path,line:m.line,preview:m.preview})),files:detail.output.items?.map(i=>({path:i.path,text:i.output?.text,read_revision:i.output?.read_revision}))});"#,
+        }),
+        json!({
+            "name": "independent_observations",
+            "source": r#"const [status, detail] = await Promise.all([
+  tools.git_status({}),
+  tools.read_files({items:[{path:"src/tool_runtime/code_mode.rs",start_line:1,limit:80}]})
+]);
+text({status:status.output?.stdout,file:detail.output.items?.[0]?.output?.text});"#,
+        }),
+    ];
+    match stage {
+        CodeModeCallableStage::ReadOnly => {}
+        CodeModeCallableStage::Validation => examples.push(json!({
+            "name": "validation_job_handoff",
+            "source": r#"const check = await tools.cargo_check({sync_wait_secs:1});
+if (!check.output?.terminal && check.output?.job_id) {
+  text({job_id:check.output.job_id,continuation:check.output.continuation});
+} else {
+  text({passed:check.output?.passed,failure_kind:check.output?.failure_kind,diagnostics:check.output?.diagnostics});
+}"#,
+        })),
+        CodeModeCallableStage::GuardedEdit => examples.push(json!({
+            "name": "guarded_edit_then_validation",
+            "source": r#"const path = "src/example.rs";
+const read = await tools.read_files({items:[{path,start_line:1,limit:120}]});
+const revision = read.output.items?.[0]?.output?.read_revision;
+const edit = await tools.apply_text_edits({changes:[{path,old_text:"old",new_text:"new",expected_read_revision:revision}]});
+if (!edit.success || typeof edit.output?.state_changed !== "boolean") throw new Error("inspect edit recovery before validating");
+const check = await tools.cargo_check({sync_wait_secs:1});
+text({state_changed:edit.output.state_changed,call_success:check.success,source_state:check.output?.source_state,job_handoff:!!check.output?.job_id});"#,
+        })),
+    }
+    examples
+}
+
+#[cfg(feature = "experimental-code-mode")]
+fn code_mode_callable_contract(
+    stage: CodeModeCallableStage,
+    specs: &[ToolSpec],
+) -> Result<Value, ToolResult> {
+    let policy = code_mode_orchestration_policy(stage);
+    let by_name = specs
+        .iter()
+        .map(|spec| (spec.name.as_str(), spec))
+        .collect::<HashMap<_, _>>();
+    let mut tools = Vec::with_capacity(policy.admitted_tools.len());
+    for tool_name in policy.admitted_tools {
+        let Some(spec) = by_name.get(tool_name).copied() else {
+            return Err(ToolResult::err_with_output(
+                "code mode callable projection is inconsistent with the canonical tool registry",
+                json!({"code":"code_mode_projection_missing_tool","tool":tool_name}),
+            ));
+        };
+        let output_fields = code_mode_output_fields(&spec.output_schema);
+        if output_fields.is_empty() {
+            return Err(ToolResult::err_with_output(
+                "code mode callable projection found no useful canonical output fields",
+                json!({"code":"code_mode_projection_missing_useful_output","tool":tool_name}),
+            ));
+        }
+        tools.push(json!({
+            "tool": spec.name,
+            "purpose": selection_description(&spec.description),
+            "input": code_mode_input_schema_projection(&spec.input_schema, policy),
+            "output_fields": output_fields,
+        }));
+    }
+    let projection = json!({
+        "kind": "code_mode_callable_contract",
+        "version": 1,
+        "stage": stage.as_str(),
+        "entry_tool": stage.entry_tool(),
+        "authority": "presentation_only",
+        "constraints": {
+            "max_mutation_calls": policy.max_mutation_calls,
+            "validation_after_successful_known_mutation": policy.validation_after_mutation,
+            "nested_sync_wait_max_secs": policy.nested_sync_wait_max_secs,
+        },
+        "tool_count": tools.len(),
+        "tools": tools,
+        "examples": code_mode_usage_examples(stage),
+        "bounds": {
+            "hard_max_bytes": CODE_MODE_CALLABLE_CONTRACT_HARD_MAX_BYTES,
+            "description_max_chars": TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS,
+            "output_fields_per_tool_max": CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX,
+        },
+    });
+    let bytes = serialized_json_len(&projection).expect("Value serialization is infallible");
+    if bytes > CODE_MODE_CALLABLE_CONTRACT_HARD_MAX_BYTES {
+        return Err(ToolResult::err_with_output(
+            "code mode callable projection exceeded its hard model-surface bound",
+            json!({
+                "code":"code_mode_projection_too_large",
+                "stage":stage.as_str(),
+                "bytes":bytes,
+                "hard_max_bytes":CODE_MODE_CALLABLE_CONTRACT_HARD_MAX_BYTES,
+            }),
+        ));
+    }
+    Ok(projection)
+}
+
 pub(crate) fn registered_tool_categories() -> Value {
     let mut categories = serde_json::Map::new();
     for group in TOOL_DISCOVERY_GROUPS {
@@ -72,18 +408,13 @@ pub(crate) fn recommended_flows() -> Vec<&'static str> {
         .collect()
 }
 
-fn tool_manifest_specs(
-    capabilities: ToolProtocolCapabilities,
-    model_surface: crate::model_surface::ModelSurface,
-) -> Vec<ToolSpec> {
+fn tool_manifest_specs(capabilities: ToolProtocolCapabilities) -> Vec<ToolSpec> {
     let mut specs = registered_tool_specs();
-    if model_surface.supports_operator_extensions() {
-        specs.extend(
-            stateless_operator_extension_tool_specs()
-                .into_iter()
-                .filter(|spec| tool_manifest_extension_capability_allows(&spec.name, capabilities)),
-        );
-    }
+    specs.extend(
+        stateless_operator_extension_tool_specs()
+            .into_iter()
+            .filter(|spec| tool_manifest_extension_capability_allows(&spec.name, capabilities)),
+    );
     specs
 }
 
@@ -91,36 +422,79 @@ fn tool_manifest_extension_capability_allows(
     tool_name: &str,
     capabilities: ToolProtocolCapabilities,
 ) -> bool {
-    if super::skills::is_skill_runtime_tool_name(tool_name) {
-        capabilities.skill_runtime
-    } else if super::skills::is_skill_management_tool_name(tool_name) {
-        capabilities.skill_management
-    } else if super::memory::is_memory_runtime_tool_name(tool_name)
-        || super::memory::is_memory_management_tool_name(tool_name)
-    {
-        capabilities.memory_surface
-    } else if operator_diagnostic_tool_specs()
-        .iter()
-        .any(|spec| spec.name == tool_name)
-    {
-        capabilities.trace_diagnostics
-    } else {
-        // New extension families must declare an explicit server-owned protocol
-        // capability before discovery can expose them.
-        false
+    match runtime_tool_operator_extension_family(tool_name) {
+        Some(ToolOperatorExtensionFamily::SkillRuntime) => capabilities.skill_runtime,
+        Some(ToolOperatorExtensionFamily::SkillManagement) => capabilities.skill_management,
+        Some(
+            ToolOperatorExtensionFamily::MemoryRuntime
+            | ToolOperatorExtensionFamily::MemoryManagement,
+        ) => capabilities.memory_surface,
+        Some(ToolOperatorExtensionFamily::TraceDiagnostics) => capabilities.trace_diagnostics,
+        None => {
+            // New extension families must declare an explicit server-owned protocol
+            // capability before discovery can expose them.
+            false
+        }
     }
 }
 
-fn tool_manifest_route(
-    spec: &ToolSpec,
-    model_surface: crate::model_surface::ModelSurface,
-) -> (&'static str, Option<&'static str>) {
+fn tool_manifest_route(spec: &ToolSpec) -> (&'static str, Option<&'static str>) {
     if is_model_visible_tool_name(spec.name.as_str()) {
-        model_surface.runtime_tool_invocation_route(spec.name.as_str())
+        crate::model_surface::adaptive_runtime_tool_invocation_route(spec.name.as_str())
     } else {
-        model_surface
-            .runtime_tool_invocation_route_with_operator_extension(spec.name.as_str(), true)
+        crate::model_surface::adaptive_runtime_tool_invocation_route_with_operator_extension(
+            spec.name.as_str(),
+            true,
+        )
     }
+}
+
+fn tool_manifest_invocation_route(spec: &ToolSpec) -> Value {
+    let target = spec.name.as_str();
+    let (availability, gateway_tool) = tool_manifest_route(spec);
+    let primary = match (availability, gateway_tool) {
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT, None) => {
+            json!({"mode": "direct", "tool": target})
+        }
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(gateway)) => {
+            json!({"mode": "gateway", "tool": gateway, "target": target})
+        }
+        _ => json!({"mode": "unavailable", "tool": Value::Null, "target": target}),
+    };
+
+    let fallback = if availability == crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT
+        && target != crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    {
+        json!({
+            "mode": "gateway",
+            "tool": crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            "target": target,
+            "when": "direct_callable_unavailable",
+            "blocked_when_mcp_apps_enabled": crate::model_surface::tool_requires_direct_app_presentation(target),
+        })
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "primary": primary,
+        "fallback": fallback,
+        "tool_manifest_registers_host_tool": false,
+        "discovery_effect": "none",
+    })
+}
+
+fn manifest_host_orchestration_projection(tool_name: &str) -> Option<Value> {
+    let hint = runtime_tool_host_orchestration_hint(tool_name);
+    if hint.is_unspecified() {
+        return None;
+    }
+    Some(json!({
+        "guidance_only": true,
+        "concurrency": hint.concurrency.as_str(),
+        "native_batch_field": hint.native_batch_field,
+        "compound_preferred": hint.compound_preferred,
+    }))
 }
 
 impl ToolRuntime {
@@ -187,8 +561,8 @@ impl ToolRuntime {
                 registered_tool_categories()
             },
             "recommended_flows": recommended_flows(),
-            "recommended_next": "For daily GPT Action discovery, call callRuntimeTool with tool=tool_manifest. Use full listRuntimeTools only when debugging schemas.",
-            "hint": "Full listRuntimeTools responses include schemas and may be large. Use summary_only=true with category, features, or limit for focused discovery.",
+            "recommended_next": "Use tool_manifest directly for focused discovery; long-tail Adaptive Runtime tools are invoked through call_runtime_tool.",
+            "hint": "Prefer exact tool_name or category/intent filters for compact discovery; availability describes routing only and grants no authority.",
         });
         if !bounded_request {
             output["filtered_count"] = json!(total_count);
@@ -255,23 +629,17 @@ impl ToolRuntime {
         protocol_capabilities: ToolProtocolCapabilities,
     ) -> Result<Value, ToolResult> {
         let tool_name = raw_tool_name.trim();
-        let model_surface = self.model_surface().ok_or_else(|| {
-            ToolResult::err(
-                "tool_manifest is unavailable under the project_connector runtime exposure"
-                    .to_string(),
-            )
-        })?;
         if tool_name.is_empty() {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         }
-        let specs = tool_manifest_specs(protocol_capabilities, model_surface);
+        let specs = tool_manifest_specs(protocol_capabilities);
         let tool_count = specs.len();
         let Some(spec) = specs.iter().find(|spec| spec.name == tool_name) else {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         };
         let category = runtime_tool_category(spec.name.as_str());
         let metadata = runtime_tool_metadata(spec.name.as_str());
-        let (availability, gateway_tool) = tool_manifest_route(spec, model_surface);
+        let (availability, gateway_tool) = tool_manifest_route(spec);
         let mut exact_categories = serde_json::Map::new();
         exact_categories.insert(category.to_string(), json!([spec.name]));
         let mut output = json!({
@@ -282,6 +650,7 @@ impl ToolRuntime {
             "total_count": tool_count,
             "filtered_count": 1,
             "tool_name": spec.name,
+            "route": tool_manifest_invocation_route(spec),
             "contract": {
                 "name": spec.name,
                 "description": spec.description,
@@ -305,8 +674,16 @@ impl ToolRuntime {
             "limit_applied": false,
             "requested_limit": Value::Null,
             "categories": Value::Object(exact_categories),
-            "tools": [compact_manifest_tool_entry(spec, model_surface)],
+            "tools": [compact_manifest_tool_entry(spec)],
+            "routing_note": "tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary, or route.fallback when the direct callable is unavailable and the fallback is not blocked by MCP App presentation requirements.",
         });
+        if let Some(execution) = runtime_tool_execution_contract(spec.name.as_str()) {
+            output["contract"]["execution"] = manifest_execution_projection(execution);
+        }
+        if let Some(host_orchestration) = manifest_host_orchestration_projection(spec.name.as_str())
+        {
+            output["host_orchestration"] = host_orchestration;
+        }
         if include_risk_summary {
             output["risk_summary"] = build_risk_summary(&[spec]);
         }
@@ -315,6 +692,10 @@ impl ToolRuntime {
                 Value::Array(tool_manifest_recommended_flows_for_visible_tools([spec
                     .name
                     .as_str()]));
+        }
+        #[cfg(feature = "experimental-code-mode")]
+        if let Some(stage) = code_mode_callable_stage_for_entry_tool(spec.name.as_str()) {
+            output["code_mode_callable_contract"] = code_mode_callable_contract(stage, &specs)?;
         }
         Ok(output)
     }
@@ -379,14 +760,8 @@ impl ToolRuntime {
                 }
             },
         };
-        let model_surface = self.model_surface().ok_or_else(|| {
-            ToolResult::err(
-                "tool_manifest is unavailable under the project_connector runtime exposure"
-                    .to_string(),
-            )
-        })?;
 
-        let specs = tool_manifest_specs(protocol_capabilities, model_surface);
+        let specs = tool_manifest_specs(protocol_capabilities);
         let tool_count = specs.len();
         let categories_requested = normalize_tool_manifest_categories(categories);
         let category = categories_requested
@@ -416,7 +791,7 @@ impl ToolRuntime {
         let risk_summary = include_risk_summary.then(|| build_risk_summary(&returned_specs));
         let tools: Vec<Value> = returned_specs
             .iter()
-            .map(|spec| compact_manifest_tool_entry(spec, model_surface))
+            .map(|spec| compact_manifest_tool_entry(spec))
             .collect();
 
         let mut output = json!({
@@ -742,6 +1117,7 @@ pub(super) fn sparsify_tool_manifest_model_result(result: &mut ToolResult) {
             "approval",
             "idempotency",
             "annotations",
+            "execution",
         ] {
             if let Some(value) = contract.get(key) {
                 projected.insert(key.to_string(), value.clone());
@@ -806,6 +1182,9 @@ pub(super) fn sparsify_tool_manifest_model_result(result: &mut ToolResult) {
                         if let Some(effect) = tool.get("effect") {
                             entry.insert("effect".to_string(), effect.clone());
                         }
+                        if let Some(execution) = tool.get("execution") {
+                            entry.insert("execution".to_string(), execution.clone());
+                        }
                         if tool.get("effect").and_then(Value::as_str) != Some("observe") {
                             if let Some(risk) = tool.get("risk") {
                                 entry.insert("risk".to_string(), risk.clone());
@@ -865,17 +1244,22 @@ pub(super) fn sparsify_tool_manifest_model_result(result: &mut ToolResult) {
     result.output = Value::Object(projected);
 }
 
-pub(super) fn compact_manifest_tool_entry(
-    spec: &ToolSpec,
-    model_surface: crate::model_surface::ModelSurface,
-) -> Value {
+fn manifest_execution_projection(execution: ToolExecutionContract) -> Value {
+    json!({
+        "form": execution.form.as_str(),
+        "lifetime": execution.lifetime.as_str(),
+        "start": execution.start.as_str(),
+        "continuation": execution.continuation.as_str(),
+    })
+}
+
+pub(super) fn compact_manifest_tool_entry(spec: &ToolSpec) -> Value {
     let name = spec.name.as_str();
     let m = runtime_tool_metadata(name);
-    let (availability, gateway_tool) = tool_manifest_route(spec, model_surface);
-    json!({
+    let (availability, gateway_tool) = tool_manifest_route(spec);
+    let mut entry = json!({
         "name": name,
         "category": runtime_tool_category(name),
-        "accepted_flattened_args": accepted_flattened_args_for_spec(spec),
         "deprecated_or_unsupported_args": [],
         "provider": m.provider_id,
         "effect": m.effect.manifest_label(),
@@ -890,7 +1274,11 @@ pub(super) fn compact_manifest_tool_entry(
         "authority": manifest_authority(m.authority),
         "availability": availability,
         "gateway_tool": gateway_tool,
-    })
+    });
+    if let Some(execution) = runtime_tool_execution_contract(name) {
+        entry["execution"] = manifest_execution_projection(execution);
+    }
+    entry
 }
 
 fn list_tool_matches_features(name: &str, features: &str) -> bool {
@@ -1007,11 +1395,81 @@ where
             if tools.is_empty() {
                 return None;
             }
+            let omitted_tools: Vec<&str> = flow
+                .tools
+                .iter()
+                .copied()
+                .filter(|tool| !visible.contains(*tool))
+                .collect();
+            if omitted_tools.is_empty() {
+                return Some(json!({
+                    "name": flow.name,
+                    "purpose": flow.manifest_purpose,
+                    "tools": tools,
+                }));
+            }
             Some(json!({
                 "name": flow.name,
-                "purpose": flow.manifest_purpose,
+                "purpose": format!(
+                    "Partial projection of the canonical flow; omitted_tools lists canonical members not selected into this projection. {}",
+                    flow.manifest_purpose
+                ),
                 "tools": tools,
+                "partial": true,
+                "omitted_tools": omitted_tools,
             }))
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "experimental-code-mode"))]
+mod code_mode_projection_tests {
+    use super::*;
+
+    #[test]
+    fn schema_noise_compaction_preserves_business_property_names() {
+        let mut schema = json!({
+            "type": "object",
+            "description": "root schema noise",
+            "properties": {
+                "description": {"type": "string", "description": "field noise"},
+                "title": {"type": "string", "title": "field title noise"},
+                "examples": {"type": "array", "items": {"type": "string"}, "examples": [["x"]]},
+                "$comment": {"type": "string", "$comment": "field comment noise"},
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "boolean", "description": "nested noise"}
+                    }
+                }
+            },
+            "$defs": {
+                "description": {"type": "integer", "description": "definition noise"}
+            }
+        });
+
+        strip_code_mode_schema_noise(&mut schema);
+
+        assert!(schema.get("description").is_none());
+        let properties = schema["properties"].as_object().unwrap();
+        for name in ["description", "title", "examples", "$comment", "nested"] {
+            assert!(
+                properties.contains_key(name),
+                "business property {name} was dropped"
+            );
+        }
+        assert!(properties["description"].get("description").is_none());
+        assert!(properties["title"].get("title").is_none());
+        assert!(properties["examples"].get("examples").is_none());
+        assert!(properties["$comment"].get("$comment").is_none());
+        assert!(properties["nested"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("description"));
+        assert!(schema["$defs"]
+            .as_object()
+            .unwrap()
+            .contains_key("description"));
+        assert!(schema["$defs"]["description"].get("description").is_none());
+    }
 }

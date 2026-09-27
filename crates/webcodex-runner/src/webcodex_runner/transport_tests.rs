@@ -1,7 +1,10 @@
 use super::super::config::{RunnerPolicy, ShellConfig};
 use super::*;
-use crate::runner_protocol::{RunnerCapabilities, RunnerRequest, RUNNER_PROTOCOL_GENERATION_V2};
-#[cfg(unix)]
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerEnvelope, RunnerJobUpdateRequest, RunnerRequest,
+    RUNNER_PROTOCOL_GENERATION_V2,
+};
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 use crate::POLLING_DISPATCH_MAX_IN_FLIGHT;
 use futures_util::{SinkExt, StreamExt};
 use std::io::{Read, Write};
@@ -10,9 +13,223 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+#[test]
+fn runner_stream_telemetry_is_fail_open() {
+    observe_runtime_metric_fail_open(|| panic!("synthetic metric sink failure"));
+}
+
+#[test]
+fn runner_stream_telemetry_dimensions_are_closed_and_payload_safe() {
+    assert_eq!(
+        [
+            StreamTransport::WebSocket.name(),
+            StreamTransport::Quic.name()
+        ],
+        ["websocket", "quic"]
+    );
+    assert_eq!(
+        [
+            RunnerStreamMetricOutcome::Success.as_str(),
+            RunnerStreamMetricOutcome::Closed.as_str(),
+            RunnerStreamMetricOutcome::Backpressure.as_str(),
+            RunnerStreamMetricOutcome::TransportError.as_str(),
+            RunnerStreamMetricOutcome::Timeout.as_str(),
+        ],
+        [
+            "success",
+            "closed",
+            "backpressure",
+            "transport_error",
+            "timeout"
+        ]
+    );
+    assert_eq!(bounded_stream_envelope_kind("result"), "result");
+    assert_eq!(bounded_stream_envelope_kind("job_update"), "job_update");
+    assert_eq!(
+        bounded_stream_envelope_kind("project_inventory_status"),
+        "project_inventory"
+    );
+    assert_eq!(
+        bounded_stream_envelope_kind("runtime_metadata"),
+        "provider_metadata"
+    );
+    assert_eq!(
+        bounded_stream_envelope_kind("/private/path?token=secret"),
+        "control"
+    );
+}
+
+#[test]
+fn runner_stream_telemetry_failed_outcomes_never_emit_success_latency_samples() {
+    let duration = Some(Duration::from_millis(9));
+    assert_eq!(
+        successful_stream_duration(RunnerStreamMetricOutcome::Success, duration),
+        duration
+    );
+    assert_eq!(
+        successful_stream_duration(RunnerStreamMetricOutcome::Closed, duration),
+        None
+    );
+    assert_eq!(
+        successful_stream_duration(RunnerStreamMetricOutcome::Backpressure, duration),
+        None
+    );
+    assert_eq!(
+        successful_stream_duration(RunnerStreamMetricOutcome::TransportError, duration),
+        None
+    );
+    assert_eq!(
+        successful_stream_duration(RunnerStreamMetricOutcome::Timeout, duration),
+        None
+    );
+}
+
+#[test]
+fn runner_stream_control_admission_preserves_best_effort_full_and_closed_semantics() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(try_send_runner_stream_control(
+            transport,
+            &tx,
+            RunnerEnvelope::Pong { ts: 1 },
+        ));
+        assert!(
+            !try_send_runner_stream_control(transport, &tx, RunnerEnvelope::Pong { ts: 2 },),
+            "a full best-effort control queue must reject immediately"
+        );
+        assert!(matches!(rx.try_recv(), Ok(RunnerEnvelope::Pong { ts: 1 })));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(
+            !try_send_runner_stream_control(transport, &tx, RunnerEnvelope::Pong { ts: 3 },),
+            "a closed control queue must stay non-blocking and fail"
+        );
+    }
+}
+
+fn test_push_sink(
+    transport: StreamTransport,
+    capacity: usize,
+) -> (RunnerSink, mpsc::Receiver<RunnerEnvelope>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let sink = match transport {
+        StreamTransport::WebSocket => RunnerSink::WebSocket {
+            tx,
+            client_id: "metric-client".to_string(),
+            runner_instance_id: "metric-instance".to_string(),
+        },
+        StreamTransport::Quic => RunnerSink::Quic {
+            tx,
+            client_id: "metric-client".to_string(),
+            runner_instance_id: "metric-instance".to_string(),
+        },
+    };
+    (sink, rx)
+}
+
+fn test_command_result(duration_ms: Option<u64>) -> CommandResult {
+    CommandResult {
+        exit_code: Some(0),
+        stdout: Some("ok\n".to_string()),
+        stderr: None,
+        duration_ms,
+        error: None,
+    }
+}
+
+fn test_job_update() -> RunnerJobUpdateRequest {
+    RunnerJobUpdateRequest {
+        client_id: "metric-client".to_string(),
+        runner_instance_id: "metric-instance".to_string(),
+        job_id: "metric-job".to_string(),
+        request_id: Some("metric-request".to_string()),
+        update_seq: Some(1),
+        status: "running".to_string(),
+        stdout_chunk: None,
+        stderr_chunk: None,
+        log_snapshot: None,
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        command_execution_state: None,
+        validation_progress: None,
+        test_count_evidence: None,
+        activity: None,
+        finished: false,
+    }
+}
+
+#[test]
+fn runner_stream_telemetry_websocket_and_quic_share_result_and_job_update_queue_semantics() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        let (sink, mut rx) = test_push_sink(transport, 4);
+        assert_eq!(
+            sink.submit_result("result-request".to_string(), test_command_result(Some(4)))
+                .unwrap(),
+            ResultSubmission::Accepted
+        );
+        sink.send_job_update(&test_job_update()).unwrap();
+
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(RunnerEnvelope::Result { .. })
+        ));
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(RunnerEnvelope::JobUpdate { .. })
+        ));
+    }
+}
+
+#[test]
+fn runner_stream_telemetry_closed_channel_preserves_transport_closed_result_semantics() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        let (sink, rx) = test_push_sink(transport, 1);
+        drop(rx);
+        let error = sink
+            .submit_result("closed-request".to_string(), test_command_result(Some(2)))
+            .expect_err("closed writer channel must reject result submission");
+        assert!(matches!(error, SubmitResultError::TransportClosed(_)));
+    }
+}
+
+#[test]
+fn runner_stream_telemetry_concurrent_results_remain_distinct_on_one_stream_writer_queue() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        let (sink, mut rx) = test_push_sink(transport, 4);
+        let left = sink.clone();
+        let right = sink.clone();
+        let left_thread = thread::spawn(move || {
+            left.submit_result("left".to_string(), test_command_result(Some(1)))
+                .unwrap();
+        });
+        let right_thread = thread::spawn(move || {
+            right
+                .submit_result("right".to_string(), test_command_result(Some(1)))
+                .unwrap();
+        });
+        left_thread.join().unwrap();
+        right_thread.join().unwrap();
+
+        let mut request_ids = Vec::new();
+        for _ in 0..2 {
+            let Some(RunnerEnvelope::Result { payload }) = rx.blocking_recv() else {
+                panic!("expected Result envelope");
+            };
+            request_ids.push(payload.result.request_id);
+        }
+        request_ids.sort();
+        assert_eq!(request_ids, ["left", "right"]);
+    }
+}
 
 fn test_runner_config(server_url: String) -> RunnerConfig {
     RunnerConfig {
@@ -43,6 +260,7 @@ fn test_runner_config(server_url: String) -> RunnerConfig {
         quic: None,
         shell: ShellConfig::default(),
         skills: super::super::config::SkillsConfig::default(),
+        instructions: super::super::config::InstructionsConfig::default(),
         ssh: Default::default(),
         tool_providers: Default::default(),
         mcp_gateway: Default::default(),
@@ -74,6 +292,8 @@ fn synthetic_project_summary(index: usize, path_bytes: Option<usize>) -> RunnerP
         hooks: Vec::new(),
         disabled: false,
         revision: Some(format!("sha256:{index:064x}")),
+        root_fingerprint: None,
+        lineage: None,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -100,11 +320,14 @@ fn inventory_status(
     }
 }
 
+/// Write synthetic project registry TOML records. Synthetic project roots
+/// intentionally do not create target directories on disk: project registry
+/// scanning discovers the records faithfully while avoiding spawning hundreds
+/// of extraneous Git subprocesses during transport tests.
 fn write_synthetic_project_configs(project_registry_dir: &Path, root: &Path, count: usize) {
     std::fs::create_dir_all(project_registry_dir).unwrap();
     for index in 0..count {
         let path = root.join(format!("project-{index:04}"));
-        std::fs::create_dir_all(&path).unwrap();
         std::fs::write(
             project_registry_dir.join(format!("project-{index:04}.toml")),
             format!(
@@ -120,6 +343,150 @@ fn test_runtime(cfg: &RunnerConfig) -> RunnerRuntimeState {
     RunnerRuntimeState::new(cfg, PathBuf::new())
 }
 
+#[cfg(windows)]
+struct WindowsTestHandle(usize);
+
+#[cfg(windows)]
+impl WindowsTestHandle {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0 as windows_sys::Win32::Foundation::HANDLE
+    }
+
+    fn close(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.raw());
+            }
+            self.0 = 0;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsTestHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(windows)]
+fn windows_test_pipe() -> (WindowsTestHandle, WindowsTestHandle) {
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    let created = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+    assert_ne!(created, 0, "CreatePipe failed");
+    (
+        WindowsTestHandle(read as usize),
+        WindowsTestHandle(write as usize),
+    )
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_parent_pipe_lease_allows_registration_until_writer_closes() {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (registered_tx, registered_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _register = read_register(&mut ws).await;
+        send_registered_ack(&mut ws).await;
+        let _ = registered_tx.send(());
+
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("Runner did not close after parent stdin EOF")
+                .expect("WebSocket closed before Runner goodbye")
+                .expect("Runner shutdown frame is valid");
+            if !msg.is_text() {
+                continue;
+            }
+            let envelope = RunnerEnvelope::from_slice(msg.into_text().unwrap().as_bytes()).unwrap();
+            if matches!(envelope, RunnerEnvelope::Goodbye { .. }) {
+                break;
+            }
+        }
+    });
+
+    let cfg = test_runner_config(format!("http://{}", addr));
+    let runtime = test_runtime(&cfg);
+    let (read_pipe, mut write_pipe) = windows_test_pipe();
+    let parent_listener =
+        spawn_windows_pipe_parent_liveness_listener(read_pipe.0, runtime.clone()).unwrap();
+
+    // Preserve the historical contract that stdin bytes are ignored. More
+    // importantly, prove the pipe watcher does not mistake an open idle lease
+    // for EOF while WebSocket registration and project inventory run.
+    let payload = b"ignored-parent-lease-data";
+    let mut bytes_written = 0_u32;
+    let wrote = unsafe {
+        WriteFile(
+            write_pipe.raw(),
+            payload.as_ptr(),
+            payload.len() as u32,
+            &mut bytes_written,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(wrote, 0, "WriteFile failed");
+    assert_eq!(bytes_written as usize, payload.len());
+    tokio::time::sleep(PARENT_PIPE_POLL_INTERVAL * 3).await;
+    assert!(
+        !runtime.shutdown_requested(),
+        "open parent stdin pipe requested shutdown before registration"
+    );
+
+    let session_cfg = cfg.clone();
+    let session_runtime = runtime.clone();
+    let session = tokio::spawn(async move {
+        websocket_session(
+            &session_cfg,
+            vec![test_project("parent-pipe-registration")],
+            "inst-parent-pipe",
+            &session_runtime,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), registered_rx)
+        .await
+        .expect("Runner registration was blocked by the open parent stdin pipe")
+        .expect("registration fixture ended before reporting readiness");
+    assert!(
+        !runtime.shutdown_requested(),
+        "open parent stdin pipe requested shutdown after registration"
+    );
+    assert!(
+        !session.is_finished(),
+        "registered Runner session ended while the parent stdin pipe was still open"
+    );
+
+    write_pipe.close();
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("Runner did not stop after parent stdin EOF")
+        .expect("Runner session task panicked")
+        .expect("Runner session returned an error");
+    assert_eq!(exit, RunnerSessionExit::Shutdown);
+    server.await.unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || parent_listener.join().unwrap()),
+    )
+    .await
+    .expect("parent-liveness pipe watcher did not exit after EOF")
+    .unwrap();
+}
+
+#[cfg(feature = "runner-real-process-tests")]
 fn wait_for_path(path: &Path, deadline: Instant, context: &str) {
     while !path.exists() {
         assert!(
@@ -159,6 +526,7 @@ fn runtime_shutdown_is_fast_ordered_and_runs_once_without_resources() {
             "active_jobs_signal",
             "active_jobs_drain",
             "external_providers_stop",
+            "browser_runtimes_stop",
             "lsp_servers_stop",
             "background_threads_join",
             "shutdown_complete",
@@ -303,6 +671,8 @@ fn test_project(id: &str) -> RunnerProjectSummary {
         hooks: vec!["check".to_string()],
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -626,6 +996,7 @@ struct PollingRunnerHandle {
 }
 
 impl PollingRunnerHandle {
+    #[cfg(feature = "runner-real-process-tests")]
     fn assert_pending(&self, context: &str) {
         match self.result_rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -728,6 +1099,8 @@ fn start_concurrent_polling_server(
 
 fn sync_file_request(request_id: &str) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: request_id.to_string(),
         client_id: "oe".to_string(),
         kind: "file_read".to_string(),
@@ -761,6 +1134,8 @@ fn sync_file_request(request_id: &str) -> RunnerRequest {
 #[cfg(unix)]
 fn polling_shell_request(request_id: &str, cwd: &Path, command: String) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: request_id.to_string(),
         client_id: "oe".to_string(),
         kind: "run_shell".to_string(),
@@ -791,7 +1166,7 @@ fn polling_shell_request(request_id: &str, cwd: &Path, command: String) -> Runne
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn polling_job_request(
     request_id: &str,
     job_id: &str,
@@ -801,11 +1176,14 @@ fn polling_job_request(
     let mut request = polling_shell_request(request_id, cwd, command);
     request.kind = "start_job".to_string();
     request.job_id = Some(job_id.to_string());
-    request.job_context = Some(crate::test_job_context(cwd, Vec::new()));
+    request.job_context = Some(crate::webcodex_runner::job_manager::test_job_context(
+        cwd,
+        Vec::new(),
+    ));
     request
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn polling_persistent_shell_request(
     request_id: &str,
     action: &str,
@@ -819,7 +1197,7 @@ fn polling_persistent_shell_request(
     request.persistent_shell = Some(crate::runner_protocol::PersistentShellRequest {
         action: action.to_string(),
         shell_id: shell_id.to_string(),
-        workflow_session_id: "wc_sess_polling_e1".to_string(),
+        workflow_session_id: "wc_sess_lkaw44QDG0J6FfyY".to_string(),
         runtime_project_id: "agent:oe:demo".to_string(),
         cwd: None,
         shell: Some("bash".to_string()),
@@ -835,7 +1213,7 @@ fn posix_quote(value: &Path) -> String {
     super::super::shell::shell_quote(&value.to_string_lossy())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn gated_marker_command(started: &Path, release: &Path, marker: &Path, value: &str) -> String {
     format!(
         "printf '%s\\n' '{}' >> {}; : > {}; while [ ! -f {} ]; do sleep 0.01; done; printf '%s\\n' '{}'",
@@ -847,6 +1225,7 @@ fn gated_marker_command(started: &Path, release: &Path, marker: &Path, value: &s
     )
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn poll_delivery_response(request: Option<&RunnerRequest>) -> ConcurrentHttpResponse {
     let request = request
         .map(serde_json::to_value)
@@ -858,6 +1237,7 @@ fn poll_delivery_response(request: Option<&RunnerRequest>) -> ConcurrentHttpResp
     )
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn register_success_response() -> ConcurrentHttpResponse {
     register_inventory_support_response()
 }
@@ -976,6 +1356,7 @@ fn accept_business_poll(listener: &StdTcpListener) -> TcpStream {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn result_success_response() -> ConcurrentHttpResponse {
     ConcurrentHttpResponse::json(r#"{"success":true}"#)
 }
@@ -984,7 +1365,7 @@ fn polling_offline_success_response() -> ConcurrentHttpResponse {
     ConcurrentHttpResponse::json(r#"{"success":true,"error":null}"#)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn job_update_success_response() -> ConcurrentHttpResponse {
     ConcurrentHttpResponse::json(r#"{"success":true,"job":null,"error":null}"#)
 }
@@ -1229,7 +1610,7 @@ fn recorded_path_count(requests: &Mutex<Vec<(String, String)>>, expected: &str) 
         .count()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process timing: coordinates concurrent shell dispatch completion"]
 fn runner_real_process_polling_long_ordinary_dispatch_does_not_pin_and_results_stay_correlated_exactly_once(
@@ -1344,7 +1725,7 @@ fn runner_real_process_polling_long_ordinary_dispatch_does_not_pin_and_results_s
     assert_eq!(runtime.background_threads.pending(), 0);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process timing: coordinates multiple gated shell workers"]
 fn runner_real_process_polling_dispatch_bound_backpressures_without_a_local_pending_queue() {
@@ -1460,7 +1841,7 @@ fn runner_real_process_polling_dispatch_bound_backpressures_without_a_local_pend
     assert_eq!(runtime.background_threads.pending(), 0);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process timing: compares Job and ordinary shell scheduling"]
 fn runner_real_process_polling_job_start_dispatches_behind_one_long_ordinary_request() {
@@ -1561,7 +1942,7 @@ fn runner_real_process_polling_job_start_dispatches_behind_one_long_ordinary_req
     assert_eq!(runtime.background_threads.pending(), 0);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process lifecycle: waits for a gated --once shell dispatch"]
 fn runner_real_process_polling_once_waits_for_its_tracked_ordinary_dispatch() {
@@ -1634,7 +2015,7 @@ fn runner_real_process_polling_once_waits_for_its_tracked_ordinary_dispatch() {
     assert_eq!(runtime.background_threads.pending(), 0);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process lifecycle: waits for a gated --once Job drain"]
 fn runner_real_process_polling_once_preserves_job_manager_drain_before_exit() {
@@ -1705,7 +2086,7 @@ fn runner_real_process_polling_once_preserves_job_manager_drain_before_exit() {
     runtime.shutdown();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process timing: validates shutdown against an active shell dispatch"]
 fn runner_real_process_polling_shutdown_with_active_background_dispatch_is_bounded_and_non_replaying(
@@ -1794,6 +2175,7 @@ fn runner_real_process_polling_shutdown_with_active_background_dispatch_is_bound
 }
 
 #[test]
+#[cfg(feature = "runner-real-process-tests")]
 #[ignore = "manual real-process timing: project registration may spawn Git and uses long readiness fences"]
 fn runner_real_process_polling_background_project_operation_invalidates_the_project_cache() {
     let temp = tempfile::tempdir().unwrap();
@@ -1891,7 +2273,7 @@ fn runner_real_process_polling_background_project_operation_invalidates_the_proj
     assert!(refreshed_seen.load(Ordering::SeqCst));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "manual real-process lifecycle: coordinates a real persistent shell with close"]
 fn runner_real_process_polling_persistent_shell_exec_remains_responsive_to_close() {
@@ -3263,6 +3645,8 @@ async fn send_register_rejected_ack(
 
 fn start_job_request(cwd: &Path, command: &str) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: "req-active-job".to_string(),
         client_id: "oe".to_string(),
         kind: "start_job".to_string(),
@@ -3285,7 +3669,10 @@ fn start_job_request(cwd: &Path, command: &str) -> RunnerRequest {
         created_at: 0,
         validation: None,
         lsp: None,
-        job_context: Some(crate::test_job_context(cwd, Vec::new())),
+        job_context: Some(crate::webcodex_runner::job_manager::test_job_context(
+            cwd,
+            Vec::new(),
+        )),
         mcp_gateway: None,
         plugin_gateway: None,
         coding_agent: None,
@@ -4156,7 +4543,6 @@ async fn streaming_stale_generation_resnapshots_current_projects_for_websocket_a
         // eagerly create generation B before the Server-side dynamic projection
         // has retired A, so B alone is not sufficient for correctness.
         let added_root = project_root.join("new-project");
-        std::fs::create_dir_all(&added_root).unwrap();
         std::fs::write(
             project_registry_dir.join("new-project.toml"),
             format!(
@@ -4954,7 +5340,7 @@ async fn websocket_proxy_connect_rejects_non_success_without_leaking_secrets() {
 
 #[tokio::test]
 async fn websocket_proxy_connect_response_header_is_bounded_and_redacted() {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let proxy_secret = "PROXY_RESPONSE_SECRET_DO_NOT_LEAK";
     let server_token = "SERVER_TOKEN_DO_NOT_LEAK";
@@ -4965,11 +5351,15 @@ async fn websocket_proxy_connect_response_header_is_bounded_and_redacted() {
         let connect = read_async_http_headers(&mut stream).await;
         assert!(!connect.contains(server_token), "{connect}");
         let mut response = format!("HTTP/1.1 200 OK\r\nX-Secret: {proxy_secret}\r\n").into_bytes();
-        response.extend(std::iter::repeat_n(
-            b'x',
-            WS_PROXY_CONNECT_HEADER_MAX_BYTES + 1024,
-        ));
-        let _ = stream.write_all(&response).await;
+        assert!(response.len() < WS_PROXY_CONNECT_HEADER_MAX_BYTES);
+        response.resize(WS_PROXY_CONNECT_HEADER_MAX_BYTES, b'x');
+        stream.write_all(&response).await.unwrap();
+        stream.flush().await.unwrap();
+        // Keep the synthetic proxy alive until the client consumes the bounded
+        // header prefix and closes. Dropping immediately can surface a Windows
+        // connection-reset error before the client observes the size fence.
+        let mut byte = [0u8; 1];
+        let _ = stream.read(&mut byte).await;
     });
 
     let ws_url = "ws://127.0.0.1:9/api/agents/ws";

@@ -14,6 +14,8 @@ pub(crate) struct CommandResult {
 pub(crate) struct ShellCommandResult {
     pub(crate) result: CommandResult,
     pub(crate) execution_state: ShellCommandExecutionState,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
 }
 
 impl ShellCommandResult {
@@ -21,6 +23,8 @@ impl ShellCommandResult {
         Self {
             result,
             execution_state: ShellCommandExecutionState::NotStarted,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -28,6 +32,8 @@ impl ShellCommandResult {
         Self {
             result,
             execution_state: ShellCommandExecutionState::OutcomeUnknown,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -35,6 +41,8 @@ impl ShellCommandResult {
         Self {
             result,
             execution_state: ShellCommandExecutionState::TimedOut,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -42,7 +50,19 @@ impl ShellCommandResult {
         Self {
             result,
             execution_state: ShellCommandExecutionState::Completed,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
+    }
+
+    pub(crate) fn with_stream_truncation(
+        mut self,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) -> Self {
+        self.stdout_truncated = stdout_truncated;
+        self.stderr_truncated = stderr_truncated;
+        self
     }
 }
 

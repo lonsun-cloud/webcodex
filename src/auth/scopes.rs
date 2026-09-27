@@ -19,18 +19,36 @@ pub use webcodex_core::authority::{
     AGENT_SCOPES, COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, KNOWN_SCOPES,
     MEMORY_MANAGE_SCOPES, MEMORY_READ_SCOPES, SCOPE_ACCOUNT_MANAGE, SCOPE_ADMIN,
     SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
-    SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ,
-    SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL,
-    SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL,
-    SCOPE_COMPUTER_READ, SCOPE_JOB_DETACH, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE,
-    SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE,
-    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNNER_MANAGE, SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
+    SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ, SCOPE_CODING_AGENT_RUN,
+    SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ, SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_DETACH,
+    SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT,
+    SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE,
+    SCOPE_RUNNER_MANAGE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
 };
 
 /// True when `scope` is one of the Runner transport scopes.
 pub(crate) fn is_agent_scope(scope: &str) -> bool {
     AGENT_SCOPES.contains(&scope)
+}
+
+/// Scopes that require an explicit principal even when legacy unauthenticated
+/// runtime-tool access is otherwise preserved.
+pub(crate) fn scope_requires_explicit_unauthenticated_authority(scope: &str) -> bool {
+    matches!(
+        scope,
+        SCOPE_ADMIN
+            | SCOPE_BROWSER_READ
+            | SCOPE_BROWSER_CONTROL
+            | SCOPE_BROWSER_LAUNCH
+            | SCOPE_MEMORY_READ
+            | SCOPE_MEMORY_MANAGE
+            | SCOPE_PLUGIN_INSPECT
+            | SCOPE_PLUGIN_INVOKE
+            | SCOPE_PLUGIN_MANAGE
+            | SCOPE_SSH_LOCAL
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +270,8 @@ mod tests {
             "/api/oauth/clients/create",
             "/api/oauth/clients/list",
             "/api/oauth/clients/update_scopes",
+            "/api/oauth/clients/add_redirect_uri",
+            "/api/oauth/clients/remove_redirect_uri",
             "/api/oauth/clients/revoke",
         ] {
             assert_eq!(
@@ -316,15 +336,6 @@ mod tests {
                 SCOPE_SESSION_COLLABORATE,
             ),
             ("POST", "/api/tools/list", SCOPE_RUNTIME_READ),
-            ("POST", "/api/connector/task/start", SCOPE_RUNTIME_READ),
-            ("POST", "/api/connector/files/read", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/code/navigate", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/code/impact", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/edits/apply", SCOPE_PROJECT_WRITE),
-            ("POST", "/api/connector/checks/run", SCOPE_JOB_RUN),
-            ("POST", "/api/connector/task/cancel", SCOPE_JOB_RUN),
-            ("POST", "/api/connector/task/finish", SCOPE_PROJECT_WRITE),
-            ("POST", "/api/projects/read_file", SCOPE_PROJECT_READ),
             ("POST", "/api/runtime-console/projects", SCOPE_PROJECT_READ),
             (
                 "POST",
@@ -336,7 +347,7 @@ mod tests {
                 "/api/runtime-console/workflow-session",
                 SCOPE_PROJECT_READ,
             ),
-            ("POST", "/api/projects/run_job", SCOPE_JOB_RUN),
+            ("POST", "/api/shell/job", SCOPE_JOB_RUN),
             ("POST", "/api/users/me", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/tokens/list", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/audit/stats", SCOPE_ACCOUNT_MANAGE),
@@ -399,16 +410,6 @@ mod tests {
         }
         for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
             assert_eq!(
-                enforce_route_scope(auth, "POST", "/api/projects/read_file"),
-                Err((
-                    Some(SCOPE_PROJECT_READ),
-                    "missing required scope: project:read".to_string()
-                )),
-                "{label} must not bypass missing project:read"
-            );
-        }
-        for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
-            assert_eq!(
                 enforce_route_scope(auth, "POST", "/api/runtime-console/projects"),
                 Err((
                     Some(SCOPE_PROJECT_READ),
@@ -417,10 +418,6 @@ mod tests {
                 "{label} must not use Runtime Console without project:read"
             );
         }
-        assert!(
-            enforce_route_scope(&shared, "POST", "/api/projects/read_file").is_ok(),
-            "direct shared key should use its declared project:read scope"
-        );
         assert!(
             enforce_route_scope(&shared, "POST", "/api/runtime-console/projects").is_ok(),
             "direct shared key should retain its existing project:read Runtime Console access"
@@ -608,10 +605,6 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
-                "read_file",
-                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
-            ),
-            (
                 "read_files",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
@@ -628,10 +621,12 @@ mod tests {
                 "workspace_symbols",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             (
                 "workspace_checkpoint_create",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             (
                 "workspace_checkpoint_restore",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
@@ -658,12 +653,20 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "computer_list_windows",
+                "browser_observe",
+                OAuthToolScopePolicy::Require(SCOPE_BROWSER_READ),
+            ),
+            (
+                "browser_act",
+                OAuthToolScopePolicy::RequireAny(&[SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH]),
+            ),
+            (
+                "computer_observe",
                 OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
             ),
             (
-                "computer_snapshot",
-                OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
+                "computer_control",
+                OAuthToolScopePolicy::RequireAny(&[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_LAUNCH]),
             ),
             (
                 "computer_save_snapshot",
@@ -675,6 +678,13 @@ mod tests {
             (
                 "coding_agent_start",
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
+            ),
+            (
+                "start_agent_task_endpoint_continuation",
+                OAuthToolScopePolicy::RequireAll(&[
+                    SCOPE_COMMUNICATION_READ,
+                    SCOPE_COMMUNICATION_MANAGE,
+                ]),
             ),
             (
                 "start_agent_task_coding_run",
@@ -720,13 +730,14 @@ mod tests {
             "resolve_session_message",
             "complete_session_message",
             "session_discussion_summary",
+            #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_create",
+            #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_restore",
             "show_changes",
             "document_diagnostics",
             "hover",
             "workspace_symbols",
-            "read_file",
             "read_files",
             "write_project_file",
             "artifact_upload_begin",
@@ -734,11 +745,9 @@ mod tests {
             "artifact_upload_finish",
             "artifact_upload_abort",
             "apply_unified_diff",
-            "computer_list_windows",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
-            "computer_snapshot",
+            "computer_observe",
+            "computer_control",
+            "computer_save_snapshot",
             "run_shell",
             "cargo_test",
         ] {

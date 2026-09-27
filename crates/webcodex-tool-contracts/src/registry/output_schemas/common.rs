@@ -1,11 +1,39 @@
-use serde_json::{json, Value};
+use schemars::JsonSchema;
+use serde_json::{json, Map, Value};
 
-use webcodex_core::runtime_contract::{RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES};
+use webcodex_core::runtime_contract::{
+    ContinuationCarrier, ContinuationKind, CONTINUATION_CARRIER_VALUES, CONTINUATION_KIND_VALUES,
+    RECOVERY_KIND_VALUES,
+};
 use webcodex_core::workflow_session_contract::{
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
 };
 
+use crate::input_property_schema_for_tool;
+use crate::schema_generation::typed_host_schema;
 use crate::tool_definition::exploration_tool_names;
+
+pub(super) fn validation_source_state_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Source freshness is independent of execution pass/fail. V1 never proves current source: uncrossed covers only canonical potential mutation dispatches in one live Control Project epoch, not external/process writes or an immutable snapshot. This is an observation, not a reusable currentness certificate.",
+        "properties": {
+            "freshness": {"type": "string", "enum": ["unproven", "stale"]},
+            "observed_mutation_fence": {"type": "string", "enum": ["uncrossed", "crossed", "unknown"]},
+            "start_fence": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "epoch": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "maxLength": 32},
+                    "generation": {"type": "integer", "minimum": 0, "maximum": webcodex_core::validation_source::MAX_SOURCE_GENERATION},
+                    "quiescent": {"type": "boolean"}
+                },
+                "required": ["epoch", "generation", "quiescent"]
+            }
+        },
+        "required": ["freshness", "observed_mutation_fence"]
+    })
+}
 
 pub fn schema_type(kind: &str, description: &str) -> Value {
     json!({
@@ -22,6 +50,119 @@ pub fn nullable_schema(kind: &str, description: &str) -> Value {
         ],
         "description": description,
     })
+}
+
+pub(super) fn session_mode_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "mode", description)
+}
+
+pub(super) fn session_guards_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "deny_write_tools": {"type": "boolean"},
+            "deny_shell_tools": {"type": "boolean"}
+        },
+        "required": ["deny_write_tools", "deny_shell_tools"]
+    })
+}
+
+pub(super) fn session_execution_context_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "execution_context", description)
+}
+
+pub(super) fn session_lifecycle_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["active", "closed"],
+        "description": description,
+    })
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_validation_schema(description: &str) -> Value {
+    input_property_schema_for_tool("workspace_checkpoint_create", "validation", description)
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_labels_schema(description: &str) -> Value {
+    input_property_schema_for_tool("workspace_checkpoint_create", "labels", description)
+}
+
+pub fn continuation_semantics_schema(
+    kind: ContinuationKind,
+    carrier: ContinuationCarrier,
+    description: &str,
+) -> Value {
+    debug_assert!(CONTINUATION_KIND_VALUES.contains(&kind.as_str()));
+    debug_assert!(CONTINUATION_CARRIER_VALUES.contains(&carrier.as_str()));
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"type": "string", "const": kind.as_str()},
+            "carrier": {"type": "string", "const": carrier.as_str()}
+        },
+        "required": ["kind", "carrier"]
+    })
+}
+
+/// Schema for an advisory parser-ready next tool call. The shape never grants
+/// authority or executes the tool; domain schemas remain responsible for the
+/// bounded argument contract.
+pub fn suggested_tool_call_schema(
+    tool: &'static str,
+    arguments: Value,
+    description: &str,
+) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "tool": {"type": "string", "const": tool},
+            "arguments": arguments
+        },
+        "required": ["tool", "arguments"]
+    })
+}
+
+/// Recognize the canonical schema shape for one parser-ready SuggestedToolCall.
+///
+/// This is intentionally structural rather than a model-visible marker keyword:
+/// adapters use it to project only formally declared action edges and never scan
+/// arbitrary tool output for user/plugin objects that happen to contain `tool`
+/// and `arguments` keys.
+pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
+    if schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() != 2
+        || !properties.contains_key("tool")
+        || !properties.contains_key("arguments")
+    {
+        return None;
+    }
+    let required = schema.get("required")?.as_array()?;
+    if required.len() != 2
+        || !required.iter().any(|field| field.as_str() == Some("tool"))
+        || !required
+            .iter()
+            .any(|field| field.as_str() == Some("arguments"))
+    {
+        return None;
+    }
+    let tool = properties.get("tool")?;
+    if tool.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    tool.get("const").and_then(Value::as_str)
 }
 
 pub fn job_activity_schema() -> Value {
@@ -55,6 +196,45 @@ pub fn job_activity_schema() -> Value {
         ],
         "description": "Runner-owned bounded current activity for an active Job. Observation only: it never replaces canonical status, proves completion, or grants retry/continuation authority. null means unavailable, terminal, or temporarily untrusted during recovery."
     })
+}
+
+pub fn observe_job_continuation_schema() -> Value {
+    suggested_tool_call_schema(
+        "observe_jobs",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "job_id": {"type": "string", "minLength": 1},
+                            "after_observation_token": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN
+                            }
+                        },
+                        "required": ["job_id"]
+                    }
+                },
+                "wait_secs": {
+                    "type": "integer",
+                    "const": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
+                    "minimum": 1,
+                    "maximum": webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
+                },
+                "wake_on": {"type": "string", "const": "terminal"}
+            },
+            "required": ["items", "wait_secs", "wake_on"]
+        }),
+        "Bounded next-call hint for observing the exact already-started Job. Advisory only: it grants no authority, is not a retry token, and never starts background polling.",
+    )
 }
 
 pub fn exploration_tool_name_schema() -> Value {
@@ -282,7 +462,7 @@ pub fn search_match_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "const": 80,
-                "description": "Deterministic bounded line count for read_file/read_files expansion."
+                "description": "Deterministic bounded line count for read_files expansion."
             }
         },
         "required": ["start_line", "limit"],
@@ -320,7 +500,7 @@ pub(super) fn session_hint_schema() -> Value {
         "properties": {
             "has_open_messages": {
                 "type": "boolean",
-                "description": "True when any counted open session-local message exists."
+                "description": "True when any counted open Session message exists or an otherwise uncounted open message requires acknowledgement."
             },
             "open_counts": {
                 "type": "object",
@@ -342,17 +522,17 @@ pub(super) fn session_hint_schema() -> Value {
             "attention_required": {
                 "type": "boolean",
                 "const": true,
-                "description": "Counts-only fallback marker for open high-priority guidance requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the urgent guidance set."
+                "description": "Counts-only fallback marker for an open Session message requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the required message set."
             },
             "attention_reason": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON],
-                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON],
+                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the ACK-required message set."
             },
             "attention_instruction": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION],
-                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION],
+                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the ACK-required message set."
             },
             "suggested_next_tool": {
                 "type": "string",
@@ -378,33 +558,51 @@ pub fn recovery_kind_schema() -> Value {
     })
 }
 
-pub fn recovery_tool_schema() -> Value {
-    json!({
-        "type": "string",
-        "enum": RECOVERY_TOOL_VALUES,
-        "description": "Optional bounded public WebCodex tool to use for the declared reobserve or reconcile action. This field never grants authority or triggers execution."
-    })
+pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
+    let properties = output_properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_string(), schema))
+        .collect::<Map<_, _>>();
+    wrapped_output_schema_from_properties(properties)
 }
 
-pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
-    let mut output_properties = output_properties;
-    output_properties.extend([
+/// Build the existing sparse ToolResult envelope from a canonical typed payload.
+///
+/// The DTO owns property names, nested shapes, enums, and structural bounds. Its
+/// `required` list is intentionally not lifted into `ToolResult.output`: runtime
+/// failures/not-started/outcome-unknown projections remain sparse, and generic
+/// runtime decorations remain legal. Overrides are reserved for explicit model
+/// projection boundaries such as intentionally-open nested LSP payloads.
+pub fn wrapped_typed_output_schema<T: JsonSchema>(overrides: Vec<(&str, Value)>) -> Value {
+    let schema = typed_host_schema::<T>();
+    let mut properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("typed output payload JsonSchema must be an object");
+    for (name, replacement) in overrides {
+        assert!(
+            properties.contains_key(name),
+            "typed output payload has no property {name}"
+        );
+        properties.insert(name.to_string(), replacement);
+    }
+    wrapped_output_schema_from_properties(properties)
+}
+
+fn wrapped_output_schema_from_properties(mut properties: Map<String, Value>) -> Value {
+    properties.extend([
         (
-            "trace_ref",
+            "trace_ref".to_string(),
             schema_type(
                 "string",
                 "Opaque operator diagnostic reference emitted only on eligible failed calls while full tracing is enabled. Read with read_tool_trace; on Adaptive Runtime invoke that target through call_runtime_tool. Never a native path.",
             ),
         ),
-        ("session_hint", session_hint_schema()),
-        ("permission", permission_decision_schema()),
-        ("recovery_kind", recovery_kind_schema()),
-        ("recovery_tool", recovery_tool_schema()),
+        ("session_hint".to_string(), session_hint_schema()),
+        ("permission".to_string(), permission_decision_schema()),
+        ("recovery_kind".to_string(), recovery_kind_schema()),
     ]);
-    let properties = output_properties
-        .into_iter()
-        .map(|(name, schema)| (name.to_string(), schema))
-        .collect::<serde_json::Map<_, _>>();
     json!({
         "type": "object",
         "properties": {
@@ -436,29 +634,7 @@ pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
                                 "recovery_kind": {
                                     "type": "null",
                                     "const": "__forbidden_on_success__"
-                                },
-                                "recovery_tool": {
-                                    "type": "null",
-                                    "const": "__forbidden_on_success__"
                                 }
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "output": {"required": ["recovery_tool"]}
-                    },
-                    "required": ["output"]
-                },
-                "then": {
-                    "properties": {
-                        "output": {
-                            "required": ["recovery_kind"],
-                            "properties": {
-                                "recovery_kind": {"enum": ["reobserve", "reconcile"]}
                             }
                         }
                     }
@@ -500,7 +676,7 @@ pub fn cargo_test_count_assertion_schema() -> Value {
             },
             "evidence_reason_code": {
                 "type": "string",
-                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary"],
+                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary", "incomplete_stream"],
                 "description": "Why executed-test count evidence was proven or remained unavailable; this refines evidence diagnostics without changing the assertion verdict."
             }
         },
@@ -543,6 +719,23 @@ pub fn continuation_feedback_schema(description: &str) -> Value {
                 }
             }
         ]
+    })
+}
+
+pub(super) fn external_observation_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": description,
+        "properties": {
+            "adapter_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "event_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "tool": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "maxLength": 64},
+            "exit_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "recorded_at": {"type": "integer"},
+            "status": {"type": "string", "enum": ["unknown", "reported_success", "reported_failure"]}
+        },
+        "required": ["adapter_id", "event_id", "tool", "exit_code", "recorded_at", "status"]
     })
 }
 
@@ -617,6 +810,39 @@ pub fn handoff_brief_schema(description: &str) -> Value {
             "minimum": 0
         }))
     };
+    let external_observations = json!({
+        "type": "object",
+        "description": "Retained external claims for the exact output project and handoff Session. These reports never become native execution, validation, Goal, or completion evidence. Last five by server timestamp then identity; source order and capture completeness are unproven.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "unavailable"]},
+            "reason_code": nullable_with(json!({
+                "type": "string",
+                "enum": ["session_project_unavailable", "store_unavailable", "projection_unavailable"]
+            })),
+            "provenance": {"type": "string", "const": "external_report"},
+            "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable", "read_unavailable"]},
+                    "ordering": {"type": "string", "const": "server_recorded_at_then_identity"}
+                },
+                "required": ["complete", "reason", "ordering"]
+            },
+            "total": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "returned": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 5})),
+            "truncated": nullable_bool(),
+            "unknown_count": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "observations": nullable_with(json!({
+                "type": "array",
+                "maxItems": 5,
+                "items": external_observation_schema("Untrusted external report with exact adapter and event identity.")
+            }))
+        },
+        "required": ["status", "reason_code", "provenance", "coverage", "total", "returned", "truncated", "unknown_count", "observations"]
+    });
 
     json!({
         "type": "object",
@@ -743,12 +969,14 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 },
                 "required": ["status", "open_failures", "reason_code"]
             },
+            "external_observations": external_observations,
             "attention": {
                 "type": "object",
                 "description": "Proven workspace, Job, and open guidance counts. Null means the corresponding evidence was unavailable.",
                 "additionalProperties": false,
                 "properties": {
                     "workspace_conflict": nullable_bool(),
+                    "active_jobs": nullable_count(),
                     "blocking_jobs": nullable_count(),
                     "terminal_pending_jobs": nullable_count(),
                     "recovering_jobs": nullable_count(),
@@ -758,7 +986,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "open_todos": nullable_count()
                 },
                 "required": [
-                    "workspace_conflict", "blocking_jobs",
+                    "workspace_conflict", "active_jobs", "blocking_jobs",
                     "terminal_pending_jobs", "recovering_jobs", "open_guidance",
                     "open_risks", "open_questions", "open_todos"
                 ]
@@ -781,15 +1009,17 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
                     "reason_codes": {
                         "type": "array",
-                        "maxItems": 8,
+                        "maxItems": 10,
                         "uniqueItems": true,
                         "items": {
                             "type": "string",
                             "enum": [
                                 "attempt_boundary_evicted",
                                 "continuation_unavailable",
+                                "external_observations_changed_during_snapshot",
                                 "guidance_unavailable",
                                 "job_summary_unavailable",
+                                "session_changed_during_snapshot",
                                 "validation_not_requested",
                                 "validation_unavailable",
                                 "workspace_not_requested",
@@ -811,7 +1041,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
         },
         "required": [
             "version", "session", "task", "workspace", "progress",
-            "validation", "attention", "next_actions", "basis",
+            "validation", "external_observations", "attention", "next_actions", "basis",
             "deterministic", "llm_summary"
         ]
     })
@@ -945,8 +1175,8 @@ fn attempt_exploration_schema() -> Value {
             },
             "total_observed_paths": schema_type("integer", "Real unique path count before the 100-path projection cap."),
             "truncated": schema_type("boolean", "True when observed_paths was capped."),
-            "read_count": schema_type("integer", "Successful direct read_file calls in the attempt."),
-            "search_count": schema_type("integer", "Successful search_project_text/search_project_texts calls in the attempt."),
+            "read_count": schema_type("integer", "Successful read_files calls in the attempt."),
+            "search_count": schema_type("integer", "Successful search_project_texts calls in the attempt."),
             "navigation_count": schema_type("integer", "Successful LSP navigation calls in the attempt."),
             "latest_tool": exploration_tool_name_schema(),
             "complete": schema_type("boolean", "False when the attempt boundary was evicted and only a retained tail is available.")
@@ -967,12 +1197,12 @@ fn attempt_exploration_schema() -> Value {
 fn attempt_validation_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Current-attempt validation evidence after the latest trusted material workspace-content change. Historical validation remains separate.",
+        "description": "Current-attempt validation evidence. Successful execution with unproven source is unproven, never a current-source pass. Historical execution results remain separate.",
         "additionalProperties": false,
         "properties": {
             "status": {
                 "type": "string",
-                "enum": ["passed", "failed", "inconclusive", "stale", "not_run", "unknown"]
+                "enum": ["unproven", "failed", "inconclusive", "stale", "not_run", "unknown"]
             },
             "latest_status": {
                 "type": "string",

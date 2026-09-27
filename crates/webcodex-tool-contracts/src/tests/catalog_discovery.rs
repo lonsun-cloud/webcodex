@@ -87,6 +87,14 @@ fn tool_manifest_schema_exposes_compact_discovery_fields() {
         "tool_manifest input schema",
         present: ["category", "intent", "include_recommended_flows", "include_risk_summary"]
     );
+    let flow_description = props["include_recommended_flows"]["description"]
+        .as_str()
+        .expect("include_recommended_flows description");
+    assert!(flow_description.contains("exact tool_name"));
+    assert!(flow_description.contains("false"));
+    assert!(flow_description.contains("category"));
+    assert!(flow_description.contains("intent"));
+    assert!(flow_description.contains("true"));
     let risk_summary_description = props["include_risk_summary"]["description"]
         .as_str()
         .expect("include_risk_summary description");
@@ -130,6 +138,15 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
                 );
                 assert!(is_model_visible_tool_name(tool), "{}: {tool}", flow.name);
             }
+            for native in ["run_process", "run_script", "run_shell"] {
+                if flow.manifest_purpose.contains(native) {
+                    assert!(
+                        flow.tools.contains(&native),
+                        "{} purpose recommends {native} but its machine-readable tools omit it",
+                        flow.name
+                    );
+                }
+            }
             flow.summary
         })
         .collect::<Vec<_>>();
@@ -137,7 +154,172 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
 }
 
 #[test]
-fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
+fn agent_continuation_setup_flow_is_focused_and_keeps_resume_tools_separate() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "agent_continuation_setup")
+        .expect("agent_continuation_setup recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+        ]
+    );
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "new durable agent window setup",
+        "yield/end",
+        "production_auto_resume_available",
+        "presentation success is not host readiness",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "setup flow should mention {phrase}: {guidance}"
+        );
+    }
+    for resume_tool in ["bootstrap_agent_conversation", "consume_agent_wake"] {
+        assert!(!flow.tools.contains(&resume_tool));
+    }
+}
+
+#[test]
+fn single_window_goal_workflow_prefers_atomic_admission_and_keeps_host_setup_separate() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "single_window_goal_workflow")
+        .expect("single_window_goal_workflow recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "work_on_project",
+            "get_goal",
+            "prepare_goal_workflow",
+            "present_goal_plan",
+            "checkpoint_goal",
+            "finish_coding_task",
+            "update_goal",
+        ]
+    );
+    for host_setup in [
+        "create_agent_identity",
+        "rotate_agent_continuation_endpoint",
+        "present_agent_continuation",
+        "list_agent_identities",
+    ] {
+        assert!(
+            !flow.tools.contains(&host_setup),
+            "ordinary Goal flow duplicated Host continuation setup: {host_setup}"
+        );
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "goal_context",
+        "reuse one exact candidate",
+        "with multiple candidates, read candidate details through exact get_goal calls",
+        "explicitly choose one before present_goal_plan",
+        "get_goal",
+        "prepare_goal_workflow",
+        "durable admission only",
+        "host carrier setup/readiness remains separate",
+        "agent_continuation_setup",
+        "low-level create_goal and associate_goal_workflow_session remain available",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "single-window Goal flow should mention {phrase}: {guidance}"
+        );
+    }
+
+    let categories = registered_tool_categories();
+    let goal_tools = categories["goal"].as_array().unwrap();
+    for low_level_or_composed in [
+        "prepare_goal_workflow",
+        "create_goal",
+        "associate_goal_workflow_session",
+    ] {
+        assert!(
+            goal_tools
+                .iter()
+                .any(|tool| tool.as_str() == Some(low_level_or_composed)),
+            "Goal discovery lost {low_level_or_composed}"
+        );
+    }
+}
+
+#[test]
+fn goal_agent_wait_orchestration_flow_registers_before_worker_execution_without_discovery() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "goal_agent_wait_orchestration")
+        .expect("goal_agent_wait_orchestration recommended flow");
+    let associate = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "associate_goal_agent_task")
+        .unwrap();
+    let wait = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "wait_for_agent_events")
+        .unwrap();
+    let start = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_attempt")
+        .unwrap();
+    let dispatch = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_endpoint_continuation")
+        .unwrap();
+    let bootstrap = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "bootstrap_agent_conversation")
+        .unwrap();
+    let consume = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "consume_agent_wake")
+        .unwrap();
+    assert!(associate < wait && wait < start && start < dispatch);
+    assert!(dispatch < bootstrap && bootstrap < consume);
+    for required in [
+        "start_agent_task_endpoint_continuation",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "read_agent_wait",
+        "get_goal",
+        "read_agent_task",
+        "update_goal",
+    ] {
+        assert!(flow.tools.contains(&required), "missing {required}");
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "before any selected worker can terminalize",
+        "explicit 1..8 task selector list",
+        "any for first-result continuation",
+        "all for fan-in",
+        "only after registration start each worker with start_agent_task_attempt followed by start_agent_task_endpoint_continuation",
+        "fresh resumed coordinator turn bootstrap the exact wake",
+        "consume it immediately",
+        "never derive the wait source list from goal correlations",
+        "not treat this flow as a scheduler",
+        "explicitly decide/update goal state",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "Goal AgentWait flow should mention {phrase}: {guidance}"
+        );
+    }
+}
+
+#[test]
+fn edit_recommended_flow_selects_mutation_by_shape_without_weakening_guards() {
     let flow = TOOL_RECOMMENDED_FLOWS
         .iter()
         .find(|flow| flow.name == "edit")
@@ -145,29 +327,35 @@ fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
     assert_eq!(flow.tools.first().copied(), Some("read_files"));
     assert_eq!(flow.tools.get(1).copied(), Some("apply_text_edits"));
     assert_eq!(flow.tools.get(2).copied(), Some("apply_patch"));
-    assert!(flow.summary.starts_with(
-        "Edit: after read_file/read_files, apply_text_edits with current SHA is the default"
-    ));
-    assert!(flow.summary.contains("even when many lines change"));
-    assert!(flow.summary.contains("Use apply_patch only when"));
     let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
     for phrase in [
-        "canonical default even when many lines change",
+        "edit by mutation shape",
+        "apply_text_edits for small/local exact edits",
+        "intentional whole-file replacement",
+        "bounded deterministic programmatic transforms",
+        "repetitive mechanical",
+        "do not add a ritual read",
+        "read_revision",
+        "naturally contextual",
         "stable unique containing function/impl/type/test/module context",
         "matching_mode_rejected",
-        "do not weaken the guard or switch to first_match",
-        "prefer apply_text_edits if exact edits are easy",
-        "bounded read_files recovery",
-        "preserve the requested guard",
-        "unique retries use matching_mode=unique with unique context",
-        "exact_unique retries remain matching_mode=exact_unique",
-        "never downgrade the stale-context/concurrency fence",
+        "never weaken the guard or switch to first_match",
+        "preserve unique/exact_unique",
         "context_mismatch requires bounded reread",
         "never blind retry",
     ] {
         assert!(
             guidance.contains(phrase),
             "edit flow should mention {phrase}: {guidance}"
+        );
+    }
+    for obsolete in [
+        "canonical default even when many lines change",
+        "after read_files, apply_text_edits with current sha is the default",
+    ] {
+        assert!(
+            !guidance.contains(obsolete),
+            "obsolete edit ritual returned: {guidance}"
         );
     }
 }
@@ -182,19 +370,22 @@ fn execution_lifetime_flow_routes_runner_owned_and_supervisor_owned_work() {
         flow.tools,
         &[
             "run_process",
+            "run_script",
+            "run_shell",
             "run_job",
             "run_detached_process",
+            "session_shell_exec",
             "observe_jobs",
             "stop_job",
         ]
     );
     let text = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_ascii_lowercase();
     for phrase in [
-        "runner-owned",
-        "outlive the current runner process",
-        "run_detached_process",
-        "supervisor-owned",
-        "replacement runner",
+        "runner-owned sync-first",
+        "run_script",
+        "supervisor-owned immediate async",
+        "session_shell_exec",
+        "duration alone is not a reason to detach",
     ] {
         assert!(
             text.contains(phrase),
@@ -229,6 +420,7 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         TOOL_DISCOVERY_GROUP_JOBS,
         TOOL_DISCOVERY_GROUP_RUNTIME,
         TOOL_DISCOVERY_GROUP_CLEANUP,
+        #[cfg(feature = "workspace-checkpoints")]
         TOOL_DISCOVERY_GROUP_CHECKPOINT,
     ] {
         assert!(
@@ -250,10 +442,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     assert!(review.iter().any(|value| value == "git_log"));
     let inspect = categories[TOOL_DISCOVERY_GROUP_INSPECT].as_array().unwrap();
     for name in [
-        "read_file",
         "read_files",
         "run_shell",
-        "search_project_text",
         "search_project_texts",
         "show_changes",
     ] {
@@ -262,6 +452,21 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
             "inspect category: {name}"
         );
     }
+    for compatibility_primitive in ["git_diff", "git_diff_summary"] {
+        assert!(
+            !inspect.iter().any(|value| value == compatibility_primitive),
+            "inspect category should prefer canonical tools over {compatibility_primitive}"
+        );
+    }
+    let git = categories[TOOL_DISCOVERY_GROUP_GIT].as_array().unwrap();
+    for compatibility_primitive in ["git_diff", "git_diff_summary"] {
+        assert!(
+            !git.iter().any(|value| value == compatibility_primitive),
+            "git category should not recommend {compatibility_primitive}"
+        );
+    }
+    assert!(!review.iter().any(|value| value == "git_diff"));
+    assert!(!review.iter().any(|value| value == "git_diff_summary"));
     let edit = categories[TOOL_DISCOVERY_GROUP_EDIT].as_array().unwrap();
     let edit_prefix = edit
         .iter()
@@ -283,7 +488,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         .expect("file_transfer category present");
     for name in [
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "transfer_project_artifact",
+        "project_artifact",
         "save_project_artifact",
         "read_project_artifact",
         "artifact_upload_begin",
@@ -299,7 +505,6 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
     assert!(edit
         .iter()
         .any(|value| value == "import_conversation_files_to_project"));
-    assert!(edit.iter().any(|value| value == "export_project_artifact"));
     let flows = recommended_flows();
     assert!(!flows.is_empty());
     for flow in &flows {
@@ -314,32 +519,110 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "ssh_resource list/register -> restart -> list -> bind -> open/reuse",
         "local persistent shell is only for true same-process state",
         "one-shot ssh uses run_process",
-        "execution lifetime: run_process/run_job stay runner-owned",
-        "outlive the current runner process",
-        "discover run_detached_process",
-        "supervisor-owned job",
-        "inspect: on adaptive runtime prefer search_project_texts/read_files even for one query/range",
-        "run_shell for a short tightly related shell chain",
-        "run_script for program-like shell content",
-        "edit: after read_file/read_files, apply_text_edits with current sha is the default",
-        "even when many lines change",
-        "use apply_patch only when contextual/large multi-hunk patch form is materially clearer",
-        "external diffs use apply_unified_diff",
-        "validate: use cargo_check / cargo_test / go_test",
-        "run_shell only for shell-specific validation",
-        "keep independent validation/effect boundaries separate",
-        "file transfer: host/conversation attachment -> import_conversation_files_to_project",
-        "project artifact -> export_project_artifact",
-        "caller-held bounded binary -> save_project_artifact/artifact_upload_*",
-        "bounded inspection -> read_project_artifact",
+        "execution selection: run_process/run_script/run_shell and structured validation are runner-owned sync-first",
+        "run_job is runner-owned immediate async",
+        "run_detached_process is supervisor-owned immediate async",
+        "session_shell_exec continues an existing session shell",
+        "inspect: choose the simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "search_project_texts/read_files when batching",
+        "edit by mutation shape",
+        "bounded deterministic transforms",
+        "validate: use structured validators when their canonical diagnostics",
+        "native execution is first-class when the command is outside or awkward",
+        "file transfer: host -> import_conversation_files_to_project -> project",
+        "project -> project_artifact -> host/model",
+        "project a -> transfer_project_artifact -> project b",
+        "inspect for one bounded segment",
+        "export for complete resourcelink delivery",
         "copy show_changes.head.commit",
-        "review: start with show_changes for the bounded worktree overview",
-        "if hunks truncate, continue/focus with git_diff_hunks",
-        "handoff: use session_summary / session_handoff_summary",
+        "review: small bounded git observations may use native git",
+        "git_review_summary to map broad or unknown committed ranges",
+        "git_diff_hunks for fenced, paged, or continued review",
+        "handoff/recovery only",
+        "session_handoff_summary only for missing task context",
+        "never routine progress polling",
     ] {
         assert!(
             joined_flows.contains(phrase),
             "recommended flows should mention {phrase}"
+        );
+    }
+}
+
+#[test]
+fn recommended_flows_encode_simplest_sufficient_selection_without_old_rituals() {
+    let flow = |name: &str| {
+        TOOL_RECOMMENDED_FLOWS
+            .iter()
+            .find(|flow| flow.name == name)
+            .unwrap_or_else(|| panic!("missing recommended flow {name}"))
+    };
+
+    let inspect = format!(
+        "{}\n{}",
+        flow("inspect").summary,
+        flow("inspect").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "batching",
+        "read_revision",
+        "snapshot continuation",
+    ] {
+        assert!(inspect.contains(phrase), "inspect selection: {phrase}");
+    }
+
+    let validate = format!(
+        "{}\n{}",
+        flow("validate").summary,
+        flow("validate").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "canonical diagnostics",
+        "test-count",
+        "validation identity",
+        "native validation is first-class",
+        "run_process for one literal-argv executable",
+        "run_shell when shell grammar/output shaping is required",
+    ] {
+        assert!(validate.contains(phrase), "validate selection: {phrase}");
+    }
+
+    let review = format!(
+        "{}\n{}",
+        flow("review").summary,
+        flow("review").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "small bounded git observations may use native git",
+        "workspace-wide review",
+        "broad/unknown committed-range mapping",
+        "scope/fence-bound paging",
+    ] {
+        assert!(review.contains(phrase), "review selection: {phrase}");
+    }
+
+    let all = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .flat_map(|flow| [flow.summary, flow.manifest_purpose])
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    for obsolete in [
+        "prefer search_project_texts/read_files even for one query/range",
+        "use search_project_texts/read_files for inspection even with one query or range",
+        "canonical default even when many lines change",
+        "use structured rust or go validation",
+        "use run_shell only for shell-specific validation",
+    ] {
+        assert!(
+            !all.contains(obsolete),
+            "obsolete selection ritual returned: {obsolete}"
         );
     }
 }
@@ -463,6 +746,9 @@ fn tool_categories_include_projects_with_management_tools() {
 
 #[test]
 fn tool_manifest_intents_reference_only_known_model_visible_tools() {
+    // High-level intent views rank canonical choices; exact compatibility
+    // primitives remain discoverable by tool_name without becoming peer choices.
+
     let expected = [
         "coding",
         "audit",
@@ -500,6 +786,50 @@ fn tool_manifest_intents_reference_only_known_model_visible_tools() {
 }
 
 #[test]
+fn audit_and_exploration_intents_prefer_canonical_batch_and_review_tools() {
+    for intent_name in ["audit", "exploration"] {
+        let intent = TOOL_MANIFEST_INTENTS
+            .iter()
+            .find(|intent| intent.name == intent_name)
+            .unwrap();
+        assert!(intent.tools.contains(&"read_files"), "{intent_name}");
+        assert!(
+            intent.tools.contains(&"search_project_texts"),
+            "{intent_name}"
+        );
+        assert!(!intent.tools.contains(&"read_file"), "{intent_name}");
+        assert!(
+            !intent.tools.contains(&"search_project_text"),
+            "{intent_name}"
+        );
+    }
+    let audit = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "audit")
+        .unwrap();
+    assert!(audit.tools.contains(&"show_changes"));
+    assert!(audit.tools.contains(&"git_diff_hunks"));
+    assert!(!audit.tools.contains(&"git_diff_summary"));
+
+    let release = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "release")
+        .unwrap();
+    assert!(release.tools.contains(&"show_changes"));
+    assert!(!release.tools.contains(&"git_diff_summary"));
+}
+
+#[test]
+fn validate_flow_uses_observe_jobs_without_recommending_job_status() {
+    let validate = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "validate")
+        .unwrap();
+    assert!(validate.tools.contains(&"observe_jobs"));
+    assert!(!validate.tools.contains(&"job_status"));
+}
+
+#[test]
 fn project_overview_manifest_profiles_match_intended_workflows() {
     for intent in ["coding", "audit", "exploration", "discovery"] {
         let profile = TOOL_MANIFEST_INTENTS
@@ -516,43 +846,71 @@ fn project_overview_manifest_profiles_match_intended_workflows() {
 }
 
 #[test]
-fn coding_intent_matches_local_coding_canonical_tools() {
+fn coding_intent_has_independent_ordered_canonical_selection_surface() {
     let coding = TOOL_MANIFEST_INTENTS
         .iter()
         .find(|intent| intent.name == "coding")
         .expect("coding intent");
-    assert_eq!(coding.tools, LOCAL_CODING_TOOL_NAMES);
+    assert_eq!(coding.tools, CODING_INTENT_TOOL_NAMES);
     assert_eq!(coding.tools.first().copied(), Some("work_on_project"));
     assert_eq!(coding.tools.last().copied(), Some("finish_coding_task"));
-    assert!(!coding.tools.contains(&"start_coding_task"));
-    let apply_patch_position = coding
-        .tools
-        .iter()
-        .position(|tool| *tool == "apply_patch")
-        .unwrap();
+
+    let mut seen = BTreeSet::new();
+    for tool in CODING_INTENT_TOOL_NAMES {
+        assert!(seen.insert(*tool), "duplicate coding intent tool {tool}");
+    }
+    for required in [
+        "work_on_project",
+        "search_project_texts",
+        "read_files",
+        "apply_text_edits",
+        "run_process",
+        "run_shell",
+        "observe_jobs",
+        "cargo_check",
+        "cargo_test",
+        "show_changes",
+        "git_diff_hunks",
+        "workspace_hygiene_check",
+        "finish_coding_task",
+        "apply_patch",
+        "run_script",
+        "cargo_fmt",
+        "go_test",
+        "goto_definition",
+        "find_references",
+    ] {
+        assert!(coding.tools.contains(&required), "missing {required}");
+    }
+    for compatibility_or_overlap in [
+        "read_file",
+        "search_project_text",
+        "git_diff",
+        "git_diff_summary",
+        "job_status",
+        "job_log",
+        "run_job",
+        "apply_unified_diff",
+        "coding_agent_start",
+        "coding_agent_observe",
+        "coding_agent_cancel",
+        "get_session_assignment",
+        "complete_session_message",
+    ] {
+        assert!(
+            !coding.tools.contains(&compatibility_or_overlap),
+            "coding intent should not recommend {compatibility_or_overlap}"
+        );
+    }
     let apply_text_edits_position = coding
         .tools
         .iter()
         .position(|tool| *tool == "apply_text_edits")
         .unwrap();
+    let apply_patch_position = coding
+        .tools
+        .iter()
+        .position(|tool| *tool == "apply_patch")
+        .unwrap();
     assert!(apply_text_edits_position < apply_patch_position);
-    for middle in [
-        "project_overview",
-        "apply_patch",
-        "apply_text_edits",
-        "apply_unified_diff",
-        "cargo_test",
-        "show_changes",
-    ] {
-        let position = coding
-            .tools
-            .iter()
-            .position(|tool| *tool == middle)
-            .unwrap();
-        assert!(position > 0 && position + 1 < coding.tools.len());
-    }
-    assert!(coding.tools.contains(&"run_shell"));
-    assert!(coding.tools.contains(&"run_job"));
-    assert!(!coding.tools.contains(&"git_restore_paths"));
-    assert!(!coding.tools.contains(&"discard_untracked"));
 }

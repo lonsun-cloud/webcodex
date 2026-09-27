@@ -41,9 +41,18 @@ pub struct LoginOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerStatusOutput {
     pub http_reachable: bool,
+    #[serde(default)]
+    pub server_pid: Option<u32>,
     pub probe_url: String,
     #[serde(default)]
     pub revision_check: Option<String>,
+    #[serde(default)]
+    pub desktop_runtime_contract:
+        Option<webcodex_core::desktop_runtime_contract::DesktopRuntimeContract>,
+    #[serde(default)]
+    pub protocol_compatibility: Option<String>,
+    #[serde(default)]
+    pub server_build: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,22 +144,6 @@ pub struct QuickShareConnection {
     pub clipboard_contains: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegularTunnelReadyEvent {
-    pub event: String,
-    pub schema_version: u64,
-    pub provider: String,
-    pub ready_for_chatgpt: bool,
-    pub connection: RegularTunnelConnection,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegularTunnelConnection {
-    pub kind: String,
-    pub clipboard_state: String,
-    pub clipboard_contains: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,24 +193,6 @@ mod tests {
         )
         .unwrap();
         assert!(share.connection.mcp_url.is_none());
-
-        let tunnel: RegularTunnelReadyEvent = serde_json::from_str(
-            r#"{
-                "event":"ready",
-                "schema_version":1,
-                "provider":"openai",
-                "ready_for_chatgpt":true,
-                "connection":{
-                    "kind":"openai_tunnel",
-                    "clipboard_state":"copied",
-                    "clipboard_contains":"tunnel_id",
-                    "future":1
-                },
-                "future_top_level":2
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(tunnel.connection.kind, "openai_tunnel");
     }
 
     #[test]

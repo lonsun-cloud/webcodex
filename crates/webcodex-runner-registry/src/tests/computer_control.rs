@@ -225,7 +225,8 @@ async fn computer_key_input_requires_independent_capability() {
 async fn computer_pointer_enqueue_requires_independent_capability_and_typed_envelope() {
     let registry = RunnerRegistry::default();
     let alice = auth_context(Some("alice"), false);
-    let payload = r#"{"display_id":"display_0123456789abcdef0123456789abcdef","snapshot_generation":7,"x":123,"y":456}"#;
+    let payload =
+        r#"{"display_id":"display_iavN7wEjRWeJq83v","snapshot_generation":7,"x":123,"y":456}"#;
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {

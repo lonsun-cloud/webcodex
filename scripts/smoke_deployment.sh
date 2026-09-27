@@ -21,7 +21,7 @@ set -euo pipefail
 # What it checks:
 #   1. GET  /openapi.json            -> valid OpenAPI JSON with paths.
 #   2. POST /api/runtime/status      -> success == true.
-#   3. POST /api/projects/list       -> success == true.
+#   3. POST /api/tools/call (list_projects)       -> success == true.
 #   4. POST /mcp initialize          -> result.protocolVersion non-empty.
 #   5. POST /mcp tools/list          -> result.tools is a non-empty array.
 #
@@ -167,16 +167,16 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 3. POST /api/projects/list
+# 3. POST /api/tools/call (list_projects)
 # ----------------------------------------------------------------------------
 
-log "POST /api/projects/list"
-body="$(api_post /api/projects/list '{}')"
+log "POST /api/tools/call (list_projects)"
+body="$(api_post /api/tools/call '{"tool":"list_projects","params":{}}')"
 ok="$(json_get "$body" success)"
 if [ "$ok" = "True" ]; then
-    pass "/api/projects/list success=true"
+    pass "list_projects via /api/tools/call success=true"
 else
-    fail "/api/projects/list not success (got: ${body:0:300})"
+    fail "list_projects via /api/tools/call not success (got: ${body:0:300})"
 fi
 
 # ----------------------------------------------------------------------------

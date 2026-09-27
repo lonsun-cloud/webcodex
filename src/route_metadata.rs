@@ -5,16 +5,13 @@
 //! auth, OpenAPI, console, audit, and test-only route tables.
 
 mod account;
-mod connector;
 mod consoles;
 mod mcp;
 mod oauth;
-mod openapi;
 mod operations;
 mod runner_transport;
 mod runtime;
 
-pub(crate) use openapi::{OpenApiExampleSet, OpenApiOperationSpec};
 use webcodex_core::authority::OAuthRouteScopePolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,13 +25,6 @@ impl RouteMethod {
         match self {
             Self::Get => method.trim().eq_ignore_ascii_case("GET"),
             Self::Post => method.trim().eq_ignore_ascii_case("POST"),
-        }
-    }
-
-    pub(crate) const fn openapi_key(self) -> &'static str {
-        match self {
-            Self::Get => "get",
-            Self::Post => "post",
         }
     }
 }
@@ -56,8 +46,6 @@ pub(crate) enum RouteSurface {
     OAuth,
     Mcp,
     RuntimeApi,
-    Connector,
-    HostConsole,
     RuntimeConsole,
     Admin,
     Audit,
@@ -73,11 +61,6 @@ pub(crate) enum RouteSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RouteOpenApiProjection {
     Hidden,
-    /// Dedicated operation on the normal server `/openapi.json` GPT Actions surface.
-    PublicAction(OpenApiOperationSpec),
-    /// Project Connector capability identity; semantic ToolSpec data stays in the
-    /// canonical Connector capability registry.
-    ConnectorCapability(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,41 +92,19 @@ pub(crate) enum RouteId {
     PairingEnroll,
     McpGet,
     McpPost,
-    ConnectorReadiness,
-    ConnectorTaskStart,
-    ConnectorTaskList,
-    ConnectorTaskResume,
-    ConnectorFilesList,
-    ConnectorFilesRead,
-    ConnectorFilesSearch,
-    ConnectorCodeNavigate,
-    ConnectorCodeImpact,
-    ConnectorEditsApply,
-    ConnectorChecksRun,
-    ConnectorCommandsRun,
-    ConnectorTaskReview,
-    ConnectorTaskCancel,
-    ConnectorTaskFinish,
-    HostConsoleReadiness,
-    HostConsoleTasks,
-    HostConsoleActivity,
-    HostConsoleWorkflowSessions,
-    HostConsoleWorkflowSession,
-    HostConsoleTaskReview,
-    HostConsoleTaskCancel,
-    HostConsoleTaskGuide,
-    HostConsoleApprovals,
-    HostConsoleApprovalDecide,
-    HostConsoleDevices,
-    HostConsoleResultAccept,
-    HostConsoleResultReject,
-    HostConsoleConnect,
     RuntimeConsoleOverview,
     RuntimeConsoleRunner,
     RuntimeConsoleWindows,
     RuntimeConsoleWindow,
     RuntimeConsoleProjects,
+    RuntimeConsoleGoals,
+    RuntimeConsoleGoal,
+    RuntimeConsoleExtensions,
+    RuntimeConsoleInstruction,
+    RuntimeConsoleProjectGit,
+    RuntimeConsolePluginReload,
     RuntimeConsoleWorkflowSessions,
+    RuntimeConsoleWorkflowSessionLocate,
     RuntimeConsoleWorkflowSession,
     RuntimeConsoleWorkflowSessionMessages,
     RuntimeConsoleWorkflowSessionObserve,
@@ -170,34 +131,15 @@ pub(crate) enum RouteId {
     AdminProjectsUnregister,
     ToolsList,
     ToolsCall,
+    GptActionsInvoke,
     ArtifactsImport,
-    JobsStatus,
-    JobsLog,
-    JobsStop,
-    JobsList,
-    JobsTail,
-    RunnerConfigCheck,
-    RunnerConfigReload,
-    ProjectsList,
-    ProjectsRegister,
-    ProjectsCreate,
-    ProjectsUnregister,
     ProjectsResolveOrRegister,
-    ProjectsReadFile,
-    ProjectsGitStatus,
-    ProjectsGitDiff,
-    ProjectsGitDiffSummary,
-    ProjectsListFiles,
-    ProjectsSearchText,
-    ProjectsApplyUnifiedDiff,
-    ProjectsRunShell,
-    ProjectsGitRestorePaths,
-    ProjectsDiscardUntracked,
-    ProjectsRunJob,
     RuntimeStatus,
     OAuthClientsCreate,
     OAuthClientsList,
     OAuthClientsUpdateScopes,
+    OAuthClientsAddRedirectUri,
+    OAuthClientsRemoveRedirectUri,
     OAuthClientsRevoke,
     OAuthSharedKeyClientProvision,
     UsersCreate,
@@ -212,6 +154,8 @@ pub(crate) enum RouteId {
     AgentTokensList,
     AgentTokensRevoke,
     PairingCreate,
+    PairingRunnerCapabilities,
+    RunnerCapabilityAuthorization,
     ShellRun,
     ShellFile,
     ShellJob,
@@ -230,9 +174,6 @@ pub(crate) enum RouteId {
     AuditSession,
     AuditStats,
     OpenApiDocument,
-    ConsoleWebRoot,
-    ConsoleWebAppJs,
-    ConsoleWebStylesCss,
     RuntimeWebRoot,
     RuntimeWebAppJs,
     RuntimeWebStylesCss,
@@ -292,7 +233,6 @@ const ROUTE_GROUPS: &[&[RouteSpec]] = &[
     oauth::PUBLIC_ROUTES,
     account::ENROLLMENT_ROUTES,
     mcp::ROUTES,
-    connector::ROUTES,
     consoles::ROUTES,
     operations::ADMIN_ROUTES,
     runtime::ROUTES,
@@ -361,7 +301,18 @@ pub(crate) fn shared_root_path(first: RouteId, second: RouteId) -> &'static str 
 
 pub(crate) fn lookup(method: &str, path: &str) -> Option<&'static RouteSpec> {
     let path = normalize_path(path);
-    iter_routes().find(|spec| spec.method.matches(method) && spec.path == path)
+    iter_routes().find(|spec| {
+        spec.method.matches(method)
+            && (spec.path == path
+                || (spec.id == RouteId::GptActionsInvoke && gpt_action_runtime_path_matches(&path)))
+    })
+}
+
+fn gpt_action_runtime_path_matches(path: &str) -> bool {
+    let Some(tool_name) = path.strip_prefix("/api/actions/") else {
+        return false;
+    };
+    !tool_name.is_empty() && !tool_name.contains('/')
 }
 
 /// Exact path-only lookup for consumers whose historical contract was an
@@ -378,6 +329,80 @@ pub(crate) fn path_has_surface(path: &str, surface: RouteSurface) -> bool {
 
 pub(crate) fn audit_class_for_path(path: &str) -> Option<AuditClass> {
     lookup_path(path).map(|spec| spec.audit_class)
+}
+
+/// Project one canonical runtime ToolDefinition into the historical ActionAudit
+/// stats vocabulary. This is observability-only: it grants no authority and
+/// deliberately derives from the runtime tool SSOT instead of transport names.
+pub(crate) fn audit_class_for_runtime_tool(tool_name: &str) -> Option<AuditClass> {
+    use webcodex_tool_contracts::{
+        ToolActivityKind, ToolEffect, ToolExecutionForm, ToolExecutionStart,
+        TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT, TOOL_CATEGORY_GIT, TOOL_CATEGORY_JOB,
+        TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_VALIDATION,
+    };
+
+    let definition = webcodex_tool_contracts::lookup_tool_definition(tool_name)?;
+    let activity = definition.activity_semantics();
+
+    if definition.is_git_like() || definition.category == TOOL_CATEGORY_GIT {
+        return Some(AuditClass::Git);
+    }
+    if definition.category == TOOL_CATEGORY_ARTIFACT {
+        return Some(AuditClass::Artifact);
+    }
+    if matches!(
+        definition.category,
+        TOOL_CATEGORY_EDIT | TOOL_CATEGORY_PATCH
+    ) || activity.kind == ToolActivityKind::Edit
+    {
+        return Some(AuditClass::Edit);
+    }
+    if definition.execution.is_some_and(|execution| {
+        matches!(
+            execution.form,
+            ToolExecutionForm::ShellCommand | ToolExecutionForm::PersistentShellCommand
+        ) && execution.start != ToolExecutionStart::AsyncImmediate
+    }) {
+        return Some(AuditClass::Shell);
+    }
+    if definition.category == TOOL_CATEGORY_RUNTIME {
+        return Some(if definition.metadata().effect == ToolEffect::Observe {
+            AuditClass::Report
+        } else {
+            AuditClass::Command
+        });
+    }
+    if matches!(
+        definition.category,
+        TOOL_CATEGORY_JOB | TOOL_CATEGORY_VALIDATION
+    ) || matches!(
+        activity.kind,
+        ToolActivityKind::Run | ToolActivityKind::Test
+    ) {
+        return Some(AuditClass::Job);
+    }
+
+    Some(match activity.kind {
+        ToolActivityKind::Read | ToolActivityKind::Search | ToolActivityKind::Navigate => {
+            AuditClass::Context
+        }
+        ToolActivityKind::Edit => AuditClass::Edit,
+        ToolActivityKind::Run | ToolActivityKind::Test => AuditClass::Job,
+        ToolActivityKind::Review => AuditClass::Report,
+        ToolActivityKind::None => AuditClass::Command,
+    })
+}
+
+/// Persisted GPT Action events share one dynamic HTTP adapter, so endpoint-only
+/// classification is intentionally insufficient. Their canonical `operation`
+/// records the resolved runtime tool identity and is projected through the same
+/// ToolDefinition semantics used elsewhere. Ordinary and historical REST events
+/// keep their route-based compatibility classes unchanged.
+pub(crate) fn audit_class_for_event(endpoint: &str, operation: Option<&str>) -> Option<AuditClass> {
+    if lookup("POST", endpoint).is_some_and(|spec| spec.id == RouteId::GptActionsInvoke) {
+        return operation.and_then(audit_class_for_runtime_tool);
+    }
+    audit_class_for_path(endpoint)
 }
 
 fn normalize_path(path: &str) -> String {
@@ -405,11 +430,9 @@ mod tests {
         source.split("#[cfg(test)]").next().unwrap_or(source)
     }
 
-    fn mounted_route_sources() -> [&'static str; 5] {
+    fn mounted_route_sources() -> [&'static str; 3] {
         [
             include_str!("lib.rs"),
-            production_prefix(include_str!("connector_runtime/http.rs")),
-            production_prefix(include_str!("host_console_http.rs")),
             production_prefix(include_str!("runtime_console_http.rs")),
             production_prefix(include_str!("admin_http.rs")),
         ]
@@ -461,31 +484,12 @@ mod tests {
             AdminWebStylesCss as usize + 1,
             "canonical iteration must cover every RouteId exactly once",
         );
-        assert_eq!(iter_routes().count(), 144, "canonical route closure");
         assert_eq!(lookup("GET", "/mcp").unwrap().id, McpGet);
         assert_eq!(lookup("POST", "/mcp").unwrap().id, McpPost);
     }
 
     #[test]
-    fn desktop_project_activation_operator_routes_stay_hidden_and_narrowly_scoped() {
-        let check = spec(RouteId::RunnerConfigCheck);
-        assert_eq!(
-            check.scope_policy,
-            webcodex_core::authority::OAuthRouteScopePolicy::Require(
-                webcodex_core::authority::SCOPE_RUNTIME_READ,
-            )
-        );
-        assert_eq!(check.openapi_projection, RouteOpenApiProjection::Hidden);
-
-        let reload = spec(RouteId::RunnerConfigReload);
-        assert_eq!(
-            reload.scope_policy,
-            webcodex_core::authority::OAuthRouteScopePolicy::Require(
-                webcodex_core::authority::SCOPE_RUNNER_MANAGE,
-            )
-        );
-        assert_eq!(reload.openapi_projection, RouteOpenApiProjection::Hidden);
-
+    fn desktop_project_activation_internal_route_stays_hidden_and_narrowly_scoped() {
         let activate = spec(RouteId::ProjectsResolveOrRegister);
         assert_eq!(
             activate.scope_policy,
@@ -497,63 +501,11 @@ mod tests {
     }
 
     #[test]
-    fn openapi_projection_is_closed_unique_and_connector_bijective() {
-        let mut public_operation_ids = BTreeSet::new();
-        let mut connector_capabilities = BTreeSet::new();
-
+    fn route_metadata_does_not_define_a_parallel_openapi_surface() {
         for route_spec in iter_routes() {
-            match route_spec.openapi_projection {
-                Hidden => {}
-                PublicAction(operation) => {
-                    assert_eq!(route_spec.method, RouteMethod::Post, "{:?}", route_spec.id);
-                    assert_eq!(route_spec.surface, RuntimeApi, "{:?}", route_spec.id);
-                    assert_eq!(
-                        route_spec.auth,
-                        RouteAuth::AuthMiddleware,
-                        "{:?} Public Action OpenAPI declares bearer security and must stay behind AuthMiddleware",
-                        route_spec.id
-                    );
-                    assert!(!operation.operation_id.is_empty(), "{:?}", route_spec.id);
-                    assert!(!operation.request_schema.is_empty(), "{:?}", route_spec.id);
-                    assert!(!operation.response_schema.is_empty(), "{:?}", route_spec.id);
-                    assert!(
-                        public_operation_ids.insert(operation.operation_id),
-                        "duplicate public OpenAPI operationId: {}",
-                        operation.operation_id
-                    );
-                }
-                ConnectorCapability(name) => {
-                    assert_eq!(route_spec.method, RouteMethod::Post, "{:?}", route_spec.id);
-                    assert_eq!(route_spec.surface, Connector, "{:?}", route_spec.id);
-                    assert_eq!(
-                        route_spec.auth,
-                        RouteAuth::AuthMiddleware,
-                        "{:?} Connector OpenAPI declares bearer security and must stay behind AuthMiddleware",
-                        route_spec.id
-                    );
-                    assert!(!name.is_empty(), "{:?}", route_spec.id);
-                    assert!(
-                        connector_capabilities.insert(name),
-                        "duplicate Connector capability route binding: {name}"
-                    );
-                }
-            }
+            assert_eq!(route_spec.openapi_projection, Hidden, "{:?}", route_spec.id);
         }
-
-        assert!(
-            public_operation_ids.len() < 30,
-            "GPT Actions operation budget exceeded: {}",
-            public_operation_ids.len()
-        );
-        let canonical_connector_capabilities =
-            webcodex_connector_runtime::surface::CAPABILITY_NAMES
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-        assert_eq!(
-            connector_capabilities, canonical_connector_capabilities,
-            "RouteSpec Connector bindings must be a bijection with the canonical capability registry"
-        );
+        assert_eq!(spec(GptActionsInvoke).openapi_projection, Hidden);
     }
 
     #[test]
@@ -567,6 +519,11 @@ mod tests {
         assert!(lookup("GET", "/api/runtime/status").is_none());
         assert!(lookup("POST", "/api/future/authenticated-route").is_none());
         assert!(lookup("POST", "/api/runtime/status/extra").is_none());
+        assert_eq!(
+            lookup("POST", "/api/actions/read_files").unwrap().id,
+            GptActionsInvoke
+        );
+        assert!(lookup("POST", "/api/actions/read_files/extra").is_none());
 
         // Path-only surface/audit consumers replaced exact historical
         // allowlists and must not inherit the scope lookup's normalization.
@@ -589,7 +546,11 @@ mod tests {
             );
             references += 1;
         }
-        assert_eq!(references, 144, "A2 production leaf RouteId closure");
+        assert_eq!(
+            references,
+            iter_routes().count(),
+            "A2 production leaf RouteId closure"
+        );
     }
 
     #[test]
@@ -619,7 +580,7 @@ mod tests {
         let routes = iter_routes()
             .filter(|spec| spec.surface == PublicWeb)
             .collect::<Vec<_>>();
-        assert_eq!(routes.len(), 10);
+        assert_eq!(routes.len(), 7);
         for route in routes {
             assert_eq!(route.method, RouteMethod::Get, "{:?}", route.id);
             assert_eq!(
@@ -632,15 +593,10 @@ mod tests {
             assert_eq!(route.openapi_projection, Hidden, "{:?}", route.id);
             assert_eq!(route.audit_class, Other, "{:?}", route.id);
         }
-        assert_eq!(direct_child_path(ConsoleWebRoot, ConsoleWebAppJs), "app.js");
         assert_eq!(
             direct_child_path(RuntimeWebRoot, RuntimeWebStylesCss),
             "styles.css"
         );
-        assert!(std::panic::catch_unwind(|| {
-            direct_child_path(ConsoleWebRoot, RuntimeWebAppJs)
-        })
-        .is_err());
     }
 
     #[test]
@@ -721,21 +677,41 @@ mod tests {
     #[test]
     fn audit_class_preserves_existing_http_stats_semantics() {
         for (path, class) in [
-            ("/api/projects/apply_unified_diff", Edit),
-            ("/api/projects/read_file", Context),
-            ("/api/projects/run_job", Job),
             ("/api/tools/call", Command),
             ("/api/runtime/status", Report),
             ("/api/artifacts/import", Artifact),
-            ("/api/projects/git_diff", Git),
-            ("/api/projects/run_shell", Shell),
+            ("/api/actions/{tool_name}", Other),
         ] {
             assert_eq!(audit_class_for_path(path), Some(class), "{path}");
         }
+        for (tool, class) in [
+            ("apply_text_edits", Edit),
+            ("run_shell", Shell),
+            ("import_conversation_files_to_project", Artifact),
+            ("git_diff_hunks", Git),
+            ("read_files", Context),
+            ("runtime_status", Report),
+            ("cargo_test", Job),
+            ("workspace_hygiene_check", Report),
+            ("plugin_tool", Command),
+        ] {
+            assert_eq!(audit_class_for_runtime_tool(tool), Some(class), "{tool}");
+            assert_eq!(
+                audit_class_for_event("/api/actions/{tool_name}", Some(tool)),
+                Some(class),
+                "{tool} placeholder route"
+            );
+            assert_eq!(
+                audit_class_for_event(&format!("/api/actions/{tool}"), Some(tool)),
+                Some(class),
+                "{tool} concrete route"
+            );
+        }
         assert_eq!(
-            audit_class_for_path("/api/connector/edits/apply"),
-            Some(Other)
+            audit_class_for_event("/api/actions/{tool_name}", None),
+            None
         );
+
         assert_eq!(
             audit_class_for_path("/api/runtime-console/projects"),
             Some(Other)

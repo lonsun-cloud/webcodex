@@ -133,8 +133,11 @@ jobs:
             npm/plugin-sdk/package-lock.json
             plugins/safe-delete/package-lock.json
             plugins/repo-info/package-lock.json
+            plugins/repo-context/package-lock.json
+            plugins/campus-application/package-lock.json
+            plugins/agent-browser/package-lock.json
       - name: Install frontend dependencies
-        if: needs.changes.outputs.needs_frontend == 'true'
+        if: needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true'
         run: npm ci --prefix frontend
       - name: Check frontend contracts
         if: needs.changes.outputs.needs_frontend == 'true'
@@ -157,6 +160,9 @@ jobs:
           npm ci --prefix npm/plugin-sdk
           npm ci --prefix plugins/safe-delete
           npm ci --prefix plugins/repo-info
+          npm ci --prefix plugins/repo-context
+          npm ci --prefix plugins/campus-application
+          npm ci --prefix plugins/agent-browser
       - name: Check Plugin SDK contracts and first-party dogfood
         if: needs.changes.outputs.needs_plugin_sdk == 'true'
         run: |
@@ -168,6 +174,12 @@ jobs:
           npm --prefix plugins/safe-delete test
           npm --prefix plugins/repo-info run typecheck
           npm --prefix plugins/repo-info test
+          npm --prefix plugins/repo-context run typecheck
+          npm --prefix plugins/repo-context test
+          npm --prefix plugins/campus-application run typecheck
+          npm --prefix plugins/campus-application test
+          npm --prefix plugins/agent-browser run typecheck
+          npm --prefix plugins/agent-browser test
       - name: Verify workspace boundaries
         run: |
           bash scripts/workspace_boundary_check.sh --self-test
@@ -186,13 +198,41 @@ jobs:
           bash scripts/test_inventory.sh
       - name: Check schema and metadata contracts
         run: |
-          cargo test --locked -p webcodex --lib -- \
-            openapi_operation_ids_are_minimal \
-            openapi_all_local_refs_resolve \
-            openapi_tool_call_request_does_not_advertise_hidden_start_bootstrap \
-            mcp_tools_list_returns_same_names_as_runtime \
-            explicit_resume_advanced_compatibility_schema_and_metadata_are_retained \
-            http_project_connector_lists_and_dispatches_only_canonical_capabilities
+          cargo test --locked -p webcodex --lib openapi
+          cargo test --locked -p webcodex --lib mcp_tools_list
+          cargo test --locked -p webcodex --lib tool_definition_surface_counts_and_action_projection_stay_canonical
+          cargo test --locked -p webcodex --lib external_provider_discovery_cannot_change_public_tool_or_openapi_surface
+
+  mcp-conformance:
+    # Dated MCP wire evidence is independent from ordinary unit/integration tests.
+    # The script pins the external referee and rejects missing or silently skipped
+    # coverage; known failures require exact check-level classification.
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check conformance report gate
+        run: python3 scripts/tests/test_mcp_conformance_report.py
+      - name: Run pinned MCP dated-revision baseline
+        run: bash scripts/mcp_conformance.sh
+      - name: Upload MCP conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-conformance-${{ github.sha }}
+          path: target/mcp-conformance/reports
+          if-no-files-found: ignore
+          retention-days: 7
 
   test-linux-rust:
     # Complete Linux Rust coverage is mandatory before merge, including owner PRs.
@@ -207,12 +247,13 @@ jobs:
           - shard: server
             packages: "-p webcodex"
           - shard: runner
-            packages: "-p webcodex-runner"
+            packages: "-p webcodex-runner -p webcodex-lsp --features runner-real-process-tests"
           - shard: workspace-crates
             packages: >-
               --workspace
               --exclude webcodex
               --exclude webcodex-runner
+              --exclude webcodex-lsp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -239,12 +280,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Check MCP App DOM and message-order contracts
+        run: node --test src/mcp_tests/*.test.mjs
       - name: Ensure Python tooling test dependencies
         run: |
           if ! command -v rg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install --no-install-recommends -y ripgrep
           fi
+      - name: Test optional Codex observation adapter
+        run: python3 -m unittest discover -s integrations/codex -p 'test_*.py' -v
       - name: Check complete workspace production/test targets
         if: github.event_name == 'pull_request' && (github.event.pull_request.user.login != github.repository_owner || contains(github.event.pull_request.labels.*.name, 'run-ci'))
         run: cargo check --locked --workspace --all-targets
@@ -312,7 +357,10 @@ jobs:
             WEBCODEX_GIT_DIRTY=false
             WEBCODEX_BUILT_AT=${{ env.WEBCODEX_CI_BUILT_AT }}
           cache-from: type=gha,scope=server-image-ci-amd64
-          cache-to: type=gha,mode=max,scope=server-image-ci-amd64
+          # GHA cache export is a performance optimization, not image evidence.
+          # BuildKit can transiently return layer-blob not_found after the image
+          # itself has built; keep build/load/smoke authoritative in that case.
+          cache-to: type=gha,mode=max,scope=server-image-ci-amd64,ignore-error=true
           provenance: false
           sbom: false
       - name: Smoke amd64 Server image
@@ -381,7 +429,7 @@ jobs:
       - name: Check macOS workspace production surfaces
         run: cargo check --locked --workspace
       - name: Run native macOS Runner and Computer tests
-        run: cargo test --locked -p webcodex-runner -p webcodex-computer
+        run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests
 
   test-macos-desktop:
     needs: changes
@@ -410,7 +458,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - name: Verify native macOS host
         env:
           EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
@@ -419,6 +469,8 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_HOST_ARCH"
           rust_host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$rust_host" = "$EXPECTED_RUST_HOST"
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -541,10 +593,9 @@ jobs:
           require_lane core "$NEEDS_CORE" "$CORE_RESULT"
           require_lane desktop "$NEEDS_DESKTOP" "$DESKTOP_RESULT"
 
-  # Keep the Runner/Computer suite at two libtest threads for now because a few
-  # ordinary subprocess fixtures still share this default lane. Timing-sensitive
-  # lifecycle/process-tree fixtures are ignored and run only by explicit local commands.
-  # Core/library, Runner, and packaging coverage run independently.
+  # Ordinary Runner/Computer fixtures must tolerate default libtest parallelism.
+  # Timing-sensitive lifecycle/process-tree fixtures remain ignored here and run only
+  # by explicit local commands. Core/library, Runner, and packaging coverage are independent.
   test-windows-core:
     needs: changes
     if: needs.changes.outputs.needs_windows_core == 'true'
@@ -567,6 +618,12 @@ jobs:
         run: cargo check --locked --workspace
       - name: Run Windows library and CLI tests
         run: cargo test --locked -p webcodex-runner-config -p webcodex-process -p webcodex-cli
+      - name: Run Windows search fallback tests
+        run: |
+          cargo test --locked -p webcodex --lib search_project_text_grep
+          if ($LASTEXITCODE -ne 0) { throw "Windows grep fallback tests failed" }
+          cargo test --locked -p webcodex --lib search_requires_ripgrep_based_on_effective_features_not_field_presence
+          if ($LASTEXITCODE -ne 0) { throw "Windows search capability test failed" }
 
   test-windows-runner:
     needs: changes
@@ -580,11 +637,12 @@ jobs:
         with:
           shared-key: windows-runner-ci
       - name: Run Windows Runner and Computer tests
-        # The Runner suite mixes timing-sensitive process, PowerShell, and cache tests.
-        # Even two concurrent test functions can starve bounded startup/timeout windows
-        # on loaded Windows hosts. Serialize test functions; concurrency exercised
-        # inside each individual test remains unchanged.
-        run: cargo test --locked -p webcodex-runner -p webcodex-computer -- --test-threads=1
+        # This lane starts real PowerShell/MCP child processes. Keep the Rust
+        # harness bounded so hosted-runner scheduling does not consume their
+        # production startup/request deadlines.
+        env:
+          RUST_TEST_THREADS: "2"
+        run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests
 
   test-windows-package:
     needs: changes
@@ -628,7 +686,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -709,6 +771,15 @@ jobs:
             -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
             -Platform win32-x64
 
+          $customInstallDir = Join-Path $env:RUNNER_TEMP "WebCodex Custom Install"
+          & .\scripts\desktop_install_windows_smoke.ps1 `
+            -Installer $env:DESKTOP_CI_INSTALLER `
+            -Version "${{ steps.runtime.outputs.version }}" `
+            -SourceSha "${{ steps.runtime.outputs.source }}" `
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
+            -Platform win32-x64 `
+            -InstallDir $customInstallDir
+
   test-windows:
     needs: [contract, changes, test-windows-core, test-windows-runner, test-windows-package, test-windows-desktop]
     # Preserve the stable Windows aggregate while allowing each heavy lane to be
@@ -753,7 +824,7 @@ jobs:
           require_lane desktop "$NEEDS_DESKTOP" "$DESKTOP_RESULT"
 
   test-native:
-    needs: [contract, changes, test-docker-server, test-macos, test-windows]
+    needs: [contract, changes, mcp-conformance, test-docker-server, test-macos, test-windows]
     # Stable branch-protection context: daily native aggregates and the path-aware
     # Server image smoke must resolve according to classifier policy.
     if: always()
@@ -765,13 +836,14 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           NEEDS_DOCKER: ${{ needs.changes.outputs.needs_docker }}
+          MCP_CONFORMANCE_RESULT: ${{ needs.mcp-conformance.result }}
           DOCKER_RESULT: ${{ needs.test-docker-server.result }}
           MACOS_RESULT: ${{ needs.test-macos.result }}
           WINDOWS_RESULT: ${{ needs.test-windows.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT docker=$DOCKER_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_docker=$NEEDS_DOCKER"
-          if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ]; then
+          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT mcp_conformance=$MCP_CONFORMANCE_RESULT docker=$DOCKER_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_docker=$NEEDS_DOCKER"
+          if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ] || [ "$MCP_CONFORMANCE_RESULT" != success ]; then
             echo "CI policy or contract classification did not succeed" >&2
             exit 1
           fi

@@ -149,10 +149,10 @@ pub fn aggregate_readiness(
     exposure: ExposureReadiness,
     project: ProjectReadiness,
 ) -> ReadinessSnapshot {
-    let runtime_ready = server == ServerReadiness::Ready
-        && runner == RunnerReadiness::Ready
-        && project == ProjectReadiness::Ready;
-    let ready_for_chatgpt = runtime_ready && exposure == ExposureReadiness::RemoteReady;
+    let runtime_ready = server == ServerReadiness::Ready && runner == RunnerReadiness::Ready;
+    let project_usable = matches!(project, ProjectReadiness::Ready | ProjectReadiness::None);
+    let ready_for_chatgpt =
+        runtime_ready && project_usable && exposure == ExposureReadiness::RemoteReady;
     let (summary_kind, next_action_kind, summary, next_action) = if ready_for_chatgpt {
         (
             ReadinessSummaryKind::ReadyForChatGpt,
@@ -190,7 +190,7 @@ pub fn aggregate_readiness(
             "Runner is not connected".to_string(),
             Some("Start the Runner and wait for it to connect.".to_string()),
         )
-    } else if project != ProjectReadiness::Ready {
+    } else if !matches!(project, ProjectReadiness::Ready | ProjectReadiness::None) {
         (
             ReadinessSummaryKind::ProjectNotReady,
             Some(ReadinessNextActionKind::AddOrReloadProject),
@@ -252,28 +252,12 @@ pub struct QuickShareState {
     pub ready_for_chatgpt: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RegularTunnelStatus {
-    Starting,
-    Ready,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegularTunnelState {
-    pub provider: String,
-    pub status: RegularTunnelStatus,
-    pub clipboard_state: String,
-    pub clipboard_contains: String,
-    pub ready_for_chatgpt: bool,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopOperationKind {
     LocalSetup,
     LocalProjectActivate,
+    ProjectUnregister,
     RemoteSetup,
     QuickShareStart,
     QuickShareStop,
@@ -284,6 +268,12 @@ pub enum DesktopOperationKind {
     RuntimeResume,
     TunnelProxyUpdate,
     TunnelConfigUpdate,
+    RunnerSettingsUpdate,
+    RunnerRestart,
+    RuntimeProbe,
+    RuntimeSwitch,
+    TraceUpdate,
+    ConfigurationRestore,
 }
 
 impl DesktopOperationKind {
@@ -291,6 +281,7 @@ impl DesktopOperationKind {
         match self {
             Self::LocalSetup => "local_setup",
             Self::LocalProjectActivate => "local_project_activate",
+            Self::ProjectUnregister => "project_unregister",
             Self::RemoteSetup => "remote_setup",
             Self::QuickShareStart => "quick_share_start",
             Self::QuickShareStop => "quick_share_stop",
@@ -300,6 +291,12 @@ impl DesktopOperationKind {
             Self::RuntimeRefresh => "runtime_refresh",
             Self::RuntimeResume => "runtime_resume",
             Self::TunnelProxyUpdate => "tunnel_proxy_update",
+            Self::RunnerSettingsUpdate => "runner_settings_update",
+            Self::RunnerRestart => "runner_restart",
+            Self::RuntimeProbe => "runtime_probe",
+            Self::RuntimeSwitch => "runtime_switch",
+            Self::TraceUpdate => "trace_update",
+            Self::ConfigurationRestore => "configuration_restore",
             Self::TunnelConfigUpdate => "tunnel_config_update",
         }
     }
@@ -351,8 +348,8 @@ pub struct TunnelProxySnapshot {
     pub mode: TunnelProxyMode,
     pub custom_url: Option<String>,
     pub effective_source: String,
-    pub effective_url: Option<String>,
-    pub detected_url: Option<String>,
+    pub effective_proxy_present: bool,
+    pub system_proxy_detected: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -397,6 +394,10 @@ pub struct ChatGptActivitySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopStateSnapshot {
+    pub workspace_runner: Option<crate::webcodex::settings::SettingsTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_issue: Option<String>,
+    pub saved_projects: Vec<ProjectSelection>,
     pub topology: Option<RuntimeTopology>,
     pub readiness: ReadinessSnapshot,
     pub project: Option<ProjectSelection>,
@@ -406,7 +407,12 @@ pub struct DesktopStateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chatgpt_activity: Option<ChatGptActivitySnapshot>,
     pub quick_share: Option<QuickShareState>,
-    pub regular_tunnel: Option<RegularTunnelState>,
+    #[serde(default)]
+    pub connections: crate::connections::ConnectionsSnapshot,
+    #[serde(default)]
+    pub mcp_providers: crate::mcp_providers::McpProvidersSnapshot,
+    #[serde(default)]
+    pub coding_agents: crate::coding_agents::CodingAgentsSnapshot,
     pub current_operation: Option<DesktopOperationSnapshot>,
     pub activity_sequence: u64,
     pub openai_tunnel_configured: bool,
@@ -420,6 +426,9 @@ pub struct DesktopStateSnapshot {
 impl Default for DesktopStateSnapshot {
     fn default() -> Self {
         Self {
+            workspace_runner: None,
+            configuration_issue: None,
+            saved_projects: Vec::new(),
             topology: None,
             readiness: ReadinessSnapshot::default(),
             project: None,
@@ -427,7 +436,9 @@ impl Default for DesktopStateSnapshot {
             powershell_runtime: None,
             chatgpt_activity: None,
             quick_share: None,
-            regular_tunnel: None,
+            connections: Default::default(),
+            mcp_providers: Default::default(),
+            coding_agents: Default::default(),
             current_operation: None,
             activity_sequence: 0,
             openai_tunnel_configured: false,
@@ -439,15 +450,31 @@ impl Default for DesktopStateSnapshot {
                 mode: TunnelProxyMode::Auto,
                 custom_url: None,
                 effective_source: "direct".to_string(),
-                effective_url: None,
-                detected_url: None,
+                effective_proxy_present: false,
+                system_proxy_detected: false,
             },
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredDesktopConfig {
+    #[serde(default = "desktop_config_schema")]
+    pub schema_version: u16,
+    #[serde(default)]
+    pub runtime_binary_source: crate::runtime_selection::RuntimeSource,
+    #[serde(default)]
+    pub runtime_selection_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binary_fingerprint: Option<String>,
+    #[serde(default)]
+    pub update_cache: crate::updates::UpdateCache,
+    #[serde(default)]
+    pub previous_runtime_source: Option<crate::runtime_selection::RuntimeSource>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub saved_projects: Vec<SavedProject>,
     pub topology: Option<RuntimeTopology>,
     pub project: Option<ProjectSelection>,
     pub runtime: Option<StoredRuntime>,
@@ -457,6 +484,37 @@ pub struct StoredDesktopConfig {
     pub preferred_connection: Option<RegularConnectionPreference>,
     #[serde(default)]
     pub tunnel_proxy: TunnelProxyConfig,
+}
+
+fn desktop_config_schema() -> u16 {
+    1
+}
+
+impl Default for StoredDesktopConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: desktop_config_schema(),
+            runtime_binary_source: Default::default(),
+            runtime_selection_revision: 0,
+            runtime_binary_fingerprint: None,
+            previous_runtime_source: None,
+            update_cache: Default::default(),
+            extra: Default::default(),
+            saved_projects: Vec::new(),
+            topology: None,
+            project: None,
+            runtime: None,
+            runtime_autostart: None,
+            preferred_connection: None,
+            tunnel_proxy: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedProject {
+    pub project: ProjectSelection,
+    pub runner_config: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -548,8 +606,21 @@ mod tests {
             ExposureReadiness::RemoteReady,
             ProjectReadiness::None,
         );
-        assert!(!missing_project.runtime_ready);
-        assert!(!missing_project.ready_for_chatgpt);
+        assert!(missing_project.runtime_ready);
+        assert!(missing_project.ready_for_chatgpt);
+
+        let stale_project = aggregate_readiness(
+            ServerReadiness::Ready,
+            RunnerReadiness::Ready,
+            ExposureReadiness::RemoteReady,
+            ProjectReadiness::ReloadRequired,
+        );
+        assert!(stale_project.runtime_ready);
+        assert!(!stale_project.ready_for_chatgpt);
+        assert_eq!(
+            stale_project.summary_kind,
+            ReadinessSummaryKind::ProjectNotReady
+        );
 
         let local_only = aggregate_readiness(
             ServerReadiness::Ready,

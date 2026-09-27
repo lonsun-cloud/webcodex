@@ -2,7 +2,6 @@ use super::Database;
 use anyhow::Context;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 impl Database {
     pub fn open(db_path: &PathBuf) -> anyhow::Result<Self> {
@@ -19,23 +18,20 @@ impl Database {
             ",
         )?;
         let state_path = std::fs::canonicalize(db_path).context("resolve database state path")?;
-        let db = Self {
-            conn: Mutex::new(conn),
-            state_path,
-            window_projects: Mutex::new(std::collections::HashMap::new()),
-        };
+        let db = Self::from_connection(conn, state_path);
         db.init_tables()?;
         // Personal-use instance: reclaim dead auth rows on every open rather
         // than running a background reaper.
         let now = chrono::Utc::now().timestamp();
         db.purge_stale_auth_rows(now)?;
+        db.prune_job_receipts(now)?;
         Ok(db)
     }
 
     /// Delete expired / used / revoked auth material that can never be used
     /// again. Safe to call repeatedly; returns the total number of deleted rows.
     pub fn purge_stale_auth_rows(&self, now: i64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Core);
         let mut deleted = 0usize;
         deleted += conn.execute(
             "DELETE FROM oauth_authorization_codes
@@ -72,9 +68,35 @@ impl Database {
     }
 
     fn init_tables(&self) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Schema);
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS wc_external_observations (
+                session_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                exit_code INTEGER,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, adapter_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS wc_job_receipts (
+                job_id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                runner_instance_id TEXT NOT NULL,
+                auth_kind TEXT NOT NULL,
+                auth_partition TEXT,
+                owner_at_admission TEXT,
+                kind TEXT NOT NULL,
+                snapshot TEXT NOT NULL,
+                terminal_observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_receipts_expiry ON wc_job_receipts(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_job_receipts_runner_history
+                ON wc_job_receipts(client_id, terminal_observed_at DESC, job_id DESC);
+
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
@@ -128,6 +150,7 @@ impl Database {
                 used_at INTEGER,
                 user_token_name TEXT,
                 agent_token_name TEXT,
+                runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1)),
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
             CREATE INDEX IF NOT EXISTS idx_pairing_codes_hash ON pairing_codes(code_hash);
@@ -307,269 +330,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_client ON oauth_refresh_tokens(client_id);
             CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_user ON oauth_refresh_tokens(user_id);
 
-            CREATE TABLE IF NOT EXISTS wc_projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS wc_workspaces (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                executor_ref TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_workspaces_project
-                ON wc_workspaces(project_id);
-
-            CREATE TABLE IF NOT EXISTS wc_connector_grants (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                subject_id TEXT NOT NULL,
-                profile TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                revoked_at INTEGER,
-                UNIQUE(project_id, subject_id),
-                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_connector_grants_subject
-                ON wc_connector_grants(subject_id, revoked_at);
-
-            CREATE TABLE IF NOT EXISTS wc_tasks (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                owner_subject_id TEXT NOT NULL,
-                goal TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('normal', 'inspect', 'read_only')),
-                status TEXT NOT NULL
-                    CHECK(status IN ('active', 'ready_for_review', 'accepted', 'rejected')),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                guidance_seen_seq INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY(project_id) REFERENCES wc_projects(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_tasks_owner_project
-                ON wc_tasks(owner_subject_id, project_id, updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS wc_runs (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'interrupted')),
-                started_at INTEGER NOT NULL,
-                finished_at INTEGER,
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id),
-                FOREIGN KEY(workspace_id) REFERENCES wc_workspaces(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_runs_task_started
-                ON wc_runs(task_id, started_at DESC);
-
-            CREATE TABLE IF NOT EXISTS wc_run_contexts (
-                run_id TEXT PRIMARY KEY,
-                target_executor_ref TEXT NOT NULL,
-                execution_executor_ref TEXT NOT NULL,
-                target_root TEXT NOT NULL,
-                execution_root TEXT NOT NULL,
-                baseline_commit TEXT,
-                baseline_tree TEXT,
-                isolated INTEGER NOT NULL CHECK(isolated IN (0, 1)),
-                created_at INTEGER NOT NULL,
-                CHECK(isolated = 0 OR (baseline_commit IS NOT NULL AND baseline_tree IS NOT NULL)),
-                FOREIGN KEY(run_id) REFERENCES wc_runs(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS wc_task_results (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL UNIQUE,
-                run_id TEXT NOT NULL UNIQUE,
-                summary TEXT NOT NULL,
-                patch_artifact TEXT,
-                patch_sha256 TEXT,
-                patch_bytes INTEGER NOT NULL CHECK(patch_bytes >= 0),
-                changed_paths_json TEXT NOT NULL,
-                validation_json TEXT NOT NULL,
-                warnings_json TEXT NOT NULL,
-                decision_status TEXT NOT NULL
-                    CHECK(decision_status IN ('pending', 'accepted', 'rejected')),
-                decided_by TEXT,
-                decided_at INTEGER,
-                cleanup_warning TEXT,
-                created_at INTEGER NOT NULL,
-                CHECK(
-                    (patch_bytes = 0 AND patch_artifact IS NULL AND patch_sha256 IS NULL)
-                    OR
-                    (patch_bytes > 0 AND patch_artifact IS NOT NULL AND patch_sha256 IS NOT NULL)
-                ),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id),
-                FOREIGN KEY(run_id) REFERENCES wc_runs(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_task_results_decision
-                ON wc_task_results(decision_status, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS wc_result_decision_intents (
-                task_id TEXT PRIMARY KEY,
-                result_id TEXT NOT NULL,
-                decision TEXT NOT NULL CHECK(decision IN ('accepted', 'rejected')),
-                actor TEXT NOT NULL,
-                started_at INTEGER NOT NULL,
-                state TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(state IN ('pending', 'needs_attention')),
-                error_code TEXT,
-                error_message TEXT,
-                last_attempt_at INTEGER,
-                FOREIGN KEY(task_id) REFERENCES wc_task_results(task_id),
-                FOREIGN KEY(result_id) REFERENCES wc_task_results(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS wc_approvals (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                action_kind TEXT NOT NULL,
-                action_hash TEXT NOT NULL,
-                action_summary TEXT NOT NULL,
-                state TEXT NOT NULL
-                    CHECK(state IN ('pending', 'approved', 'denied', 'consumed', 'expired')),
-                requested_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                decided_by TEXT,
-                decided_at INTEGER,
-                decision_reason TEXT,
-                consumed_at INTEGER,
-                CHECK(expires_at > requested_at),
-                UNIQUE(task_id, run_id, action_hash),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id),
-                FOREIGN KEY(run_id) REFERENCES wc_runs(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_approvals_task_state
-                ON wc_approvals(task_id, state, requested_at DESC);
-
-            CREATE TABLE IF NOT EXISTS wc_edit_operations (
-                task_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                request_sha256 TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed')),
-                result_json TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(task_id, operation_id),
-                CHECK(
-                    (state IN ('pending', 'failed') AND result_json IS NULL)
-                    OR (state = 'completed' AND result_json IS NOT NULL)
-                ),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS wc_executions (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL CHECK(kind IN ('command', 'check')),
-                task_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN (
-                    'accepted', 'queued', 'starting', 'running', 'cancel_requested',
-                    'succeeded', 'failed', 'cancelled', 'interrupted', 'unknown'
-                )),
-                submitted_at INTEGER NOT NULL,
-                queued_at INTEGER,
-                queue_deadline INTEGER NOT NULL,
-                started_at INTEGER,
-                last_output_at INTEGER,
-                finished_at INTEGER,
-                stdout_cursor INTEGER NOT NULL DEFAULT 1 CHECK(stdout_cursor >= 1),
-                stderr_cursor INTEGER NOT NULL DEFAULT 1 CHECK(stderr_cursor >= 1),
-                exit_code INTEGER,
-                failure_source TEXT,
-                failure_code TEXT,
-                cancel_requested_at INTEGER,
-                terminal_reason TEXT,
-                operation_id TEXT NOT NULL,
-                request_sha256 TEXT NOT NULL,
-                executor_reference TEXT,
-                first_status_failure_at INTEGER,
-                last_successful_observation_at INTEGER,
-                status_failure_code TEXT,
-                check_plan TEXT,
-                check_recipe_json TEXT,
-                check_completed INTEGER NOT NULL DEFAULT 0 CHECK(check_completed >= 0),
-                check_workspace_sha256 TEXT,
-                validated_workspace_sha256 TEXT,
-                failed_check TEXT,
-                assertion_evidence_json TEXT,
-                terminal_continuation_intent TEXT NOT NULL DEFAULT 'none'
-                    CHECK(terminal_continuation_intent IN ('none', 'armed_for_terminal')),
-                terminal_continuation_armed_at INTEGER,
-                terminal_continuation_delivery_state TEXT NOT NULL DEFAULT 'unclaimed'
-                    CHECK(terminal_continuation_delivery_state IN (
-                        'unclaimed', 'claimed', 'dispatching', 'delivered', 'delivery_unknown'
-                    )),
-                terminal_continuation_claim_fence TEXT
-                    CHECK(terminal_continuation_claim_fence IS NULL OR (
-                        length(terminal_continuation_claim_fence) BETWEEN 1 AND 80
-                    )),
-                mcp_task_materialized_at INTEGER,
-                mcp_task_result_finalized_at INTEGER,
-                mcp_task_output_tail_json TEXT,
-                CHECK(
-                    (terminal_continuation_delivery_state = 'unclaimed'
-                        AND terminal_continuation_claim_fence IS NULL)
-                    OR (terminal_continuation_delivery_state IN ('claimed', 'dispatching')
-                        AND terminal_continuation_claim_fence IS NOT NULL)
-                    OR (terminal_continuation_delivery_state IN ('delivered', 'delivery_unknown')
-                        AND terminal_continuation_claim_fence IS NULL)
-                ),
-                UNIQUE(task_id, run_id, operation_id),
-                CHECK(
-                    (kind = 'command' AND check_plan IS NULL)
-                    OR (kind = 'check' AND check_plan IS NOT NULL)
-                ),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id),
-                FOREIGN KEY(run_id) REFERENCES wc_runs(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_executions_task_submitted
-                ON wc_executions(task_id, submitted_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_wc_executions_run_state
-                ON wc_executions(run_id, state, submitted_at DESC);
-
-            CREATE TABLE IF NOT EXISTS wc_task_events (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                sequence INTEGER NOT NULL CHECK(sequence > 0),
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                UNIQUE(task_id, sequence),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id),
-                FOREIGN KEY(run_id) REFERENCES wc_runs(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_task_events_task_sequence
-                ON wc_task_events(task_id, sequence);
-
-            CREATE TABLE IF NOT EXISTS wc_window_project_contexts (
-                window_key TEXT NOT NULL,
-                window_source TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                owner_subject_id TEXT NOT NULL,
-                project_root_sha256 TEXT NOT NULL,
-                task_id TEXT NOT NULL UNIQUE,
-                target_path TEXT NOT NULL DEFAULT '',
-                fingerprint_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(
-                    window_key,
-                    project_id,
-                    owner_subject_id,
-                    project_root_sha256
-                ),
-                FOREIGN KEY(project_id) REFERENCES wc_projects(id),
-                FOREIGN KEY(task_id) REFERENCES wc_tasks(id)
-            );
-
             CREATE TABLE IF NOT EXISTS admin_project_lifecycle_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at INTEGER NOT NULL,
@@ -622,37 +382,73 @@ impl Database {
                 ON workspace_activity(id DESC);
             CREATE INDEX IF NOT EXISTS idx_workspace_activity_scope
                 ON workspace_activity(scope_kind, scope_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS project_references (
+                principal_key TEXT NOT NULL,
+                ref_index INTEGER NOT NULL CHECK(ref_index >= 1),
+                canonical_project_id TEXT NOT NULL,
+                root_fingerprint TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(principal_key, ref_index),
+                UNIQUE(principal_key, canonical_project_id, root_fingerprint)
+            );
             ",
         )?;
 
         Self::ensure_oauth_client_refresh_token_mode_schema(&mut conn)?;
+
+        // Preserve the authority of previously issued enrollment codes. Only a
+        // newly issued explicit admin grant adds ACP/SSH scopes; old codes stay 0.
+        {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !table_columns(&tx, "pairing_codes")?
+                .iter()
+                .any(|column| column == "runner_capabilities")
+            {
+                tx.execute_batch("ALTER TABLE pairing_codes ADD COLUMN runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1));")?;
+            }
+            tx.commit()?;
+        }
         // ActionAudit predates Window correlation. Fresh databases already have
         // the current columns above; existing databases receive the same shape
         // through this additive, idempotent migration.
         Self::ensure_action_event_window_schema(&mut conn)?;
+        Self::ensure_action_event_observability_views(&mut conn)?;
 
         // Durable Agent identity and Conversation state are an independent
         // communication domain. Workflow Session and project Memory ledgers
         // remain separate authoritative stores.
         Self::ensure_communication_schema(&mut conn)?;
-        // Agent Wake is a distinct durable continuation/outbox domain. It is
-        // initialized only after Agent, Endpoint, Message, and Inbox tables so
-        // all stable references are enforceable by foreign keys.
-        Self::ensure_agent_wake_schema(&mut conn)?;
-
         // AgentTask and AgentTaskAttempt are an independent durable work-ownership
         // domain. They reference durable Agents/Conversations for correlation only
         // and deliberately do not bind any execution backend in A3.
         Self::ensure_agent_task_schema(&mut conn)?;
 
+        // AgentWait is a one-shot durable interest in future source facts. Sources
+        // reference AgentTasks, while the Wait itself owns no source-domain authority.
+        Self::ensure_agent_wait_schema(&mut conn)?;
+
+        // Generic Job terminal attention has its own authority model and bounded
+        // one-shot store; it deliberately does not reuse Durable Agent waits.
+        Self::ensure_job_terminal_wait_schema(&mut conn)?;
+
+        // Agent Wake is the shared durable continuation/outbox domain. Initialize it
+        // after AgentTask and AgentWait so every source foreign key is enforceable.
+        Self::ensure_agent_wake_schema(&mut conn)?;
+
+        // Goal is independent high-level durable intent/control state. It may
+        // correlate AgentTasks and Workflow Sessions, but owns no execution authority.
+        Self::ensure_goal_schema(&mut conn)?;
+
+        // Agent attention is a narrow semantic-fact domain. The first and only
+        // event kind records terminal Goal-correlated AgentTask facts; it is not
+        // a generic event bus and owns no scheduling or Goal authority.
+        Self::ensure_agent_attention_schema(&mut conn)?;
+
         // Project Memory was introduced after v0.3.9. Only the current schema is
         // supported; development-only intermediate shapes are rejected.
         Self::ensure_project_memory_schema(&mut conn)?;
 
-        // Development database shapes are not migration inputs. Fresh databases
-        // are created above with the current execution schema; any pre-current
-        // persisted shape must be recreated instead of being altered in place.
-        Self::ensure_current_execution_schema(&conn)?;
         Ok(())
     }
 
@@ -721,7 +517,55 @@ impl Database {
                 ON action_event_workflow_links(workflow_session_id, linked_at_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_action_events_window_started
                 ON action_events(client_window_key, window_started_at_ms DESC)
-                WHERE client_window_key IS NOT NULL;";
+                WHERE client_window_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_action_events_window_completed
+                ON action_events(client_window_key, window_ended_at_ms DESC, event_id DESC)
+                WHERE window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_action_events_window_meaningful_completed
+                ON action_events(client_window_key, window_ended_at_ms DESC, event_id DESC)
+                WHERE window_meaningful = 1 AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS window_peer_messages (
+                message_id TEXT PRIMARY KEY,
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                sender_window_key TEXT NOT NULL,
+                recipient_window_key TEXT NOT NULL,
+                sender_peer_id TEXT NOT NULL,
+                recipient_peer_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                message TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                requires_ack INTEGER NOT NULL CHECK(requires_ack IN (0, 1)),
+                created_at_ms INTEGER NOT NULL,
+                sender_session_id TEXT,
+                sender_project TEXT,
+                first_projected_at_ms INTEGER,
+                last_projected_at_ms INTEGER,
+                projection_count INTEGER NOT NULL DEFAULT 0,
+                first_ack_observed_at_ms INTEGER,
+                delivery_key_hash TEXT,
+                delivery_payload_hash TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_window_peer_messages_recipient
+                ON window_peer_messages(
+                    principal_kind, principal_id, recipient_window_key,
+                    requires_ack, first_projected_at_ms, created_at_ms
+                );
+
+            CREATE TABLE IF NOT EXISTS window_peer_discoveries (
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                observer_window_key TEXT NOT NULL,
+                peer_window_key TEXT NOT NULL,
+                project TEXT NOT NULL,
+                first_projected_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(
+                    principal_kind, principal_id, observer_window_key,
+                    peer_window_key, project
+                )
+            );";
 
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -739,8 +583,126 @@ impl Database {
         }
         tx.execute_batch(CHILD_SCHEMA)
             .context("create ActionAudit Window correlation schema")?;
+        let mut peer_columns = table_columns(&tx, "window_peer_messages")?;
+        for (name, definition) in [
+            ("delivery_key_hash", "TEXT"),
+            ("delivery_payload_hash", "TEXT"),
+        ] {
+            if peer_columns.iter().any(|column| column == name) {
+                continue;
+            }
+            tx.execute_batch(&format!(
+                "ALTER TABLE window_peer_messages ADD COLUMN {name} {definition};"
+            ))
+            .with_context(|| format!("add Peer message replay column {name}"))?;
+            peer_columns.push(name.to_string());
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_window_peer_messages_delivery
+                 ON window_peer_messages(
+                    principal_kind, principal_id, sender_window_key, delivery_key_hash
+                 )
+                 WHERE delivery_key_hash IS NOT NULL;",
+        )
+        .context("create Peer message delivery replay index")?;
         tx.commit()
             .context("commit ActionAudit Window schema migration")?;
+        Ok(())
+    }
+
+    fn ensure_action_event_observability_views(conn: &mut Connection) -> anyhow::Result<()> {
+        // Views are derived observability contracts over the canonical ActionAudit row.
+        // Creation is idempotent and introduces no second telemetry write path.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_action_events_operation_started
+                 ON action_events(operation, started_at DESC)
+                 WHERE operation IS NOT NULL;
+             CREATE VIEW IF NOT EXISTS code_mode_action_traces AS
+             SELECT
+                 event_id,
+                 session_id AS action_session_id,
+                 started_at,
+                 ended_at,
+                 duration_ms AS outer_duration_ms,
+                 operation,
+                 project,
+                 status,
+                 http_status,
+                 principal_kind,
+                 principal_user_id,
+                 client_window_key,
+                 client_window_source,
+                 server_trace_id,
+                 request_observed_at_ms,
+                 response_handed_at_ms,
+                 CASE
+                     WHEN request_observed_at_ms IS NOT NULL
+                      AND response_handed_at_ms IS NOT NULL
+                      AND response_handed_at_ms >= request_observed_at_ms
+                     THEN response_handed_at_ms - request_observed_at_ms
+                 END AS service_ms,
+                 window_transition_kind,
+                 response_streaming,
+                 window_continuity_eligible,
+                 window_meaningful,
+                 json_extract(summary_json, '$.model_ergonomics.duration_ms')
+                     AS model_runtime_duration_ms,
+                 json_extract(summary_json, '$.model_ergonomics.serialized_result_bytes')
+                     AS serialized_result_bytes,
+                 json_extract(summary_json, '$.model_ergonomics.context_recovery_bytes')
+                     AS context_recovery_bytes,
+                 json_extract(summary_json, '$.model_ergonomics.session_recovery_event_count')
+                     AS session_recovery_event_count,
+                 json_extract(summary_json, '$.model_ergonomics.session_recovery_truncated')
+                     AS session_recovery_truncated,
+                 json_extract(summary_json, '$.model_ergonomics.session_history_lost')
+                     AS session_history_lost,
+                 CASE
+                     WHEN json_type(summary_json, '$.code_mode_composition') = 'object' THEN 1
+                     ELSE 0
+                 END AS composition_available,
+                 json_extract(summary_json, '$.code_mode_composition.input_bytes') AS input_bytes,
+                 json_extract(summary_json, '$.code_mode_composition.returned_bytes') AS returned_bytes,
+                 json_extract(summary_json, '$.code_mode_composition.nested_raw_result_bytes_total')
+                     AS nested_raw_result_bytes_total,
+                 json_extract(summary_json, '$.code_mode_composition.nested_calls') AS nested_calls,
+                 json_extract(summary_json, '$.code_mode_composition.nested_successes')
+                     AS nested_successes,
+                 json_extract(summary_json, '$.code_mode_composition.nested_failures')
+                     AS nested_failures,
+                 json_extract(summary_json, '$.code_mode_composition.max_in_flight')
+                     AS max_in_flight,
+                 json_extract(summary_json, '$.code_mode_composition.duration_ms')
+                     AS composition_duration_ms,
+                 json_extract(summary_json, '$.code_mode_composition.slot_wait_ms') AS slot_wait_ms,
+                 json_extract(summary_json, '$.code_mode_composition.consequential_calls')
+                     AS consequential_calls,
+                 json_extract(summary_json, '$.code_mode_composition.known_results') AS known_results,
+                 json_extract(summary_json, '$.code_mode_composition.job_handoffs') AS job_handoffs,
+                 json_extract(summary_json, '$.code_mode_composition.outcome_unknown') AS outcome_unknown,
+                 json_extract(summary_json, '$.code_mode_composition.nested_tool_counts')
+                     AS nested_tool_counts_json
+             FROM action_events
+             WHERE operation IN (
+                 'code_mode_exec', 'code_mode_exec_effectful', 'code_mode_exec_mutating'
+             );
+             CREATE VIEW IF NOT EXISTS code_mode_nested_tool_usage AS
+             SELECT
+                 traces.event_id,
+                 traces.action_session_id,
+                 traces.started_at,
+                 traces.operation,
+                 traces.project,
+                 traces.status,
+                 tools.key AS tool_name,
+                 CAST(tools.value AS INTEGER) AS calls
+             FROM code_mode_action_traces AS traces
+             JOIN json_each(traces.nested_tool_counts_json) AS tools
+             WHERE tools.key IS NOT NULL
+               AND tools.type = 'integer'
+               AND CAST(tools.value AS INTEGER) >= 0;",
+        )
+        .context("create ActionAudit observability views")?;
         Ok(())
     }
 
@@ -823,62 +785,6 @@ impl Database {
             .context("commit project Memory schema initialization")?;
         Ok(())
     }
-
-    fn ensure_current_execution_schema(conn: &Connection) -> anyhow::Result<()> {
-        const CURRENT_EXECUTION_COLUMNS: &[&str] = &[
-            "id",
-            "kind",
-            "task_id",
-            "run_id",
-            "state",
-            "submitted_at",
-            "queued_at",
-            "queue_deadline",
-            "started_at",
-            "last_output_at",
-            "finished_at",
-            "stdout_cursor",
-            "stderr_cursor",
-            "exit_code",
-            "failure_source",
-            "failure_code",
-            "cancel_requested_at",
-            "terminal_reason",
-            "operation_id",
-            "request_sha256",
-            "executor_reference",
-            "first_status_failure_at",
-            "last_successful_observation_at",
-            "status_failure_code",
-            "check_plan",
-            "check_recipe_json",
-            "check_completed",
-            "check_workspace_sha256",
-            "validated_workspace_sha256",
-            "failed_check",
-            "assertion_evidence_json",
-            "terminal_continuation_intent",
-            "terminal_continuation_armed_at",
-            "terminal_continuation_delivery_state",
-            "terminal_continuation_claim_fence",
-            "mcp_task_materialized_at",
-            "mcp_task_result_finalized_at",
-            "mcp_task_output_tail_json",
-        ];
-
-        let columns = table_columns(conn, "wc_executions")?;
-        let current_shape = CURRENT_EXECUTION_COLUMNS
-            .iter()
-            .copied()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if columns != current_shape {
-            anyhow::bail!(
-                "unsupported wc_executions schema shape; recreate post-v0.3.9 development state"
-            );
-        }
-        Ok(())
-    }
 }
 
 fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
@@ -958,6 +864,113 @@ mod action_event_window_migration_tests {
     use super::*;
 
     #[test]
+    fn code_mode_observability_views_flatten_current_and_historical_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("code-mode-observability.db");
+        let db = Database::open(&path).unwrap();
+        let conn = db.conn_for_tests();
+        conn.execute(
+            "INSERT INTO action_sessions (session_id, status, created_at, updated_at)
+             VALUES ('audit-session', 'open', 1, 1)",
+            [],
+        )
+        .unwrap();
+        for (event_id, operation, status, summary_json) in [
+            (
+                "old-composition",
+                "code_mode_exec",
+                "success",
+                r#"{"transport":"mcp","code_mode_composition":{"nested_calls":2,"nested_successes":2,"nested_failures":0,"max_in_flight":1,"duration_ms":10,"slot_wait_ms":0,"returned_bytes":120,"nested_raw_result_bytes_total":500,"nested_tool_counts":{"read_files":2},"consequential_calls":0,"known_results":0,"job_handoffs":0,"outcome_unknown":0}}"#,
+            ),
+            (
+                "current-composition",
+                "code_mode_exec_effectful",
+                "success",
+                r#"{"transport":"mcp","model_ergonomics":{"duration_ms":19,"serialized_result_bytes":777},"code_mode_composition":{"nested_calls":1,"nested_successes":1,"nested_failures":0,"max_in_flight":1,"duration_ms":20,"slot_wait_ms":3,"input_bytes":42,"returned_bytes":90,"nested_raw_result_bytes_total":250,"nested_tool_counts":{"cargo_check":1},"consequential_calls":1,"known_results":1,"job_handoffs":0,"outcome_unknown":0}}"#,
+            ),
+            (
+                "pre-composition",
+                "code_mode_exec_mutating",
+                "failed",
+                r#"{"transport":"mcp"}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO action_events (
+                    event_id, session_id, started_at, ended_at, duration_ms,
+                    endpoint, operation, action_name, status,
+                    changed_files_json, ids_json, summary_json
+                 ) VALUES (?1, 'audit-session', 10, 20, 10, '/mcp', ?2, 'toolsCall', ?3,
+                           '[]', '{}', ?4)",
+                rusqlite::params![event_id, operation, status, summary_json],
+            )
+            .unwrap();
+        }
+
+        let aggregate: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT count(*), sum(composition_available),
+                        sum(coalesce(input_bytes, 0)), sum(coalesce(nested_calls, 0))
+                 FROM code_mode_action_traces",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(aggregate, (3, 2, 42, 3));
+        conn.execute(
+            "UPDATE action_events
+             SET request_observed_at_ms = 100, response_handed_at_ms = 140
+             WHERE event_id = 'current-composition'",
+            [],
+        )
+        .unwrap();
+        let outer: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT service_ms, model_runtime_duration_ms, serialized_result_bytes
+                 FROM code_mode_action_traces WHERE event_id = 'current-composition'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(outer, (40, 19, 777));
+
+        let mut statement = conn
+            .prepare(
+                "SELECT tool_name, calls FROM code_mode_nested_tool_usage
+                 ORDER BY tool_name",
+            )
+            .unwrap();
+        let usage = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            usage,
+            vec![
+                ("cargo_check".to_string(), 1),
+                ("read_files".to_string(), 2)
+            ]
+        );
+        drop(statement);
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let conn = reopened.conn_for_tests();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM code_mode_action_traces", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            3,
+            "derived views must reopen idempotently without losing rows"
+        );
+    }
+
+    #[test]
     fn legacy_action_events_upgrade_additively_and_remain_readable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("legacy-window-audit.db");
@@ -1017,7 +1030,7 @@ mod action_event_window_migration_tests {
         assert!(!rows[0].window_meaningful);
         assert!(rows[0].recorder_gap_session_id.is_none());
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn_for_tests();
             let columns = table_columns(&conn, "action_events").unwrap();
             for expected in [
                 "client_window_key",
@@ -1050,86 +1063,5 @@ mod action_event_window_migration_tests {
             1,
             "migration must be idempotent and preserve legacy audit rows"
         );
-    }
-}
-
-#[cfg(test)]
-mod connector_execution_column_tests {
-    use super::*;
-
-    fn create_v039_execution_schema(conn: &Connection) {
-        conn.execute_batch(
-            "CREATE TABLE wc_executions (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                state TEXT NOT NULL,
-                submitted_at INTEGER NOT NULL,
-                queued_at INTEGER,
-                queue_deadline INTEGER NOT NULL,
-                started_at INTEGER,
-                last_output_at INTEGER,
-                finished_at INTEGER,
-                stdout_cursor INTEGER NOT NULL DEFAULT 1,
-                stderr_cursor INTEGER NOT NULL DEFAULT 1,
-                exit_code INTEGER,
-                failure_source TEXT,
-                failure_code TEXT,
-                cancel_requested_at INTEGER,
-                terminal_reason TEXT,
-                operation_id TEXT NOT NULL,
-                request_sha256 TEXT NOT NULL,
-                executor_reference TEXT,
-                first_status_failure_at INTEGER,
-                last_successful_observation_at INTEGER,
-                status_failure_code TEXT,
-                check_plan TEXT,
-                check_recipe_json TEXT,
-                check_completed INTEGER NOT NULL DEFAULT 0,
-                check_workspace_sha256 TEXT,
-                validated_workspace_sha256 TEXT,
-                failed_check TEXT,
-                assertion_evidence_json TEXT
-            );
-            INSERT INTO wc_executions (
-                id, kind, task_id, run_id, state, submitted_at, queue_deadline,
-                operation_id, request_sha256
-            ) VALUES ('released', 'command', 'task', 'run', 'succeeded', 1, 2, 'op', 'sha');",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn v039_execution_schema_is_rejected_without_migration() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_v039_execution_schema(&conn);
-        let before = table_columns(&conn, "wc_executions").unwrap();
-
-        let error = Database::ensure_current_execution_schema(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("recreate post-v0.3.9 development state"));
-        assert_eq!(table_columns(&conn, "wc_executions").unwrap(), before);
-        let state: String = conn
-            .query_row(
-                "SELECT state FROM wc_executions WHERE id = 'released'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "succeeded");
-    }
-
-    #[test]
-    fn partial_post_v039_execution_schema_is_rejected() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_v039_execution_schema(&conn);
-        conn.execute_batch(
-            "ALTER TABLE wc_executions
-             ADD COLUMN terminal_continuation_intent TEXT NOT NULL DEFAULT 'none';",
-        )
-        .unwrap();
-
-        let error = Database::ensure_current_execution_schema(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("recreate post-v0.3.9 development state"));
     }
 }

@@ -393,8 +393,11 @@ pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "runner-real-process-tests")]
     use std::path::PathBuf;
+    #[cfg(feature = "runner-real-process-tests")]
     use std::sync::{Arc, OnceLock};
+    #[cfg(feature = "runner-real-process-tests")]
     use std::time::SystemTime;
 
     #[cfg(unix)]
@@ -430,13 +433,16 @@ mod tests {
     /// Compiled copy of the `validation_tree_helper` fixture, kept alive for
     /// the whole test process so its binary path never disappears under a
     /// running descendant (same pattern as the MCP/LSP/job-tree fixtures).
+    #[cfg(feature = "runner-real-process-tests")]
     struct ValidationTreeHelper {
         _temp: tempfile::TempDir,
         path: PathBuf,
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     static VALIDATION_TREE_HELPER: OnceLock<Arc<ValidationTreeHelper>> = OnceLock::new();
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn helper_binary() -> PathBuf {
         VALIDATION_TREE_HELPER
             .get_or_init(|| {
@@ -475,8 +481,10 @@ mod tests {
     }
 
     /// A unique temp file, removed on drop.
+    #[cfg(feature = "runner-real-process-tests")]
     struct CleanupPath(PathBuf);
 
+    #[cfg(feature = "runner-real-process-tests")]
     impl std::ops::Deref for CleanupPath {
         type Target = PathBuf;
         fn deref(&self) -> &PathBuf {
@@ -484,12 +492,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     impl Drop for CleanupPath {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn unique_temp_path(tag: &str) -> CleanupPath {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -507,6 +517,7 @@ mod tests {
     /// on the small GitHub CI runners, process startup can take well over a
     /// few seconds, so callers pass a generous 30s budget (matching the
     /// helper's own 30s gate).
+    #[cfg(feature = "runner-real-process-tests")]
     fn wait_until_file(path: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -521,6 +532,7 @@ mod tests {
     }
 
     /// Parse `KEY=<pid>` from a marker file written by the helper.
+    #[cfg(feature = "runner-real-process-tests")]
     fn read_pid(marker: &Path, key: &str) -> u32 {
         let text = std::fs::read_to_string(marker).expect("read pid marker");
         text.lines()
@@ -532,6 +544,7 @@ mod tests {
             .unwrap_or_else(|| panic!("marker {marker:?} missing {key}: {text}"))
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(windows)]
     fn process_alive(pid: u32) -> bool {
         use windows_sys::Win32::System::Threading::{
@@ -551,6 +564,7 @@ mod tests {
         ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(target_os = "linux")]
     fn process_alive(pid: u32) -> bool {
         // `kill(pid, 0)` also succeeds for zombies, while ManagedChild's Linux
@@ -572,6 +586,7 @@ mod tests {
         state != "Z" && state != "X"
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(all(unix, not(target_os = "linux")))]
     fn process_alive(pid: u32) -> bool {
         // SAFETY: signal 0 is an existence probe; the pid comes from our own
@@ -581,10 +596,12 @@ mod tests {
 
     /// Upper bound for the whole test body including cleanup; the child sleeps
     /// far longer, so any run exceeding this is a cleanup hang, not a slow exit.
+    #[cfg(feature = "runner-real-process-tests")]
     const BOUNDEDNESS_LIMIT: Duration = Duration::from_secs(30);
 
     /// A. Normal completion: real exit code, stdout/stderr capture, no errors.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_normal_completion_preserves_exit_code_and_capture() {
         let cwd = tempfile::tempdir().unwrap();
@@ -610,6 +627,7 @@ mod tests {
     /// B. Timeout terminates the entire tree: parent AND descendant must both
     /// be gone, with the timeout semantics unchanged.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_timeout_terminates_entire_tree() {
         let parent_marker = unique_temp_path("timeout-parent");
@@ -668,6 +686,7 @@ mod tests {
     /// cleanup: the descendant is terminated, the reader reaches EOF, and
     /// run_bounded stays bounded.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_parent_exit_alone_does_not_finish_cleanup() {
         let parent_marker = unique_temp_path("parent-first");
@@ -719,6 +738,7 @@ mod tests {
     /// D. Runner shutdown terminates the whole tree with the shutdown
     /// semantics unchanged.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_runner_shutdown_terminates_whole_tree() {
         let parent_marker = unique_temp_path("shutdown-parent");
@@ -782,7 +802,7 @@ mod tests {
 
     /// E. A SIGTERM-resistant tree is escalated to force: the graceful request
     /// gets a bounded grace, then the whole tree is killed. Never unbounded.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "runner-real-process-tests"))]
     #[test]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_sigterm_resistant_tree_is_forcefully_escalated() {
@@ -840,6 +860,7 @@ mod tests {
     /// F. Cleanup of an already-exited tree: no panic, no false infrastructure
     /// error, and it is idempotent.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_already_exited_cleanup_is_not_an_error() {
         // Normal completion runs cleanup after the tree already exited; the

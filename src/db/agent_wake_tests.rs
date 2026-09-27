@@ -251,9 +251,23 @@ fn fake_adapter_recovers_same_wake_before_fence_and_exact_consume_is_idempotent(
     assert_eq!(envelope.agent_id, fixture.receiver_agent_id);
     assert_eq!(envelope.endpoint_id, generation_two.endpoint_id);
     assert_eq!(envelope.controller_generation, 2);
+    assert!(envelope.resume_hint.contains("list_agent_inbox"));
+    assert!(envelope.resume_hint.contains("read_conversation"));
     assert!(envelope
         .resume_hint
-        .contains("read the authoritative Agent Inbox"));
+        .contains("authoritative current deliveries"));
+    assert!(envelope
+        .resume_hint
+        .contains("consume this exact Wake with consume_agent_wake"));
+    assert!(envelope
+        .resume_hint
+        .contains("consume processed Delivery ids separately"));
+    assert!(envelope
+        .resume_hint
+        .contains("Re-authorize any non-communication capabilities"));
+    assert!(envelope
+        .resume_hint
+        .contains("Report the actual result or blocker"));
     assert!(!envelope.resume_hint.contains(secret_body));
     assert!(!envelope
         .resume_hint

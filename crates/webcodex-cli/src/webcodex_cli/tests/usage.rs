@@ -292,7 +292,6 @@ fn unified_project_and_auth_commands_dispatch() {
         &["setup", "--help"][..],
         &["status", "--help"][..],
         &["doctor", "--help"][..],
-        &["task", "--help"][..],
         &["run", "--help"][..],
         &["share", "--help"][..],
     ] {
@@ -300,6 +299,13 @@ fn unified_project_and_auth_commands_dispatch() {
             cli_action(args.iter().copied()),
             CliAction::Project(_)
         ));
+    }
+    match cli_action(["task", "list"]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.starts_with("unknown command: task"), "{stderr}");
+        }
+        other => panic!("retired task namespace still dispatched: {other:?}"),
     }
     match cli_action(["auth", "status", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
@@ -342,6 +348,8 @@ fn webcodex_cli_runner_help_mentions_lifecycle_subcommands() {
             assert!(stdout.contains("Stable Runner client id"));
             assert!(stdout.contains("Human-readable Runner name"));
             assert!(stdout.contains("runner.toml"));
+            assert!(stdout.contains("--project-registry-dir PATH"));
+            assert!(!stdout.contains("--projects-dir PATH"));
         }
         other => panic!("expected Runner init help exit, got {other:?}"),
     }
@@ -557,33 +565,23 @@ fn canonical_plural_admin_actions_dispatch_and_singular_groups_fail_closed() {
 }
 
 #[test]
-fn legacy_agent_tokens_alias_uses_canonical_runner_token_implementation() {
-    assert!(matches!(
-        cli_action([
-            "agent-tokens",
-            "create-local",
-            "--server-url",
-            "https://example.test",
-            "--username",
-            "alice",
-            "--credential",
-            "wc_acct_example",
-            "--client-id",
-            "runner-1",
-        ]),
-        CliAction::RunnerTokenCreateLocal(_)
-    ));
-    assert!(matches!(
-        cli_action([
-            "agent-tokens",
-            "list",
-            "--server-url",
-            "https://example.test",
-            "--username",
-            "alice",
-        ]),
-        CliAction::Admin(_)
-    ));
+fn retired_agent_tokens_alias_reports_canonical_replacement() {
+    for action in ["create-local", "list"] {
+        match cli_action(["agent-tokens", action]) {
+            CliAction::Exit {
+                code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(code, 2);
+                assert!(stdout.is_empty());
+                assert!(stderr.contains("agent-tokens"), "{stderr}");
+                assert!(stderr.contains("removed"), "{stderr}");
+                assert!(stderr.contains("webcodex runner-tokens"), "{stderr}");
+            }
+            other => panic!("retired agent-tokens alias still dispatched: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -668,6 +666,23 @@ fn removed_user_selection_aliases_are_rejected() {
             }
             other => panic!("removed --username alias still dispatched: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn pairing_create_rejects_retired_agent_token_name_flag() {
+    match cli_action(["pairing", "create", "--agent-token-name", "legacy"]) {
+        CliAction::Exit {
+            code,
+            stdout,
+            stderr,
+        } => {
+            assert_eq!(code, 2);
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("--agent-token-name is retired"), "{stderr}");
+            assert!(stderr.contains("--runner-token-name"), "{stderr}");
+        }
+        other => panic!("retired --agent-token-name still dispatched: {other:?}"),
     }
 }
 

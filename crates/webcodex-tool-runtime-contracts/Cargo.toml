@@ -4,6 +4,11 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+experimental-code-mode = ["webcodex-tool-contracts/experimental-code-mode"]
+workspace-checkpoints = ["webcodex-tool-contracts/workspace-checkpoints"]
+
 [dependencies]
 webcodex-core = { path = "../webcodex-core" }
 webcodex-tool-contracts = { path = "../webcodex-tool-contracts" }
@@ -11,6 +16,3 @@ webcodex-workflow-session = { path = "../webcodex-workflow-session" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-
-[dev-dependencies]
-webcodex-tool-contracts = { path = "../webcodex-tool-contracts", features = ["root-test-support"] }

@@ -1,5 +1,7 @@
 use super::{ValidationAdapter, ValidationCommandOptions, ValidationFailureEvidence};
-use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
+use webcodex_core::runner_protocol::{
+    normalize_cargo_packages, normalize_cargo_value, normalize_rust_test_filter,
+};
 use webcodex_core::shell_quote::shell_escape_simple;
 use webcodex_core::validation_evidence::{
     parse_cargo_check_diagnostics, parse_cargo_test_diagnostics, ValidationDiagnostics,
@@ -156,7 +158,11 @@ fn cargo_fmt_command(check: bool) -> String {
 
 fn cargo_check_command(options: ValidationCommandOptions) -> Result<String, String> {
     let features = validate_arg("features", options.features)?;
-    let package = validate_arg("package", options.package)?;
+    let packages = normalize_cargo_packages(
+        options.package.as_deref(),
+        options.cargo_packages.as_deref(),
+    )
+    .map_err(|reason| format!("packages {reason}"))?;
     let mut args = vec!["cargo".to_string(), "check".to_string()];
     if options.all_targets.unwrap_or(true) {
         args.push("--all-targets".to_string());
@@ -171,7 +177,7 @@ fn cargo_check_command(options: ValidationCommandOptions) -> Result<String, Stri
         args.push("--features".to_string());
         args.push(shell_escape_simple(&features));
     }
-    if let Some(package) = package {
+    for package in packages.into_iter().flatten() {
         args.push("-p".to_string());
         args.push(shell_escape_simple(&package));
     }
@@ -179,12 +185,18 @@ fn cargo_check_command(options: ValidationCommandOptions) -> Result<String, Stri
 }
 
 fn cargo_test_command(options: ValidationCommandOptions) -> Result<String, String> {
+    if options.cargo_packages.is_some() {
+        return Err("cargo_test does not accept cargo_check packages".to_string());
+    }
     let filter = validate_filter(options.filter)?;
     let features = validate_arg("features", options.features)?;
     let package = validate_arg("package", options.package)?;
     let mut args = vec!["cargo".to_string(), "test".to_string()];
     if let Some(filter) = filter {
         args.push(shell_escape_simple(&filter));
+    }
+    if options.lib.unwrap_or(false) {
+        args.push("--lib".to_string());
     }
     if options.all_targets.unwrap_or(false) {
         args.push("--all-targets".to_string());

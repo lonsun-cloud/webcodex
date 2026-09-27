@@ -5,9 +5,9 @@
 //! `ToolResult` projection before attaching it to the existing Action Audit row.
 
 use super::edit_tool_telemetry::{edit_tool_surface, EditToolSurface};
-use super::sessions::SessionContextRevisionAck;
 use super::tool_definition::model_visible_tool_definitions;
 use super::{ToolResult, RECOVERY_KIND_VALUES};
+use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(test)]
@@ -15,12 +15,42 @@ use std::time::Duration;
 use std::time::Instant;
 
 const MAX_STRUCTURED_KIND_BYTES: usize = 64;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextAckShape {
-    Unsupported,
-    Missing,
-    Revision,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkOnProjectSource {
+    Project,
+    Path,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkOnProjectMode {
+    Checkout,
+    Worktree,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkOnProjectGuidanceProfile {
+    Direct,
+    HostCodeMode,
+    CodeMode,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkOnProjectErgonomicsFacts {
+    resume_requested: bool,
+    source: WorkOnProjectSource,
+    mode: WorkOnProjectMode,
+    mode_explicit: bool,
+    base_ref_present: bool,
+    guidance_profile: WorkOnProjectGuidanceProfile,
+    guidance_profile_explicit: bool,
+    include_extension_catalog: Option<bool>,
+    include_extension_catalog_explicit: bool,
 }
 
 #[derive(Debug)]
@@ -28,8 +58,9 @@ pub(crate) struct ModelErgonomicsTimer {
     tool_name: &'static str,
     tool_category: &'static str,
     started: Instant,
-    context_ack_shape: ContextAckShape,
     finish_summary_only: Option<bool>,
+    work_on_project: Option<WorkOnProjectErgonomicsFacts>,
+    bulk_exact_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +68,9 @@ pub(crate) struct ModelErgonomicsCompletion {
     tool_name: &'static str,
     tool_category: &'static str,
     duration_ms: u64,
-    context_ack_shape: ContextAckShape,
     finish_summary_only: Option<bool>,
+    work_on_project: Option<WorkOnProjectErgonomicsFacts>,
+    bulk_exact_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,17 +85,6 @@ pub(crate) struct ModelErgonomicsRecord {
     pub(crate) failure_kind: Option<String>,
     pub(crate) recovery_kind: Option<String>,
     pub(crate) execution_state: Option<String>,
-    pub(crate) context_continuity_eligible: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) context_ack_present: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) context_continuity_status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) session_recovery_event_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) session_recovery_truncated: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) session_history_lost: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) finish_summary_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +93,12 @@ pub(crate) struct ModelErgonomicsRecord {
     pub(crate) edit_outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) edit_conflict_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bulk_exact_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bulk_exact_match_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) work_on_project: Option<WorkOnProjectErgonomicsFacts>,
 }
 
 impl ModelErgonomicsRecord {
@@ -90,38 +117,43 @@ impl ModelErgonomicsRecord {
 
 impl ModelErgonomicsTimer {
     pub(crate) fn start(tool_name: &str) -> Option<Self> {
-        Self::start_with_protocol(
-            tool_name,
-            &Value::Null,
-            SessionContextRevisionAck::Unsupported,
-        )
+        Self::start_with_arguments(tool_name, &Value::Null)
     }
 
-    pub(crate) fn start_with_protocol(
-        tool_name: &str,
-        arguments: &Value,
-        context_ack: SessionContextRevisionAck,
-    ) -> Option<Self> {
+    pub(crate) fn start_with_arguments(tool_name: &str, arguments: &Value) -> Option<Self> {
         let definition =
             model_visible_tool_definitions().find(|definition| definition.name == tool_name)?;
-        let context_ack_shape = match context_ack {
-            SessionContextRevisionAck::Unsupported => ContextAckShape::Unsupported,
-            SessionContextRevisionAck::Unacknowledged => ContextAckShape::Missing,
-            SessionContextRevisionAck::Revision(_) => ContextAckShape::Revision,
-            SessionContextRevisionAck::Invalid => ContextAckShape::Invalid,
-        };
         let finish_summary_only = (tool_name == "finish_coding_task").then(|| {
             arguments
                 .get("summary_only")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         });
+        let work_on_project = work_on_project_facts(tool_name, arguments);
+        let bulk_exact_requested = tool_name == "apply_text_edits"
+            && arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .get("edits")
+                            .and_then(Value::as_array)
+                            .is_some_and(|edits| {
+                                edits
+                                    .iter()
+                                    .any(|edit| edit.get("expected_match_count").is_some())
+                            })
+                    })
+                });
         Some(Self {
             tool_name: definition.name,
             tool_category: definition.category,
             started: Instant::now(),
-            context_ack_shape,
+
             finish_summary_only,
+            work_on_project,
+            bulk_exact_requested,
         })
     }
 
@@ -131,8 +163,10 @@ impl ModelErgonomicsTimer {
             tool_name: self.tool_name,
             tool_category: self.tool_category,
             duration_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
-            context_ack_shape: self.context_ack_shape,
+
             finish_summary_only: self.finish_summary_only,
+            work_on_project: self.work_on_project,
+            bulk_exact_requested: self.bulk_exact_requested,
         }
     }
 
@@ -142,8 +176,10 @@ impl ModelErgonomicsTimer {
             tool_name: self.tool_name,
             tool_category: self.tool_category,
             duration_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
-            context_ack_shape: self.context_ack_shape,
+
             finish_summary_only: self.finish_summary_only,
+            work_on_project: self.work_on_project,
+            bulk_exact_requested: self.bulk_exact_requested,
         }
     }
 }
@@ -156,7 +192,7 @@ impl ModelErgonomicsCompletion {
         &self,
         result: &ToolResult,
     ) -> Option<ModelErgonomicsRecord> {
-        let serialized_result_bytes = serde_json::to_vec(result).ok()?.len();
+        let serialized_result_bytes = serialized_json_len(result).ok()?;
         Some(self.record_from_parts(
             result.success,
             &result.output,
@@ -173,7 +209,7 @@ impl ModelErgonomicsCompletion {
     ) -> Option<ModelErgonomicsRecord> {
         let success = structured_content.get("success")?.as_bool()?;
         let output = structured_content.get("output")?;
-        let serialized_result_bytes = serde_json::to_vec(structured_content).ok()?.len();
+        let serialized_result_bytes = serialized_json_len(structured_content).ok()?;
         Some(self.record_from_parts(success, output, Some(serialized_result_bytes)))
     }
 
@@ -187,11 +223,11 @@ impl ModelErgonomicsCompletion {
         let mut record = self.record_from_parts(false, &Value::Null, None);
         record.error_kind = Some(error_kind.to_string());
         // The MCP outer hard timeout fires after dispatch and explicitly leaves
-        // terminal tool state unknown. A canonical edit therefore cannot be
+        // terminal tool state unknown. A structured/patch edit therefore cannot be
         // projected as a definite rejection merely because no ToolResult was
         // available to classify.
         if error_kind == "dispatch_hard_timeout"
-            && record.edit_surface.as_deref() == Some("canonical")
+            && record.edit_surface.as_deref() == Some("structured_or_patch")
         {
             record.edit_outcome = Some("uncertain".to_string());
         }
@@ -213,10 +249,10 @@ impl ModelErgonomicsCompletion {
                 recovery_kind(output),
             )
         };
-        let continuity = continuity_facts(self.context_ack_shape, output);
         let edit = edit_facts(self.tool_name, success, output);
+        let edit_uncertain = edit.outcome.as_deref() == Some("uncertain");
         ModelErgonomicsRecord {
-            schema_version: 3,
+            schema_version: 9,
             tool_name: self.tool_name,
             tool_category: self.tool_category,
             success,
@@ -227,17 +263,126 @@ impl ModelErgonomicsCompletion {
             failure_kind,
             recovery_kind,
             execution_state: execution_state(output),
-            context_continuity_eligible: continuity.eligible,
-            context_ack_present: continuity.ack_present,
-            context_continuity_status: continuity.status,
-            session_recovery_event_count: continuity.recovery_event_count,
-            session_recovery_truncated: continuity.recovery_truncated,
-            session_history_lost: continuity.history_lost,
             finish_summary_only: self.finish_summary_only,
             edit_surface: edit.surface,
             edit_outcome: edit.outcome,
             edit_conflict_kind: edit.conflict_kind,
+            bulk_exact_outcome: self.bulk_exact_requested.then(|| {
+                if success {
+                    if output.get("dry_run").and_then(Value::as_bool) == Some(true) {
+                        "dry_run"
+                    } else {
+                        "success"
+                    }
+                } else if edit_uncertain {
+                    "uncertain"
+                } else {
+                    "rejection"
+                }
+                .to_string()
+            }),
+            bulk_exact_match_total: if self.bulk_exact_requested {
+                if success {
+                    Some(
+                        output
+                            .get("files")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|file| {
+                                file.get("edits")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .filter_map(|edit| {
+                                edit.get("expected_match_count")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|_| edit.get("match_count").and_then(Value::as_u64))
+                            })
+                            .sum::<u64>()
+                            .min(327_680),
+                    )
+                } else {
+                    output
+                        .get("actual_match_count")
+                        .and_then(Value::as_u64)
+                        .map(|count| count.min(327_680))
+                }
+            } else {
+                None
+            },
+            work_on_project: self.work_on_project,
         }
+    }
+}
+
+fn work_on_project_facts(
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<WorkOnProjectErgonomicsFacts> {
+    if tool_name != "work_on_project" {
+        return None;
+    }
+    let object = arguments.as_object()?;
+    let source = match (
+        object.get("project"),
+        object.get("client_id"),
+        object.get("path"),
+    ) {
+        (Some(Value::String(project)), None, None) if !project.is_empty() => {
+            WorkOnProjectSource::Project
+        }
+        (None, Some(Value::String(client_id)), Some(Value::String(path)))
+            if !client_id.is_empty() && !path.is_empty() =>
+        {
+            WorkOnProjectSource::Path
+        }
+        _ => WorkOnProjectSource::Invalid,
+    };
+    let mode_explicit = object.contains_key("mode");
+    let mode = match object.get("mode") {
+        None => WorkOnProjectMode::Checkout,
+        Some(Value::String(mode)) if mode == "checkout" => WorkOnProjectMode::Checkout,
+        Some(Value::String(mode)) if mode == "worktree" => WorkOnProjectMode::Worktree,
+        _ => WorkOnProjectMode::Invalid,
+    };
+    let guidance_profile_explicit = object.contains_key("guidance_profile");
+    let guidance_profile = match object.get("guidance_profile") {
+        None => WorkOnProjectGuidanceProfile::Direct,
+        Some(Value::String(profile)) if profile == "direct" => WorkOnProjectGuidanceProfile::Direct,
+        Some(Value::String(profile)) if profile == "host_code_mode" => {
+            WorkOnProjectGuidanceProfile::HostCodeMode
+        }
+        Some(Value::String(profile))
+            if cfg!(feature = "experimental-code-mode") && profile == "code_mode" =>
+        {
+            WorkOnProjectGuidanceProfile::CodeMode
+        }
+        _ => WorkOnProjectGuidanceProfile::Invalid,
+    };
+    let (include_extension_catalog, include_extension_catalog_explicit) =
+        effective_default_true_boolean(object, "include_extension_catalog");
+    Some(WorkOnProjectErgonomicsFacts {
+        resume_requested: object.contains_key("session_id"),
+        source,
+        mode,
+        mode_explicit,
+        base_ref_present: object.contains_key("base_ref"),
+        guidance_profile,
+        guidance_profile_explicit,
+        include_extension_catalog,
+        include_extension_catalog_explicit,
+    })
+}
+
+fn effective_default_true_boolean(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> (Option<bool>, bool) {
+    match object.get(field) {
+        None => (Some(true), false),
+        Some(value) => (value.as_bool(), true),
     }
 }
 
@@ -256,7 +401,7 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
         conflict_kind: None,
     };
     match edit_tool_surface(tool_name) {
-        Some(EditToolSurface::Canonical)
+        Some(EditToolSurface::StructuredOrPatch)
             if matches!(tool_name, "apply_text_edits" | "apply_patch") =>
         {
             facts.conflict_kind = edit_conflict_kind(output);
@@ -285,7 +430,7 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
                 Some("rejected".to_string())
             };
         }
-        Some(EditToolSurface::Canonical) if tool_name == "apply_unified_diff" => {
+        Some(EditToolSurface::StructuredOrPatch) if tool_name == "apply_unified_diff" => {
             let error_kind = output.get("error_kind").and_then(Value::as_str);
             facts.outcome = match (
                 output.get("applied").and_then(Value::as_bool),
@@ -316,97 +461,18 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
 }
 
 fn edit_conflict_kind(output: &Value) -> Option<String> {
-    let value = output
-        .pointer("/conflict_recovery/conflict_kind")
-        .and_then(Value::as_str)?;
+    let value = output.get("error_kind").and_then(Value::as_str)?;
     matches!(
         value,
         "multiple_matches"
+            | "match_count_mismatch"
             | "match_not_found"
             | "occurrence_out_of_range"
+            | "occurrence_outside_line_scope"
             | "overlapping_edits"
-            | "sha256_mismatch"
+            | "stale_file_revision"
     )
     .then(|| value.to_string())
-}
-
-#[derive(Debug)]
-struct ContinuityFacts {
-    eligible: bool,
-    ack_present: Option<bool>,
-    status: Option<String>,
-    recovery_event_count: Option<u64>,
-    recovery_truncated: Option<bool>,
-    history_lost: Option<bool>,
-}
-
-fn continuity_facts(ack_shape: ContextAckShape, output: &Value) -> ContinuityFacts {
-    let eligible = !matches!(ack_shape, ContextAckShape::Unsupported);
-    if !eligible {
-        return ContinuityFacts {
-            eligible: false,
-            ack_present: None,
-            status: None,
-            recovery_event_count: None,
-            recovery_truncated: None,
-            history_lost: None,
-        };
-    }
-    let ack_present = Some(!matches!(ack_shape, ContextAckShape::Missing));
-    if output
-        .get("session_context_revision")
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return ContinuityFacts {
-            eligible: true,
-            ack_present,
-            status: None,
-            recovery_event_count: None,
-            recovery_truncated: None,
-            history_lost: None,
-        };
-    }
-    let detailed_status = output
-        .pointer("/session_continuity/status")
-        .and_then(Value::as_str)
-        .filter(|status| matches!(*status, "exact" | "unacknowledged" | "behind" | "invalid"));
-    let status = detailed_status.map(str::to_string).or_else(|| {
-        let status = match ack_shape {
-            ContextAckShape::Missing => "unacknowledged",
-            ContextAckShape::Revision => "exact",
-            ContextAckShape::Invalid => "invalid",
-            ContextAckShape::Unsupported => return None,
-        };
-        Some(status.to_string())
-    });
-    let recovery = output.get("session_recovery");
-    let recovery_event_count = recovery
-        .and_then(|value| value.get("model_facing_events"))
-        .and_then(Value::as_array)
-        .map(|events| events.len().min(u64::MAX as usize) as u64)
-        .or_else(|| status.as_ref().map(|_| 0));
-    let recovery_truncated = recovery
-        .and_then(|value| value.get("truncated"))
-        .and_then(Value::as_bool)
-        .or_else(|| status.as_ref().map(|_| false));
-    let history_lost = output
-        .pointer("/session_continuity/history_lost")
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            recovery
-                .and_then(|value| value.get("history_lost"))
-                .and_then(Value::as_bool)
-        })
-        .or_else(|| status.as_ref().map(|_| false));
-    ContinuityFacts {
-        eligible: true,
-        ack_present,
-        status,
-        recovery_event_count,
-        recovery_truncated,
-        history_lost,
-    }
 }
 
 fn structured_kind(output: &Value, field: &str) -> Option<String> {
@@ -457,6 +523,42 @@ mod tests {
     }
 
     #[test]
+    fn bulk_exact_metrics_record_only_bounded_counts_and_outcomes() {
+        let args = json!({"changes":[{"path":"private.rs","edits":[{"kind":"replace_exact","old_text":"SECRET_OLD","new_text":"SECRET_NEW","expected_match_count":2}]}]});
+        let completion = ModelErgonomicsTimer::start_with_arguments("apply_text_edits", &args)
+            .unwrap()
+            .finish();
+        let dry = completion
+            .record_for_tool_result(&ToolResult::ok(json!({
+                "dry_run":true,"changed":false,"would_change":true,
+                "files":[{"edits":[{"expected_match_count":2,"match_count":2}]}]
+            })))
+            .unwrap();
+        assert_eq!(dry.bulk_exact_outcome.as_deref(), Some("dry_run"));
+        assert_eq!(dry.bulk_exact_match_total, Some(2));
+        let reject = completion.record_for_tool_result(&ToolResult::err_with_output(
+            "count mismatch", json!({"error_kind":"match_count_mismatch","actual_match_count":1,"state_changed":false,"execution_state":"not_started"})
+        )).unwrap();
+        assert_eq!(reject.bulk_exact_outcome.as_deref(), Some("rejection"));
+        assert_eq!(reject.bulk_exact_match_total, Some(1));
+        assert_eq!(
+            reject.edit_conflict_kind.as_deref(),
+            Some("match_count_mismatch")
+        );
+        let serialized = serde_json::to_string(&reject).unwrap();
+        assert!(!serialized.contains("SECRET_OLD"));
+        assert!(!serialized.contains("private.rs"));
+    }
+
+    fn work_on_project_record(arguments: Value) -> ModelErgonomicsRecord {
+        ModelErgonomicsTimer::start_with_arguments("work_on_project", &arguments)
+            .expect("work_on_project telemetry")
+            .finish_after(Duration::ZERO)
+            .record_for_tool_result(&ToolResult::ok(json!({})))
+            .expect("serializable telemetry")
+    }
+
+    #[test]
     fn success_record_uses_exact_utf8_tool_result_bytes() {
         let result = ToolResult::ok(json!({"text": "中文", "count": 2}));
         let record = completion("tool_manifest", 7)
@@ -476,6 +578,158 @@ mod tests {
         assert_eq!(record.error_kind, None);
         assert_eq!(record.failure_kind, None);
         assert_eq!(record.recovery_kind, None);
+    }
+
+    #[test]
+    fn non_work_on_project_omits_bootstrap_preference_facts() {
+        let record = completion("tool_manifest", 0)
+            .record_for_tool_result(&ToolResult::ok(json!({})))
+            .unwrap();
+        assert_eq!(record.schema_version, 9);
+        assert_eq!(record.work_on_project, None);
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("work_on_project"));
+    }
+
+    #[test]
+    fn work_on_project_fresh_defaults_are_queryable_without_raw_values() {
+        let record = work_on_project_record(json!({
+            "project": "agent:private:project",
+            "instruction": "private instruction"
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert!(!facts.resume_requested);
+        assert_eq!(facts.source, WorkOnProjectSource::Project);
+        assert_eq!(facts.mode, WorkOnProjectMode::Checkout);
+        assert!(!facts.mode_explicit);
+        assert!(!facts.base_ref_present);
+        assert_eq!(facts.guidance_profile, WorkOnProjectGuidanceProfile::Direct);
+        assert!(!facts.guidance_profile_explicit);
+        assert_eq!(facts.include_extension_catalog, Some(true));
+        assert!(!facts.include_extension_catalog_explicit);
+    }
+
+    #[test]
+    fn work_on_project_explicit_resume_and_remaining_preferences_are_queryable() {
+        let record = work_on_project_record(json!({
+            "project": "agent:private:project",
+            "instruction": "private instruction",
+            "session_id": "wc_sess_private",
+            "guidance_profile": "direct",
+            "include_extension_catalog": false
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert!(facts.resume_requested);
+        assert_eq!(facts.guidance_profile, WorkOnProjectGuidanceProfile::Direct);
+        assert!(facts.guidance_profile_explicit);
+        assert_eq!(facts.include_extension_catalog, Some(false));
+        assert!(facts.include_extension_catalog_explicit);
+    }
+
+    #[test]
+    fn work_on_project_host_code_mode_profile_is_not_feature_gated() {
+        let record = work_on_project_record(json!({
+            "project": "agent:private:project",
+            "instruction": "private instruction",
+            "guidance_profile": "host_code_mode"
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert_eq!(
+            facts.guidance_profile,
+            WorkOnProjectGuidanceProfile::HostCodeMode
+        );
+        assert!(facts.guidance_profile_explicit);
+    }
+
+    #[test]
+    fn work_on_project_code_mode_profile_telemetry_matches_compiled_availability() {
+        let record = work_on_project_record(json!({
+            "project": "agent:private:project",
+            "instruction": "private instruction",
+            "guidance_profile": "code_mode"
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert_eq!(
+            facts.guidance_profile,
+            if cfg!(feature = "experimental-code-mode") {
+                WorkOnProjectGuidanceProfile::CodeMode
+            } else {
+                WorkOnProjectGuidanceProfile::Invalid
+            }
+        );
+        assert!(facts.guidance_profile_explicit);
+    }
+
+    #[test]
+    fn work_on_project_path_worktree_records_only_closed_preferences() {
+        let record = work_on_project_record(json!({
+            "client_id": "private-client",
+            "path": "/private/path",
+            "mode": "worktree",
+            "base_ref": "private/base-ref",
+            "instruction": "private instruction"
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert_eq!(facts.source, WorkOnProjectSource::Path);
+        assert_eq!(facts.mode, WorkOnProjectMode::Worktree);
+        assert!(facts.mode_explicit);
+        assert!(facts.base_ref_present);
+    }
+
+    #[test]
+    fn work_on_project_malformed_values_fail_closed_without_guessing_effective_booleans() {
+        let record = work_on_project_record(json!({
+            "project": 42,
+            "instruction": "private instruction",
+            "session_id": 7,
+            "mode": 9,
+            "base_ref": {"private": true},
+            "guidance_profile": {"invalid": true},
+            "include_extension_catalog": []
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert!(facts.resume_requested);
+        assert_eq!(facts.source, WorkOnProjectSource::Invalid);
+        assert_eq!(facts.mode, WorkOnProjectMode::Invalid);
+        assert!(facts.mode_explicit);
+        assert!(facts.base_ref_present);
+        assert_eq!(
+            facts.guidance_profile,
+            WorkOnProjectGuidanceProfile::Invalid
+        );
+        assert!(facts.guidance_profile_explicit);
+        assert_eq!(facts.include_extension_catalog, None);
+        assert!(facts.include_extension_catalog_explicit);
+    }
+
+    #[test]
+    fn work_on_project_telemetry_never_serializes_private_request_bodies() {
+        let sentinels = [
+            "PRIVATE_INSTRUCTION_SENTINEL",
+            "PRIVATE_PROJECT_SENTINEL",
+            "PRIVATE_CLIENT_SENTINEL",
+            "PRIVATE_PATH_SENTINEL",
+            "PRIVATE_SESSION_SENTINEL",
+            "PRIVATE_BASE_REF_SENTINEL",
+        ];
+        let record = work_on_project_record(json!({
+            "instruction": sentinels[0],
+            "project": sentinels[1],
+            "client_id": sentinels[2],
+            "path": sentinels[3],
+            "session_id": sentinels[4],
+            "base_ref": sentinels[5],
+            "mode": "worktree",
+            "include_extension_catalog": false
+        }));
+        let serialized = serde_json::to_string(&record).unwrap();
+        for sentinel in sentinels {
+            assert!(
+                !serialized.contains(sentinel),
+                "work_on_project telemetry leaked {sentinel}: {serialized}"
+            );
+        }
     }
 
     #[test]
@@ -548,7 +802,7 @@ mod tests {
 
     #[test]
     fn pre_result_failure_counts_invocation_without_fabricating_tool_result_bytes() {
-        let record = completion("read_file", 2).record_for_pre_result_failure("invalid_arguments");
+        let record = completion("read_files", 2).record_for_pre_result_failure("invalid_arguments");
         assert!(!record.success);
         assert_eq!(record.error_kind.as_deref(), Some("invalid_arguments"));
         assert_eq!(record.serialized_result_bytes, None);
@@ -558,14 +812,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_edit_pre_result_hard_timeout_is_uncertain_not_rejected() {
+    fn structured_or_patch_edit_pre_result_hard_timeout_is_uncertain_not_rejected() {
         for tool in ["apply_text_edits", "apply_patch", "apply_unified_diff"] {
             let record = completion(tool, 0).record_for_pre_result_failure("dispatch_hard_timeout");
             assert!(!record.success);
             assert_eq!(record.error_kind.as_deref(), Some("dispatch_hard_timeout"));
             assert_eq!(record.outcome_class(), "unknown");
             assert_eq!(record.serialized_result_bytes, None);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), Some("uncertain"));
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -577,7 +831,7 @@ mod tests {
             assert_eq!(record.error_kind.as_deref(), Some(error_kind));
             assert_eq!(record.outcome_class(), "failure");
             assert_eq!(record.serialized_result_bytes, None);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -612,19 +866,19 @@ mod tests {
             ),
             (
                 false,
-                json!({"conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                json!({"error_kind": "multiple_matches"}),
                 Some("conflict"),
                 Some("multiple_matches"),
             ),
             (
                 false,
-                json!({"conflict_recovery": {"conflict_kind": "sha256_mismatch"}}),
+                json!({"error_kind": "stale_file_revision"}),
                 Some("conflict"),
-                Some("sha256_mismatch"),
+                Some("stale_file_revision"),
             ),
             (
                 false,
-                json!({"rollback_complete": false, "changed": true, "conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                json!({"rollback_complete": false, "changed": true, "error_kind": "multiple_matches"}),
                 Some("uncertain"),
                 Some("multiple_matches"),
             ),
@@ -638,8 +892,8 @@ mod tests {
             let record = completion("apply_text_edits", 0)
                 .record_for_tool_result(&result)
                 .unwrap();
-            assert_eq!(record.schema_version, 3);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.schema_version, 9);
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), outcome);
             assert_eq!(record.edit_conflict_kind.as_deref(), conflict_kind);
         }
@@ -690,7 +944,7 @@ mod tests {
             let record = completion("apply_unified_diff", 0)
                 .record_for_tool_result(&result)
                 .unwrap();
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), outcome);
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -712,13 +966,13 @@ mod tests {
         let record = completion("apply_text_edits", 0)
             .record_for_tool_result(&result)
             .unwrap();
-        assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+        assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
         assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
         assert_eq!(record.edit_conflict_kind, None);
         let serialized = serde_json::to_string(&record).unwrap();
         assert!(!serialized.contains(private));
 
-        for tool in ["read_file", "tool_manifest"] {
+        for tool in ["read_files", "tool_manifest"] {
             let record = completion(tool, 0)
                 .record_for_tool_result(&ToolResult::ok(json!({"changed": true})))
                 .unwrap();
@@ -731,114 +985,22 @@ mod tests {
             let record = completion(tool, 0)
                 .record_for_tool_result(&ToolResult::ok(json!({"changed": true})))
                 .unwrap();
-            assert_eq!(record.edit_surface.as_deref(), Some("advanced"));
+            assert_eq!(record.edit_surface.as_deref(), Some("whole_file"));
             assert_eq!(record.edit_outcome, None);
             assert_eq!(record.edit_conflict_kind, None);
         }
     }
 
     #[test]
-    fn protocol_telemetry_distinguishes_unsupported_missing_exact_and_recovery_states() {
-        let unsupported = ModelErgonomicsTimer::start_with_protocol(
-            "read_file",
-            &json!({}),
-            SessionContextRevisionAck::Unsupported,
-        )
-        .unwrap()
-        .finish_after(Duration::ZERO)
-        .record_for_tool_result(&ToolResult::ok(json!({"session_context_revision": 1})))
-        .unwrap();
-        assert!(!unsupported.context_continuity_eligible);
-        assert_eq!(unsupported.context_ack_present, None);
-        assert_eq!(unsupported.context_continuity_status, None);
-
-        let missing = ModelErgonomicsTimer::start_with_protocol(
-            "read_file",
-            &json!({}),
-            SessionContextRevisionAck::Unacknowledged,
-        )
-        .unwrap()
-        .finish_after(Duration::ZERO)
-        .record_for_tool_result(&ToolResult::ok(json!({"session_context_revision": 1})))
-        .unwrap();
-        assert!(missing.context_continuity_eligible);
-        assert_eq!(missing.context_ack_present, Some(false));
-        assert_eq!(
-            missing.context_continuity_status.as_deref(),
-            Some("unacknowledged")
-        );
-        assert_eq!(missing.session_recovery_event_count, Some(0));
-
-        let exact = ModelErgonomicsTimer::start_with_protocol(
-            "read_file",
-            &json!({}),
-            SessionContextRevisionAck::Revision(1),
-        )
-        .unwrap()
-        .finish_after(Duration::ZERO)
-        .record_for_tool_result(&ToolResult::ok(json!({"session_context_revision": 2})))
-        .unwrap();
-        assert_eq!(exact.context_ack_present, Some(true));
-        assert_eq!(exact.context_continuity_status.as_deref(), Some("exact"));
-
-        let behind = ModelErgonomicsTimer::start_with_protocol(
-            "read_file",
-            &json!({}),
-            SessionContextRevisionAck::Revision(1),
-        )
-        .unwrap()
-        .finish_after(Duration::ZERO)
-        .record_for_tool_result(&ToolResult::ok(json!({
-            "session_context_revision": 3,
-            "session_continuity": {"status": "behind", "history_lost": false},
-            "session_recovery": {"model_facing_events": [{"tool_name": "read_file"}], "truncated": false, "history_lost": false}
-        })))
-        .unwrap();
-        assert_eq!(behind.context_ack_present, Some(true));
-        assert_eq!(behind.context_continuity_status.as_deref(), Some("behind"));
-        assert_eq!(behind.session_recovery_event_count, Some(1));
-        assert_eq!(behind.session_history_lost, Some(false));
-
-        let invalid = ModelErgonomicsTimer::start_with_protocol(
-            "read_file",
-            &json!({}),
-            SessionContextRevisionAck::Invalid,
-        )
-        .unwrap()
-        .finish_after(Duration::ZERO)
-        .record_for_tool_result(&ToolResult::ok(json!({
-            "session_context_revision": 4,
-            "session_continuity": {"status": "invalid", "history_lost": false},
-            "session_recovery": {
-                "model_facing_events": [],
-                "truncated": false,
-                "history_lost": false,
-                "current_handoff": {"work_performed": []}
-            }
-        })))
-        .unwrap();
-        assert_eq!(invalid.context_ack_present, Some(true));
-        assert_eq!(
-            invalid.context_continuity_status.as_deref(),
-            Some("invalid")
-        );
-        assert_eq!(invalid.session_recovery_event_count, Some(0));
-        assert_eq!(invalid.session_history_lost, Some(false));
-    }
-
-    #[test]
     fn finish_summary_only_is_taken_from_request_metadata_without_body_capture() {
         for (arguments, expected) in [(json!({"summary_only": true}), true), (json!({}), false)] {
-            let record = ModelErgonomicsTimer::start_with_protocol(
-                "finish_coding_task",
-                &arguments,
-                SessionContextRevisionAck::Unsupported,
-            )
-            .unwrap()
-            .finish_after(Duration::ZERO)
-            .record_for_tool_result(&ToolResult::ok(json!({"private_body": "do-not-copy"})))
-            .unwrap();
-            assert_eq!(record.schema_version, 3);
+            let record =
+                ModelErgonomicsTimer::start_with_arguments("finish_coding_task", &arguments)
+                    .unwrap()
+                    .finish_after(Duration::ZERO)
+                    .record_for_tool_result(&ToolResult::ok(json!({"private_body": "do-not-copy"})))
+                    .unwrap();
+            assert_eq!(record.schema_version, 9);
             assert_eq!(record.finish_summary_only, Some(expected));
             assert!(record.serialized_result_bytes.is_some());
             let serialized = serde_json::to_string(&record).unwrap();

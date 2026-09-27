@@ -133,6 +133,7 @@ export class AdminRefreshController<T> {
   dispose(): void {
     this.invalidateRequests();
     this.stopAutoRefresh();
+    this.token = "";
   }
 
   private invalidateRequests(): void {

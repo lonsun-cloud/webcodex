@@ -21,8 +21,8 @@ impl ToolRuntime {
                 mode,
                 base_ref,
                 instruction,
-                include_project_instructions,
-                include_workflow_guidance,
+                guidance_profile,
+                include_extension_catalog,
                 session_id,
             } => {
                 self.work_on_project(
@@ -33,8 +33,8 @@ impl ToolRuntime {
                     base_ref,
                     instruction,
                     session_id,
-                    include_project_instructions,
-                    include_workflow_guidance,
+                    guidance_profile,
+                    include_extension_catalog,
                     auth,
                     trusted_recording_session_id,
                     trusted_recording_session_project,

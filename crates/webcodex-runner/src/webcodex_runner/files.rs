@@ -362,46 +362,16 @@ fn handle_file_read_request(
         .max_bytes
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
         .min(policy.max_output_bytes);
-    if let (Some(start_line), Some(end_line)) = (request.start_line, request.end_line) {
-        return handle_file_read_range_request(resolved, start_line, end_line, max, start);
-    }
-
-    // Legacy non-range path: read the whole file under the transport cap. This
-    // is only reached by older callers that omit the line range; the server's
-    // read_file tool always requests a range. No absolute path leaks: the error
-    // carries a stable code, not `resolved.display()`.
-    match std::fs::read(resolved) {
-        Ok(bytes) => {
-            if bytes.len() > max {
-                CommandResult {
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some(format!(
-                        "file too large: {} bytes exceeds max_bytes {}",
-                        bytes.len(),
-                        max
-                    )),
-                }
-            } else {
-                CommandResult {
-                    exit_code: Some(0),
-                    stdout: Some(String::from_utf8_lossy(&bytes).to_string()),
-                    stderr: Some(String::new()),
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: None,
-                }
-            }
-        }
-        Err(e) => CommandResult {
+    let (Some(start_line), Some(end_line)) = (request.start_line, request.end_line) else {
+        return CommandResult {
             exit_code: None,
             stdout: None,
             stderr: None,
             duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(file_read_error_message(&e)),
-        },
-    }
+            error: Some("invalid line range for file_read".to_string()),
+        };
+    };
+    handle_file_read_range_request(resolved, start_line, end_line, max, start)
 }
 
 #[derive(Serialize)]
@@ -801,12 +771,6 @@ fn handle_skill_read_file_request(
         duration_ms: Some(start.elapsed().as_millis() as u64),
         error: None,
     }
-}
-
-/// Map a raw IO error from the legacy whole-file read path to a stable
-/// path-free message.
-fn file_read_error_message(error: &std::io::Error) -> String {
-    read_file_reason_message(read_file_reason_from_io(error))
 }
 
 fn handle_file_write_request(

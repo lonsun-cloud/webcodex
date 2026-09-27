@@ -237,58 +237,15 @@ pub(crate) fn enforce_token_surface(
     Ok(())
 }
 
-/// A project-bound runtime is a capability grant for one configured project,
-/// not a general runtime admin endpoint. Non-bootstrap user-facing credentials may
-/// therefore reach only the canonical connector API and MCP. Bootstrap stays
-/// available for local setup; agent tokens stay available for their already
-/// exact transport routes.
-pub(crate) fn enforce_project_connector_surface(
-    enabled: bool,
-    ctx: &AuthContext,
-    path: &str,
-) -> Result<(), (StatusCode, &'static str)> {
-    if !enabled || ctx.is_bootstrap() || ctx.is_agent_token() {
-        return Ok(());
-    }
-    if (ctx.is_project_credential() || ctx.is_oauth_project_subject())
-        && (path == "/mcp" || is_project_connector_path(path) || is_project_console_path(path))
-    {
-        return Ok(());
-    }
-    Err((
-        StatusCode::FORBIDDEN,
-        "project connector credentials may only access canonical connector capabilities",
-    ))
-}
-
-fn is_project_console_path(path: &str) -> bool {
-    crate::route_metadata::path_has_surface(path, crate::route_metadata::RouteSurface::HostConsole)
-}
-
-fn is_project_connector_path(path: &str) -> bool {
-    crate::route_metadata::path_has_surface(path, crate::route_metadata::RouteSurface::Connector)
-}
-
-fn project_connector_runtime(
-    depot: &Depot,
-) -> Option<Arc<crate::connector_runtime::ConnectorRuntime>> {
-    depot
-        .obtain::<crate::connector_runtime::ConnectorRuntimeSlot>()
-        .ok()
-        .and_then(|slot| slot.0.clone())
-}
-
-fn project_connector_enabled(depot: &Depot) -> bool {
-    project_connector_runtime(depot).is_some()
+fn project_auth_state(depot: &Depot) -> Option<Arc<super::ProjectAuthState>> {
+    depot.obtain::<Arc<super::ProjectAuthState>>().ok().cloned()
 }
 
 fn enforce_request_surface(
-    project_mode: bool,
     ctx: &AuthContext,
     path: &str,
 ) -> Result<(), (StatusCode, &'static str)> {
-    enforce_token_surface(ctx, path)?;
-    enforce_project_connector_surface(project_mode, ctx, path)
+    enforce_token_surface(ctx, path)
 }
 
 fn reject(res: &mut Response, ctrl: &mut FlowCtrl, status: StatusCode, message: &str) {
@@ -320,7 +277,10 @@ impl Handler for AuthMiddleware {
         };
 
         let db = get_db(depot);
-        let project_mode = project_connector_enabled(depot);
+        let project_auth = project_auth_state(depot);
+        let project_mode = project_auth
+            .as_deref()
+            .is_some_and(super::ProjectAuthState::is_configured);
         let project_share_query_token = project_share_mcp_query_token(req, project_mode);
         let project_share_query_token_used = project_share_query_token.is_some();
         let token = project_share_query_token.or_else(|| bearer_token(req));
@@ -345,11 +305,7 @@ impl Handler for AuthMiddleware {
                     // Explicit --open: anonymous callers get a non-admin open
                     // context. Surface restrictions and declared scopes still apply.
                     let ctx = open_anonymous_context();
-                    if let Err((status, msg)) = enforce_request_surface(
-                        project_connector_enabled(depot),
-                        &ctx,
-                        req.uri().path(),
-                    ) {
+                    if let Err((status, msg)) = enforce_request_surface(&ctx, req.uri().path()) {
                         reject(res, ctrl, status, msg);
                         return;
                     }
@@ -376,26 +332,30 @@ impl Handler for AuthMiddleware {
             }
         };
 
-        // Project mode has one exact credential verifier loaded from its
-        // protected setup state. This path is separate from the ordinary
-        // shared-key quick-start fallback below.
-        if let Some(runtime) = project_connector_runtime(depot) {
-            if let Some(ctx) = runtime.authenticate_project_credential(&token) {
-                if let Err((status, msg)) = enforce_request_surface(true, &ctx, req.uri().path()) {
+        // A project-scoped Server has exact protected credential verifiers in
+        // ordinary auth state. Successful model credentials continue through the
+        // same route-scope checks as every other ordinary Runtime principal.
+        if let Some(project_auth) = project_auth.as_deref() {
+            if let Some(ctx) = project_auth.authenticate_project_credential(&token) {
+                if let Err((status, msg)) = enforce_request_surface(&ctx, req.uri().path()) {
                     reject(res, ctrl, status, msg);
                     return;
                 }
-                // Project credentials are a specialized Connector capability.
-                // Their exact surface and operation authorization stay owned by
-                // the project Connector instead of the ordinary route registry.
+                if let Err((scope, description)) =
+                    scopes::enforce_route_scope(&ctx, req.method().as_str(), req.uri().path())
+                {
+                    render_scope_forbidden(res, Some(&ctx), scope, description);
+                    ctrl.skip_rest();
+                    return;
+                }
                 depot.inject(ctx);
                 ctrl.call_next(req, depot, res).await;
                 return;
             }
             if project_share_query_token_used {
-                // Query auth is a share-only transport convenience for the
-                // exact temporary Connector credential. It must never fall
-                // through to project Agent tokens, PATs, OAuth, or shared keys.
+                // Query auth is a share-only transport convenience for the exact
+                // temporary project credential. It must never fall through to an
+                // Agent Token, PAT, OAuth token, or shared key.
                 reject(
                     res,
                     ctrl,
@@ -404,13 +364,18 @@ impl Handler for AuthMiddleware {
                 );
                 return;
             }
-            if let Some(ctx) = runtime.authenticate_project_agent_token(&token) {
-                if let Err((status, msg)) = enforce_request_surface(true, &ctx, req.uri().path()) {
+            if let Some(ctx) = project_auth.authenticate_project_agent_token(&token) {
+                if let Err((status, msg)) = enforce_request_surface(&ctx, req.uri().path()) {
                     reject(res, ctrl, status, msg);
                     return;
                 }
-                // Project Agent Tokens remain governed by the exact Agent
-                // transport surface and its agent:* scope checks.
+                if let Err((scope, description)) =
+                    scopes::enforce_route_scope(&ctx, req.method().as_str(), req.uri().path())
+                {
+                    render_scope_forbidden(res, Some(&ctx), scope, description);
+                    ctrl.skip_rest();
+                    return;
+                }
                 depot.inject(ctx);
                 ctrl.call_next(req, depot, res).await;
                 return;
@@ -436,11 +401,7 @@ impl Handler for AuthMiddleware {
             Ok(Some(ctx)) => {
                 // Enforce token-kind surface restrictions (agent tokens,
                 // account credentials) before the handler runs.
-                if let Err((status, msg)) = enforce_request_surface(
-                    project_connector_enabled(depot),
-                    &ctx,
-                    req.uri().path(),
-                ) {
+                if let Err((status, msg)) = enforce_request_surface(&ctx, req.uri().path()) {
                     reject(res, ctrl, status, msg);
                     return;
                 }
@@ -463,16 +424,11 @@ impl Handler for AuthMiddleware {
                 let trimmed = token.trim();
                 if config.is_auth_enabled()
                     && shared_key_enabled()
-                    && !project_connector_enabled(depot)
                     && !trimmed.is_empty()
                     && !is_managed_token_prefix(trimmed)
                 {
                     let ctx = shared_key_context(trimmed);
-                    if let Err((status, msg)) = enforce_request_surface(
-                        project_connector_enabled(depot),
-                        &ctx,
-                        req.uri().path(),
-                    ) {
+                    if let Err((status, msg)) = enforce_request_surface(&ctx, req.uri().path()) {
                         reject(res, ctrl, status, msg);
                         return;
                     }
@@ -530,6 +486,238 @@ pub(crate) fn json_error(status: StatusCode, msg: impl Into<String>) -> Json<ser
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpOrigin {
+    scheme: String,
+    authority: HttpAuthority,
+}
+
+fn parse_http_authority(value: &str) -> Option<HttpAuthority> {
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?.parse::<u16>().ok()?)
+        };
+        (host, port)
+    } else {
+        if value.matches(':').count() > 1 {
+            return None;
+        }
+        match value.rsplit_once(':') {
+            Some((host, port)) => {
+                if host.is_empty() || port.is_empty() {
+                    return None;
+                }
+                (host, Some(port.parse::<u16>().ok()?))
+            }
+            None => (value, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let host = if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        address.to_string()
+    } else {
+        match url::Host::parse(host).ok()? {
+            url::Host::Domain(domain) => {
+                let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+                if domain.is_empty() {
+                    return None;
+                }
+                domain
+            }
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) => address.to_string(),
+        }
+    };
+    Some(HttpAuthority { host, port })
+}
+
+fn parse_http_origin(value: &str) -> Option<HttpOrigin> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let authority = parse_http_authority(&match parsed.port() {
+        Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+        Some(port) => format!("{host}:{port}"),
+        None if host.contains(':') => format!("[{host}]"),
+        None => host.to_string(),
+    })?;
+    Some(HttpOrigin {
+        scheme: parsed.scheme().to_string(),
+        authority,
+    })
+}
+
+fn default_http_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn origin_effective_port(origin: &HttpOrigin) -> Option<u16> {
+    origin
+        .authority
+        .port
+        .or_else(|| default_http_port(&origin.scheme))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_unspecified_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+fn configured_public_origin() -> Option<HttpOrigin> {
+    let value = std::env::var("WEBCODEX_PUBLIC_URL").ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    parse_http_origin(value)
+}
+
+fn authority_matches_configured_origin(authority: &HttpAuthority, origin: &HttpOrigin) -> bool {
+    if authority.host != origin.authority.host {
+        return false;
+    }
+    match origin.authority.port {
+        Some(expected_port) => authority.port == Some(expected_port),
+        None => authority
+            .port
+            .is_none_or(|port| default_http_port(&origin.scheme) == Some(port)),
+    }
+}
+
+fn request_authority_allowed(
+    authority: &HttpAuthority,
+    config: &Config,
+    public_origin: Option<&HttpOrigin>,
+) -> bool {
+    if is_loopback_host(&authority.host) {
+        return true;
+    }
+    if public_origin.is_some_and(|origin| authority_matches_configured_origin(authority, origin)) {
+        return true;
+    }
+    parse_http_authority(&config.addr).is_some_and(|bound| {
+        !is_unspecified_host(&bound.host)
+            && bound.host == authority.host
+            && authority
+                .port
+                .is_none_or(|port| bound.port.is_some_and(|bound_port| bound_port == port))
+    })
+}
+
+fn origin_matches_request_authority(origin: &HttpOrigin, authority: &HttpAuthority) -> bool {
+    if origin.authority.host != authority.host {
+        return false;
+    }
+    match authority.port {
+        Some(port) => origin_effective_port(origin) == Some(port),
+        None => origin.authority.port.is_none(),
+    }
+}
+
+pub(crate) fn require_mcp_request_authority(
+    req: &Request,
+    config: &Config,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    let host = match req.headers().get("host") {
+        Some(value) => value.to_str().ok(),
+        None => req.uri().authority().map(|authority| authority.as_str()),
+    }
+    .and_then(parse_http_authority)
+    .ok_or((400, "invalid_request_authority", "invalid Host header"))?;
+    let public_origin = configured_public_origin();
+    if !request_authority_allowed(&host, config, public_origin.as_ref()) {
+        return Err((
+            403,
+            "untrusted_request_authority",
+            "request Host is not an allowed WebCodex authority",
+        ));
+    }
+
+    let Some(raw_origin) = req.headers().get("origin") else {
+        return Ok(());
+    };
+    let raw_origin = raw_origin
+        .to_str()
+        .map_err(|_| (400, "invalid_origin", "invalid Origin header"))?;
+    let origin =
+        parse_http_origin(raw_origin).ok_or((400, "invalid_origin", "invalid Origin header"))?;
+    if !origin_matches_request_authority(&origin, &host) {
+        return Err((
+            403,
+            "cross_origin_denied",
+            "cross-origin requests are not allowed",
+        ));
+    }
+    if public_origin
+        .as_ref()
+        .is_some_and(|public| authority_matches_configured_origin(&host, public))
+        && public_origin.as_ref().is_some_and(|public| {
+            origin.scheme != public.scheme
+                || origin_effective_port(&origin) != origin_effective_port(public)
+        })
+    {
+        return Err((
+            403,
+            "cross_origin_denied",
+            "cross-origin requests are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_mcp_json_request(
+    req: &Request,
+    config: &Config,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    require_mcp_request_authority(req, config)?;
+    if req
+        .content_type()
+        .is_none_or(|content_type| content_type.essence_str() != "application/json")
+    {
+        return Err((
+            415,
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn require_same_origin(req: &Request) -> Result<(), (u16, &'static str, &'static str)> {
     if let Some(origin) = req
         .headers()
@@ -567,45 +755,4 @@ pub(crate) fn require_json_same_origin(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod connector_surface_tests {
-    use super::*;
-    use crate::auth::{AuthKind, SCOPE_PROJECT_READ};
-
-    fn project_context() -> AuthContext {
-        AuthContext {
-            role: Some("project".to_string()),
-            scopes: vec![SCOPE_PROJECT_READ.to_string()],
-            token_kind: Some("project".to_string()),
-            project_grant_id: Some("wc_pgrant_1111111111111111".to_string()),
-            ..AuthContext::new(AuthKind::ProjectCredential)
-        }
-    }
-
-    #[test]
-    fn project_connector_hard_gates_legacy_user_routes() {
-        let user = project_context();
-        assert!(
-            enforce_project_connector_surface(true, &user, "/api/connector/files/read").is_ok()
-        );
-        assert!(enforce_project_connector_surface(true, &user, "/mcp").is_ok());
-        assert!(
-            enforce_project_connector_surface(true, &user, "/api/connector/not-a-capability")
-                .is_err()
-        );
-        assert!(enforce_project_connector_surface(true, &user, "/api/tools/call").is_err());
-        assert!(enforce_project_connector_surface(true, &user, "/api/projects/list").is_err());
-        assert!(
-            enforce_project_connector_surface(true, &user, "/api/runtime-console/projects")
-                .is_err()
-        );
-        let agent = AuthContext::new(AuthKind::AgentToken);
-        assert!(enforce_token_surface(&agent, "/api/runtime-console/projects").is_err());
-        assert!(enforce_project_connector_surface(false, &user, "/api/tools/call").is_ok());
-
-        let bootstrap = bootstrap_context();
-        assert!(enforce_project_connector_surface(true, &bootstrap, "/api/projects/list").is_ok());
-    }
 }

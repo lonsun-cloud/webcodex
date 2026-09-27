@@ -47,6 +47,8 @@ async fn complete_plugin_request(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -404,6 +406,112 @@ fn spawn_binding_call(
     })
 }
 
+#[tokio::test]
+async fn openai_presentation_preserves_plugin_provider_errors_and_projects_governance_denials() {
+    let runtime = Arc::new(test_runtime());
+    let auth = plugin_auth_with_scopes(&[
+        crate::auth::SCOPE_PLUGIN_INSPECT,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+    ]);
+    let tool = plugin_tool("search_symbol");
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools",
+        "provider-instance-a",
+        vec![tool.clone()],
+    )
+    .await;
+    let (binding, _) = describe_dynamic_binding(
+        &runtime,
+        &auth,
+        "runner-a",
+        "runner-instance-a",
+        PluginProviderView {
+            provider_id: "repo-tools".into(),
+            provider_instance_id: "provider-instance-a".into(),
+            name: "Repo Tools".into(),
+            status: "ready".into(),
+            error_code: None,
+        },
+        tool,
+        780,
+    )
+    .await;
+    let provider_result = PluginToolResult {
+        content: vec![PluginContent::Text {
+            text: "upstream rejected the request".into(),
+        }],
+        // Even a provider payload resembling ToolResult remains provider-owned.
+        structured_content: Some(
+            json!({"success": false, "output": {"provider_code": "REJECTED"}, "error": "provider failure"}),
+        ),
+        is_error: true,
+    };
+    let session =
+        start_authorized_test_session(&runtime, &auth, crate::tool_runtime::SessionMode::ReadOnly);
+    for client in ["generic-test-client", "openai-mcp"] {
+        let mut params = json!({
+            "name": "plugin_tool", "arguments": {"action": "call", "binding": binding, "arguments": {"query": "probe"}},
+            "_meta": {"io.modelcontextprotocol/clientInfo": {"name": client, "version": "2"}},
+        });
+        let call = handle_mcp_request(
+            &runtime,
+            rpc("tools/call", Some(json!(781)), params.clone()),
+            Some(&auth),
+        );
+        let complete = async {
+            let request =
+                wait_for_plugin_request(&runtime.runner_registry, "runner-a", "runner-instance-a")
+                    .await;
+            complete_plugin_request(
+                &runtime,
+                request,
+                "runner-instance-a",
+                PluginGatewayResponse::success(PluginGatewayResponsePayload::ToolResult {
+                    result: provider_result.clone(),
+                }),
+            )
+            .await;
+        };
+        let (outcome, ()) = tokio::join!(call, complete);
+        let McpOutcome::Ok(body) = outcome else {
+            panic!("provider result must remain a result");
+        };
+        assert_eq!(
+            body["result"],
+            serde_json::to_value(&provider_result).unwrap()
+        );
+
+        params["arguments"]["recording_session_id"] = json!(session.session_id);
+        let denied = handle_mcp_request(
+            &runtime,
+            rpc("tools/call", Some(json!(782)), params),
+            Some(&auth),
+        )
+        .await;
+        let McpOutcome::Ok(body) = denied else {
+            panic!("canonical governance denial must remain a result");
+        };
+        assert_eq!(body["result"]["isError"], client != "openai-mcp");
+        assert_eq!(body["result"]["structuredContent"]["success"], false);
+        assert_eq!(
+            body["result"]["structuredContent"]["output"]["error_kind"],
+            "session_guard_denied"
+        );
+        assert!(runtime
+            .runner_registry
+            .poll(RunnerPollRequest {
+                client_id: "runner-a".into(),
+                runner_instance_id: "runner-instance-a".into()
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn spawn_plugin_metadata_call(
     runtime: &Arc<ToolRuntime>,
     auth: &crate::auth::AuthContext,
@@ -459,7 +567,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
             681,
             json!({
                 "action":"call",
-                "binding":"wc_pbind_00000000000000000000000000000000",
+                "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                 "arguments":{}
             }),
             crate::auth::SCOPE_PLUGIN_INVOKE,
@@ -502,7 +610,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -555,7 +663,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -642,7 +750,7 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"},
                     "recording_session_id":session.session_id
                 }
@@ -677,7 +785,7 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
         runtime.sessions.summary(&session.session_id, Some(100))
     );
     assert!(!ledger.contains("must-not-run"));
-    assert!(!ledger.contains("wc_pbind_0123456789abcdef0123456789abcdef"));
+    assert!(!ledger.contains("wc_pbind_ASNFZ4mrze8BI0VniavN7w"));
 }
 
 #[tokio::test]
@@ -722,8 +830,8 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
 }
 
 #[tokio::test]
-async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+async fn plugin_tool_accepts_collaboration_ack_but_rejects_other_stateless_wrappers() {
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[crate::auth::SCOPE_PLUGIN_INSPECT]);
     register_plugin_runner(
         &runtime,
@@ -735,21 +843,40 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
     )
     .await;
 
+    let ack = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(694)),
+            mcp_2026_params(json!({
+                "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                "arguments": {
+                    "action":"list",
+                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_0123456789abcdef"]
+                }
+            })),
+        ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(ack) = ack else {
+        panic!("specialized plugin_tool must accept the collaboration ACK wrapper");
+    };
+    assert_eq!(ack["result"]["isError"], false, "{ack}");
+    assert!(!serde_json::to_string(&ack)
+        .unwrap()
+        .contains("ack_session_message_ids"));
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-a".to_string(),
+            runner_instance_id: "runner-instance-a".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
     for (id, arguments) in [
-        (
-            694,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_cached"]
-            }),
-        ),
-        (
-            695,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 7
-            }),
-        ),
         (
             696,
             json!({
@@ -782,7 +909,7 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
         )
         .await;
         let McpOutcome::BadRequest(value) = outcome else {
-            panic!("specialized plugin_tool must reject generic continuity wrappers");
+            panic!("specialized plugin_tool must reject non-ACK generic continuity wrappers");
         };
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(encoded.contains("unknown field"), "{encoded}");
@@ -825,7 +952,7 @@ async fn restricted_permission_denies_plugin_call_and_outer_direct_name_never_di
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"}
                 }
             }),
@@ -1409,7 +1536,7 @@ async fn plugin_tool_list_argument_matrix_rejects_ambiguous_inputs_before_dispat
         ),
         (
             769,
-            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_00000000000000000000000000000000"}),
+            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         ),
         (
             770,
@@ -1719,7 +1846,7 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
         &invoke,
         json!({
             "action":"call",
-            "binding":"wc_pbind_00000000000000000000000000000000",
+            "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
             "arguments":{}
         }),
         None,
@@ -1750,58 +1877,44 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
 }
 
 #[tokio::test]
-async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surface() {
+async fn provider_tool_names_never_enter_outer_mcp_inventory() {
     let auth = plugin_auth(true);
-    for surface in [
-        ModelSurface::LocalCoding,
-        ModelSurface::AdaptiveRuntime,
-        ModelSurface::FullOperatorRuntime,
-    ] {
-        let runtime = test_runtime_with_surface(surface);
-        register_plugin_runner(
-            &runtime,
-            "runner-a",
-            "runner-instance-a",
-            "repo-tools-a",
-            "provider-instance-a",
-            vec![plugin_tool("safe_delete"), plugin_tool("runtime_status")],
-        )
-        .await;
-        register_plugin_runner(
-            &runtime,
-            "runner-b",
-            "runner-instance-b",
-            "repo-tools-b",
-            "provider-instance-b",
-            vec![plugin_tool("safe_delete")],
-        )
-        .await;
+    let runtime = test_runtime();
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools-a",
+        "provider-instance-a",
+        vec![plugin_tool("safe_delete"), plugin_tool("runtime_status")],
+    )
+    .await;
+    register_plugin_runner(
+        &runtime,
+        "runner-b",
+        "runner-instance-b",
+        "repo-tools-b",
+        "provider-instance-b",
+        vec![plugin_tool("safe_delete")],
+    )
+    .await;
 
-        let value = tools_list(&runtime, &auth, true).await;
-        let names = value["result"]["tools"]
-            .as_array()
-            .unwrap()
+    let value = tools_list(&runtime, &auth, true).await;
+    let names = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME));
+    assert!(!names.contains(&"safe_delete"));
+    assert_eq!(
+        names
             .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME),
-            "stable gateway missing on {surface:?}"
-        );
-        assert!(
-            !names.contains(&"safe_delete"),
-            "provider-local name leaked into outer MCP on {surface:?}"
-        );
-        // A provider-local collision with a built-in is legal because the
-        // provider tool never contributes a second outer ToolSpec.
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| **name == "runtime_status")
-                .count(),
-            usize::from(surface != ModelSurface::LocalCoding)
-        );
-    }
+            .filter(|name| **name == "runtime_status")
+            .count(),
+        1
+    );
 
     let specs = registered_tool_specs();
     assert_eq!(
@@ -1816,7 +1929,7 @@ async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surfac
 
 #[tokio::test]
 async fn outer_direct_provider_tool_call_is_never_plugin_dispatch() {
-    let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+    let runtime = test_runtime();
     let auth = plugin_auth(true);
     register_plugin_runner(
         &runtime,
@@ -1871,7 +1984,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
         (705, crate::auth::SCOPE_PLUGIN_INVOKE),
         (706, crate::auth::SCOPE_PLUGIN_MANAGE),
     ] {
-        let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+        let runtime = test_runtime();
         register_plugin_runner(
             &runtime,
             "runner-a",
@@ -1904,7 +2017,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
 
 #[tokio::test]
 async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner_inventory() {
-    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[
         crate::auth::SCOPE_PLUGIN_INSPECT,
         crate::auth::SCOPE_RUNTIME_READ,
@@ -1931,11 +2044,20 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
     };
     let output = &value["result"]["structuredContent"]["output"];
     assert_eq!(output["name"], crate::plugin_gateway::PLUGIN_TOOL_NAME);
-    assert_eq!(output["route"]["mode"], "direct");
-    assert!(output["route"].get("via").is_none());
+    assert_eq!(output["route"]["primary"]["mode"], "direct");
+    assert_eq!(
+        output["route"]["primary"]["tool"],
+        crate::plugin_gateway::PLUGIN_TOOL_NAME
+    );
+    assert_eq!(output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(output["route"]["fallback"]["tool"], "call_runtime_tool");
+    assert_eq!(
+        output["route"]["fallback"]["target"],
+        crate::plugin_gateway::PLUGIN_TOOL_NAME
+    );
     assert_eq!(
         output["input_schema"]["properties"]["binding"]["pattern"],
-        "^wc_pbind_[0-9a-f]{32}$"
+        "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
     );
     assert_eq!(output["authority"]["policy"], "require_any");
     let scopes = output["authority"]["scopes"]
@@ -1986,10 +2108,14 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
             "Stateless MCP must preserve canonical Plugin business schema for {field}"
         );
     }
-    assert_eq!(
-        stateless_gateway["inputSchema"]["properties"]["recording_session_id"]["pattern"],
-        "^wc_sess_[A-Za-z0-9_]+$"
-    );
+    for schema in [&output["input_schema"], &stateless_gateway["inputSchema"]] {
+        assert!(
+            schema["properties"]["recording_session_id"]
+                .get("pattern")
+                .is_none(),
+            "sparse Plugin discovery intentionally omits the opaque wc_sess_* regex"
+        );
+    }
 }
 
 #[tokio::test]

@@ -191,8 +191,13 @@ request_body() {
     python3 -c 'import json,sys; print(json.dumps({"project":sys.argv[1],"command":sys.argv[2],"timeout_secs":5}))' \
         "$RUNTIME_PROJECT" "$1"
 }
+runtime_tool_call() {
+    local tool="$1"
+    local params="$2"
+    api_post /api/tools/call "{\"tool\":\"${tool}\",\"params\":${params}}"
+}
 run_shell_request() {
-    api_post /api/projects/run_shell "$(request_body "$1")" >"$RESPONSE_FILE"
+    runtime_tool_call "run_shell" "$(request_body "$1")" >"$RESPONSE_FILE"
 }
 assert_marker() {
     run_shell_request 'printf %s "$WEBCODEX_RELOAD_MARKER"'
@@ -200,12 +205,12 @@ assert_marker() {
         "$RESPONSE_FILE" "$1" || fail "shell marker was not $1"
 }
 start_job() {
-    api_post /api/projects/run_job "$(request_body "$1")" | python3 -c \
+    runtime_tool_call "run_job" "$(request_body "$1")" | python3 -c \
         'import json,sys; d=json.load(sys.stdin); assert d["success"]; print(d["output"]["job_id"])'
 }
 job_status() {
-    api_post /api/jobs/status "{\"job_id\":\"$1\"}" | python3 -c \
-        'import json,sys; d=json.load(sys.stdin); assert d["success"]; print(d["output"]["status"])'
+    runtime_tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"$1\"}],\"tail_lines\":1}" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); assert d["success"]; item=d["output"]["items"][0]; assert item["job_id"]==sys.argv[1]; print(item["status"])' "$1"
 }
 for command in awk curl git mv python3 setsid tail "$CARGO_BIN"; do require_command "$command"; done
 cd "$ROOT"

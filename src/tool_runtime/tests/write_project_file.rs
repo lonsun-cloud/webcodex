@@ -27,10 +27,7 @@ fn assert_outcome_unknown(result: &ToolResult) {
     assert!(result.output["state_changed"].is_null());
     assert_eq!(result.output["error_kind"], "outcome_unknown");
     assert_eq!(result.output["failure_kind"], "outcome_unknown");
-    assert_eq!(
-        result.output["recovery_action"],
-        "inspect_workspace_before_retry"
-    );
+    assert!(result.output.get("recovery_action").is_none());
     assert_eq!(result.output["recovery_kind"], "reobserve");
     let error = result.error.as_deref().expect("model-facing uncertainty");
     assert!(error.contains("outcome is unknown"), "{error}");
@@ -48,7 +45,7 @@ fn assert_outcome_unknown(result: &ToolResult) {
 }
 
 #[tokio::test]
-async fn write_project_file_requires_sha_for_overwrite_before_enqueue() {
+async fn write_project_file_requires_read_revision_for_overwrite_before_enqueue() {
     let (runtime, project) = write_runtime("write-guard").await;
     let result = runtime
         .write_project_file(
@@ -63,7 +60,10 @@ async fn write_project_file_requires_sha_for_overwrite_before_enqueue() {
     assert!(!result.success);
     assert_eq!(result.output["execution_state"], "not_started");
     assert_eq!(result.output["state_changed"], false);
-    assert_eq!(result.output["error_kind"], "missing_expected_sha256");
+    assert_eq!(
+        result.output["error_kind"],
+        "missing_expected_read_revision"
+    );
     assert_eq!(result.output["recovery_kind"], "fix_input");
     assert!(result
         .error
@@ -72,6 +72,127 @@ async fn write_project_file_requires_sha_for_overwrite_before_enqueue() {
     assert!(probe_patch_agent_request(&runtime, "write-guard")
         .await
         .is_none());
+}
+
+#[tokio::test]
+async fn write_project_file_translates_read_revision_to_wire_sha_and_sanitizes_stale_conflict() {
+    let (runtime, project) = write_runtime("write-revision-translation").await;
+    let expected_sha = "a".repeat(64);
+    let revision = seed_read_revision(&runtime, &project, "existing.txt", &expected_sha).await;
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .write_project_file(
+                    project,
+                    "existing.txt".to_string(),
+                    "replacement\n".to_string(),
+                    Some(true),
+                    Some(revision),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "write-revision-translation").await;
+    assert_eq!(request.kind, "file_write_project_file");
+    let payload: serde_json::Value =
+        serde_json::from_str(request.content.as_deref().expect("write payload")).unwrap();
+    assert_eq!(payload["overwrite"], true);
+    assert_eq!(payload["expected_sha256"], expected_sha);
+    assert!(payload.get("expected_read_revision").is_none());
+
+    complete_patch_agent_request(
+        &runtime,
+        "write-revision-translation",
+        &request.request_id,
+        0,
+        &json!({
+            "path": "existing.txt",
+            "created": false,
+            "overwritten": false,
+            "bytes_written": 0,
+            "sha256": "b".repeat(64),
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error": "expected_sha256 mismatch"
+        })
+        .to_string(),
+        "",
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "stale_file_revision");
+    assert!(result.output.get("expected_read_revision").is_none());
+    assert!(result.output.get("reread_required").is_none());
+    assert_eq!(result.output["recovery"]["tool"], "read_files");
+    assert_eq!(
+        result.output["recovery"]["arguments"]["items"][0]["path"],
+        "existing.txt"
+    );
+    assert!(result.output.get("sha256").is_none());
+    let error = result.error.as_deref().unwrap();
+    assert!(error.contains("source"));
+    assert!(!error.contains("expected_sha256"));
+    assert!(!error.contains("read revision"));
+
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("write_project_file");
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&result).unwrap(),
+        &schema,
+    )
+    .unwrap_or_else(|schema_error| {
+        panic!("stale write read-revision recovery must match output schema: {schema_error}")
+    });
+}
+
+#[tokio::test]
+async fn write_project_file_rejects_project_mismatched_read_revision_before_dispatch() {
+    let (runtime, project) = write_runtime("write-revision-project-mismatch").await;
+    let resolved = runtime.resolve_project_input(&project).await.unwrap();
+    let runner = runtime
+        .runner_registry
+        .get_runner_view(&resolved.config.client_id)
+        .await
+        .unwrap();
+    let revision = runtime.read_revisions.observe(
+        super::super::read_revisions::ReadRevisionTarget {
+            project_id: "agent:other:project".to_string(),
+            path: "existing.txt".to_string(),
+            client_id: resolved.config.client_id,
+            runner_instance_id: runner.runner_instance_id,
+            project_root: resolved.config.path,
+            root_fingerprint: resolved.root_fingerprint,
+        },
+        "a".repeat(64),
+    );
+
+    let result = runtime
+        .write_project_file(
+            project,
+            "existing.txt".to_string(),
+            "replacement\n".to_string(),
+            Some(true),
+            Some(revision),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(
+        result.output["error_kind"],
+        "read_revision_project_mismatch"
+    );
+    assert_eq!(result.output["state_changed"], false);
+    assert!(result.output.get("expected_read_revision").is_none());
+    assert_eq!(result.output["recovery"]["tool"], "read_files");
+    assert!(
+        probe_patch_agent_request(&runtime, "write-revision-project-mismatch")
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]

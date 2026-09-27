@@ -24,8 +24,11 @@ PLATFORMS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x6
 BINARIES = ("webcodex", "webcodex-server", "webcodex-runner")
 LEGACY_DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64")
 DESKTOP_PLATFORMS = (*LEGACY_DESKTOP_PLATFORMS, "win32-arm64")
+PRIMARY_DESKTOP_PLATFORMS = ("darwin-arm64", "win32-x64", "win32-arm64")
+SUPPLEMENTAL_DESKTOP_PLATFORMS = ("darwin-x64",)
 DESKTOP_FIRST_VERSION = "0.4.0"
 WINDOWS_ARM64_DESKTOP_FIRST_VERSION = "0.4.2"
+SUPPLEMENTAL_DESKTOP_FIRST_VERSION = "0.4.3"
 SERVER_IMAGE = "ghcr.io/yyjeqhc/webcodex-server"
 SERVER_IMAGE_METADATA = "webcodex-server-image.json"
 SERVER_BOOTSTRAP_ASSET = "webcodex-server-bootstrap.sh"
@@ -109,6 +112,14 @@ def expected_desktop_url(version: str, platform: str) -> str:
     return f"https://github.com/{REPO}/releases/download/v{version}/{canonical_desktop_name(version, platform)}"
 
 
+def canonical_desktop_checksum_name(version: str, platform: str) -> str:
+    return f"{canonical_desktop_name(version, platform)}.sha256"
+
+
+def expected_desktop_checksum_url(version: str, platform: str) -> str:
+    return f"https://github.com/{REPO}/releases/download/v{version}/{canonical_desktop_checksum_name(version, platform)}"
+
+
 def _semver_parts(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
     normalized = normalize_version(value)
     core_and_pre = normalized.split("+", 1)[0]
@@ -127,10 +138,21 @@ def desktop_platforms_for_version(version: str) -> tuple[str, ...]:
     if not desktop_required(version):
         return ()
     version_core, _ = _semver_parts(version)
+    supplemental_first_core, _ = _semver_parts(SUPPLEMENTAL_DESKTOP_FIRST_VERSION)
+    if version_core >= supplemental_first_core:
+        return PRIMARY_DESKTOP_PLATFORMS
     arm64_first_core, _ = _semver_parts(WINDOWS_ARM64_DESKTOP_FIRST_VERSION)
     if version_core >= arm64_first_core:
         return DESKTOP_PLATFORMS
     return LEGACY_DESKTOP_PLATFORMS
+
+
+def supplemental_desktop_platforms_for_version(version: str) -> tuple[str, ...]:
+    version_core, _ = _semver_parts(version)
+    supplemental_first_core, _ = _semver_parts(SUPPLEMENTAL_DESKTOP_FIRST_VERSION)
+    if version_core >= supplemental_first_core:
+        return SUPPLEMENTAL_DESKTOP_PLATFORMS
+    return ()
 
 
 def expected_binary_names(platform: str) -> set[str]:
@@ -297,11 +319,13 @@ def validate_public_manifest(manifest: dict, version: str) -> dict[str, dict[str
     return result
 
 
-def parse_sha256sums(text: str, version: str) -> dict[str, str]:
+def parse_sha256sums(text: str, version: str, *, runtime_manifest: bool = False) -> dict[str, str]:
     expected_names = {canonical_archive_name(version, platform) for platform in PLATFORMS}
     expected_names.update(
         canonical_desktop_name(version, platform) for platform in desktop_platforms_for_version(version)
     )
+    if runtime_manifest:
+        expected_names.add("webcodex-release-manifest.json")
     result: dict[str, str] = {}
     for raw_line in text.splitlines():
         if not raw_line:
@@ -418,6 +442,14 @@ def validate_github_assets(release: dict, version: str) -> dict[str, dict]:
         canonical_desktop_name(version, platform) for platform in desktop_platforms_for_version(version)
     )
     server_assets = {SERVER_IMAGE_METADATA, *SERVER_DEPLOYMENT_ASSETS}
+    supplemental_assets = {
+        name
+        for platform in supplemental_desktop_platforms_for_version(version)
+        for name in (
+            canonical_desktop_name(version, platform),
+            canonical_desktop_checksum_name(version, platform),
+        )
+    }
     assets = release.get("assets")
     if not isinstance(assets, list):
         raise VerificationError("GitHub Release assets are missing")
@@ -430,8 +462,14 @@ def validate_github_assets(release: dict, version: str) -> dict[str, dict]:
             raise VerificationError(f"GitHub Release contains duplicate asset: {name}")
         result[name] = asset
     names = set(result)
+    if "webcodex-release-manifest.json" in names:
+        required.add("webcodex-release-manifest.json")
+    expected = set(required)
     post_publication = names & server_assets
-    expected = required | server_assets if post_publication else required
+    if post_publication:
+        expected |= server_assets
+    supplemental_present = names & supplemental_assets
+    expected |= supplemental_present
     if names != expected:
         raise VerificationError(f"GitHub Release asset set mismatch: {sorted(result)}")
     for name, asset in result.items():
@@ -711,6 +749,40 @@ def verify_desktop_asset(
     return desktop_size, desktop_digest
 
 
+def verify_supplemental_desktop_asset(
+    version: str,
+    platform: str,
+    assets: dict[str, dict],
+    root: Path,
+    timeout: float,
+) -> tuple[int, str]:
+    desktop_name = canonical_desktop_name(version, platform)
+    checksum_name = canonical_desktop_checksum_name(version, platform)
+    checksum_asset = assets[checksum_name]
+    checksum_url = checksum_asset.get("browser_download_url")
+    if checksum_url != expected_desktop_checksum_url(version, platform):
+        raise VerificationError(f"unexpected supplemental Desktop checksum URL: {checksum_url!r}")
+    checksum_bytes = fetch_bytes(checksum_url, MAX_JSON_BYTES, timeout)
+    checksum_digest = _asset_digest(checksum_asset)
+    if checksum_digest is not None and hashlib.sha256(checksum_bytes).hexdigest() != checksum_digest:
+        raise VerificationError(f"GitHub supplemental Desktop checksum digest mismatch for {platform}")
+    try:
+        checksum_text = checksum_bytes.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise VerificationError(f"supplemental Desktop checksum is not ASCII for {platform}") from exc
+    match = re.fullmatch(rf"([0-9a-f]{{64}})  {re.escape(desktop_name)}\n?", checksum_text)
+    if match is None:
+        raise VerificationError(f"supplemental Desktop checksum is malformed for {platform}")
+    return verify_desktop_asset(
+        version,
+        platform,
+        assets[desktop_name],
+        {desktop_name: match.group(1)},
+        root,
+        timeout,
+    )
+
+
 def verify_public_release(version: str, timeout: float) -> None:
     encoded_package = urllib.parse.quote(PACKAGE, safe="@")
     npm_url = f"https://registry.npmjs.org/{encoded_package}/{version}"
@@ -745,7 +817,21 @@ def verify_public_release(version: str, timeout: float) -> None:
             sums_text = sums_bytes.decode("ascii")
         except UnicodeDecodeError as exc:
             raise VerificationError("SHA256SUMS is not ASCII") from exc
-        sums = parse_sha256sums(sums_text, version)
+        runtime_asset = assets.get("webcodex-release-manifest.json")
+        sums = parse_sha256sums(sums_text, version, runtime_manifest=runtime_asset is not None)
+        if runtime_asset is not None:
+            try:
+                from .desktop_runtime_manifest import validate, ManifestError
+            except ImportError:
+                from desktop_runtime_manifest import validate, ManifestError
+            runtime_bytes = fetch_bytes(runtime_asset["browser_download_url"], MAX_JSON_BYTES, timeout)
+            digest = hashlib.sha256(runtime_bytes).hexdigest()
+            if sums.get("webcodex-release-manifest.json") != digest or (_asset_digest(runtime_asset) is not None and _asset_digest(runtime_asset) != digest):
+                raise VerificationError("Runtime release manifest digest mismatch")
+            try:
+                validate(json.loads(runtime_bytes), version)
+            except (ValueError, UnicodeError, ManifestError) as exc:
+                raise VerificationError("Runtime release manifest contract is invalid") from exc
 
         for platform in desktop_platforms_for_version(version):
             desktop_name = canonical_desktop_name(version, platform)
@@ -758,6 +844,28 @@ def verify_public_release(version: str, timeout: float) -> None:
                 timeout,
             )
             print(f"desktop_{platform.replace('-', '_')} sha256={desktop_digest} bytes={desktop_size}")
+
+        for platform in supplemental_desktop_platforms_for_version(version):
+            desktop_name = canonical_desktop_name(version, platform)
+            checksum_name = canonical_desktop_checksum_name(version, platform)
+            present = {name for name in (desktop_name, checksum_name) if name in assets}
+            if not present:
+                print(f"desktop_{platform.replace('-', '_')}_supplemental=not_published")
+                continue
+            if present != {desktop_name, checksum_name}:
+                print(f"desktop_{platform.replace('-', '_')}_supplemental=publication_in_progress")
+                continue
+            desktop_size, desktop_digest = verify_supplemental_desktop_asset(
+                version,
+                platform,
+                assets,
+                root,
+                timeout,
+            )
+            print(
+                f"desktop_{platform.replace('-', '_')}_supplemental "
+                f"sha256={desktop_digest} bytes={desktop_size}"
+            )
 
         image_identity = None
         image_asset = assets.get(SERVER_IMAGE_METADATA)

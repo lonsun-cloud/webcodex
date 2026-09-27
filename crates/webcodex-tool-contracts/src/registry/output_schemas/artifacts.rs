@@ -1,11 +1,121 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
+    array_schema, nullable_schema, open_object_schema, schema_type, suggested_tool_call_schema,
+    wrapped_output_schema,
 };
+
+fn read_project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        "read_project_artifact",
+        json!({
+            "type": "object",
+            "description": "Parser-ready next ranged read of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "encoding": {"type": "string", "const": "base64"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "encoding",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory call for the next ranged read of the same exact artifact content snapshot. It grants no Project or Session authority.",
+    )
+}
+
+fn project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        "project_artifact",
+        json!({
+            "type": "object",
+            "description": "Parser-ready continuation for one more bounded inspect of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "action": {"type": "string", "const": "inspect"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "action",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory continuation for project_artifact(action=inspect). It carries the observed full-file SHA-256 fence and grants no Project or Session authority.",
+    )
+}
+
+fn project_artifact_output_schema() -> Value {
+    let mut merged = wrapped_output_schema(vec![]);
+    let target = merged["properties"]["output"]["properties"]
+        .as_object_mut()
+        .expect("project_artifact output properties");
+    for specialist in ["read_project_artifact_metadata", "read_project_artifact"] {
+        let source = output_schema_for_tool(specialist).expect("artifact specialist output schema");
+        let properties = source["properties"]["output"]["properties"]
+            .as_object()
+            .expect("artifact specialist output properties");
+        for (name, schema) in properties {
+            target.entry(name.clone()).or_insert_with(|| schema.clone());
+        }
+    }
+    target.insert(
+        "project".to_string(),
+        schema_type("string", "Canonical resolved Runtime Project id."),
+    );
+    target.insert(
+        "name".to_string(),
+        schema_type(
+            "string",
+            "Safe basename presented by project_artifact(action=export).",
+        ),
+    );
+    target.insert(
+        "suggested_call".to_string(),
+        project_artifact_suggested_call_schema(),
+    );
+    target.insert(
+        "content_delivery".to_string(),
+        json!({
+            "type": "string",
+            "const": "mcp_image",
+            "description": "MCP image action marker after native-image framing; image bytes are carried in an MCP image ContentBlock instead of structuredContent."
+        }),
+    );
+    merged
+}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "project_artifact" => Some(project_artifact_output_schema()),
         "save_project_artifact" => Some(wrapped_output_schema(vec![
             (
                 "path",
@@ -37,27 +147,34 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "export_project_artifact" => Some(wrapped_output_schema(vec![
+        "transfer_project_artifact" => Some(wrapped_output_schema(vec![
             (
-                "project",
-                schema_type("string", "Canonical Runner-registered project id."),
+                "source_project",
+                schema_type("string", "Canonical resolved source Runtime Project id."),
             ),
             (
-                "path",
-                schema_type("string", "Project-relative artifact path."),
+                "source_path",
+                schema_type("string", "Project-relative source artifact path."),
             ),
-            ("bytes", schema_type("integer", "Artifact size in bytes.")),
+            (
+                "destination_project",
+                schema_type("string", "Canonical resolved destination Runtime Project id."),
+            ),
+            (
+                "destination_path",
+                schema_type("string", "Project-relative destination artifact path."),
+            ),
+            (
+                "bytes",
+                schema_type("integer", "Transferred artifact size in bytes."),
+            ),
             (
                 "sha256",
-                schema_type("string", "sha256 digest of the full artifact file."),
+                schema_type("string", "SHA-256 of the exact source snapshot and committed destination."),
             ),
             (
                 "mime_type",
-                schema_type("string", "Validated artifact MIME type."),
-            ),
-            (
-                "name",
-                schema_type("string", "Safe basename presented by the MCP ResourceLink."),
+                schema_type("string", "Canonical artifact presentation MIME type."),
             ),
         ])),
         "read_project_artifact_metadata" => Some(wrapped_output_schema(vec![
@@ -275,7 +392,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_offset",
-                schema_type("integer", "Offset to use for the next chunk."),
+                schema_type(
+                    "integer",
+                    "Domain metadata for the next chunk offset. Models should continue through suggested_call, which also carries the observed full-file SHA-256 snapshot fence.",
+                ),
             ),
             (
                 "truncated",
@@ -284,6 +404,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "eof",
                 schema_type("boolean", "True when this chunk reaches end of file."),
+            ),
+            (
+                "suggested_call",
+                read_project_artifact_suggested_call_schema(),
             ),
         ])),
         _ => None,

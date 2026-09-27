@@ -1,14 +1,15 @@
 //! Edit tool usage telemetry (phase 1).
 //!
-//! Emits always-on structured logs for edit-surface tool calls so operators can
-//! measure how often the canonical edit tools (`apply_text_edits`, `apply_patch`,
-//! `apply_unified_diff`) are used relative to the intentional whole-file
-//! rewrite path (`write_project_file`).
+//! Emits always-on structured logs for known edit-surface tool calls so operators
+//! can compare outcome, error, and duration evidence across mutation forms. Tool
+//! selection is a factual dimension, not a success metric or preferred-tool KPI.
 //!
 //! Design constraints:
 //! - No new database tables, Action Audit columns, session ledger fields, or
 //!   OpenAPI/MCP/schema changes.
 //! - Never log arguments, file paths, file contents, patches, secrets, or tokens.
+//! - Do not inspect run_shell command text, script bodies, or paths to guess whether
+//!   a programmatic transformation was an edit; privacy takes precedence over coverage.
 //! - Reuses existing `tracing` infrastructure (same family as `tool_request_trace`).
 //! - Does not change tool execution semantics, permissions, or session behavior.
 
@@ -21,20 +22,18 @@ pub(crate) const TELEMETRY_CATEGORY_EDIT: &str = "edit";
 /// Event name written to structured logs / metrics pipelines.
 pub(crate) const EDIT_TOOL_USAGE_EVENT: &str = "edit_tool_usage";
 
-/// How a specific edit tool sits on the preferred-vs-legacy surface.
+/// Coarse factual mutation form for this privacy-safe telemetry stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditToolSurface {
-    /// Preferred precise/local or unified-diff multi-file paths.
-    Canonical,
-    /// Valid but non-preferred specialized path (intentional whole-file write).
-    Advanced,
+    StructuredOrPatch,
+    WholeFile,
 }
 
 impl EditToolSurface {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Canonical => "canonical",
-            Self::Advanced => "advanced",
+            Self::StructuredOrPatch => "structured_or_patch",
+            Self::WholeFile => "whole_file",
         }
     }
 }
@@ -44,9 +43,9 @@ impl EditToolSurface {
 pub(crate) fn edit_tool_surface(tool_name: &str) -> Option<EditToolSurface> {
     match tool_name {
         "apply_text_edits" | "apply_patch" | "apply_unified_diff" => {
-            Some(EditToolSurface::Canonical)
+            Some(EditToolSurface::StructuredOrPatch)
         }
-        "write_project_file" => Some(EditToolSurface::Advanced),
+        "write_project_file" => Some(EditToolSurface::WholeFile),
         _ => None,
     }
 }
@@ -306,11 +305,12 @@ fn safe_recovery_action(result: &ToolResult) -> Option<&'static str> {
         .get("recovery_action")
         .and_then(|value| value.as_str())
         .or_else(|| {
-            result
-                .output
-                .get("recovery")
-                .and_then(|value| value.get("action"))
-                .and_then(|value| value.as_str())
+            result.output.get("recovery").and_then(|value| {
+                value
+                    .get("tool")
+                    .or_else(|| value.get("action"))
+                    .and_then(|value| value.as_str())
+            })
         })?;
     match raw {
         "read_files" => Some("read_files"),
@@ -382,11 +382,13 @@ pub(crate) fn record_contains_sensitive_keys(record: &EditToolUsageRecord) -> bo
     // Also reject if any string field accidentally embeds path/content markers
     // from test fixtures that should never appear in telemetry.
     let surface = record.edit_surface.as_str();
+    if !matches!(surface, "structured_or_patch" | "whole_file") {
+        return true;
+    }
     let kind = record.error_kind.unwrap_or("");
     let haystacks = [
         record.tool_name,
         record.category,
-        surface,
         kind,
         record.requested_matching_mode.unwrap_or(""),
         record.selected_match_mode.unwrap_or(""),
@@ -409,8 +411,9 @@ pub(crate) fn record_contains_sensitive_keys(record: &EditToolUsageRecord) -> bo
             "token",
             "password",
         ] {
-            // tool_name may legitimately contain none of these; category/surface
-            // are fixed. error_kind allowlist is fixed. This is a safety net.
+            // tool_name can legitimately name apply_patch; edit_surface is validated
+            // separately against its closed factual enum. Other fields are fixed
+            // allowlists, so this remains a safety net against accidental payload data.
             if h.contains(banned) && h != record.tool_name {
                 return true;
             }
@@ -452,22 +455,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn classifies_canonical_and_advanced_edit_tools() {
+    fn classifies_known_edit_tools_by_mutation_form() {
         assert_eq!(
             edit_tool_surface("apply_text_edits"),
-            Some(EditToolSurface::Canonical)
+            Some(EditToolSurface::StructuredOrPatch)
         );
         assert_eq!(
             edit_tool_surface("apply_patch"),
-            Some(EditToolSurface::Canonical)
+            Some(EditToolSurface::StructuredOrPatch)
         );
         assert_eq!(
             edit_tool_surface("apply_unified_diff"),
-            Some(EditToolSurface::Canonical)
+            Some(EditToolSurface::StructuredOrPatch)
         );
         assert_eq!(
             edit_tool_surface("write_project_file"),
-            Some(EditToolSurface::Advanced)
+            Some(EditToolSurface::WholeFile)
         );
         // Removed legacy compatibility tools are no longer classified.
         for name in [
@@ -488,7 +491,7 @@ mod tests {
     #[test]
     fn non_edit_tools_are_not_tracked() {
         for name in [
-            "read_file",
+            "read_files",
             "run_shell",
             "list_tools",
             "save_project_artifact",
@@ -504,7 +507,7 @@ mod tests {
         let record = EditToolUsageRecord {
             tool_name: "write_project_file",
             category: TELEMETRY_CATEGORY_EDIT,
-            edit_surface: EditToolSurface::Advanced,
+            edit_surface: EditToolSurface::WholeFile,
             success: false,
             duration_ms: 12,
             error_kind: Some("runtime_error"),
@@ -517,7 +520,7 @@ mod tests {
         };
         assert!(!record_contains_sensitive_keys(&record));
         assert_eq!(record.category, "edit");
-        assert_eq!(record.edit_surface.as_str(), "advanced");
+        assert_eq!(record.edit_surface.as_str(), "whole_file");
         assert_eq!(record.tool_name, "write_project_file");
     }
 
@@ -552,7 +555,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "apply_text_edits");
         assert_eq!(events[0].category, "edit");
-        assert_eq!(events[0].edit_surface, EditToolSurface::Canonical);
+        assert_eq!(events[0].edit_surface, EditToolSurface::StructuredOrPatch);
         assert!(events[0].success);
         assert!(events[0].error_kind.is_none());
         assert!(!record_contains_sensitive_keys(&events[0]));
@@ -605,8 +608,34 @@ mod tests {
     }
 
     #[test]
+    fn compact_parser_ready_recovery_records_read_files_action() {
+        let parser_ready = ToolResult::err_with_output(
+            "stale file",
+            json!({
+                "recovery": {
+                    "tool": "read_files",
+                    "arguments": {
+                        "project": "agent:test:project",
+                        "items": [{"path": "src/private.rs"}]
+                    }
+                }
+            }),
+        );
+        assert_eq!(safe_recovery_action(&parser_ready), Some("read_files"));
+
+        let legacy_domain_shape = ToolResult::err_with_output(
+            "context mismatch",
+            json!({"recovery": {"action": "read_files"}}),
+        );
+        assert_eq!(
+            safe_recovery_action(&legacy_domain_shape),
+            Some("read_files")
+        );
+    }
+
+    #[test]
     fn start_returns_none_for_non_edit_tools() {
-        assert!(start_edit_tool_usage("read_file").is_none());
+        assert!(start_edit_tool_usage("read_files").is_none());
     }
 
     #[test]
@@ -619,7 +648,7 @@ mod tests {
         let events = take_test_edit_tool_usage();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "write_project_file");
-        assert_eq!(events[0].edit_surface, EditToolSurface::Advanced);
+        assert_eq!(events[0].edit_surface, EditToolSurface::WholeFile);
         assert!(!events[0].success);
         assert_eq!(events[0].error_kind, Some("incomplete"));
     }

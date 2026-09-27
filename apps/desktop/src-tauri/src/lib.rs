@@ -1,16 +1,27 @@
 mod activity;
+mod coding_agents;
 mod commands;
+mod connection_id;
+mod connections;
 mod deadline;
 mod desktop_shell;
+mod diagnostics;
 mod error;
+mod mcp_providers;
 mod models;
 mod operation;
 mod platform;
 mod process;
+mod project_inventory;
+mod runner_capability_grant;
+mod runtime_selection;
+mod ssh_resources;
 mod state;
 mod tray;
 mod tunnel_config;
+mod updates;
 mod webcodex;
+mod workspace;
 
 use state::AppState;
 use tauri::Manager;
@@ -46,6 +57,28 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_desktop_state,
+            commands::get_runtime_settings,
+            commands::get_desktop_build_info,
+            commands::check_for_updates,
+            commands::remind_update_later,
+            commands::open_latest_release,
+            commands::get_diagnostics,
+            commands::set_tool_request_tracing,
+            commands::open_diagnostic_resource,
+            commands::copy_runtime_console_credential,
+            commands::copy_diagnostic_report,
+            commands::export_support_bundle,
+            commands::probe_runtime,
+            commands::recheck_runtime,
+            commands::switch_runtime,
+            commands::restore_previous_configuration,
+            commands::workspace_query,
+            commands::get_computer_permissions,
+            commands::request_computer_permission,
+            commands::get_runner_settings,
+            commands::add_runner_plugin,
+            commands::update_runner_settings,
+            commands::restart_owned_runner,
             commands::open_powershell_install_guide,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
@@ -54,9 +87,22 @@ pub fn run() {
             commands::resume_saved_runtime,
             commands::update_tunnel_proxy,
             commands::update_tunnel_config,
+            commands::save_tunnel_profile,
+            commands::save_mcp_provider,
+            commands::remove_mcp_provider,
+            commands::save_coding_agent,
+            commands::remove_coding_agent,
+            commands::ssh_resource_list,
+            commands::ssh_resource_register,
+            commands::ssh_resource_remove,
+            commands::authorize_runner_capabilities,
+            commands::runner_capability_authorization,
+            commands::tunnel_profile_action,
             commands::inspect_project,
             commands::configure_local_setup,
             commands::activate_local_project,
+            commands::prepare_project_unregister,
+            commands::unregister_project,
             commands::configure_remote_setup,
             commands::start_quick_share,
             commands::stop_quick_share,

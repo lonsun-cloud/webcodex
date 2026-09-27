@@ -81,6 +81,7 @@ async fn git_log_parses_commits() {
                 .dispatch_with_auth(
                     ToolCall::GitLog {
                         project,
+                        head_commit: None,
                         limit: None,
                         skip: None,
                         session_id: None,
@@ -143,6 +144,7 @@ async fn git_log_limit_and_skip_returns_second_recent_and_truncated() {
                 .dispatch_with_auth(
                     ToolCall::GitLog {
                         project,
+                        head_commit: None,
                         limit: Some(1),
                         skip: Some(1),
                         session_id: None,
@@ -194,7 +196,7 @@ async fn run_git_log_page_with_stdout(
         },
     )
     .await;
-    let project = agent_test_project_id(client_id);
+    let project = "agent-proj".to_string();
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -203,6 +205,7 @@ async fn run_git_log_page_with_stdout(
                 .dispatch_with_auth(
                     ToolCall::GitLog {
                         project,
+                        head_commit: None,
                         limit: Some(limit),
                         skip: Some(skip),
                         session_id: None,
@@ -219,6 +222,45 @@ async fn run_git_log_page_with_stdout(
     task.await.unwrap()
 }
 
+async fn run_git_log_tool_call_with_stdout(
+    client_id: &str,
+    call: ToolCall,
+    stdout: String,
+    expected_head: &str,
+) -> ToolResult {
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            git: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime.dispatch_with_auth(call, Some(&bootstrap)).await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert!(
+        request.command.contains(expected_head),
+        "{}",
+        request.command
+    );
+    assert!(
+        !request.command.contains("HEAD^{commit}"),
+        "{}",
+        request.command
+    );
+    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
+    task.await.unwrap()
+}
+
 #[tokio::test]
 async fn git_log_retained_tail_never_advertises_a_complete_or_continuable_page() {
     let record = |subject: &str| {
@@ -229,7 +271,9 @@ async fn git_log_retained_tail_never_advertises_a_complete_or_continuable_page()
     };
     // Exercise actual registry retention, which drops the oversized first
     // record's prefix but leaves a perfectly parseable older commit behind.
-    let stdout = record(&"x".repeat(300 * 1024)) + &record("older");
+    let stdout = record(&"x".repeat(300 * 1024))
+        + &record("older")
+        + &format!("__WEBCODEX_GIT_LOG_HEAD__={}\u{1e}", "a".repeat(40));
     let result = run_git_log_page_with_stdout("git-log-retained-tail", stdout, 2, 0).await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "source_incomplete");
@@ -238,7 +282,7 @@ async fn git_log_retained_tail_never_advertises_a_complete_or_continuable_page()
 }
 
 #[tokio::test]
-async fn git_log_next_skip_reconstructs_multiple_pages_without_gap_or_duplicate() {
+async fn git_log_snapshot_continuation_survives_head_advance_without_gap_or_duplicate() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     init_git_repo(root);
@@ -250,27 +294,85 @@ async fn git_log_next_skip_reconstructs_multiple_pages_without_gap_or_duplicate(
             &format!("commit {index}"),
         );
     }
+
     let first = run_git_log_page("git-log-multipage", root, 2, 0).await;
+    assert!(first.success, "{:?}", first.error);
     assert_eq!(first.output["truncated"], true);
     assert_eq!(first.output["next_skip"], 2);
-    let second = run_git_log_page(
+    let snapshot = first.output["head_commit"].as_str().unwrap().to_string();
+    assert_eq!(snapshot.len(), 40);
+    let first_next = &first.output["suggested_call"];
+    assert_eq!(first_next["tool"], "git_log");
+    assert_eq!(
+        first_next["arguments"]["project"],
+        agent_test_project_id("git-log-multipage")
+    );
+    assert_eq!(first_next["arguments"]["head_commit"], snapshot);
+    assert_eq!(first_next["arguments"]["limit"], 2);
+    assert_eq!(first_next["arguments"]["skip"], 2);
+    let second_call = ToolCall::from_tool_name(
+        first_next["tool"].as_str().unwrap(),
+        first_next["arguments"].clone(),
+    )
+    .expect("git_log suggested_call must be parser-ready");
+    let mut projected_first = ToolResult::ok(first.output.clone());
+    crate::model_surface::project_tool_result_suggested_calls(
+        "git_log",
+        &mut projected_first,
+        &|target| crate::model_surface::suggested_tool_call_route(target, false),
+    );
+    let projected_next = &projected_first.output["suggested_call"];
+    assert_eq!(
+        projected_next["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(projected_next["arguments"]["tool"], "git_log");
+    assert_eq!(
+        projected_next["arguments"]["arguments"],
+        first_next["arguments"]
+    );
+
+    commit_file(root, "paged.txt", "6\n", "commit 6");
+    let current_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(current_head.status.success());
+    assert_ne!(
+        String::from_utf8_lossy(&current_head.stdout).trim(),
+        snapshot
+    );
+
+    let second_stdout = git_log_stdout_at_head(root, &snapshot, 2, 2);
+    let second = run_git_log_tool_call_with_stdout(
         "git-log-multipage",
-        root,
-        2,
-        first.output["next_skip"].as_u64().unwrap() as usize,
+        second_call,
+        second_stdout,
+        &snapshot,
     )
     .await;
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!(second.output["head_commit"], snapshot);
     assert_eq!(second.output["truncated"], true);
     assert_eq!(second.output["next_skip"], 4);
-    let final_page = run_git_log_page(
-        "git-log-multipage",
-        root,
-        2,
-        second.output["next_skip"].as_u64().unwrap() as usize,
+    let second_next = &second.output["suggested_call"];
+    assert_eq!(second_next["arguments"]["head_commit"], snapshot);
+    assert_eq!(second_next["arguments"]["skip"], 4);
+    let final_call = ToolCall::from_tool_name(
+        second_next["tool"].as_str().unwrap(),
+        second_next["arguments"].clone(),
     )
-    .await;
+    .expect("second git_log suggested_call must be parser-ready");
+    let final_stdout = git_log_stdout_at_head(root, &snapshot, 2, 4);
+    let final_page =
+        run_git_log_tool_call_with_stdout("git-log-multipage", final_call, final_stdout, &snapshot)
+            .await;
+    assert!(final_page.success, "{:?}", final_page.error);
+    assert_eq!(final_page.output["head_commit"], snapshot);
     assert_eq!(final_page.output["truncated"], false);
     assert_eq!(final_page.output["next_skip"], serde_json::Value::Null);
+    assert!(final_page.output.get("suggested_call").is_none());
 
     let subjects = first.output["commits"]
         .as_array()
@@ -284,12 +386,68 @@ async fn git_log_next_skip_reconstructs_multiple_pages_without_gap_or_duplicate(
         subjects,
         vec!["commit 5", "commit 4", "commit 3", "commit 2", "commit 1"]
     );
+    assert!(!subjects.iter().any(|subject| subject == "commit 6"));
     let unique = subjects.iter().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(unique.len(), subjects.len());
 
     assert_eq!(normalize_git_log_limit(Some(usize::MAX)), 100);
     assert_eq!(normalize_git_log_skip(Some(usize::MAX)), 10_000);
     assert_eq!(git_log_next_skip(10_000, 1, true), None);
+}
+
+#[tokio::test]
+async fn git_log_missing_exact_snapshot_fails_closed_without_head_fallback() {
+    let runtime = runtime_with_agent_project("git-log-missing-snapshot");
+    register_agent(
+        &runtime,
+        "git-log-missing-snapshot",
+        None,
+        RunnerCapabilities {
+            git: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("git-log-missing-snapshot");
+    let missing = "f".repeat(40);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let missing_for_call = missing.clone();
+        async move {
+            let bootstrap = auth_context(None, true);
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::GitLog {
+                        project,
+                        head_commit: Some(missing_for_call),
+                        limit: Some(2),
+                        skip: Some(2),
+                        session_id: None,
+                    },
+                    Some(&bootstrap),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "git-log-missing-snapshot").await;
+    assert!(request.command.contains(&missing));
+    assert!(!request.command.contains("HEAD^{commit}"));
+    complete_patch_agent_request(
+        &runtime,
+        "git-log-missing-snapshot",
+        &request.request_id,
+        42,
+        "",
+        "git log snapshot unavailable\n",
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "snapshot_unavailable");
+    assert_eq!(result.output["head_commit"], missing);
+    assert!(result.output.get("commits").is_none());
+    assert!(result.output.get("suggested_call").is_none());
 }
 
 #[tokio::test]
@@ -315,6 +473,7 @@ async fn git_log_unborn_repository_is_an_empty_final_page() {
                 .dispatch_with_auth(
                     ToolCall::GitLog {
                         project,
+                        head_commit: None,
                         limit: Some(20),
                         skip: Some(0),
                         session_id: None,
@@ -329,13 +488,14 @@ async fn git_log_unborn_repository_is_an_empty_final_page() {
         &runtime,
         "git-log-unborn",
         &request.request_id,
-        128,
+        0,
+        "__WEBCODEX_GIT_LOG_HEAD__=unborn\u{1e}",
         "",
-        "fatal: your current branch 'main' does not have any commits yet\n",
     )
     .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["head_commit"], serde_json::Value::Null);
     assert_eq!(result.output["count"], 0);
     assert_eq!(result.output["commits"], json!([]));
     assert_eq!(result.output["truncated"], false);
@@ -355,6 +515,7 @@ async fn git_log_unknown_project_and_unknown_session_are_structured_errors() {
     let unknown_project = runtime
         .dispatch(ToolCall::GitLog {
             project: "ghost".to_string(),
+            head_commit: None,
             limit: None,
             skip: None,
             session_id: None,
@@ -366,6 +527,7 @@ async fn git_log_unknown_project_and_unknown_session_are_structured_errors() {
     let unknown_session = runtime
         .dispatch(ToolCall::GitLog {
             project,
+            head_commit: None,
             limit: None,
             skip: None,
             session_id: Some("wc_sess_missing".to_string()),
@@ -381,7 +543,8 @@ async fn git_log_read_only_session_allowed_and_recorded() {
     let root = tmp.path();
     init_git_repo(root);
     commit_file(root, "a.txt", "one\n", "first commit");
-    let stdout = git_log_stdout(root, 5, 0);
+    commit_file(root, "a.txt", "two\n", "second commit");
+    let stdout = git_log_stdout(root, 1, 0);
     let runtime = runtime_with_agent_project("git-log-readonly");
     let caps = RunnerCapabilities {
         git: true,
@@ -416,7 +579,8 @@ async fn git_log_read_only_session_allowed_and_recorded() {
                 .dispatch_with_auth(
                     ToolCall::GitLog {
                         project,
-                        limit: Some(5),
+                        head_commit: None,
+                        limit: Some(1),
                         skip: Some(0),
                         session_id: Some(session_id),
                     },
@@ -438,6 +602,15 @@ async fn git_log_read_only_session_allowed_and_recorded() {
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.output["suggested_call"]["arguments"]["session_id"],
+        session_id
+    );
+    assert!(ToolCall::from_tool_name(
+        result.output["suggested_call"]["tool"].as_str().unwrap(),
+        result.output["suggested_call"]["arguments"].clone(),
+    )
+    .is_ok());
     assert!(result.output.get("session_recorded").is_none());
     assert!(result.output.get("session_event_id").is_none());
     assert!(result.output.get("session_id").is_none());

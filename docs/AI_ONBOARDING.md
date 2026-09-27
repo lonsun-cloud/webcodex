@@ -13,7 +13,7 @@ Before the first successful setup, keep the user-facing vocabulary to: **WebCode
 ## First choose the experience
 
 1. The user wants normal/daily/long-lived WebCodex use, or did not explicitly ask for a temporary trial: use the [Full Setup guide](PERSONAL_SETUP.md) with a regular Server + Runner.
-2. The user explicitly wants a few-minute, zero-commitment trial of one repository: use **`webcodex share`**. It is temporary, single-project, and more restricted.
+2. The user explicitly wants a few-minute, zero-commitment trial of one repository: use **`webcodex share`**. It is temporary and single-project, but still exposes the ordinary Adaptive Runtime under project-scoped authentication.
 3. The user already has a WebCodex Server URL: use the enrollment method that Server actually provides. Fresh managed self-hosting uses pairing + `webcodex login`; use `webcodex connect <server>` only when an operator explicitly supplied a shared-key credential.
 4. Move to [Deployment](DEPLOYMENT.md) only for production hosting, multiple users, OAuth, systemd/Docker, private CAs, and similar operator concerns.
 

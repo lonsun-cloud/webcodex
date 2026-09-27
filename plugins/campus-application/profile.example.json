@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "full_name": "示例候选人",
+    "first_name": "Ming",
+    "last_name": "Li"
+  },
+  "contact": {
+    "email": "candidate@example.test",
+    "phone": "+86 138 0000 0000",
+    "city": "Shanghai",
+    "address": "Shanghai, China"
+  },
+  "links": {
+    "linkedin": "https://www.linkedin.com/in/example-candidate",
+    "github": "https://github.com/example-candidate",
+    "portfolio": "https://example.test"
+  },
+  "education": [
+    {
+      "school": "Example University",
+      "degree": "Master",
+      "major": "Computer Science",
+      "start_date": "2024-09",
+      "graduation_date": "2027-06",
+      "gpa": "3.8/4.0",
+      "education_type": "Full-time",
+      "advisor": "Example Advisor",
+      "laboratory": "Example Systems Lab"
+    },
+    {
+      "school": "Example Institute of Technology",
+      "degree": "Bachelor",
+      "major": "Software Engineering",
+      "start_date": "2020-09",
+      "graduation_date": "2024-06",
+      "gpa": "3.7/4.0",
+      "education_type": "Full-time",
+      "advisor": "Example Undergraduate Advisor",
+      "laboratory": "Example Software Lab"
+    }
+  ],
+  "experience": [
+    {
+      "company": "Example AI Lab",
+      "title": "Research Intern",
+      "location": "Shanghai",
+      "start_date": "2026-06",
+      "end_date": "2026-09",
+      "summary": "Worked on fictional AI infrastructure experiments for the local Campus Apply Lab fixture."
+    },
+    {
+      "company": "Example Systems Company",
+      "title": "Software Engineering Intern",
+      "location": "Hangzhou",
+      "start_date": "2025-07",
+      "end_date": "2025-10",
+      "summary": "Built fictional developer tooling and reliability tests for a local-only internship fixture."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Campus Apply Lab",
+      "role": "Developer",
+      "start_date": "2026-08",
+      "end_date": "2026-09",
+      "technologies": ["Rust", "TypeScript", "Browser CDP"],
+      "summary": "Built a fictional browser form automation fixture without submitting real applications.",
+      "url": "https://example.test/projects/campus-apply-lab"
+    },
+    {
+      "name": "WebCodex Browser Dogfood",
+      "role": "Contributor",
+      "start_date": "2026-07",
+      "end_date": "2026-09",
+      "technologies": ["Rust", "CDP", "TypeScript"],
+      "summary": "Validated fictional structured browser actions and semantic snapshots in a local test environment.",
+      "url": "https://example.test/projects/browser-dogfood"
+    }
+  ],
+  "campus_experience": [
+    {
+      "organization": "Example University Open Source Club",
+      "role": "Maintainer",
+      "start_date": "2025-09",
+      "end_date": "2026-06",
+      "summary": "Maintained fictional student developer tooling and organized code review sessions."
+    }
+  ],
+  "skills": ["Rust", "TypeScript", "Python", "Git", "Linux"],
+  "languages": [
+    {
+      "name": "English",
+      "level": "Professional working proficiency",
+      "score": "Example score"
+    }
+  ],
+  "job_preferences": {
+    "accept_transfer": "否",
+    "preferred_locations": ["Shanghai", "Hangzhou"],
+    "target_roles": ["Software Engineer", "AI Infrastructure Engineer"],
+    "employment_type": "Full-time",
+    "available_date": "2027-07"
+  },
+  "application": {
+    "cover_letter": "Interested in software engineering and AI infrastructure roles."
+  },
+  "attachments": {
+    "resume_path": "plugins/campus-application/fixtures/sample-resume.pdf"
+  }
+}

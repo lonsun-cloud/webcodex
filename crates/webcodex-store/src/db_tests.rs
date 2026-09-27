@@ -1,11 +1,259 @@
 #![allow(clippy::all)]
 
+#[test]
+fn pairing_capability_migration_preserves_old_codes_without_granting_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-pairing.sqlite");
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("
+            CREATE TABLE pairing_codes (
+                id TEXT PRIMARY KEY, code_hash TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL,
+                username TEXT NOT NULL, client_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, used_at INTEGER, user_token_name TEXT, agent_token_name TEXT
+            );
+        ").unwrap();
+        // Startup legitimately prunes expired codes; keep this legacy code live
+        // so the test isolates migration rather than expiry cleanup.
+        conn.execute(
+            "INSERT INTO pairing_codes VALUES ('old-code','old-hash','owner','alice','mini',1,?1,NULL,NULL,NULL)",
+            rusqlite::params![expires_at],
+        ).unwrap();
+    }
+    // Opening twice also verifies that repeated initialization does not reset a
+    // grant or recreate the schema column. Previously issued codes stay false.
+    for _ in 0..2 {
+        let db = Database::open(&path).unwrap();
+        let old = db.get_pairing_code_by_hash("old-hash").unwrap().unwrap();
+        assert!(!old.runner_capabilities);
+        assert_eq!(old.client_id, "mini");
+        assert_eq!(old.expires_at, expires_at);
+    }
+}
+
 use super::*;
 use crate::models::{
     ApiKeyRecord, OAuthAccessTokenRecord, OAuthAuthorizationCodeRecord, OAuthClientRecord,
     OAuthRefreshTokenRecord, UserRecord,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::connection_observation::{
+    StoreConnectionObserver, STORE_CONNECTION_ACQUISITIONS_TOTAL, STORE_CONNECTION_HOLD_SECONDS,
+    STORE_CONNECTION_LOCK_WAIT_SECONDS,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedConnectionObservation {
+    Acquisition(StoreDomain, Duration),
+    Hold(StoreDomain, Duration),
+}
+
+#[derive(Default)]
+struct RecordingConnectionObserver {
+    observations: std::sync::Mutex<Vec<RecordedConnectionObservation>>,
+}
+
+impl RecordingConnectionObserver {
+    fn snapshot(&self) -> Vec<RecordedConnectionObservation> {
+        self.observations.lock().unwrap().clone()
+    }
+}
+
+impl StoreConnectionObserver for RecordingConnectionObserver {
+    fn record_acquisition(&self, domain: StoreDomain, wait: Duration) {
+        self.observations
+            .lock()
+            .unwrap()
+            .push(RecordedConnectionObservation::Acquisition(domain, wait));
+    }
+
+    fn record_hold(&self, domain: StoreDomain, hold: Duration) {
+        self.observations
+            .lock()
+            .unwrap()
+            .push(RecordedConnectionObservation::Hold(domain, hold));
+    }
+}
+
+struct PanickingConnectionObserver;
+
+impl StoreConnectionObserver for PanickingConnectionObserver {
+    fn record_acquisition(&self, _domain: StoreDomain, _wait: Duration) {
+        panic!("injected acquisition observer panic");
+    }
+
+    fn record_hold(&self, _domain: StoreDomain, _hold: Duration) {
+        panic!("injected hold observer panic");
+    }
+}
+
+#[test]
+fn store_connection_domains_and_metric_names_are_closed_and_stable() {
+    let domains = StoreDomain::ALL.map(StoreDomain::as_str);
+    assert_eq!(
+        domains,
+        [
+            "accounts",
+            "activity",
+            "admin_project_lifecycle",
+            "agent_task",
+            "agent_wait",
+            "agent_wake",
+            "audit",
+            "communication",
+            "core",
+            "goal",
+            "job_receipts",
+            "job_terminal_wait",
+            "memory",
+            "oauth",
+            "project_reference",
+            "schema",
+            "window_activity",
+        ]
+    );
+    assert_eq!(
+        domains.iter().copied().collect::<HashSet<_>>().len(),
+        domains.len()
+    );
+    assert_eq!(
+        STORE_CONNECTION_ACQUISITIONS_TOTAL,
+        "store_connection_acquisitions_total"
+    );
+    assert_eq!(
+        STORE_CONNECTION_LOCK_WAIT_SECONDS,
+        "store_connection_lock_wait_seconds"
+    );
+    assert_eq!(
+        STORE_CONNECTION_HOLD_SECONDS,
+        "store_connection_hold_seconds"
+    );
+}
+
+#[test]
+fn observed_connection_guard_records_wait_and_hold_and_preserves_mutable_transactions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Database::open(&tmp.path().join("observed-connection.db")).unwrap();
+    let observer = Arc::new(RecordingConnectionObserver::default());
+    db.connection_observer = observer.clone();
+
+    {
+        let mut conn = db.lock_connection(StoreDomain::Memory);
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            tx.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+    }
+
+    let observations = observer.snapshot();
+    assert_eq!(observations.len(), 2);
+    assert!(matches!(
+        observations[0],
+        RecordedConnectionObservation::Acquisition(StoreDomain::Memory, duration)
+            if duration >= Duration::ZERO
+    ));
+    assert!(matches!(
+        observations[1],
+        RecordedConnectionObservation::Hold(StoreDomain::Memory, duration)
+            if duration >= Duration::ZERO
+    ));
+}
+
+#[test]
+fn connection_observer_panics_are_fail_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Database::open(&tmp.path().join("observer-panic.db")).unwrap();
+    db.connection_observer = Arc::new(PanickingConnectionObserver);
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut conn = db.lock_connection(StoreDomain::Core);
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            tx.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+    }));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn connection_mutex_poison_still_panics_at_the_observed_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&tmp.path().join("poison.db")).unwrap());
+    let poison_target = db.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = poison_target.conn.lock().unwrap();
+        panic!("poison connection mutex");
+    })
+    .join()
+    .is_err());
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = db.lock_connection(StoreDomain::Core);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn production_store_connection_locks_use_the_observed_boundary() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut direct_database_locks = Vec::new();
+    fn collect_direct_database_locks(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        direct_database_locks: &mut Vec<(String, usize)>,
+    ) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_direct_database_locks(root, &path, direct_database_locks);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with("_tests.rs"))
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let count = text.matches(".conn.lock(").count();
+            if count > 0 {
+                direct_database_locks.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    count,
+                ));
+            }
+        }
+    }
+    collect_direct_database_locks(&src, &src, &mut direct_database_locks);
+    direct_database_locks.sort();
+    assert_eq!(direct_database_locks, vec![("lib.rs".to_string(), 1)]);
+
+    let helper = std::fs::read_to_string(src.join("connection_observation.rs")).unwrap();
+    assert_eq!(helper.matches("connection.lock().unwrap()").count(), 1);
+    let root = std::fs::read_to_string(src.join("lib.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(root.contains(
+        "pub fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {\n        self.conn.lock().unwrap()"
+    ));
+}
 
 #[test]
 fn open_enables_wal_busy_timeout_and_foreign_keys() {
@@ -98,6 +346,7 @@ fn purge_stale_auth_rows_removes_dead_material_keeps_live() {
 
     // Live + dead pairing codes.
     db.insert_pairing_code(&crate::models::PairingCodeRecord {
+        runner_capabilities: false,
         id: "p-live".to_string(),
         code_hash: "pair-live".to_string(),
         user_id: "u-1".to_string(),
@@ -111,6 +360,7 @@ fn purge_stale_auth_rows_removes_dead_material_keeps_live() {
     })
     .unwrap();
     db.insert_pairing_code(&crate::models::PairingCodeRecord {
+        runner_capabilities: false,
         id: "p-dead".to_string(),
         code_hash: "pair-dead".to_string(),
         user_id: "u-1".to_string(),
@@ -873,6 +1123,39 @@ fn can_insert_and_get_oauth_client() {
         fetched.redirect_uris_vec(),
         vec!["https://example.com/callback"]
     );
+}
+
+#[test]
+fn oauth_client_redirect_uri_update_is_compare_and_swap_guarded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("oauth.db")).unwrap();
+    let user = oauth_seed_user(&db, "alice");
+    let (client, _) = oauth_seed_client(&db, &user, "Test App");
+    let original = client.redirect_uris.clone();
+    let updated = "https://example.com/new-callback";
+
+    assert!(db
+        .update_oauth_client_redirect_uris(&client.client_id, &original, updated)
+        .unwrap());
+    assert!(!db
+        .update_oauth_client_redirect_uris(
+            &client.client_id,
+            &original,
+            "https://example.com/stale-callback",
+        )
+        .unwrap());
+    assert_eq!(
+        db.get_oauth_client_by_client_id(&client.client_id)
+            .unwrap()
+            .unwrap()
+            .redirect_uris,
+        updated
+    );
+
+    db.revoke_oauth_client(&client.id, 100).unwrap();
+    assert!(!db
+        .update_oauth_client_redirect_uris(&client.client_id, updated, &original)
+        .unwrap());
 }
 
 #[test]

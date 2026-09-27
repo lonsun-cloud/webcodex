@@ -4,6 +4,7 @@ use crate::RunnerAccessGroup;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, watch, Notify};
 use webcodex_core::coding_agent::{
     CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
@@ -15,8 +16,8 @@ use webcodex_core::runner_operation::RunnerOperation;
 use webcodex_core::runner_protocol::{
     PersistentShellResult, RunnerBuildInfo, RunnerHostContext, RunnerPolicySummary,
     RunnerProjectSummary, RunnerRequest, RunnerView, ShellCommandExecutionState, ShellJobActivity,
-    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobValidationProgress,
-    ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
+    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
+    ShellJobValidationProgress, ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
     JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
 };
 
@@ -121,6 +122,9 @@ pub(super) struct RunnerRecord {
 #[derive(Debug, Clone)]
 pub struct RunnerSemanticView {
     pub view: RunnerView,
+    /// Captured with the record under the registry lock, not after an awaiting
+    /// caller resumes. This preserves identity-observation order across tasks.
+    pub observed_at: std::time::Instant,
     pub(super) runner_features: RunnerFeatureSet,
 }
 
@@ -134,6 +138,7 @@ impl RunnerSemanticView {
         let runner_features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
         Self {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         }
     }
@@ -202,10 +207,9 @@ impl RunnerRecord {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SkillStoreDispatchFence {
+pub(super) struct SkillDispatchFence {
     pub(super) runner_instance_id: String,
     pub(super) management: bool,
-    pub(super) configured_roots: bool,
 }
 
 #[derive(Debug)]
@@ -223,6 +227,10 @@ pub(super) struct PendingShellRequest {
     pub(super) expected_runner_owner: Option<String>,
     pub(super) expected_project_id: Option<String>,
     pub(super) expected_project_cwd: Option<String>,
+    /// Exact Runner process lease for a project-placement-fenced file access.
+    /// Revalidated immediately before dequeue so a replacement process using
+    /// the same client_id/project path cannot inherit stale project work.
+    pub(super) expected_project_runner_instance_id: Option<String>,
     /// Exact Runner process lease captured for an MCP gateway request. This is
     /// revalidated under the registry lock immediately before dequeue so a
     /// replacement Runner cannot consume stale bridge work.
@@ -240,10 +248,19 @@ pub(super) struct PendingShellRequest {
     /// Revalidated at dequeue so neither check nor reload can silently retarget
     /// a replacement process using the same client_id.
     pub(super) expected_runner_config_runner_instance_id: Option<String>,
+    /// Exact Runner process lease captured for configured-instruction observation.
+    /// Revalidated at dequeue so a replacement process cannot inherit the request.
+    pub(super) expected_instruction_runner_instance_id: Option<String>,
     /// Exact Runner process lease plus source/read/manage mode captured for a
     /// Runner-global Skill request. Revalidated at dequeue so a replacement
     /// process using the same client_id cannot inherit authority.
-    pub(super) skill_store_fence: Option<SkillStoreDispatchFence>,
+    pub(super) skill_fence: Option<SkillDispatchFence>,
+    /// Server-process monotonic enqueue instant for queue-wait and request
+    /// round-trip observability. It is never serialized or exposed on the wire.
+    pub(super) enqueued_at: Instant,
+    /// Transport that authoritatively dequeued this request. Captured at
+    /// dispatch so a later same-instance reconnect cannot relabel its result.
+    pub(super) dispatched_transport: Option<RunnerTransport>,
     pub(super) dispatched: bool,
 }
 
@@ -363,6 +380,12 @@ pub(super) struct JobObservationState {
     /// lifecycle. Runner-reported `ended_at` remains the public execution time
     /// and never controls Server registry retention.
     pub(super) terminal_observed_at: Option<i64>,
+    pub(super) receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    /// Exact terminal-event candidates consumed by a post-registry-lock sink.
+    /// This owns no Job truth: authoritative terminal state remains on the Job.
+    pub(super) terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
+    /// Fixed historical deadline, also identifies a receipt with no live lease.
+    pub(super) receipt_expires_at: Option<i64>,
 }
 
 impl JobObservationState {
@@ -372,6 +395,9 @@ impl JobObservationState {
             revision: Arc::new(AtomicU64::new(0)),
             notify: Arc::new(Notify::new()),
             terminal_observed_at: None,
+            receipt_candidates: None,
+            terminal_event_candidates: None,
+            receipt_expires_at: None,
         }
     }
 }
@@ -402,6 +428,8 @@ pub(super) struct ShellJobRecord {
     /// plaintext key. Keeping this on the Job preserves authorization after
     /// the originating runner registration is removed.
     pub(super) auth_group: Option<RunnerAccessGroup>,
+    /// Immutable historical attribution; registration replacement cannot retarget it.
+    pub(super) owner_at_admission: Option<String>,
     /// Internal lease owner. Never exposed through public job tools.
     pub(super) runner_instance_id: String,
     pub(super) kind: String,
@@ -432,6 +460,7 @@ pub(super) struct ShellJobRecord {
     pub(super) validation_steps: Vec<String>,
     pub(super) validation: Option<webcodex_core::runner_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
+    pub(super) test_count_evidence: Option<ShellJobTestCountEvidence>,
     /// Last Runner-authoritative bounded activity for an active Job. Cleared on
     /// terminal/recovery transitions; never used as execution authority.
     pub(super) activity: Option<ShellJobActivity>,

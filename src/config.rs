@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -315,13 +316,27 @@ pub(crate) fn tool_request_trace_max_total_bytes() -> u64 {
         .unwrap_or(2 * 1024 * 1024 * 1024)
 }
 
-/// Experimental MCP `tools/list` compact schemas switch.
+/// Optional operator override for MCP `tools/list` compact schema projection.
 ///
-/// When true, MCP discovery omits `outputSchema` only (keeps name, description,
-/// inputSchema, annotations). Default false — production behavior unchanged.
-/// Invalid / unset values follow `env_flag` and default to false.
-pub(crate) fn mcp_compact_schemas_enabled() -> bool {
-    env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS").unwrap_or(false)
+/// `true` omits `outputSchema` from MCP discovery while preserving name,
+/// description, inputSchema, annotations, and adapter metadata. `false` restores
+/// the full discovery schema. Unset or invalid values use the Adaptive Runtime
+/// default, which is compact discovery.
+pub(crate) fn mcp_compact_schemas_override() -> Option<bool> {
+    env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS")
+}
+
+/// Opt-in compatibility projection for MCP hosts that expose only text content.
+///
+/// `structuredContent` remains canonical. When enabled, ordinary Runtime tool
+/// results also serialize that same structured value into
+/// `content[0].text`. The default stays compact to avoid duplicating model context.
+fn mcp_text_json_compat_enabled_from_flag(flag: Option<bool>) -> bool {
+    flag.unwrap_or(false)
+}
+
+pub(crate) fn mcp_text_json_compat_enabled() -> bool {
+    mcp_text_json_compat_enabled_from_flag(env_flag("WEBCODEX_MCP_TEXT_JSON_COMPAT"))
 }
 
 /// Global Server switch for optional MCP App presentation resources and metadata.
@@ -394,6 +409,12 @@ pub struct OAuth2Config {
     /// DCR client into stable, non-rotating refresh tokens. Empty by default.
     /// A client must register exactly one URI and it must match this allow-list.
     pub confidential_reuse_redirect_uris: Vec<String>,
+    /// Whether a loopback-bound Server may trust ChatGPT MCP host-file rewrites
+    /// authenticated with an explicitly allowed local tunnel credential: either
+    /// a normal user API token or the configured Server bootstrap credential used
+    /// by the regular OpenAI Secure Tunnel. Default `false`; non-loopback binds
+    /// are never eligible.
+    pub trust_loopback_api_token_mcp_file_import: bool,
     /// Exact project grant active for a project-first OAuth share session.
     /// Unset on managed/self-hosted OAuth servers.
     pub project_share_grant_id: Option<String>,
@@ -415,6 +436,7 @@ impl Default for OAuth2Config {
             dynamic_client_registration_enabled: false,
             trusted_mcp_file_client_ids: Vec::new(),
             confidential_reuse_redirect_uris: Vec::new(),
+            trust_loopback_api_token_mcp_file_import: false,
             project_share_grant_id: None,
             project_share_session_id: None,
         }
@@ -516,6 +538,8 @@ impl OAuth2Config {
                     redirect_uris
                 })
                 .unwrap_or_default();
+        let trust_loopback_api_token_mcp_file_import =
+            env_flag("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT").unwrap_or(false);
         let project_share_grant_id = std::env::var("WEBCODEX_OAUTH2_PROJECT_SHARE_GRANT_ID")
             .ok()
             .map(|value| value.trim().to_string())
@@ -535,6 +559,7 @@ impl OAuth2Config {
             dynamic_client_registration_enabled,
             trusted_mcp_file_client_ids,
             confidential_reuse_redirect_uris,
+            trust_loopback_api_token_mcp_file_import,
             project_share_grant_id,
             project_share_session_id,
         }
@@ -560,6 +585,18 @@ impl Config {
             max_text_size: 2 * 1024 * 1024,
             oauth2: OAuth2Config::from_env(),
         }
+    }
+
+    pub(crate) fn is_loopback_bound(&self) -> bool {
+        self.addr
+            .parse::<SocketAddr>()
+            .map(|address| address.ip().is_loopback())
+            .unwrap_or_else(|_| {
+                self.addr
+                    .strip_prefix("localhost:")
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .is_some()
+            })
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -706,6 +743,24 @@ mod tests {
     }
 
     #[test]
+    fn loopback_binding_detection_is_strict() {
+        let mut config = (*crate::test_support::test_config(None)).clone();
+        for addr in ["127.0.0.1:8090", "[::1]:8090", "localhost:8090"] {
+            config.addr = addr.to_string();
+            assert!(config.is_loopback_bound(), "{addr} must be loopback");
+        }
+        for addr in [
+            "0.0.0.0:8090",
+            "[::]:8090",
+            "192.168.1.10:8090",
+            "localhost",
+        ] {
+            config.addr = addr.to_string();
+            assert!(!config.is_loopback_bound(), "{addr} must not be loopback");
+        }
+    }
+
+    #[test]
     fn oauth2_config_defaults_to_disabled() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove("WEBCODEX_SHARED_KEY_ENABLED");
@@ -721,6 +776,7 @@ mod tests {
         env.remove("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE");
         env.remove("WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED");
         env.remove("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
+        env.remove("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT");
 
         let cfg = OAuth2Config::from_env();
         assert!(!cfg.enabled);
@@ -732,6 +788,7 @@ mod tests {
         assert!(!cfg.shared_key_bridge_enabled);
         assert!(!cfg.dynamic_client_registration_enabled);
         assert!(cfg.trusted_mcp_file_client_ids.is_empty());
+        assert!(!cfg.trust_loopback_api_token_mcp_file_import);
     }
 
     #[test]
@@ -748,6 +805,7 @@ mod tests {
             "WEBCODEX_OAUTH2_DYNAMIC_CLIENT_REGISTRATION_ENABLED",
             "true",
         );
+        env.set("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT", "true");
         let trusted_a = format!("wc_client_{}", "a".repeat(64));
         let trusted_b = format!("wc_client_{}", "b".repeat(64));
         env.set(
@@ -768,6 +826,7 @@ mod tests {
         assert!(cfg.shared_key_bridge_enabled);
         assert!(cfg.dynamic_client_registration_enabled);
         assert_eq!(cfg.trusted_mcp_file_client_ids, vec![trusted_a, trusted_b]);
+        assert!(cfg.trust_loopback_api_token_mcp_file_import);
 
         env.remove("WEBCODEX_OAUTH2_ENABLED");
         env.remove("WEBCODEX_OAUTH2_ISSUER");
@@ -776,6 +835,7 @@ mod tests {
         env.remove("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS");
         env.remove("WEBCODEX_OAUTH2_REQUIRE_PKCE");
         env.remove("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
+        env.remove("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT");
     }
 
     #[test]
@@ -821,39 +881,42 @@ mod tests {
         env.set("WEBCODEX_ENV_FILE", &env_file);
         env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
 
-        assert!(!mcp_compact_schemas_enabled());
+        assert_eq!(mcp_compact_schemas_override(), None);
         let from_file = load_startup_env_files().unwrap();
         assert_eq!(from_file[0].loaded_count, 1);
-        assert!(mcp_compact_schemas_enabled());
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
 
         env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
         let with_process_override = load_startup_env_files().unwrap();
         assert_eq!(with_process_override[0].loaded_count, 0);
-        assert!(!mcp_compact_schemas_enabled());
+        assert_eq!(mcp_compact_schemas_override(), Some(false));
 
         env.remove("WEBCODEX_ENV_FILE");
         env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
     }
     #[test]
-    fn mcp_compact_schemas_defaults_off() {
+    fn mcp_compact_schemas_override_distinguishes_unset_true_and_false() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
-        assert!(!mcp_compact_schemas_enabled());
+        assert_eq!(mcp_compact_schemas_override(), None);
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "1");
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+        assert_eq!(mcp_compact_schemas_override(), Some(false));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "maybe");
+        // Invalid values are treated as unset by env_flag and defer to the
+        // canonical Adaptive Runtime default.
+        assert_eq!(mcp_compact_schemas_override(), None);
+        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
     }
 
     #[test]
-    fn mcp_compact_schemas_true_enables() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
-        assert!(mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "1");
-        assert!(mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
-        assert!(!mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "maybe");
-        // Invalid values are treated as unset by env_flag -> default false.
-        assert!(!mcp_compact_schemas_enabled());
-        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    fn mcp_text_json_compat_defaults_off_and_requires_explicit_enablement() {
+        assert!(!mcp_text_json_compat_enabled_from_flag(None));
+        assert!(!mcp_text_json_compat_enabled_from_flag(Some(false)));
+        assert!(mcp_text_json_compat_enabled_from_flag(Some(true)));
     }
 
     #[test]

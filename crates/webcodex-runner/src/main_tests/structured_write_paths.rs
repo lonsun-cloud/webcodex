@@ -57,22 +57,22 @@ fn file_structured_edits_reject_canonical_boundary_escapes() {
             (
                 "file_apply_patch",
                 "routing-placeholder".to_string(),
-                serde_json::json!({"patch": format!("*** Begin Patch\n*** Add File: would-create.txt\n+first\n*** Add File: {target}\n+replacement\n*** End Patch")}),
+                serde_json::json!({"patch": format!("*** Begin Patch\n*** Add File: would-create.txt\n+first\n*** Add File: {target}\n+replacement\n*** End Patch"), "matching_mode": "exact_unique"}),
             ),
             (
                 "file_apply_patch",
                 "routing-placeholder".to_string(),
-                serde_json::json!({"patch": format!("*** Begin Patch\n*** Update File: {existing}\n-original\n+replacement\n*** End Patch")}),
+                serde_json::json!({"patch": format!("*** Begin Patch\n*** Update File: {existing}\n-original\n+replacement\n*** End Patch"), "matching_mode": "exact_unique"}),
             ),
             (
                 "file_apply_patch",
                 "routing-placeholder".to_string(),
-                serde_json::json!({"patch": format!("*** Begin Patch\n*** Delete File: {existing}\n*** End Patch")}),
+                serde_json::json!({"patch": format!("*** Begin Patch\n*** Delete File: {existing}\n*** End Patch"), "matching_mode": "exact_unique"}),
             ),
             (
                 "file_apply_patch",
                 "routing-placeholder".to_string(),
-                serde_json::json!({"patch": format!("*** Begin Patch\n*** Update File: source.txt\n*** Move to: {target}\n-original\n+replacement\n*** End Patch")}),
+                serde_json::json!({"patch": format!("*** Begin Patch\n*** Update File: source.txt\n*** Move to: {target}\n-original\n+replacement\n*** End Patch"), "matching_mode": "exact_unique"}),
             ),
         ];
 

@@ -4,7 +4,68 @@ use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
+use crate::tool_runtime::kernel::{
+    HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+    ToolProtocolCapabilities, ToolTransport,
+};
 use serde_json::json;
+
+#[test]
+fn public_dispatch_future_stays_heap_bounded() {
+    let runtime = test_runtime();
+    let future = runtime.dispatch_with_auth(
+        ToolCall::RuntimeStatus {
+            compact: true,
+            summary_only: false,
+            client_id: None,
+        },
+        None,
+    );
+    assert!(
+        std::mem::size_of_val(&future) <= 32,
+        "public dispatch should expose only a small boxed future, got {} bytes",
+        std::mem::size_of_val(&future)
+    );
+}
+
+#[test]
+fn kernel_adapter_futures_stay_heap_bounded() {
+    let runtime = test_runtime();
+    let context = ToolCallContext {
+        transport: ToolTransport::Api,
+        session_id: None,
+        auth: None,
+        window: None,
+        record_oauth_scope_denials: true,
+        host_file_import_trust: HostFileImportTrust::Untrusted,
+    };
+    let request = || ToolCallRequest {
+        tool_name: "runtime_status".to_string(),
+        arguments: json!({"compact": true}),
+    };
+
+    let api_future = runtime.call_tool_with_context(request(), context);
+    assert!(
+        std::mem::size_of_val(&api_future) <= 32,
+        "REST/Host kernel entry should expose only a small boxed future, got {} bytes",
+        std::mem::size_of_val(&api_future)
+    );
+
+    let mcp_future = runtime.call_tool_with_invocation_metadata(
+        request(),
+        ToolCallContext {
+            transport: ToolTransport::Mcp,
+            ..context
+        },
+        ToolInvocationMetadata::default(),
+        ToolProtocolCapabilities::default(),
+    );
+    assert!(
+        std::mem::size_of_val(&mcp_future) <= 32,
+        "MCP kernel entry should expose only a small boxed future, got {} bytes",
+        std::mem::size_of_val(&mcp_future)
+    );
+}
 
 #[test]
 fn structured_validation_tools_are_known_and_parse() {
@@ -198,7 +259,20 @@ async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .cargo_check(project, None, None, None, None, None, None, Some(60))
+            .cargo_check_with_context(
+                project,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(55),
+                Some(55),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let req = wait_for_patch_agent_request(&runtime, "cargo-checker").await;
@@ -215,14 +289,20 @@ async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
     let result = task.await.unwrap();
     assert!(!result.success);
     let error = result.error.as_deref().unwrap_or("");
-    assert!(error.contains("structured validation command failed"));
-    assert!(error.contains("command was started"));
+    assert!(error.contains("structured validation command completed with validation failure"));
+    assert!(error.contains("terminal"));
+    assert!(error.contains("no active Job continuation"));
+    assert!(!error.contains("command was started"));
     assert!(error.contains("bounded validation evidence"));
     assert_eq!(result.output["passed"], false);
     assert_eq!(result.output["execution_state"], "completed");
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], true);
     assert_eq!(result.output["failure_kind"], "validation_failed");
+    assert_eq!(result.output["terminal"], true);
+    assert_eq!(result.output["promoted_to_job"], false);
+    assert!(result.output.get("job_id").is_none());
+    assert!(result.output.get("continuation").is_none());
     assert!(result.output["stderr_tail"]
         .as_str()
         .unwrap_or("")
@@ -241,7 +321,7 @@ async fn cargo_test_failure_includes_stderr_tail_or_guidance() {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .cargo_test(
+            .cargo_test_with_context(
                 project,
                 None,
                 Some("failing".to_string()),
@@ -251,7 +331,14 @@ async fn cargo_test_failure_includes_stderr_tail_or_guidance() {
                 None,
                 None,
                 None,
-                Some(60),
+                None,
+                None,
+                None,
+                Some(55),
+                Some(55),
+                None,
+                None,
+                None,
             )
             .await
     });
@@ -269,8 +356,10 @@ async fn cargo_test_failure_includes_stderr_tail_or_guidance() {
     let result = task.await.unwrap();
     assert!(!result.success);
     let error = result.error.as_deref().unwrap_or("");
-    assert!(error.contains("structured validation command failed"));
-    assert!(error.contains("command was started"));
+    assert!(error.contains("structured validation command completed with validation failure"));
+    assert!(error.contains("terminal"));
+    assert!(error.contains("no active Job continuation"));
+    assert!(!error.contains("command was started"));
     assert!(error.contains("bounded validation evidence"));
     assert_eq!(result.output["passed"], false);
     assert_eq!(result.output["failure_kind"], "validation_failed");
@@ -292,7 +381,7 @@ async fn cargo_test_output_includes_bounded_failed_test_diagnostics() {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .cargo_test(
+            .cargo_test_with_context(
                 project,
                 None,
                 Some("multi_fail".to_string()),
@@ -302,7 +391,14 @@ async fn cargo_test_output_includes_bounded_failed_test_diagnostics() {
                 None,
                 None,
                 None,
-                Some(60),
+                None,
+                None,
+                None,
+                Some(55),
+                Some(55),
+                None,
+                None,
+                None,
             )
             .await
     });
@@ -510,7 +606,7 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .cargo_test(
+            .cargo_test_with_context(
                 project,
                 None,
                 Some("slow".to_string()),
@@ -520,7 +616,14 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
                 None,
                 None,
                 None,
-                Some(60),
+                None,
+                None,
+                None,
+                Some(55),
+                Some(55),
+                None,
+                None,
+                None,
             )
             .await
     });
@@ -534,8 +637,10 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
             request_id: req.request_id,
             exit_code: Some(-1),
             stdout: Some("partial cargo output\n".to_string()),
-            stderr: Some("Command timed out after 60 seconds".to_string()),
-            duration_ms: Some(60_000),
+            stderr: Some("Command timed out after 55 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: Some(55_000),
             error: Some("command timed out".to_string()),
         })
         .await
@@ -561,7 +666,16 @@ async fn cargo_fmt_failure_includes_stderr_tail_or_guidance() {
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .cargo_fmt(project, None, Some(true), Some(60))
+            .cargo_fmt_with_context(
+                project,
+                None,
+                Some(true),
+                Some(55),
+                Some(55),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let req = wait_for_patch_agent_request(&runtime, "cargo-formatter").await;
@@ -578,8 +692,10 @@ async fn cargo_fmt_failure_includes_stderr_tail_or_guidance() {
     let result = task.await.unwrap();
     assert!(!result.success);
     let error = result.error.as_deref().unwrap_or("");
-    assert!(error.contains("structured validation command failed"));
-    assert!(error.contains("command was started"));
+    assert!(error.contains("structured validation command completed with validation failure"));
+    assert!(error.contains("terminal"));
+    assert!(error.contains("no active Job continuation"));
+    assert!(!error.contains("command was started"));
     assert!(error.contains("bounded validation evidence"));
     assert_eq!(result.output["passed"], false);
     assert_eq!(result.output["failure_kind"], "validation_failed");
@@ -652,7 +768,11 @@ fn project_management_tools_require_expected_fields() {
 
 #[tokio::test]
 async fn register_project_crosses_historical_64_threshold_and_is_immediately_resolvable() {
-    let runtime = test_runtime();
+    let reference_db_dir = tempfile::tempdir().unwrap();
+    let reference_db = std::sync::Arc::new(
+        crate::Database::open(&reference_db_dir.path().join("project-refs.db")).unwrap(),
+    );
+    let runtime = test_runtime().with_project_reference_database(reference_db);
     let client_id = "project-scale-mutation";
     let existing = (0..64)
         .map(|index| {
@@ -699,7 +819,8 @@ async fn register_project_crosses_historical_64_threshold_and_is_immediately_res
         "name": "Project 0064",
         "path": "/tmp/project-0064",
         "allow_patch": true,
-        "revision": format!("sha256:{}", "a".repeat(64))
+        "revision": format!("sha256:{}", "a".repeat(64)),
+        "root_fingerprint": format!("wc_projroot_{}", "7".repeat(64))
     });
     complete_patch_agent_request_for_instance(
         &runtime,
@@ -716,6 +837,20 @@ async fn register_project_crosses_historical_64_threshold_and_is_immediately_res
     assert!(
         result.success,
         "authoritative projection should commit: {result:?}"
+    );
+    let project_ref = result.output["project_ref"]
+        .as_str()
+        .expect("register_project should return a short Project ref")
+        .to_string();
+    assert!(project_ref.starts_with("~p"));
+    let bootstrap = bootstrap_auth_context();
+    assert_eq!(
+        runtime
+            .resolve_project_input_for_auth(&project_ref, Some(&bootstrap))
+            .await
+            .unwrap()
+            .resolved_id,
+        "agent:project-scale-mutation:project-0064"
     );
     let projects = runtime
         .runner_registry
@@ -1086,10 +1221,12 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "echo activity-probe".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1115,10 +1252,12 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: "agent-proj".to_string(),
                         command: "echo activity-alias".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,

@@ -102,8 +102,8 @@ fn runner_init_explicit_output_and_project_registry_dir_win() {
 }
 
 #[test]
-fn runner_init_accepts_legacy_projects_dir_alias() {
-    let opts = parse_cli_runner_init(&args(&[
+fn runner_init_rejects_retired_projects_dir_alias() {
+    let error = parse_cli_runner_init(&args(&[
         "--server-url",
         "https://example.test",
         "--token",
@@ -115,13 +115,14 @@ fn runner_init_accepts_legacy_projects_dir_alias() {
         "--projects-dir",
         "/tmp/projects.d",
     ]))
-    .unwrap();
-    assert_eq!(opts.project_registry_dir, PathBuf::from("/tmp/projects.d"));
+    .unwrap_err();
+    assert!(error.contains("--projects-dir is retired"), "{error}");
+    assert!(error.contains("--project-registry-dir"), "{error}");
 }
 
 #[cfg(unix)]
 #[test]
-fn user_scope_runner_config_keeps_legacy_only_and_rejects_dual_names() {
+fn user_scope_runner_config_accepts_legacy_only_agent_toml_and_rejects_dual_names() {
     let _guard = env_test_guard();
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_str().unwrap();
@@ -140,15 +141,18 @@ fn user_scope_runner_config_keeps_legacy_only_and_rejects_dual_names() {
         runner_config_for_scope(ServiceScope::User, None).unwrap(),
         config_dir.join("agent.toml")
     );
+
     std::fs::write(config_dir.join("runner.toml"), "current = true\n").unwrap();
     let error = runner_config_for_scope(ServiceScope::User, None).unwrap_err();
-    assert!(error.contains("runner.toml"));
-    assert!(error.contains("agent.toml"));
-    assert!(error.contains("refusing to guess"));
+    assert!(
+        error.contains("both runner.toml and legacy agent.toml"),
+        "{error}"
+    );
+    assert!(error.contains("remove or archive agent.toml"), "{error}");
 }
 
 #[test]
-fn runner_init_rejects_new_and_legacy_registry_flags_together() {
+fn runner_init_rejects_retired_projects_dir_even_with_canonical_flag() {
     let error = parse_cli_runner_init(&args(&[
         "--server-url",
         "https://example.test",
@@ -164,7 +168,8 @@ fn runner_init_rejects_new_and_legacy_registry_flags_together() {
         "/tmp/projects.d",
     ]))
     .unwrap_err();
-    assert!(error.contains("use only one"), "{error}");
+    assert!(error.contains("--projects-dir is retired"), "{error}");
+    assert!(error.contains("--project-registry-dir"), "{error}");
 }
 
 #[test]
@@ -272,18 +277,16 @@ fn runner_status_explicit_paths_win_and_no_profile_uses_canonical_default() {
 
 #[cfg(unix)]
 #[test]
-fn legacy_runner_status_agent_token_file_flag_is_an_alias() {
-    let opts = parse_runner_status(&args(&[
+fn runner_status_rejects_retired_agent_token_file_flag() {
+    let error = parse_runner_status(&args(&[
         "--scope",
         "system",
         "--agent-token-file",
         "/tmp/legacy-runner-token",
     ]))
-    .unwrap();
-    assert_eq!(
-        opts.runner_token_file,
-        Some(PathBuf::from("/tmp/legacy-runner-token"))
-    );
+    .unwrap_err();
+    assert!(error.contains("--agent-token-file is retired"), "{error}");
+    assert!(error.contains("--runner-token-file"), "{error}");
 }
 
 /// Unix-only: derives systemd service paths, which require Unix
@@ -474,6 +477,12 @@ fn user_scope_falls_back_to_home_and_profile_paths() {
 #[cfg(unix)]
 #[test]
 fn runner_service_scope_rejects_invalid_and_conflicting_flags() {
+    let _guard = env_test_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_str().unwrap();
+    let _env = EnvGuard::new()
+        .set("HOME", tmp_path)
+        .set("XDG_CONFIG_HOME", tmp_path);
     let bin = "/opt/webcodex/bin/webcodex-runner";
     let invalid = parse_runner_install_service_with_identity(
         &args(&["--scope", "session", "--bin", bin]),

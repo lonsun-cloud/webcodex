@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+pub(in crate::tool_runtime::tests) const CODING_WORKFLOW_FIXTURE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(50);
+
 pub(in crate::tool_runtime::tests) const SAMPLE_PROJECT: &str = "agent:oe:private-drop";
 pub(in crate::tool_runtime::tests) const UNIT_TOOL_FIXTURES: &[&str] = &[
     "list_tools",
@@ -56,11 +59,38 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
+        "update_goal" | "checkpoint_goal" => {
+            args.insert("expected_revision".to_string(), json!(1));
+        }
         "observe_jobs" => {
             args.insert("items".to_string(), json!([{"job_id": "job_123"}]));
         }
+        "search_and_read" => {
+            args.insert("query".to_string(), json!({"pattern": "fn main"}));
+        }
         "plugin_tool" => {
             args.insert("action".to_string(), json!("list"));
+        }
+        "browser_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "browser_act" => {
+            args.insert("action".to_string(), json!("launch"));
+            args.insert("client_id".to_string(), json!("oe"));
+        }
+        "computer_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "computer_control" => {
+            args.insert("action".to_string(), json!("launch_application"));
+            args.insert("client_id".to_string(), json!("oe"));
+            args.insert(
+                "application_id".to_string(),
+                json!("application_qqqqqqqqqqqqqqqq"),
+            );
+        }
+        "project_artifact" => {
+            args.insert("action".to_string(), json!("metadata"));
         }
         "ssh_resource" => {
             args.insert("action".to_string(), json!("list"));
@@ -73,24 +103,29 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
 
 pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
     match field {
-        "project" => json!(SAMPLE_PROJECT),
+        "project" | "source_project" => json!(SAMPLE_PROJECT),
+        "destination_project" => json!("agent:fixture:destination"),
         "command" => json!("true"),
         "executable" => json!("git"),
         "language" => json!("sh"),
+        "source" => json!("text(\"ok\")"),
         "script" => json!("true"),
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
         "items" => json!([{"path": "src/lib.rs"}]),
         "queries" => json!([{"pattern": "fn main"}]),
-        "path" => json!("src/lib.rs"),
+        "path" | "source_path" => json!("src/lib.rs"),
+        "destination_path" => json!("artifacts/copied.bin"),
         "old" | "old_text" => json!("a"),
         "new" | "new_text" => json!("b"),
         "pattern" => json!("fn main"),
         "text" => json!("// hi\n"),
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
+        "objective" => json!("Preserve durable high-level intent without execution authority."),
+        "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),
-        "include_project_instructions" | "include_workflow_guidance" => json!(false),
+        "include_extension_catalog" => json!(false),
         "content_base64" => json!("AA=="),
         "openaiFileIdRefs" => json!([{
             "download_url": "https://files.oaiusercontent.com/test",
@@ -102,7 +137,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "changes" => json!([{
             "kind": "edit",
             "path": "src/lib.rs",
-            "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expected_read_revision": 3817291045227_u64,
             "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
         }]),
         "prompt" => json!("summarize"),
@@ -112,32 +147,40 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "idempotency_key" => json!("sample-detached-key"),
         "handle" => json!("reviewer"),
         "display_name" => json!("Reviewer"),
-        "agent_id" => json!(format!("wc_dagent_{}", "a".repeat(32))),
-        "assignee_agent_id" => json!(format!("wc_dagent_{}", "a".repeat(32))),
-        "task_id" => json!(format!("wc_agent_task_{}", "1".repeat(32))),
-        "attempt_id" => json!(format!("wc_agent_task_attempt_{}", "2".repeat(32))),
-        "attempt_fence" => json!(format!("wc_agent_task_fence_{}", "3".repeat(32))),
+        "agent_id" => json!("wc_dagent_qqqqqqqqqqqqqqqq".to_string()),
+        "assignee_agent_id" => json!("wc_dagent_qqqqqqqqqqqqqqqq".to_string()),
+        "task_id" => json!("wc_agent_task_ERERERERERERERER".to_string()),
+        "wait_id" => json!("wc_agent_wait_ZmZmZmZmZmZmZmZm".to_string()),
+        "events" => json!([{
+            "kind": "agent_task_terminal",
+            "task_id": "wc_agent_task_ERERERERERERERER".to_string()
+        }]),
+        "goal_id" => json!("wc_goal_AAAAAAAAAAAAAAAA".to_string()),
+        "attempt_id" => json!("wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string()),
+        "attempt_fence" => json!("wc_agent_task_fence_MzMzMzMzMzMzMzMzMzMzMw".to_string()),
         "attempt_controller_generation" | "expected_generation" => json!(1),
         "outcome" => json!("succeeded"),
-        "agent_ids" => json!([format!("wc_dagent_{}", "a".repeat(32))]),
-        "endpoint_id" => json!(format!("wc_endpoint_{}", "b".repeat(32))),
-        "conversation_id" => json!(format!("wc_conv_{}", "c".repeat(32))),
-        "delivery_ids" => json!([format!("wc_delivery_{}", "d".repeat(32))]),
+        "agent_ids" => json!(["wc_dagent_qqqqqqqqqqqqqqqq".to_string()]),
+        "endpoint_id" => json!("wc_endpoint_u7u7u7u7u7u7u7u7".to_string()),
+        "conversation_id" => json!("wc_conv_zMzMzMzMzMzMzMzM".to_string()),
+        "delivery_ids" => json!(["wc_delivery_3d3d3d3d3d3d3d3d".to_string()]),
         "expected_profile_revision" => json!(1),
         "expected_controller_generation" => json!(1),
-        "wake_id" => json!(format!("wc_wake_{}", "e".repeat(32))),
-        "consume_token" => json!(format!("wc_wake_consume_{}", "f".repeat(32))),
+        "wake_id" => json!("wc_wake_7u7u7u7u7u7u7u7u".to_string()),
+        "consume_token" => json!("wc_wake_consume______________________w".to_string()),
         "host" => json!("ChatGPT"),
         "body" => json!("hello"),
         "provider_id" => json!("codex"),
         "run_id" => json!("wc_agent_run_sample_1234"),
         "shell_id" => json!("wc_shell_123"),
-        "session_id" => json!("wc_sess_existing"),
+        "adapter_id" | "event_id" => json!("a".repeat(64)),
+        "observed_tool" => json!("Bash"),
+        "session_id" => json!(format!("wc_sess_{}", "1".repeat(32))),
         "checkpoint_id" => json!("wc_ckpt_1234"),
         "confirm" => json!(true),
         "client_id" => json!("oe"),
-        "application_id" => json!(format!("application_{}", "a".repeat(32))),
-        "display_id" => json!(format!("display_{}", "a".repeat(32))),
+        "application_id" => json!("application_qqqqqqqqqqqqqqqq".to_string()),
+        "display_id" => json!("display_qqqqqqqqqqqqqqqq".to_string()),
         "snapshot_generation" => json!(1),
         "x" | "y" => json!(0),
         "surface_id" => json!("surface_test"),
@@ -154,9 +197,12 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "message" => json!("hello"),
         "answer" => json!("done"),
         "completion_key" => json!("sample-completion-key"),
-        "expected_assignment_fence" => json!(format!("wsa1_{}", "A".repeat(43))),
+        "expected_assignment_fence" => json!(format!("wsa2_{}", "A".repeat(22))),
         "message_id" => json!("wc_msg_0001"),
+        "peer_id" => json!(format!("wc_peer_{}", "a".repeat(32))),
         "execution_context" => json!({}),
+        "skill_id" => json!("wc_skill_EREREREREREREREREREREQ"),
+        "expected_definition_revision" => json!("a".repeat(64)),
         other => panic!("missing sample value for required field {other}"),
     }
 }
@@ -184,17 +230,14 @@ pub(in crate::tool_runtime::tests) fn required_fields(spec: &ToolSpec) -> Vec<St
         .unwrap_or_default()
 }
 
-pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
+pub(in crate::tool_runtime::tests) fn seed_recovery_events(
     runtime: &ToolRuntime,
     session_id: &str,
     project: &str,
     count: usize,
-) -> u64 {
-    use crate::tool_runtime::sessions::{
-        SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-    };
+) {
+    use crate::tool_runtime::sessions::{SessionTransport, ToolCallRecorderMetadata};
 
-    let mut revision = 0u64;
     for index in 0..count {
         let start = runtime.sessions.record_tool_call_started_with_metadata(
             Some(session_id),
@@ -202,16 +245,13 @@ pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
             "run_process",
             &json!({"project": project, "executable": "true"}),
             Some(project.to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
-                ..Default::default()
-            },
+            ToolCallRecorderMetadata::default(),
             crate::tool_runtime::sessions::session_tool_contract("run_process"),
         );
         let evidence = format!("event-{index:02}-{}", "x".repeat(760));
-        let recorded = runtime
+        runtime
             .sessions
-            .record_model_facing_tool_call_finished(
+            .record_tool_call_finished(
                 start,
                 true,
                 &json!({
@@ -231,23 +271,18 @@ pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
                 None,
                 None,
             )
-            .expect("seeded model-facing recovery event");
-        revision = recorded.context_revision;
+            .expect("seeded recovery event");
     }
-    revision
 }
 
-pub(in crate::tool_runtime::tests) fn seed_large_changed_path_recovery_events(
+pub(in crate::tool_runtime::tests) fn seed_large_changed_path_events(
     runtime: &ToolRuntime,
     session_id: &str,
     project: &str,
     count: usize,
-) -> u64 {
-    use crate::tool_runtime::sessions::{
-        SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-    };
+) {
+    use crate::tool_runtime::sessions::{SessionTransport, ToolCallRecorderMetadata};
 
-    let mut revision = runtime.sessions.context_revision(session_id).unwrap_or(0);
     for index in 0..count {
         let paths = (0..8)
             .map(|path_index| {
@@ -263,25 +298,14 @@ pub(in crate::tool_runtime::tests) fn seed_large_changed_path_recovery_events(
             "delete_project_files",
             &json!({"project": project, "paths": paths}),
             Some(project.to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
-                ..Default::default()
-            },
+            ToolCallRecorderMetadata::default(),
             crate::tool_runtime::sessions::session_tool_contract("delete_project_files"),
         );
-        let recorded = runtime
+        runtime
             .sessions
-            .record_model_facing_tool_call_finished(
-                start,
-                true,
-                &json!({"deleted_count": 8}),
-                None,
-                None,
-            )
+            .record_tool_call_finished(start, true, &json!({"deleted_count": 8}), None, None)
             .expect("seeded large changed-path recovery event");
-        revision = recorded.context_revision;
     }
-    revision
 }
 
 pub(in crate::tool_runtime::tests) fn local_project_config(path: &str) -> ProjectConfig {

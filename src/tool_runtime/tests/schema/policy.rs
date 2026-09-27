@@ -12,6 +12,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::StructuredProcess,
         ),
         (
+            "run_skill_resource",
+            ToolRisk::JobRun,
+            RunnerCapabilityRequirement::SkillResourceExecution,
+        ),
+        (
             "run_detached_process",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::DetachedProcess,
@@ -142,11 +147,6 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::GitOrShell,
         ),
         (
-            "git_diff",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
             "git_diff_hunks",
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
@@ -182,12 +182,12 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::OwnerOnly,
         ),
         (
-            "read_file",
+            "read_files",
             ToolRisk::Read,
             RunnerCapabilityRequirement::FileRead,
         ),
         (
-            "read_files",
+            "skill_load",
             ToolRisk::Read,
             RunnerCapabilityRequirement::FileRead,
         ),
@@ -252,19 +252,14 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::Shell,
         ),
         (
-            "search_project_text",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
             "search_project_texts",
             ToolRisk::Read,
             RunnerCapabilityRequirement::Shell,
         ),
         (
-            "git_diff_summary",
+            "search_and_read",
             ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
+            RunnerCapabilityRequirement::Shell,
         ),
         (
             "show_changes",
@@ -276,26 +271,31 @@ fn required_runner_capability_matches_metadata_risk_table() {
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_create",
             ToolRisk::CheckpointManage,
             RunnerCapabilityRequirement::FileRead,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_restore",
             ToolRisk::ProjectWrite,
             RunnerCapabilityRequirement::FileWrite,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_list",
             ToolRisk::Read,
             RunnerCapabilityRequirement::OwnerOnly,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_show",
             ToolRisk::Read,
             RunnerCapabilityRequirement::OwnerOnly,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_delete",
             ToolRisk::ProjectWrite,

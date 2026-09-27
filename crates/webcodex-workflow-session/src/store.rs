@@ -3,7 +3,8 @@
 //! All durable session-map mutations flow through `SessionStoreInner` helpers.
 //! Callers outside this module use `SessionStore` methods only.
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,7 +14,10 @@ use webcodex_core::validation_identity::{
     assertion_validation_identity, is_validation_execution_identity,
 };
 use webcodex_core::workflow_session_contract::{is_safe_job_id, PermissionDecision, SessionMode};
-use webcodex_tool_contracts::{runtime_tool_session_evidence_policy, ToolSessionLifecycleEffect};
+use webcodex_tool_contracts::{
+    runtime_tool_activity_semantics, runtime_tool_session_evidence_policy, ToolActivityKind,
+    ToolSessionLifecycleEffect,
+};
 
 use super::assignment::{
     assignment_fence_fingerprint, assignment_fence_from_state, current_assignment_state,
@@ -37,19 +41,19 @@ use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, ColdSessionRecord,
     CompleteSessionMessageInput, CompleteSessionMessageOutcome, PersistedSessionLedger,
     PersistedSessionRecord, PersistedSessionSnapshot, PersistentShellEventEvidence,
-    PostSessionMessageInput, RecordedModelFacingToolCall, ReplaceSessionMessageInput,
-    ReplaceSessionMessageOutcome, SessionCloseError, SessionCloseOutcome,
-    SessionContextRevisionAck, SessionCounts, SessionCreateOptions, SessionEvent,
+    PostSessionMessageInput, ReplaceSessionMessageInput, ReplaceSessionMessageOutcome,
+    SessionCloseError, SessionCloseOutcome, SessionCounts, SessionCreateOptions, SessionEvent,
     SessionExecutionContext, SessionExecutionContextUpdateError,
     SessionExecutionContextUpdateOutcome, SessionGuardDenial, SessionGuards, SessionLifecycle,
-    SessionLifecycleDenial, SessionMessage, SessionMessageClosureKind, SessionMessageError,
-    SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary, SessionTransport,
-    StoredSession, ToolCallExpectation, ToolCallRecorderMetadata, ToolCallStart,
-    ToolEffectEventEvidence, WithdrawSessionMessageOutcome, CALL_ID_PREFIX,
+    SessionLifecycleDenial, SessionMessage, SessionMessageClosureKind, SessionMessageDelivery,
+    SessionMessageDeliveryOutcome, SessionMessageDeliveryReplay, SessionMessageError,
+    SessionMessagePriority, SessionMessageStatus, SessionRecord, SessionStoreStatus,
+    SessionSummary, SessionTransport, StoredSession, ToolCallExpectation, ToolCallRecorderMetadata,
+    ToolCallStart, ToolEffectEventEvidence, WithdrawSessionMessageOutcome, CALL_ID_PREFIX,
     DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_SESSIONS,
-    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
-    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX,
-    SESSION_LEDGER_VERSION,
+    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
+    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_DELIVERY_KEY_CHARS, MAX_SUMMARY_LIMIT,
+    MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::{
     cold_session_from_persisted, load_persisted_ledger, materialize_cold_session,
@@ -63,6 +67,10 @@ use super::util::{
     bound_event_error_summary, bound_summary_string, now_ts, redact_and_bound_instruction,
     redact_and_bound_value,
 };
+
+#[cfg(test)]
+#[path = "identifier_tests.rs"]
+mod identifier_tests;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -484,40 +492,46 @@ impl SessionStore {
                     .to_string(),
             );
         }
-        let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
-        let now = now_ts();
-        let guards = SessionGuards::effective(opts.mode, opts.guards);
-        let owner_authority_fingerprint = opts.owner_authority_fingerprint.ok_or_else(|| {
-            "Workflow Session creation requires a canonical authority fingerprint".to_string()
-        })?;
-        let record = SessionRecord {
-            session_id: session_id.clone(),
-            project: opts.project,
-            owner_authority_fingerprint,
-            title: opts.title,
-            mode: opts.mode,
-            guards,
-            execution_context: opts.execution_context,
-            // Create always yields Active; only explicit close transitions later.
-            lifecycle: SessionLifecycle::Active,
-            created_at: now,
-            updated_at: now,
-            messages: VecDeque::new(),
-            events: VecDeque::new(),
-            events_observed: 0,
-            context_revision: 0,
-            materialized_validation_job_ids: VecDeque::new(),
-            message_observation_revision: 0,
-            message_observation_floor: 0,
-            message_observation_revisions: Default::default(),
-            assignment_history_floors: Default::default(),
-            assignment_history_tracking_complete: true,
-            completion_assignment_fence_fingerprints: Default::default(),
-            completion_assignment_fence_tracking_complete: true,
-            project_instructions: opts.project_instructions,
-        };
         let summary = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let session_id = inner
+                .allocate_session_id(|| webcodex_core::compact::random_suffix::<12>())
+                .ok_or_else(|| "session_id_allocation_exhausted".to_string())?;
+            let now = now_ts();
+            let guards = SessionGuards::effective(opts.mode, opts.guards);
+            let owner_authority_fingerprint =
+                opts.owner_authority_fingerprint.ok_or_else(|| {
+                    "Workflow Session creation requires a canonical authority fingerprint"
+                        .to_string()
+                })?;
+            let record = SessionRecord {
+                session_id: session_id.clone(),
+                project: opts.project,
+                owner_authority_fingerprint,
+                title: opts.title,
+                mode: opts.mode,
+                guards,
+                execution_context: opts.execution_context,
+                // Create always yields Active; only explicit close transitions later.
+                lifecycle: SessionLifecycle::Active,
+                created_at: now,
+                updated_at: now,
+                messages: VecDeque::new(),
+                message_delivery_replays: Default::default(),
+                events: VecDeque::new(),
+                events_observed: 0,
+                git_baseline_tree: None,
+                repository_edit_observed: false,
+                materialized_validation_job_ids: VecDeque::new(),
+                message_observation_revision: 0,
+                message_observation_floor: 0,
+                message_observation_revisions: Default::default(),
+                assignment_history_floors: Default::default(),
+                assignment_history_tracking_complete: true,
+                completion_assignment_fence_fingerprints: Default::default(),
+                completion_assignment_fence_tracking_complete: true,
+                project_instructions: opts.project_instructions,
+            };
             inner.insert_session(record)
         };
         self.persist_after_mutation();
@@ -535,6 +549,17 @@ impl SessionStore {
         &self,
         request: CodingSessionRequest,
     ) -> Result<CodingSessionOutcome, CodingSessionError> {
+        self.ensure_coding_session_with_git_baseline(request, None)
+    }
+
+    /// Coding bootstrap variant used by `work_on_project` to bind one fresh
+    /// startup Git tree. Exact continuation ignores the supplied candidate and
+    /// preserves the durable Session baseline already recorded at creation.
+    pub fn ensure_coding_session_with_git_baseline(
+        &self,
+        request: CodingSessionRequest,
+        git_baseline_tree: Option<String>,
+    ) -> Result<CodingSessionOutcome, CodingSessionError> {
         let explicit_resume_session_id = match request.resume_session_id.as_deref() {
             Some(session_id)
                 if session_id != session_id.trim() || !is_valid_session_id(session_id) =>
@@ -546,7 +571,6 @@ impl SessionStore {
         };
         let explicit_resume = explicit_resume_session_id.is_some();
         let now = now_ts();
-        let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let requested_guards = SessionGuards::effective(request.mode, request.guards);
         let requested_execution_context = request
@@ -686,15 +710,10 @@ impl SessionStore {
                     record.execution_context = next_execution_context;
                     record.updated_at = now;
                     if let Some(project_instructions) = request.project_instructions {
-                        // A transient runner/read failure must not erase the
-                        // last complete in-memory rules snapshot. Fresh
-                        // sessions may still retain a partial/unavailable
-                        // snapshot so startup can report it conservatively.
-                        if project_instructions.scan_complete
-                            || record.project_instructions.is_none()
-                        {
-                            record.project_instructions = Some(project_instructions);
-                        }
+                        record.project_instructions = Some(
+                            project_instructions
+                                .retain_unavailable_scopes(record.project_instructions.as_ref()),
+                        );
                     }
                     record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
@@ -707,6 +726,11 @@ impl SessionStore {
                     .summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT))
                     .expect("continued session must summarize");
                 CodingSessionOutcome {
+                    project_instructions: inner
+                        .sessions
+                        .get(&session_id)
+                        .and_then(StoredSession::hot)
+                        .and_then(|record| record.project_instructions.clone()),
                     summary,
                     pre_instruction_summary: Some(pre_instruction_summary),
                     reused: true,
@@ -719,6 +743,9 @@ impl SessionStore {
                 if self.take_coding_continuity_fault() {
                     return Err(CodingSessionError::CommitFailed);
                 }
+                let new_session_id = inner
+                    .allocate_session_id(|| webcodex_core::compact::random_suffix::<12>())
+                    .ok_or(CodingSessionError::CommitFailed)?;
                 let execution_context = requested_execution_context.clone().unwrap_or_default();
                 let execution_context_changed = !execution_context.is_empty();
                 let event = coding_instruction_event(
@@ -754,9 +781,11 @@ impl SessionStore {
                     created_at: now,
                     updated_at: now,
                     messages: VecDeque::new(),
+                    message_delivery_replays: Default::default(),
                     events: VecDeque::from([Arc::new(event)]),
                     events_observed: 1,
-                    context_revision: 0,
+                    git_baseline_tree,
+                    repository_edit_observed: false,
                     materialized_validation_job_ids: VecDeque::new(),
                     message_observation_revision: 0,
                     message_observation_floor: 0,
@@ -767,8 +796,10 @@ impl SessionStore {
                     completion_assignment_fence_tracking_complete: true,
                     project_instructions: request.project_instructions,
                 };
+                let project_instructions = record.project_instructions.clone();
                 let summary = inner.insert_session(record);
                 CodingSessionOutcome {
+                    project_instructions,
                     summary,
                     pre_instruction_summary: None,
                     reused: false,
@@ -806,6 +837,75 @@ impl SessionStore {
         self.with_record_for_query(session_id, |record, cold| {
             summarize_record(record, limit, cold)
         })
+    }
+
+    /// Exact retained changed-path evidence for recovery attribution. Unlike
+    /// `summary`, this scans the full bounded durable event ledger instead of the
+    /// model-facing 200-event tail, so ordinary presentation truncation does not
+    /// masquerade as history loss. The boolean is true only when the retained
+    /// ledger and each event's changed-path projection are known complete.
+    pub fn retained_changed_path_evidence(&self, session_id: &str) -> Option<(Vec<String>, bool)> {
+        self.with_record_for_query(session_id, |record, _cold| {
+            let retained_events = record
+                .events
+                .iter()
+                .map(|event| event.as_ref().clone())
+                .collect::<Vec<_>>();
+            let mut paths = BTreeSet::new();
+            let mut complete = record.events_observed <= retained_events.len() as u64;
+            // Every persisted event sanitizes changed_paths to MAX_INPUT_ARRAY_ITEMS,
+            // and runtime audit arguments can already be bounded before the Store
+            // observes them. Equality to that durable bound therefore cannot prove
+            // the original path set was complete, even while the Session is hot.
+            for event in super::events::canonical_tool_call_finished_events(&retained_events) {
+                // Path attribution is consequence evidence, not an attempted-write
+                // list. A failed/no-op edit can name the same path without proving
+                // that this Session caused the current dirty state.
+                if !event_observes_repository_edit(event) {
+                    continue;
+                }
+                if event.changed_paths.len() >= MAX_INPUT_ARRAY_ITEMS {
+                    complete = false;
+                }
+                paths.extend(event.changed_paths.iter().cloned());
+            }
+            (paths.into_iter().collect(), complete)
+        })
+    }
+
+    /// Latest retained task-instruction identity at an exact Session event-count
+    /// snapshot. Unlike `summary`, this scans the full bounded durable ledger so
+    /// the model-facing 200-event tail cannot erase the current attempt identity.
+    /// `through_events_total` fences the lookup against a later instruction racing
+    /// the caller's already-observed Session snapshot. Durable eviction remains
+    /// fail-closed and therefore returns `None`.
+    pub fn retained_task_instruction_event_id_at(
+        &self,
+        session_id: &str,
+        through_events_total: usize,
+    ) -> Option<String> {
+        self.with_record_for_query(session_id, |record, _cold| {
+            let observed_total = usize::try_from(record.events_observed).unwrap_or(usize::MAX);
+            if through_events_total > observed_total {
+                return None;
+            }
+            let retained_len = record.events.len();
+            let first_retained_sequence = observed_total.saturating_sub(retained_len);
+            if through_events_total <= first_retained_sequence {
+                return None;
+            }
+            let retained_end = through_events_total
+                .saturating_sub(first_retained_sequence)
+                .min(retained_len);
+            record
+                .events
+                .iter()
+                .take(retained_end)
+                .rev()
+                .find(|event| event.kind == "task_instruction")
+                .map(|event| event.event_id.clone())
+        })
+        .flatten()
     }
 
     /// Bounded, read-only Workflow Session rows for one exact runtime project.
@@ -938,12 +1038,13 @@ impl SessionStore {
         inner.contains_session(session_id)
     }
 
-    pub fn context_revision(&self, session_id: &str) -> Option<u64> {
-        let inner = self.inner.lock().expect("session store mutex poisoned");
-        inner
-            .sessions
-            .get(session_id)
-            .map(StoredSession::context_revision)
+    /// Internal consistency fence for assembling recovery evidence. Event mutations
+    /// advance events_observed; collaboration mutations advance
+    /// message_observation_revision. Never serialized or accepted from a caller.
+    pub fn handoff_revision(&self, session_id: &str) -> Option<(u64, u64)> {
+        self.with_record_for_query(session_id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
     }
 
     pub fn session_project(&self, session_id: &str) -> Option<Option<String>> {
@@ -954,6 +1055,28 @@ impl SessionStore {
     pub fn session_target_authority(&self, session_id: &str) -> Option<(Option<String>, String)> {
         let inner = self.inner.lock().expect("session store mutex poisoned");
         inner.session_target_authority(session_id)
+    }
+
+    /// Synchronous revalidation boundary for an already authorized current-work
+    /// target. Identity and creation authority remain explicit; this closure
+    /// cannot close/reassign a Session or confer authority through a Window.
+    /// The callback must not reenter SessionStore or perform asynchronous work.
+    pub fn with_active_session_authority_fence<T>(
+        &self,
+        session_id: &str,
+        expected_project: &str,
+        expected_owner_authority_fingerprint: &str,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().ok()?;
+        let record = inner.sessions.get(session_id)?;
+        if !record.lifecycle().allows_mutation()
+            || record.project() != Some(expected_project)
+            || record.owner_authority_fingerprint() != expected_owner_authority_fingerprint
+        {
+            return None;
+        }
+        Some(commit())
     }
 
     /// Return inherited defaults only for an active Session whose registered
@@ -1176,7 +1299,11 @@ impl SessionStore {
         if !is_valid_session_id(session_id) {
             return None;
         }
-        let pre_call_context_revision = self.context_revision(session_id)?;
+        // Preserve the existing fail-closed Session boundary. Evicted or unknown
+        // Sessions cannot be revived by appending a tool event.
+        if !self.contains_session(session_id) {
+            return None;
+        }
         let now = now_ts();
         let event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let project = extract_project(arguments);
@@ -1188,11 +1315,6 @@ impl SessionStore {
         let diff_review_like = diff_review_like_for_tool(tool_name, arguments);
         let input_summary = Some(session_input_summary_for_tool(tool_name, arguments));
         let expectation = metadata.expectation;
-        let ack_session_context_revision = if contract.accepts_context_ack {
-            metadata.ack_session_context_revision
-        } else {
-            SessionContextRevisionAck::Unsupported
-        };
         let start = ToolCallStart {
             event_id: event_id.clone(),
             call_id: call_id.clone(),
@@ -1216,15 +1338,12 @@ impl SessionStore {
             started_instant: Instant::now(),
             permission: None,
             expectation: expectation.clone(),
-            pre_call_context_revision,
-            advances_context_checkpoint: contract.advances_context_checkpoint,
-            ack_session_context_revision,
         };
         self.push_event(SessionEvent {
             event_id,
             session_id: session_id.to_string(),
             kind: "tool_call_started".to_string(),
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: None,
             call_id: Some(call_id),
             logical_invocation_id: metadata.logical_invocation_id,
@@ -1349,108 +1468,7 @@ impl SessionStore {
         })
     }
 
-    fn push_model_facing_event(
-        &self,
-        mut event: SessionEvent,
-        pre_call_context_revision: u64,
-        ack_session_context_revision: SessionContextRevisionAck,
-        advances_context_checkpoint: bool,
-    ) -> Option<RecordedModelFacingToolCall> {
-        let session_id = event.session_id.clone();
-        let outcome = {
-            let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            let max_events = inner.max_events_per_session;
-            let stored = inner.sessions.get_mut(&session_id)?;
-            let project_instructions = match stored {
-                StoredSession::Cold(cold) => cold.project_instructions.clone(),
-                StoredSession::Hot(_) => None,
-            };
-            let mut materialized = match stored {
-                StoredSession::Hot(_) => None,
-                StoredSession::Cold(cold) => materialize_cold_session(cold, max_events),
-            };
-            let record = match stored {
-                StoredSession::Hot(record) => record,
-                StoredSession::Cold(_) => materialized.as_mut()?,
-            };
-            if record.context_revision < pre_call_context_revision {
-                return None;
-            }
-            // Recover only the checkpoint prefix that existed immediately before
-            // this result. Non-checkpoint model-facing events stay in the ledger
-            // without consuming a context revision.
-            let pre_response_context_revision = record.context_revision;
-            let context_revision = if advances_context_checkpoint {
-                pre_response_context_revision.checked_add(1)?
-            } else {
-                pre_response_context_revision
-            };
-            let recovery_start = match ack_session_context_revision {
-                SessionContextRevisionAck::Revision(revision)
-                    if revision <= pre_call_context_revision =>
-                {
-                    revision
-                }
-                // Missing, malformed, and future ACKs prove no caller-held
-                // prefix. They recover from a compact current-state handoff at
-                // response projection time instead of replaying retained history
-                // as though revision zero had been explicitly acknowledged.
-                _ => pre_response_context_revision,
-            };
-            let recovery_events = record
-                .events
-                .iter()
-                .filter_map(|candidate| {
-                    let candidate_revision = candidate.context_revision?;
-                    (candidate_revision > recovery_start
-                        && candidate_revision <= pre_response_context_revision)
-                        .then(|| candidate.as_ref().clone())
-                })
-                .collect::<Vec<_>>();
-            let expected_recovery_count = match ack_session_context_revision {
-                SessionContextRevisionAck::Revision(revision)
-                    if revision <= pre_call_context_revision =>
-                {
-                    pre_response_context_revision.saturating_sub(revision)
-                }
-                _ => 0,
-            };
-            let history_lost = expected_recovery_count > recovery_events.len() as u64;
-            event.context_revision = advances_context_checkpoint.then_some(context_revision);
-            if advances_context_checkpoint {
-                record.context_revision = context_revision;
-            }
-            record.updated_at = record.updated_at.max(event.timestamp);
-            record.events.push_back(Arc::new(event));
-            record.events_observed = record.events_observed.saturating_add(1);
-            while record.events.len() > max_events {
-                record.events.pop_front();
-            }
-            let outcome = RecordedModelFacingToolCall {
-                session_id: session_id.clone(),
-                context_revision,
-                pre_response_context_revision,
-                checkpoint_advanced: advances_context_checkpoint,
-                pre_call_context_revision,
-                ack_session_context_revision,
-                recovery_events,
-                history_lost,
-            };
-            if let Some(record) = materialized.as_ref() {
-                let persisted = PersistedSessionRecord::from_record(record, max_events);
-                let cold = cold_session_from_persisted(&persisted, project_instructions).ok()?;
-                *stored = StoredSession::Cold(cold);
-            }
-            inner.touch(&session_id);
-            outcome
-        };
-        self.persist_after_mutation();
-        Some(outcome)
-    }
-
-    /// Append a finished ledger event that is not itself returned as a model-facing
-    /// ToolResult (for example a pre-kernel parsing/scope failure or an internal
-    /// nested operation). It deliberately does not advance model context continuity.
+    /// Append a finished tool-call ledger event through the canonical event path.
     pub fn record_tool_call_finished(
         &self,
         start: Option<ToolCallStart>,
@@ -1459,35 +1477,10 @@ impl SessionStore {
         error: Option<&str>,
         error_kind: Option<&str>,
     ) -> Option<String> {
-        let (event, _, _, _) =
-            Self::tool_call_finished_event(start, success, output, error, error_kind)?;
+        let event = Self::tool_call_finished_event(start, success, output, error, error_kind)?;
         let event_id = event.event_id.clone();
         self.push_event(event);
         Some(event_id)
-    }
-
-    /// Append a finished model-facing ToolResult and atomically advance the
-    /// Session-local context revision only for a ToolDefinition checkpoint.
-    pub fn record_model_facing_tool_call_finished(
-        &self,
-        start: Option<ToolCallStart>,
-        success: bool,
-        output: &Value,
-        error: Option<&str>,
-        error_kind: Option<&str>,
-    ) -> Option<RecordedModelFacingToolCall> {
-        let (
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        ) = Self::tool_call_finished_event(start, success, output, error, error_kind)?;
-        self.push_model_facing_event(
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        )
     }
 
     fn tool_call_finished_event(
@@ -1496,11 +1489,8 @@ impl SessionStore {
         output: &Value,
         error: Option<&str>,
         error_kind: Option<&str>,
-    ) -> Option<(SessionEvent, u64, SessionContextRevisionAck, bool)> {
+    ) -> Option<SessionEvent> {
         let start = start?;
-        let pre_call_context_revision = start.pre_call_context_revision;
-        let ack_session_context_revision = start.ack_session_context_revision;
-        let advances_context_checkpoint = start.advances_context_checkpoint;
         let finished_at = now_ts();
         let duration_ms = start
             .started_instant
@@ -1560,7 +1550,7 @@ impl SessionStore {
             event_id,
             session_id: start.session_id,
             kind: "tool_call_finished".to_string(),
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: context_result_summary_for_tool_result(
                 &start.tool_name,
                 output,
@@ -1617,12 +1607,7 @@ impl SessionStore {
             previous_execution_context: None,
             execution_context_changed: None,
         };
-        Some((
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        ))
+        Some(event)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1768,7 +1753,7 @@ impl SessionStore {
             kind: "validation_job_terminal".to_string(),
             logical_invocation_id: None,
             logical_invocation_role: None,
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: None,
             timestamp,
             transport: "job_terminal".to_string(),
@@ -1973,7 +1958,11 @@ impl SessionStore {
             match stored {
                 StoredSession::Hot(record) => {
                     record.updated_at = now_ts();
-                    record.events.push_back(Arc::new(event.take().unwrap()));
+                    let event = event.take().unwrap();
+                    if event_observes_repository_edit(&event) {
+                        record.repository_edit_observed = true;
+                    }
+                    record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
                     while record.events.len() > max_events_per_session {
                         record.events.pop_front();
@@ -2279,7 +2268,7 @@ fn coding_instruction_event(
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
         kind: "task_instruction".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2370,7 +2359,7 @@ fn coding_agent_lifecycle_event(
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: bound_summary_string(kind),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2431,7 +2420,7 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: "session_closed".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2500,7 +2489,7 @@ fn session_execution_context_updated_event(
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: "session_execution_context_updated".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2558,6 +2547,17 @@ fn session_execution_context_updated_event(
         previous_execution_context: Some(previous_execution_context),
         execution_context_changed: Some(changed),
     }
+}
+
+fn event_observes_repository_edit(event: &SessionEvent) -> bool {
+    event.kind == "tool_call_finished"
+        && event.status.as_deref() == Some("succeeded")
+        && event
+            .effect_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.state_changed)
+            == Some(true)
+        && runtime_tool_activity_semantics(&event.tool_name).kind == ToolActivityKind::Edit
 }
 
 fn summarize_record(
@@ -2630,11 +2630,17 @@ fn summarize_record(
         guards: record.guards,
         execution_context: record.execution_context.clone(),
         lifecycle: record.lifecycle,
+        git_baseline_tree: record.git_baseline_tree.clone(),
+        repository_edit_observed: record.repository_edit_observed,
         created_at: record.created_at,
         updated_at: record.updated_at,
         counts,
         events,
         events_total: observed_total,
+        events_retained: retained_total,
+        events_evicted: observed_total.saturating_sub(retained_total),
+        retention_truncated: observed_total > retained_total,
+        ledger_first_retained_sequence: observed_total.saturating_sub(retained_total),
         events_returned,
         events_truncated: observed_total > events_returned,
         first_retained_sequence: observed_total.saturating_sub(events_returned),
@@ -2643,11 +2649,79 @@ fn summarize_record(
     }
 }
 
+fn session_message_delivery_identity(
+    delivery: &SessionMessageDelivery,
+    kind: super::model::SessionMessageKind,
+    message: &str,
+    tags: &[String],
+    reply_to: Option<&str>,
+    priority: SessionMessagePriority,
+    requires_ack: bool,
+) -> Result<(String, String), SessionMessageError> {
+    if delivery.sender_scope.len() != 64
+        || !delivery
+            .sender_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SessionMessageError::InvalidInput(
+            "message delivery sender scope is unavailable".to_string(),
+        ));
+    }
+    let delivery_key = delivery.delivery_key.trim();
+    if delivery_key.is_empty() || delivery_key.chars().count() > MAX_MESSAGE_DELIVERY_KEY_CHARS {
+        return Err(SessionMessageError::InvalidInput(format!(
+            "delivery_key must contain 1..={MAX_MESSAGE_DELIVERY_KEY_CHARS} characters"
+        )));
+    }
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(b"webcodex.session-message-delivery-key.v1\0");
+    key_hasher.update(delivery_key.as_bytes());
+    let scope_key = format!("{}:{:x}", delivery.sender_scope, key_hasher.finalize());
+
+    fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    let mut payload = Sha256::new();
+    payload.update(b"webcodex.session-message-delivery-payload.v1\0");
+    hash_field(&mut payload, kind.as_str().as_bytes());
+    hash_field(&mut payload, message.as_bytes());
+    payload.update((tags.len() as u64).to_be_bytes());
+    for tag in tags {
+        hash_field(&mut payload, tag.as_bytes());
+    }
+    hash_field(&mut payload, reply_to.unwrap_or_default().as_bytes());
+    let priority = match priority {
+        SessionMessagePriority::Low => "low",
+        SessionMessagePriority::Normal => "normal",
+        SessionMessagePriority::High => "high",
+    };
+    hash_field(&mut payload, priority.as_bytes());
+    payload.update([u8::from(requires_ack)]);
+    Ok((scope_key, format!("{:x}", payload.finalize())))
+}
+
 impl SessionStoreInner {
     // --- create / lifecycle ---
 
     /// Sole map-insert path for a newly created session.
+    // Called under the store mutex; every fresh-session path uses this allocator.
+    pub(super) fn allocate_session_id(&self, mut suffix: impl FnMut() -> String) -> Option<String> {
+        for _ in 0..16 {
+            let id = format!("{SESSION_ID_PREFIX}{}", suffix());
+            if !self.sessions.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub(super) fn insert_session(&mut self, record: SessionRecord) -> SessionSummary {
+        assert!(
+            !self.sessions.contains_key(&record.session_id),
+            "Session allocation must not replace an existing ledger"
+        );
         let session_id = record.session_id.clone();
         self.sessions
             .insert(session_id.clone(), StoredSession::Hot(record));
@@ -2716,7 +2790,8 @@ impl SessionStoreInner {
         &mut self,
         input: PostSessionMessageInput,
         requires_ack: bool,
-    ) -> Result<(SessionMessage, bool), SessionMessageError> {
+        delivery: Option<SessionMessageDelivery>,
+    ) -> Result<SessionMessageDeliveryOutcome, SessionMessageError> {
         self.touch(&input.session_id);
         let Some(stored) = self.sessions.get_mut(&input.session_id) else {
             return Err(SessionMessageError::UnknownSession);
@@ -2727,15 +2802,7 @@ impl SessionStoreInner {
         }
         let record = stored
             .hot_mut()
-            .expect("active session message mutation must stay hot");
-        if requires_ack
-            && (input.kind != super::model::SessionMessageKind::Guidance
-                || input.priority != super::model::SessionMessagePriority::High)
-        {
-            return Err(SessionMessageError::InvalidInput(
-                "requires_ack is only valid for high-priority guidance".to_string(),
-            ));
-        }
+            .expect("active touched session message mutation must stay hot");
         let message = validate_message_text(input.message)?;
         let tags = validate_message_tags(input.tags)?;
         if let Some(reply_to) = input.reply_to.as_deref() {
@@ -2747,9 +2814,44 @@ impl SessionStoreInner {
                 return Err(SessionMessageError::UnknownMessage);
             }
         }
+        let delivery_identity = delivery
+            .as_ref()
+            .map(|delivery| {
+                session_message_delivery_identity(
+                    delivery,
+                    input.kind,
+                    &message,
+                    &tags,
+                    input.reply_to.as_deref(),
+                    input.priority,
+                    requires_ack,
+                )
+            })
+            .transpose()?;
+        if let Some((scope_key, payload_fingerprint)) = delivery_identity.as_ref() {
+            if let Some(replay) = record.message_delivery_replays.get(scope_key) {
+                if replay.payload_fingerprint != *payload_fingerprint {
+                    return Err(SessionMessageError::DeliveryKeyConflict);
+                }
+                let Some(message) = record
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == replay.message_id)
+                else {
+                    return Err(SessionMessageError::DeliveryKeyConflict);
+                };
+                return Ok(SessionMessageDeliveryOutcome {
+                    message: message.as_ref().clone(),
+                    replayed: true,
+                    state_changed: false,
+                });
+            }
+        }
         let now = now_ts();
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let message = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: input.kind,
@@ -2775,12 +2877,28 @@ impl SessionStoreInner {
         record
             .message_observation_revisions
             .insert(message.message_id.clone(), revision);
+        if let Some((scope_key, payload_fingerprint)) = delivery_identity {
+            record.message_delivery_replays.insert(
+                scope_key,
+                SessionMessageDeliveryReplay {
+                    payload_fingerprint,
+                    message_id: message.message_id.clone(),
+                },
+            );
+        }
         while record.messages.len() > DEFAULT_MAX_MESSAGES_PER_SESSION {
             if let Some(evicted) = record.messages.pop_front() {
+                record
+                    .message_delivery_replays
+                    .retain(|_, replay| replay.message_id != evicted.message_id);
                 Self::note_evicted_message_observation(record, evicted.as_ref());
             }
         }
-        Ok((message, true))
+        Ok(SessionMessageDeliveryOutcome {
+            message,
+            replayed: false,
+            state_changed: true,
+        })
     }
 
     pub(super) fn observe_message_acks(
@@ -2810,8 +2928,6 @@ impl SessionStoreInner {
             let Some(index) = record.messages.iter().position(|message| {
                 message.message_id == *message_id
                     && message.status == SessionMessageStatus::Open
-                    && message.kind == super::model::SessionMessageKind::Guidance
-                    && message.priority == super::model::SessionMessagePriority::High
                     && message.requires_ack
             }) else {
                 outcome.ignored_count += 1;
@@ -2977,6 +3093,8 @@ impl SessionStoreInner {
             return Err(SessionMessageError::MessageNotOpen);
         }
 
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let original_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -2987,7 +3105,7 @@ impl SessionStoreInner {
         record.message_observation_revision = replacement_revision;
         let now = now_ts();
         let replacement = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: original_snapshot.kind,
@@ -3157,7 +3275,7 @@ impl SessionStoreInner {
         }
         if snapshot.requires_ack && !current_request_acknowledged {
             return Err(SessionMessageError::InvalidInput(
-                "requires_ack guidance must be acknowledged on the same request before wrapper resolution"
+                "requires_ack message must be acknowledged on the same request before wrapper resolution"
                     .to_string(),
             ));
         }
@@ -3301,6 +3419,8 @@ impl SessionStoreInner {
             });
         }
 
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let todo_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -3312,7 +3432,7 @@ impl SessionStoreInner {
 
         let now = now_ts();
         let answer = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: super::model::SessionMessageKind::Answer,
@@ -3498,4 +3618,24 @@ impl SessionStoreInner {
         let record = self.sessions.get(session_id)?.hot()?;
         Some(summarize_record(record, limit, None))
     }
+}
+
+// No retained identity or historical retained link may silently retarget.
+pub(super) fn allocate_message_id(
+    record: &SessionRecord,
+    mut suffix: impl FnMut() -> String,
+) -> Result<String, SessionMessageError> {
+    for _ in 0..16 {
+        let id = format!("{MESSAGE_ID_PREFIX}{}", suffix());
+        if !record.messages.iter().any(|m| {
+            m.message_id == id
+                || m.reply_to.as_deref() == Some(&id)
+                || m.resolved_by_message_id.as_deref() == Some(&id)
+                || m.superseded_by_message_id.as_deref() == Some(&id)
+                || m.supersedes_message_id.as_deref() == Some(&id)
+        }) {
+            return Ok(id);
+        }
+    }
+    Err(SessionMessageError::InvalidObservationState)
 }

@@ -21,7 +21,7 @@ fn write_tool_call(
         content: content.to_string(),
         session_id,
         overwrite: None,
-        expected_sha256: None,
+        expected_read_revision: None,
     }
 }
 
@@ -232,7 +232,7 @@ async fn hard_policy_deny_still_suppresses_permission_attach() {
         .dispatch_with_auth(
             ToolCall::ArtifactUploadBegin {
                 project,
-                path: "artifacts/smoke/raw.bin".to_string(),
+                path: ".env".to_string(),
                 session_id: Some(session.session_id.clone()),
                 expected_bytes: Some(1),
                 expected_sha256: None,
@@ -292,13 +292,17 @@ async fn observe_tool_skips_permission_evaluator() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )

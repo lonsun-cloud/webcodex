@@ -268,7 +268,7 @@ impl ShareSession {
         let share_root = state.join("share");
         create_private_dir(&share_root)?;
         let directory = share_root.join(uuid::Uuid::new_v4().simple().to_string());
-        let credential_file = directory.join("connector-key");
+        let credential_file = directory.join("project-credential");
         let result = (|| {
             create_private_dir(&directory)?;
             let credential = generate_project_credential();
@@ -530,7 +530,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         config.port,
         "Stop the conflicting process, then retry webcodex share.",
     )?;
-    let persistent_credential = read_project_credential(&paths.connector_key)?;
+    let persistent_credential = read_project_credential(&paths.project_credential)?;
     let session = ShareSession::create(&paths.state)?;
     if session.credential == persistent_credential {
         return Err(ProductError::new(
@@ -586,7 +586,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         &options.project,
         LocalRuntimeOptions {
             public_url: Some(public_url.clone()),
-            connector_credential_file: Some(session.credential_file.clone()),
+            project_credential_file: Some(session.credential_file.clone()),
             mcp_query_token_auth: options.auth == ShareAuth::QueryToken,
             project_share_oauth,
             child_environment_remove: if options.tunnel == TunnelProvider::OpenAiSecure {
@@ -964,6 +964,23 @@ async fn start_cloudflare_quick_with_binary(
 
     loop {
         if let Some(status) = child.try_wait().map_err(|_| tunnel_runtime_error())? {
+            // The child can exit after writing a valid Quick Tunnel URL but before
+            // the async pipe readers are scheduled. Give those readers one bounded
+            // chance to publish a URL already emitted by the child before classifying
+            // startup as failed. A returned tunnel may therefore already be terminal;
+            // the normal forwarding/exit supervision path will report that state.
+            if let Ok(Some(url)) =
+                tokio::time::timeout(TUNNEL_LOG_DRAIN_TIMEOUT, url_rx.recv()).await
+            {
+                return Ok((
+                    url,
+                    CloudflareTunnel {
+                        child,
+                        stdout_task,
+                        stderr_task,
+                    },
+                ));
+            }
             drain_tunnel_readers(stdout_task, stderr_task).await;
             let detail = bounded_tunnel_log_summary(&recent);
             let message = if detail.is_empty() {
@@ -1350,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn share_output_contains_only_the_temporary_connector_credential() {
+    fn share_output_contains_only_the_temporary_project_credential() {
         let persistent = "webcodex_persistent-never-print";
         let temporary = "webcodex_temporary-print-once";
         let output = render_share_ready(
@@ -1499,7 +1516,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         create_private_dir(&state).unwrap();
-        let persistent = state.join("credentials/connector-key");
+        let persistent = state.join("credentials/project-credential");
         let persistent_value = generate_project_credential();
         write_new_private(&persistent, format!("{persistent_value}\n").as_bytes()).unwrap();
         let persistent_before = fs::read_to_string(&persistent).unwrap();
@@ -1605,7 +1622,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_startup_timeout_kills_fake_process() {
-        let (_temp, binary) = fake_cloudflared("#!/bin/sh\nsleep 5\n");
+        // Keep the fake process alive without spawning an external `sleep` child.
+        // The full server test suite runs many process-heavy tests concurrently on
+        // CI; under transient process pressure an extra shell child can fail to
+        // spawn and make this fixture look like an early tunnel exit instead of
+        // the startup timeout this test is intended to exercise.
+        let (_temp, binary) = fake_cloudflared("#!/bin/sh\nwhile :; do :; done\n");
         let error = start_cloudflare_quick_with_binary(
             &binary,
             "http://127.0.0.1:23456",
@@ -1614,7 +1636,11 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "tunnel_unavailable");
-        assert!(error.message.contains("startup timeout"));
+        assert!(
+            error.message.contains("startup timeout"),
+            "unexpected tunnel startup error: {}",
+            error.message
+        );
     }
 
     #[cfg(unix)]
@@ -1637,9 +1663,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_early_exit_after_url_is_supervised() {
-        let (_temp, binary) = fake_cloudflared(
-            "#!/bin/sh\necho https://short-lived.trycloudflare.com >&2\nsleep 0.1\nexit 9\n",
-        );
+        let (_temp, binary) =
+            fake_cloudflared("#!/bin/sh\necho https://short-lived.trycloudflare.com >&2\nexit 9\n");
         let (url, mut tunnel) = start_cloudflare_quick_with_binary(
             &binary,
             "http://127.0.0.1:23456",

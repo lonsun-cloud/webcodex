@@ -7,45 +7,11 @@ use super::events::{
 use super::model::{PersistedSessionLedger, MAX_OBSERVED_PATHS_PER_EVENT, SESSION_LEDGER_VERSION};
 use super::persistence::write_ledger_atomic;
 use super::*;
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 mod audit_policy;
-
-fn record_model_facing_result(
-    store: &SessionStore,
-    session_id: &str,
-    tool_name: &str,
-    ack: SessionContextRevisionAck,
-    success: bool,
-    output: Value,
-) -> RecordedModelFacingToolCall {
-    let arguments = json!({"project": "proj"});
-    let start = store
-        .record_tool_call_started_with_metadata(
-            Some(session_id),
-            SessionTransport::Mcp,
-            tool_name,
-            &arguments,
-            Some("proj".to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: ack,
-                ..Default::default()
-            },
-            crate::tool_runtime::sessions::session_tool_contract(tool_name),
-        )
-        .expect("recorded call start");
-    let session_output = super::super::tool_audit::session_log_result_for_tool(tool_name, &output);
-    store
-        .record_model_facing_tool_call_finished(
-            Some(start),
-            success,
-            &session_output,
-            (!success).then_some("business failure"),
-            (!success).then_some("business_failure"),
-        )
-        .expect("recorded model-facing result")
-}
 
 fn persistent_store(path: PathBuf) -> SessionStore {
     SessionStore::with_persistence(path, 10, 10)
@@ -54,6 +20,29 @@ fn persistent_store(path: PathBuf) -> SessionStore {
 fn flush_and_restore(store: &SessionStore, path: PathBuf) -> SessionStore {
     store.flush_persistence();
     SessionStore::with_persistence(path, 10, 10)
+}
+
+fn read_files_input(project: &str, path: &str) -> Value {
+    json!({"project": project, "items": [{"path": path}]})
+}
+
+fn search_project_texts_input(project: &str, pattern: &str, path: Option<&str>) -> Value {
+    let mut query = json!({"pattern": pattern});
+    if let Some(path) = path {
+        query["path"] = json!(path);
+    }
+    json!({"project": project, "queries": [query]})
+}
+
+fn single_search_batch_output(output: Value) -> Value {
+    json!({
+        "items": [{
+            "index": 0,
+            "success": true,
+            "output": output,
+            "error": null
+        }]
+    })
 }
 
 fn record_console_tool(
@@ -119,6 +108,7 @@ fn session_tool_classification_uses_definition_policy() {
         ("show_changes", "read_only"),
         ("start_session", "workflow_manage"),
         ("close_session", "session_collaborate"),
+        #[cfg(feature = "workspace-checkpoints")]
         ("workspace_checkpoint_create", "checkpoint_manage"),
         ("coding_agent_cancel", "run_control"),
         ("write_project_file", "project_write"),
@@ -177,11 +167,9 @@ fn changed_paths_single_path_and_path_list_from_metadata() {
         ),
         vec!["out/image.png".to_string()]
     );
-    assert!(changed_paths_for_tool(
-        "read_file",
-        &json!({"project": "demo", "path": "src/lib.rs"}),
-    )
-    .is_empty());
+    assert!(
+        changed_paths_for_tool("read_files", &read_files_input("demo", "src/lib.rs"),).is_empty()
+    );
     assert!(changed_paths_for_tool(
         "apply_unified_diff",
         &json!({"project": "demo", "diff": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n"}),
@@ -228,6 +216,7 @@ fn apply_unified_diff_finished_event_records_trusted_result_changed_paths() {
 }
 
 #[test]
+#[cfg(feature = "workspace-checkpoints")]
 fn checkpoint_restore_finished_event_records_trusted_result_changed_paths() {
     let store = SessionStore::default();
     let session = store.start_session(
@@ -307,9 +296,9 @@ fn successful_reads_record_input_paths_but_failed_reads_do_not_finish_with_evide
     let successful = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "read_file",
-        &json!({"project": "demo", "path": "src\\lib.rs"}),
-        crate::tool_runtime::sessions::session_tool_contract("read_file"),
+        "read_files",
+        &read_files_input("demo", "src\\lib.rs"),
+        crate::tool_runtime::sessions::session_tool_contract("read_files"),
     );
     store.record_tool_call_finished(
         successful,
@@ -322,9 +311,9 @@ fn successful_reads_record_input_paths_but_failed_reads_do_not_finish_with_evide
     let failed = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "read_file",
-        &json!({"project": "demo", "path": "src/failed.rs"}),
-        crate::tool_runtime::sessions::session_tool_contract("read_file"),
+        "read_files",
+        &read_files_input("demo", "src/failed.rs"),
+        crate::tool_runtime::sessions::session_tool_contract("read_files"),
     );
     store.record_tool_call_finished(
         failed,
@@ -395,19 +384,22 @@ fn search_result_modes_extract_only_known_structured_file_paths() {
     ];
 
     for (mode, output, expected) in cases {
-        let paths =
-            observed_paths_for_successful_result("search_project_text", Vec::new(), &output);
+        let paths = observed_paths_for_successful_result(
+            "search_project_texts",
+            Vec::new(),
+            &single_search_batch_output(output),
+        );
         assert_eq!(paths, expected, "{mode}");
     }
 
     let bounded = observed_paths_for_successful_result(
-        "search_project_text",
+        "search_project_texts",
         Vec::new(),
-        &json!({
+        &single_search_batch_output(json!({
             "files": (0..MAX_OBSERVED_PATHS_PER_EVENT + 5)
                 .map(|index| json!({"path": format!("src/file-{index:03}.rs"), "match_count": 1}))
                 .collect::<Vec<_>>()
-        }),
+        })),
     );
     assert_eq!(bounded.len(), MAX_OBSERVED_PATHS_PER_EVENT);
 }
@@ -481,16 +473,15 @@ fn lsp_observations_use_path_metadata_and_known_typed_result_locations_only() {
 #[test]
 fn exploration_input_audit_omits_queries_and_shell_commands() {
     let search = session_input_summary_for_tool(
-        "search_project_text",
-        &json!({
-            "project": "demo",
-            "pattern": "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
-            "pattern_present": true,
-            "path": "src"
-        }),
+        "search_project_texts",
+        &search_project_texts_input(
+            "demo",
+            "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
+            Some("src"),
+        ),
     );
-    assert_eq!(search["pattern_present"], true);
-    assert!(search.get("pattern").is_none());
+    assert_eq!(search["queries"][0]["path"], "src");
+    assert!(search["queries"][0].get("pattern").is_none());
 
     let symbols = session_input_summary_for_tool(
         "workspace_symbols",
@@ -678,12 +669,12 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
         &json!({"project": project, "query_present": false, "limit": 20}),
         crate::tool_runtime::sessions::session_tool_contract("skill_list"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         list_start,
         true,
         &json!({
             "project": project,
-            "catalog_revision": "wc_skillcat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog_revision": "wc_skillcat_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
             "total_count": 1,
             "returned_count": 1,
             "truncated": false,
@@ -701,21 +692,21 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
         "skill_read_file",
         &json!({
             "project": project,
-            "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+            "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
             "path": "SKILL.md",
             "start_line": 1,
             "limit": 20
         }),
         crate::tool_runtime::sessions::session_tool_contract("skill_read_file"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         read_start,
         true,
         &json!({
             "project": project,
-            "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+            "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
             "definition_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "package_revision": "wc_skillpkg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "package_revision": "wc_skillpkg_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw",
             "path": "SKILL.md",
             "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "text": private_body,
@@ -734,9 +725,8 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
     assert!(!raw.contains(private_body));
     assert!(!raw.contains(private_description));
     assert!(!raw.contains("\"skills\""));
-    assert!(raw.contains("wc_skill_0123456789abcdef0123456789abcdef"));
-    assert!(raw
-        .contains("wc_skillpkg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"));
+    assert!(raw.contains("wc_skill_ASNFZ4mrze8BI0VniavN7w"));
+    assert!(raw.contains("wc_skillpkg_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw"));
     assert!(raw.contains("returned_lines"));
     assert!(raw.contains("catalog_revision"));
 
@@ -760,12 +750,13 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
     let private_summary = "PRIVATE_MEMORY_SUMMARY_MUST_NOT_PERSIST";
     let private_body = "PRIVATE_MEMORY_BODY_MUST_NOT_PERSIST";
     let private_tag = "PRIVATE_MEMORY_TAG_MUST_NOT_PERSIST";
-    let memory_id = "wc_mem_0123456789abcdef0123456789abcdef";
-    let revision = format!("wc_memrev_{}", "a".repeat(64));
-    let catalog_revision = format!("wc_memcat_{}", "b".repeat(64));
+    let memory_id = "wc_mem_iavN7wEjRWeJq83v";
+    let revision = format!("wc_memrev_{}", webcodex_core::compact::encode([0xaa; 32]));
+    let catalog_revision = format!("wc_memcat_{}", webcodex_core::compact::encode([0xbb; 32]));
     let private_principal_digest = format!("wc_memprincipal_{}", "c".repeat(64));
-    let scope_id = format!("wc_memscope_{}", "d".repeat(64));
-    let private_root_fingerprint = format!("wc_memroot_{}", "e".repeat(64));
+    let scope_id = format!("wc_memscope_{}", webcodex_core::compact::encode([0xdd; 32]));
+    let private_root_fingerprint =
+        format!("wc_memroot_{}", webcodex_core::compact::encode([0xee; 32]));
     let private_native_root = "/PRIVATE/NATIVE/MEMORY/ROOT";
 
     let set_args = super::super::ToolCall::MemorySet {
@@ -791,7 +782,7 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
         &set_args,
         crate::tool_runtime::sessions::session_tool_contract("memory_set"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         set_start,
         true,
         &json!({
@@ -827,7 +818,7 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
         &search_args,
         crate::tool_runtime::sessions::session_tool_contract("memory_search"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         search_start,
         true,
         &json!({
@@ -863,7 +854,7 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
         }),
         crate::tool_runtime::sessions::session_tool_contract("memory_read"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         read_start,
         true,
         &json!({
@@ -896,7 +887,7 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
         &json!({"offset": 0, "limit": 50}),
         crate::tool_runtime::sessions::session_tool_contract("memory_scope_list"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         scope_list_start,
         true,
         &json!({
@@ -937,7 +928,7 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
         &purge_args,
         crate::tool_runtime::sessions::session_tool_contract("memory_scope_purge"),
     );
-    store.record_model_facing_tool_call_finished(
+    store.record_tool_call_finished(
         purge_start,
         true,
         &json!({
@@ -1037,9 +1028,9 @@ fn legacy_session_events_without_call_id_restore() {
     let start = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "read_file",
+        "read_files",
         &json!({"project": "agent:eval:demo", "path": "src/legacy.rs"}),
-        crate::tool_runtime::sessions::session_tool_contract("read_file"),
+        crate::tool_runtime::sessions::session_tool_contract("read_files"),
     );
     store.record_tool_call_finished(start, true, &json!({"content": "omitted"}), None, None);
     store.flush_persistence();
@@ -1080,14 +1071,14 @@ fn console_overview_counts_runtime_work_attention_and_sanitizes_reported_progres
 
     for (tool, input, output) in [
         (
-            "read_file",
-            json!({"project": project, "path": "src/lib.rs"}),
+            "read_files",
+            read_files_input(project, "src/lib.rs"),
             json!({"content": "RAW_FILE_CONTENT"}),
         ),
         (
-            "search_project_text",
-            json!({"project": project, "pattern": "SECRET_PATTERN", "path": "src"}),
-            json!({"matches": [{"path": "src/lib.rs"}]}),
+            "search_project_texts",
+            search_project_texts_input(project, "SECRET_PATTERN", Some("src")),
+            single_search_batch_output(json!({"matches": [{"path": "src/lib.rs"}]})),
         ),
         (
             "goto_definition",
@@ -1286,8 +1277,8 @@ fn console_overview_marks_retained_event_history_truncated_without_claiming_tota
             &store,
             &session.session_id,
             project,
-            "read_file",
-            json!({"project": project, "path": path}),
+            "read_files",
+            read_files_input(project, path),
             true,
             json!({"content": "omitted"}),
         );
@@ -1468,14 +1459,14 @@ fn console_projection_is_bounded_semantic_and_progress_is_informational() {
 
     let completed = [
         (
-            "read_file",
-            json!({"project": project, "path": "src/lib.rs"}),
+            "read_files",
+            read_files_input(project, "src/lib.rs"),
             json!({"content": "RAW_FILE_CONTENT"}),
         ),
         (
-            "search_project_text",
-            json!({"project": project, "pattern": "SECRET_PATTERN", "path": "src"}),
-            json!({"matches": [{"path": "src/lib.rs"}]}),
+            "search_project_texts",
+            search_project_texts_input(project, "SECRET_PATTERN", Some("src")),
+            single_search_batch_output(json!({"matches": [{"path": "src/lib.rs"}]})),
         ),
         (
             "apply_text_edits",
@@ -1536,10 +1527,10 @@ fn console_projection_is_bounded_semantic_and_progress_is_informational() {
     if let Some(explored) = detail.activity.iter().find(|item| item.kind == "Explored") {
         assert_eq!(explored.group_count, Some(2));
         assert_eq!(explored.group_kinds, vec!["Read", "Searched"]);
-        assert!(explored.group_tools.contains(&"read_file".to_string()));
+        assert!(explored.group_tools.contains(&"read_files".to_string()));
         assert!(explored
             .group_tools
-            .contains(&"search_project_text".to_string()));
+            .contains(&"search_project_texts".to_string()));
     } else {
         // If Progress shares this coarse timestamp, conservative grouping keeps
         // the exploration facts separate rather than crossing an unordered
@@ -1614,9 +1605,9 @@ fn console_list_orders_recent_activity_first_with_deterministic_session_id_ties(
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");
     let project = "agent:eval:ordering";
-    let older = "wc_sess_order_old";
-    let tie_a = "wc_sess_order_tie_a";
-    let tie_z = "wc_sess_order_tie_z";
+    let older = "wc_sess_0000000000000000";
+    let tie_a = "wc_sess_aaaaaaaaaaaaaaaa";
+    let tie_z = "wc_sess_zzzzzzzzzzzzzzzz";
 
     let seed = persistent_store(ledger.clone());
     let seed_older = seed.start_session(Some(project.to_string()), Some("older".to_string()));
@@ -1664,9 +1655,9 @@ fn console_list_orders_recent_activity_first_with_deterministic_session_id_ties(
         .record_tool_call_started(
             Some(older),
             SessionTransport::Api,
-            "read_file",
+            "read_files",
             &json!({"project": project, "path": "src/lib.rs"}),
-            crate::tool_runtime::sessions::session_tool_contract("read_file"),
+            crate::tool_runtime::sessions::session_tool_contract("read_files"),
         )
         .expect("older Session activity should be recorded");
     assert_eq!(activity.session_id, older);
@@ -1691,9 +1682,9 @@ fn console_list_uses_only_unfinished_call_as_now_and_keeps_job_handoff_as_last()
     let read = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "read_file",
+        "read_files",
         &json!({"project": project, "path": "src/lib.rs"}),
-        crate::tool_runtime::sessions::session_tool_contract("read_file"),
+        crate::tool_runtime::sessions::session_tool_contract("read_files"),
     );
     store.record_tool_call_finished(read, true, &json!({"content": "omitted"}), None, None);
 
@@ -1789,117 +1780,159 @@ fn console_list_uses_only_unfinished_call_as_now_and_keeps_job_handoff_as_last()
 }
 
 #[test]
-fn console_list_keeps_started_run_job_handoff_historical_and_later_activity_becomes_last() {
-    let store = SessionStore::new_in_memory(10, 30);
-    let project = "agent:eval:demo";
-    let session = store.start_session(Some(project.to_string()), Some("async job".to_string()));
-    let job_id = "12345678-1234-5678-9abc-123456789abc";
-    let start = store.record_tool_call_started(
-        Some(&session.session_id),
-        SessionTransport::Api,
-        "run_job",
-        &json!({"project": project}),
-        crate::tool_runtime::sessions::session_tool_contract("run_job"),
-    );
-    store.record_tool_call_finished(
-        start,
-        true,
-        &json!({
-            "execution_state": "started",
-            "job_id": job_id,
-            "status": "running",
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "stdout_lines": 0,
-            "stderr_lines": 0
-        }),
-        None,
-        None,
-    );
+fn console_list_keeps_job_handoff_historical_and_hides_observation_transport() {
+    for tool in ["run_job", "cargo_test"] {
+        let store = SessionStore::new_in_memory(10, 30);
+        let project = "agent:eval:demo";
+        let session = store.start_session(Some(project.to_string()), Some("async job".to_string()));
+        let job_id = "12345678-1234-5678-9abc-123456789abc";
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            tool,
+            &json!({"project": project}),
+            crate::tool_runtime::sessions::session_tool_contract(tool),
+        );
+        store.record_tool_call_finished(
+            start,
+            true,
+            &json!({
+                "execution_state": "started",
+                "job_id": job_id,
+                "status": "running",
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0
+            }),
+            None,
+            None,
+        );
 
-    let list = store.console_list_for_project(
-        project,
-        Some(10),
-        crate::tool_runtime::sessions::console_validation_hooks(),
-    );
-    let row = list
-        .sessions
-        .iter()
-        .find(|row| row.session_id == session.session_id)
-        .unwrap();
-    assert!(row.current_activity.is_none());
-    let last = row.last_activity.as_ref().unwrap();
-    assert_eq!(last.tool.as_deref(), Some("run_job"));
-    assert!(last.job_handoff);
-    assert_eq!(last.state, "running");
-    assert_eq!(last.execution_state.as_deref(), Some("started"));
-    assert_eq!(last.job_id.as_deref(), Some(job_id));
-
-    // A later authoritative Job observation may say terminal completed while
-    // the original handoff event remains the historical `started` snapshot.
-    let observed = store.record_tool_call_started(
-        Some(&session.session_id),
-        SessionTransport::Api,
-        "job_status",
-        &json!({"project": project, "job_id": job_id}),
-        crate::tool_runtime::sessions::session_tool_contract("job_status"),
-    );
-    store.record_tool_call_finished(
-        observed,
-        true,
-        &json!({"job_id": job_id, "status": "completed", "execution_state": "completed"}),
-        None,
-        None,
-    );
-
-    let detail = store
-        .console_detail_for_project(
+        let list = store.console_list_for_project(
             project,
-            &session.session_id,
-            Some(20),
+            Some(10),
             crate::tool_runtime::sessions::console_validation_hooks(),
-        )
-        .unwrap();
-    let handoff = detail
-        .activity
-        .iter()
-        .find(|activity| activity.tool.as_deref() == Some("run_job"))
-        .unwrap();
-    assert_eq!(handoff.execution_state.as_deref(), Some("started"));
+        );
+        let row = list
+            .sessions
+            .iter()
+            .find(|row| row.session_id == session.session_id)
+            .unwrap();
+        assert!(row.current_activity.is_none());
+        let last = row.last_activity.as_ref().unwrap();
+        assert_eq!(last.tool.as_deref(), Some(tool));
+        assert!(last.job_handoff);
+        assert_eq!(last.state, "running");
+        assert_eq!(last.execution_state.as_deref(), Some("started"));
+        assert_eq!(last.job_id.as_deref(), Some(job_id));
 
-    let list = store.console_list_for_project(
-        project,
-        Some(10),
-        crate::tool_runtime::sessions::console_validation_hooks(),
-    );
-    let row = list
-        .sessions
-        .iter()
-        .find(|row| row.session_id == session.session_id)
-        .unwrap();
-    assert!(row.current_activity.is_none());
-    assert_eq!(
-        row.last_activity.as_ref().unwrap().tool.as_deref(),
-        Some("job_status")
-    );
+        // A later authoritative Job observation may say terminal completed while
+        // the original handoff event remains the historical `started` snapshot.
+        for _ in 0..5 {
+            let observed = store.record_tool_call_started(
+                Some(&session.session_id),
+                SessionTransport::Api,
+                "observe_jobs",
+                &json!({"items": [{"job_id": job_id}]}),
+                crate::tool_runtime::sessions::session_tool_contract("observe_jobs"),
+            );
+            let pending = store.console_list_for_project(
+                project,
+                Some(10),
+                crate::tool_runtime::sessions::console_validation_hooks(),
+            );
+            let row = &pending.sessions[0];
+            assert!(row.running_call);
+            assert!(row.current_activity.is_none());
+            assert_eq!(
+                row.last_activity.as_ref().unwrap().tool.as_deref(),
+                Some(tool)
+            );
+            store.record_tool_call_finished(
+                observed,
+                true,
+                &json!({
+                    "items": [{
+                        "success": true,
+                        "output": {
+                            "job_id": job_id,
+                            "status": "completed",
+                            "execution_state": "completed"
+                        }
+                    }]
+                }),
+                None,
+                None,
+            );
+        }
 
-    store.close_session(&session.session_id).unwrap();
-    let list = store.console_list_for_project(
-        project,
-        Some(10),
-        crate::tool_runtime::sessions::console_validation_hooks(),
-    );
-    let row = list
-        .sessions
-        .iter()
-        .find(|row| row.session_id == session.session_id)
-        .unwrap();
-    assert_eq!(row.lifecycle, "closed");
-    assert!(row.current_activity.is_none());
-    assert_eq!(
-        row.last_activity.as_ref().unwrap().tool.as_deref(),
-        Some("job_status")
-    );
+        let detail = store
+            .console_detail_for_project(
+                project,
+                &session.session_id,
+                Some(20),
+                crate::tool_runtime::sessions::console_validation_hooks(),
+            )
+            .unwrap();
+        let handoff = detail
+            .activity
+            .iter()
+            .find(|activity| activity.tool.as_deref() == Some(tool))
+            .unwrap();
+        assert_eq!(handoff.execution_state.as_deref(), Some("started"));
+        assert!(detail
+            .activity
+            .iter()
+            .all(|activity| activity.tool.as_deref() != Some("observe_jobs")));
+        assert_eq!(detail.activity.len(), 1);
+        let expected_runs = usize::from(tool == "run_job");
+        assert_eq!(detail.overview.work.runs, expected_runs);
+        let raw = store.summary(&session.session_id, Some(30)).unwrap();
+        assert_eq!(
+            raw.events
+                .iter()
+                .filter(|event| event.tool_name == "observe_jobs")
+                .count(),
+            10
+        );
+
+        let list = store.console_list_for_project(
+            project,
+            Some(10),
+            crate::tool_runtime::sessions::console_validation_hooks(),
+        );
+        let row = list
+            .sessions
+            .iter()
+            .find(|row| row.session_id == session.session_id)
+            .unwrap();
+        assert!(row.current_activity.is_none());
+        assert_eq!(
+            row.last_activity.as_ref().unwrap().tool.as_deref(),
+            Some(tool)
+        );
+
+        store.close_session(&session.session_id).unwrap();
+        let list = store.console_list_for_project(
+            project,
+            Some(10),
+            crate::tool_runtime::sessions::console_validation_hooks(),
+        );
+        let row = list
+            .sessions
+            .iter()
+            .find(|row| row.session_id == session.session_id)
+            .unwrap();
+        assert_eq!(row.overview.work.runs, expected_runs);
+        assert!(!row.running_call);
+        assert_eq!(row.lifecycle, "closed");
+        assert!(row.current_activity.is_none());
+        assert_eq!(
+            row.last_activity.as_ref().unwrap().tool.as_deref(),
+            Some(tool)
+        );
+    }
 }
 
 #[test]
@@ -1909,7 +1942,7 @@ fn console_list_without_running_work_shows_last_meaningful_activity() {
     let session = store.start_session(Some(project.to_string()), Some("last activity".to_string()));
     for (tool, input, output) in [
         (
-            "read_file",
+            "read_files",
             json!({"project": project, "path": "src/lib.rs"}),
             json!({"content": "omitted"}),
         ),
@@ -1969,14 +2002,14 @@ fn console_exploration_grouping_is_ordered_bounded_and_stops_at_fact_barriers() 
 
     for (tool, input, output) in [
         (
-            "read_file",
-            json!({"project": project, "path": "src/a.rs"}),
+            "read_files",
+            read_files_input(project, "src/a.rs"),
             json!({"content": "PRIVATE_CONTENT_A"}),
         ),
         (
-            "search_project_text",
-            json!({"project": project, "pattern": "PRIVATE_PATTERN", "path": "src"}),
-            json!({"matches": [{"path": "src/b.rs"}]}),
+            "search_project_texts",
+            search_project_texts_input(project, "PRIVATE_PATTERN", Some("src")),
+            single_search_batch_output(json!({"matches": [{"path": "src/b.rs"}]})),
         ),
         (
             "goto_definition",
@@ -2012,9 +2045,9 @@ fn console_exploration_grouping_is_ordered_bounded_and_stops_at_fact_barriers() 
     let read = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "read_file",
-        &json!({"project": project, "path": "src/d.rs"}),
-        crate::tool_runtime::sessions::session_tool_contract("read_file"),
+        "read_files",
+        &read_files_input(project, "src/d.rs"),
+        crate::tool_runtime::sessions::session_tool_contract("read_files"),
     );
     store.record_tool_call_finished(
         read,
@@ -2026,9 +2059,9 @@ fn console_exploration_grouping_is_ordered_bounded_and_stops_at_fact_barriers() 
     let failed = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "search_project_text",
-        &json!({"project": project, "pattern": "PRIVATE_FAILED_PATTERN", "path": "src"}),
-        crate::tool_runtime::sessions::session_tool_contract("search_project_text"),
+        "search_project_texts",
+        &search_project_texts_input(project, "PRIVATE_FAILED_PATTERN", Some("src")),
+        crate::tool_runtime::sessions::session_tool_contract("search_project_texts"),
     );
     store.record_tool_call_finished(
         failed,
@@ -2087,7 +2120,7 @@ fn console_exploration_grouping_is_ordered_bounded_and_stops_at_fact_barriers() 
     assert_eq!(group.group_kinds, vec!["Read", "Searched", "Navigated"]);
     assert_eq!(
         group.group_tools,
-        vec!["read_file", "search_project_text", "goto_definition"]
+        vec!["read_files", "search_project_texts", "goto_definition"]
     );
     assert_eq!(group.paths, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
     assert_eq!(detail.activity[3].state, "failed");
@@ -2411,20 +2444,18 @@ fn exploration_ledger_persists_only_bounded_relative_paths_and_safe_metadata() {
     let search = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "search_project_text",
-        &json!({
-            "project": "demo",
-            "pattern": "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
-            "pattern_present": true,
-            "context_before": 2,
-            "context_after": 2
-        }),
-        crate::tool_runtime::sessions::session_tool_contract("search_project_text"),
+        "search_project_texts",
+        &search_project_texts_input(
+            "demo",
+            "RAW_SEARCH_PATTERN wc_pat_PRIVATE_TOKEN",
+            Some("src"),
+        ),
+        crate::tool_runtime::sessions::session_tool_contract("search_project_texts"),
     );
     store.record_tool_call_finished(
         search,
         true,
-        &json!({
+        &single_search_batch_output(json!({
             "matches": [{
                 "path": "src/search.rs",
                 "line": 3,
@@ -2436,7 +2467,7 @@ fn exploration_ledger_persists_only_bounded_relative_paths_and_safe_metadata() {
                 "line": 4,
                 "preview": "ABSOLUTE_PATH_PREVIEW"
             }]
-        }),
+        })),
         None,
         None,
     );
@@ -2667,13 +2698,13 @@ fn persistence_snapshot_shares_payload_and_stays_stable_across_message_cow() {
         .record_tool_call_started(
             Some(&session.session_id),
             SessionTransport::Api,
-            "read_file",
+            "read_files",
             &json!({
                 "project": "demo",
                 "path": "src/lib.rs",
                 "query": "snapshot payload"
             }),
-            crate::tool_runtime::sessions::session_tool_contract("read_file"),
+            crate::tool_runtime::sessions::session_tool_contract("read_files"),
         )
         .is_some());
     let message = post_message(
@@ -2818,6 +2849,8 @@ fn project_instructions_content_not_persisted_or_leaked_after_restore() {
             .with_project_instructions(Some(
                 ProjectInstructionsSnapshot::from_candidates(
                     vec![LoadedInstructionCandidate {
+                        source_scope:
+                            webcodex_core::project_instructions::InstructionSourceScope::Project,
                         path: "AGENTS.md".to_string(),
                         content: secret_body.to_string(),
                         total_lines: 1,
@@ -2856,893 +2889,4 @@ fn post_message(
             priority: SessionMessagePriority::Normal,
         })
         .unwrap()
-}
-
-#[test]
-fn raw_model_facing_events_do_not_consume_context_revisions() {
-    let store = SessionStore::new(10, 100);
-    let session = store.start_session(
-        Some("proj".to_string()),
-        Some("checkpoint loop".to_string()),
-    );
-
-    for tool in ["read_file", "search_project_texts", "show_changes"] {
-        let observed = record_model_facing_result(
-            &store,
-            &session.session_id,
-            tool,
-            SessionContextRevisionAck::Revision(0),
-            true,
-            json!({"observed": true}),
-        );
-        assert_eq!(observed.context_revision, 0, "{tool}");
-        assert_eq!(observed.pre_response_context_revision, 0, "{tool}");
-        assert!(!observed.checkpoint_advanced, "{tool}");
-        assert_eq!(
-            observed.ack_session_context_revision,
-            SessionContextRevisionAck::Revision(0),
-            "{tool}"
-        );
-        let mut projected = super::super::ToolResult::ok(json!({"observed": true}));
-        assert!(
-            !super::super::session_context::add_session_context_continuity(
-                &mut projected,
-                &observed,
-            ),
-            "exact no-op {tool} should not request recovery"
-        );
-        for field in [
-            "session_context_revision",
-            "session_continuity",
-            "session_recovery",
-        ] {
-            assert!(
-                projected.output.get(field).is_none(),
-                "exact no-op {tool} leaked {field}: {}",
-                projected.output
-            );
-        }
-    }
-
-    let edit = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(edit.context_revision, 1);
-    assert!(edit.checkpoint_advanced);
-    let mut edit_projection = super::super::ToolResult::ok(json!({"state_changed": true}));
-    assert!(
-        !super::super::session_context::add_session_context_continuity(&mut edit_projection, &edit,)
-    );
-    assert_eq!(edit_projection.output["session_context_revision"], 1);
-    assert!(edit_projection.output.get("session_continuity").is_none());
-    assert!(edit_projection.output.get("session_recovery").is_none());
-
-    let read_batch = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "read_files",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"observed": true}),
-    );
-    assert_eq!(read_batch.context_revision, 1);
-    assert!(!read_batch.checkpoint_advanced);
-
-    let process = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "run_process",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-    );
-    assert_eq!(process.context_revision, 2);
-    assert_eq!(store.context_revision(&session.session_id), Some(2));
-
-    let summary = store.summary(&session.session_id, Some(100)).unwrap();
-    let finished = summary
-        .events
-        .iter()
-        .filter(|event| event.kind == "tool_call_finished")
-        .collect::<Vec<_>>();
-    for event in &finished {
-        let expected = match event.tool_name.as_str() {
-            "apply_text_edits" => Some(1),
-            "run_process" => Some(2),
-            "read_file" | "search_project_texts" | "show_changes" | "read_files" => None,
-            other => panic!("unexpected finished tool {other}"),
-        };
-        assert_eq!(event.context_revision, expected, "{}", event.tool_name);
-    }
-}
-
-#[test]
-fn history_lost_counts_checkpoint_revisions_not_raw_events() {
-    let store = SessionStore::new(10, 40);
-    let session = store.start_session(
-        Some("proj".to_string()),
-        Some("mixed retention".to_string()),
-    );
-
-    let first = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-    for _ in 0..8 {
-        let read = record_model_facing_result(
-            &store,
-            &session.session_id,
-            "read_file",
-            SessionContextRevisionAck::Revision(1),
-            true,
-            json!({"content": "re-observable"}),
-        );
-        assert_eq!(read.context_revision, 1);
-    }
-    let second = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "run_process",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-    );
-    assert_eq!(second.context_revision, 2);
-    for _ in 0..4 {
-        let status = record_model_facing_result(
-            &store,
-            &session.session_id,
-            "git_status",
-            SessionContextRevisionAck::Revision(2),
-            true,
-            json!({"clean": true}),
-        );
-        assert_eq!(status.context_revision, 2);
-    }
-
-    let recovered = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(recovered.context_revision, 2);
-    assert!(!recovered.history_lost);
-    assert_eq!(
-        recovered
-            .recovery_events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(&mut response, &recovered,)
-    );
-    assert_eq!(response.output["session_continuity"]["events_after_ack"], 2);
-}
-
-#[test]
-fn history_lost_detects_evicted_checkpoint_after_raw_event_churn() {
-    let store = SessionStore::new(10, 8);
-    let session = store.start_session(
-        Some("proj".to_string()),
-        Some("raw event retention".to_string()),
-    );
-
-    let first = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-
-    for _ in 0..3 {
-        let read = record_model_facing_result(
-            &store,
-            &session.session_id,
-            "read_file",
-            SessionContextRevisionAck::Revision(1),
-            true,
-            json!({"content": "raw churn"}),
-        );
-        assert_eq!(read.context_revision, 1);
-        assert!(!read.checkpoint_advanced);
-    }
-
-    let second = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "run_process",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-    );
-    assert_eq!(second.context_revision, 2);
-
-    let recovered = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(recovered.context_revision, 2);
-    assert!(recovered.history_lost);
-    assert_eq!(
-        recovered
-            .recovery_events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .collect::<Vec<_>>(),
-        vec![2],
-        "raw event churn may evict checkpoint 1, but must never be counted as extra revisions"
-    );
-
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(&mut response, &recovered,)
-    );
-    assert_eq!(response.output["session_continuity"]["events_after_ack"], 2);
-    assert_eq!(response.output["session_continuity"]["history_lost"], true);
-    assert_eq!(
-        response.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn simultaneous_model_facing_results_allocate_unique_ordered_revisions() {
-    let store = SessionStore::new(10, 100);
-    let session = store.start_session(Some("proj".to_string()), Some("concurrent".to_string()));
-    let first = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-
-    let make_start = || {
-        store
-            .record_tool_call_started_with_metadata(
-                Some(&session.session_id),
-                SessionTransport::Mcp,
-                "apply_text_edits",
-                &json!({"project": "proj"}),
-                Some("proj".to_string()),
-                ToolCallRecorderMetadata {
-                    ack_session_context_revision: SessionContextRevisionAck::Revision(1),
-                    ..Default::default()
-                },
-                crate::tool_runtime::sessions::session_tool_contract("apply_text_edits"),
-            )
-            .unwrap()
-    };
-    let start_a = make_start();
-    let start_b = make_start();
-    assert_eq!(start_a.pre_call_context_revision, 1);
-    assert_eq!(start_b.pre_call_context_revision, 1);
-
-    let a_store = store.clone();
-    let b_store = store.clone();
-    let a = std::thread::spawn(move || {
-        a_store
-            .record_model_facing_tool_call_finished(
-                Some(start_a),
-                true,
-                &json!({"content": "a"}),
-                None,
-                None,
-            )
-            .unwrap()
-    });
-    let b = std::thread::spawn(move || {
-        b_store
-            .record_model_facing_tool_call_finished(
-                Some(start_b),
-                true,
-                &json!({"content": "b"}),
-                None,
-                None,
-            )
-            .unwrap()
-    });
-    let mut outcomes = vec![a.join().unwrap(), b.join().unwrap()];
-    outcomes.sort_by_key(|recorded| recorded.context_revision);
-    assert_eq!(
-        outcomes
-            .iter()
-            .map(|recorded| recorded.context_revision)
-            .collect::<Vec<_>>(),
-        vec![2, 3]
-    );
-    assert_eq!(store.context_revision(&session.session_id), Some(3));
-
-    // The later completion started from the same model ACK as the earlier one,
-    // so its response must carry the intervening result before revision 3 can be
-    // safely acknowledged. Losing the revision-2 HTTP/MCP response must not make
-    // revision 2 disappear from the model's recoverable context prefix.
-    let later = &outcomes[1];
-    assert_eq!(later.pre_call_context_revision, 1);
-    assert_eq!(
-        later
-            .recovery_events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .collect::<Vec<_>>(),
-        vec![2]
-    );
-    let mut later_response = super::super::ToolResult::ok(json!({"content": "later"}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(&mut later_response, later,)
-    );
-    assert_eq!(
-        later_response.output["session_continuity"]["status"],
-        "behind"
-    );
-    assert_eq!(
-        later_response.output["session_continuity"]["events_after_ack"],
-        1
-    );
-    assert_eq!(
-        later_response.output["session_recovery"]["model_facing_events"][0]["context_revision"],
-        2
-    );
-
-    let next = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(3),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(next.pre_call_context_revision, 3);
-    assert_eq!(next.context_revision, 3);
-    assert!(!next.checkpoint_advanced);
-    assert!(next.recovery_events.is_empty());
-
-    let future_start = store
-        .record_tool_call_started_with_metadata(
-            Some(&session.session_id),
-            SessionTransport::Mcp,
-            "run_process",
-            &json!({"project": "proj"}),
-            Some("proj".to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(4),
-                ..Default::default()
-            },
-            crate::tool_runtime::sessions::session_tool_contract("run_process"),
-        )
-        .unwrap();
-    let intervening_start = store
-        .record_tool_call_started_with_metadata(
-            Some(&session.session_id),
-            SessionTransport::Mcp,
-            "run_process",
-            &json!({"project": "proj"}),
-            Some("proj".to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(3),
-                ..Default::default()
-            },
-            crate::tool_runtime::sessions::session_tool_contract("run_process"),
-        )
-        .unwrap();
-    assert_eq!(future_start.pre_call_context_revision, 3);
-    assert_eq!(intervening_start.pre_call_context_revision, 3);
-    let intervening = store
-        .record_model_facing_tool_call_finished(
-            Some(intervening_start),
-            true,
-            &json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-            None,
-            None,
-        )
-        .unwrap();
-    assert_eq!(intervening.context_revision, 4);
-    let future = store
-        .record_model_facing_tool_call_finished(
-            Some(future_start),
-            true,
-            &json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-            None,
-            None,
-        )
-        .unwrap();
-    assert_eq!(future.pre_call_context_revision, 3);
-    assert_eq!(future.pre_response_context_revision, 4);
-    assert_eq!(future.context_revision, 5);
-    let mut future_response = super::super::ToolResult::ok(json!({"exit_code": 0}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(
-            &mut future_response,
-            &future,
-        )
-    );
-    assert_eq!(
-        future_response.output["session_continuity"]["status"],
-        "invalid"
-    );
-}
-
-#[test]
-fn batch_budget_preserves_recorder_overlay_for_no_ack_read_batch() {
-    fn canonical_read_batch(text: String) -> Value {
-        let default_limit =
-            webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
-        json!({
-            "project": "proj",
-            "requested_count": 1,
-            "returned_count": 1,
-            "succeeded_count": 1,
-            "failed_count": 0,
-            "items": [{
-                "index": 0,
-                "path": "src/lib.rs",
-                "success": true,
-                "output": {
-                    "text": text,
-                    "format": "plain",
-                    "path": "src/lib.rs",
-                    "sha256": "a".repeat(64),
-                    "start_line": 1,
-                    "limit": default_limit,
-                    "total_lines": 1,
-                    "returned_lines": 1,
-                    "end_line": 1,
-                    "has_more": false,
-                    "next_start_line": null
-                },
-                "error": null
-            }],
-            "output_truncated": false,
-            "next_index": null
-        })
-    }
-
-    let store = SessionStore::new(10, 100);
-    let session = store.start_session(
-        Some("proj".to_string()),
-        Some("batch budget overlays".to_string()),
-    );
-    let first = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-
-    for text in ["x".repeat(56 * 1024), "y".repeat(8 * 1024)] {
-        let batch = canonical_read_batch(text);
-        let recorded = record_model_facing_result(
-            &store,
-            &session.session_id,
-            "read_files",
-            SessionContextRevisionAck::Revision(1),
-            true,
-            batch.clone(),
-        );
-        assert_eq!(recorded.context_revision, 1);
-        assert_eq!(recorded.pre_response_context_revision, 1);
-        assert!(!recorded.checkpoint_advanced);
-        assert_eq!(
-            recorded.ack_session_context_revision,
-            SessionContextRevisionAck::Revision(1)
-        );
-        assert!(recorded.recovery_events.is_empty());
-
-        let mut response = super::super::ToolResult::ok(batch);
-        super::super::session_context::add_session_hint(&mut response, &store, &session.session_id);
-        assert!(
-            !super::super::session_context::add_session_context_continuity(
-                &mut response,
-                &recorded,
-            )
-        );
-        super::super::read_files::apply_model_facing_output_budget(
-            &mut response,
-            None,
-            &super::super::read_files::ReadModelProjection::None,
-        );
-        super::super::dispatch::sparsify_complete_read_success("read_files", &mut response);
-        assert!(response.output.get("session_recorded").is_none());
-        assert!(response.output.get("session_event_id").is_none());
-        assert!(response.output.get("session_id").is_none());
-        assert!(response.output.get("session_context_revision").is_none());
-        assert!(response.output.get("session_continuity").is_none());
-        assert!(response.output.get("session_recovery").is_none());
-        assert!(
-            serde_json::to_vec(&response).unwrap().len()
-                <= super::super::read_files::DEFAULT_READ_FILES_RESULT_BYTES
-        );
-    }
-    assert_eq!(store.context_revision(&session.session_id), Some(1));
-}
-
-#[tokio::test]
-async fn unknown_session_context_recovery_uses_current_handoff_not_history_replay() {
-    let runtime = super::super::ToolRuntime::new_for_tests();
-    let session = runtime
-        .sessions
-        .start_session(None, Some("unknown continuity recovery".to_string()));
-    let first = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-    let second = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "run_process",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"command_started": true, "command_completed": true, "exit_code": 0}),
-    );
-    assert_eq!(second.context_revision, 2);
-
-    let unknown = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(unknown.pre_call_context_revision, 2);
-    assert_eq!(unknown.pre_response_context_revision, 2);
-    assert_eq!(unknown.context_revision, 2);
-    assert!(!unknown.checkpoint_advanced);
-    assert!(unknown.recovery_events.is_empty());
-    assert!(!unknown.history_lost);
-
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(&mut response, &unknown,)
-    );
-    assert_eq!(
-        response.output["session_continuity"]["status"],
-        "unacknowledged"
-    );
-    assert!(response.output["session_continuity"]
-        .get("events_after_ack")
-        .is_none());
-    assert!(response.output["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(response.output["session_recovery"]
-        .get("current_handoff")
-        .is_none());
-
-    runtime
-        .add_session_history_recovery(&mut response, &unknown, None)
-        .await;
-    let current = &response.output["session_recovery"]["current_handoff"];
-    assert!(current.is_object());
-    assert!(current["work_performed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|work| work["tool_name"] == "work_on_project"));
-    assert!(response.output["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty(),
-        "the current ToolResult may inform current state but must not be replayed as missed history");
-}
-
-#[tokio::test]
-async fn required_session_context_recovery_handoff_failure_does_not_expose_new_revision() {
-    let runtime = super::super::ToolRuntime::new_for_tests();
-    let session = runtime
-        .sessions
-        .start_session(None, Some("handoff failure continuity".to_string()));
-    let first = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-    let mut unknown = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(unknown.context_revision, 1);
-    assert!(unknown.recovery_events.is_empty());
-
-    // The production path re-authorizes the exact recorded Session before
-    // reading current handoff state. Corrupt only this local projection id to
-    // force that read to fail and verify the revision fail-safe.
-    unknown.session_id = "wc_sess_missing_for_handoff_test".to_string();
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(
-        super::super::session_context::add_session_context_continuity(&mut response, &unknown,)
-    );
-    assert_eq!(response.output["session_context_revision"], 1);
-    assert_eq!(
-        response.output["session_continuity"]["status"],
-        "unacknowledged"
-    );
-
-    runtime
-        .add_session_history_recovery(&mut response, &unknown, None)
-        .await;
-    assert!(response.output.get("session_context_revision").is_none());
-    assert!(response.output["session_recovery"]
-        .get("current_handoff")
-        .is_none());
-}
-
-#[tokio::test]
-async fn bounded_session_context_recovery_adds_current_handoff_before_latest_ack() {
-    let runtime = super::super::ToolRuntime::new_for_tests();
-    let session = runtime
-        .sessions
-        .start_session(None, Some("bounded continuity recovery".to_string()));
-    let mut latest = 0;
-    for _ in 0..25 {
-        let recorded = record_model_facing_result(
-            &runtime.sessions,
-            &session.session_id,
-            "apply_text_edits",
-            SessionContextRevisionAck::Revision(latest),
-            true,
-            json!({"state_changed": true}),
-        );
-        latest = recorded.context_revision;
-    }
-    assert_eq!(latest, 25);
-
-    let stale = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(stale.pre_call_context_revision, 25);
-    assert_eq!(stale.pre_response_context_revision, 25);
-    assert_eq!(stale.context_revision, 25);
-    assert!(!stale.checkpoint_advanced);
-    assert_eq!(stale.recovery_events.len(), 25);
-    assert!(!stale.history_lost);
-
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(super::super::session_context::add_session_context_continuity(&mut response, &stale,));
-    assert_eq!(response.output["session_recovery"]["truncated"], true);
-    assert_eq!(response.output["session_recovery"]["omitted_count"], 5);
-    assert!(response.output["session_recovery"]
-        .get("current_handoff")
-        .is_none());
-
-    runtime
-        .add_session_history_recovery(&mut response, &stale, None)
-        .await;
-    assert!(
-        response.output["session_recovery"]["current_handoff"].is_object(),
-        "bounded event omission must add a compact current-state recovery before revision 25 is ACK-able"
-    );
-}
-
-#[tokio::test]
-async fn history_lost_session_context_recovery_adds_current_handoff() {
-    let runtime = super::super::ToolRuntime::new_for_tests();
-    let session = runtime
-        .sessions
-        .start_session(None, Some("history lost continuity recovery".to_string()));
-    let first = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(first.context_revision, 1);
-    let mut behind = record_model_facing_result(
-        &runtime.sessions,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(0),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(
-        behind
-            .recovery_events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .collect::<Vec<_>>(),
-        vec![1]
-    );
-    // Store retention behavior is covered independently above. Force the same
-    // recorded projection flag here so this test isolates the response fallback.
-    behind.history_lost = true;
-
-    let mut response = super::super::ToolResult::ok(json!({"session_id": session.session_id}));
-    assert!(super::super::session_context::add_session_context_continuity(&mut response, &behind,));
-    assert_eq!(response.output["session_continuity"]["status"], "behind");
-    assert_eq!(response.output["session_continuity"]["history_lost"], true);
-    assert!(response.output["session_recovery"]
-        .get("current_handoff")
-        .is_none());
-
-    runtime
-        .add_session_history_recovery(&mut response, &behind, None)
-        .await;
-    assert!(response.output["session_recovery"]["current_handoff"].is_object());
-}
-
-#[test]
-fn stale_session_recovery_preserves_consequential_git_workspace_evidence() {
-    let store = SessionStore::new(10, 100);
-    let session = store.start_session(
-        Some("proj".to_string()),
-        Some("acp reproduction".to_string()),
-    );
-    let seed = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "apply_text_edits",
-        SessionContextRevisionAck::Unacknowledged,
-        true,
-        json!({"state_changed": true}),
-    );
-    assert_eq!(seed.context_revision, 1);
-
-    let checkpoint = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "workspace_checkpoint_create",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({
-            "checkpoint_id": "wc_ckpt_demo",
-            "head": "pre-commit",
-            "branch": "feature",
-            "complete": true,
-            "tracked_diff_bytes": 4096,
-            "staged_diff_bytes": 0,
-            "untracked_file_count": 0,
-            "status_summary": {"modified": 21},
-            "state_changed": true
-        }),
-    );
-    let commit = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "run_shell",
-        SessionContextRevisionAck::Revision(checkpoint.context_revision),
-        true,
-        json!({
-            "command_completed": true,
-            "command_started": true,
-            "exit_code": 0,
-            "stdout_tail": "[feature 64ac72ae] checkpointed work\n21 files changed",
-            "stderr_tail": ""
-        }),
-    );
-    let push = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "run_shell",
-        SessionContextRevisionAck::Revision(commit.context_revision),
-        true,
-        json!({
-            "command_completed": true,
-            "command_started": true,
-            "exit_code": 0,
-            "stdout_tail": "feature -> feature 64ac72ae",
-            "stderr_tail": ""
-        }),
-    );
-    let status = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "git_status",
-        SessionContextRevisionAck::Revision(push.context_revision),
-        true,
-        json!({"clean": true, "head": "64ac72ae", "remote_head": "64ac72ae"}),
-    );
-    assert_eq!(status.context_revision, 4);
-    assert_eq!(status.pre_response_context_revision, 4);
-    assert!(!status.checkpoint_advanced);
-
-    let resumed = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(1),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(resumed.pre_call_context_revision, 4);
-    assert_eq!(resumed.pre_response_context_revision, 4);
-    assert_eq!(resumed.context_revision, 4);
-    assert!(!resumed.checkpoint_advanced);
-    assert_eq!(
-        resumed
-            .recovery_events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .collect::<Vec<_>>(),
-        vec![2, 3, 4]
-    );
-    assert!(resumed.recovery_events.iter().any(|event| {
-        event.tool_name == "workspace_checkpoint_create"
-            && event
-                .context_result_summary
-                .as_ref()
-                .is_some_and(|summary| {
-                    summary["status_summary"]["modified"] == 21
-                        && summary["checkpoint_id"] == "wc_ckpt_demo"
-                })
-    }));
-    assert!(resumed
-        .recovery_events
-        .iter()
-        .any(|event| event.tool_name == "run_shell"
-            && event
-                .validation_output_summary
-                .as_ref()
-                .is_some_and(|summary| summary.to_string().contains("64ac72ae"))));
-    assert!(
-        resumed
-            .recovery_events
-            .iter()
-            .all(|event| event.tool_name != "git_status"),
-        "recovery replays checkpoint knowledge, not re-observable git_status results"
-    );
-
-    let exact = record_model_facing_result(
-        &store,
-        &session.session_id,
-        "work_on_project",
-        SessionContextRevisionAck::Revision(4),
-        true,
-        json!({"session_id": session.session_id}),
-    );
-    assert_eq!(exact.context_revision, 4);
-    assert!(!exact.checkpoint_advanced);
-    assert!(exact.recovery_events.is_empty());
 }

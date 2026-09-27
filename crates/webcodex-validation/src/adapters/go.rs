@@ -23,6 +23,7 @@ impl ValidationAdapter for GoTestValidationAdapter {
     fn build_command(&self, options: ValidationCommandOptions) -> Result<String, String> {
         if options.check
             || options.filter.is_some()
+            || options.lib.is_some()
             || options.all_targets.is_some()
             || options.all_features.is_some()
             || options.no_default_features.is_some()

@@ -16,6 +16,8 @@ fn apply_patch_request_with_mode(
         "matching_mode": matching_mode,
     });
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: "req-apply-patch".to_string(),
         client_id: "agent-1".to_string(),
         kind: "file_apply_patch".to_string(),
@@ -44,17 +46,6 @@ fn apply_patch_request_with_mode(
         coding_agent: None,
         persistent_shell: None,
     }
-}
-
-fn apply_patch_request_legacy_strict(cwd: &Path, patch: &str, dry_run: bool) -> RunnerRequest {
-    let payload = serde_json::json!({
-        "patch": patch,
-        "dry_run": dry_run,
-        "strict_matching": true,
-    });
-    let mut request = apply_patch_request_with_mode(cwd, patch, dry_run, "unique");
-    request.content = Some(payload.to_string());
-    request
 }
 
 #[test]
@@ -469,17 +460,16 @@ fn file_apply_patch_first_match_is_deterministic_for_repeated_candidates() {
 }
 
 #[test]
-fn file_apply_patch_rejects_contradictory_enum_and_legacy_bool() {
+fn file_apply_patch_rejects_legacy_strict_matching_field() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
     std::fs::write(tmp.path().join("target.txt"), "old\n").unwrap();
     let patch = "*** Begin Patch\n*** Update File: target.txt\n-old\n+new\n*** End Patch";
-    let mut request = apply_patch_request_with_mode(tmp.path(), patch, false, "unique");
+    let mut request = apply_patch_request(tmp.path(), patch, false);
     request.content = Some(
         serde_json::json!({
             "patch": patch,
             "dry_run": false,
-            "matching_mode": "unique",
             "strict_matching": true,
         })
         .to_string(),
@@ -495,20 +485,27 @@ fn file_apply_patch_rejects_contradictory_enum_and_legacy_bool() {
 }
 
 #[test]
-fn file_apply_patch_legacy_strict_true_maps_to_exact_unique() {
+fn file_apply_patch_rejects_missing_matching_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
-    std::fs::write(tmp.path().join("target.txt"), " old \n").unwrap();
+    std::fs::write(tmp.path().join("target.txt"), "old\n").unwrap();
     let patch = "*** Begin Patch\n*** Update File: target.txt\n-old\n+new\n*** End Patch";
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &apply_patch_request_legacy_strict(tmp.path(), patch, false),
-    ));
-    assert_eq!(out["error_kind"], "matching_mode_rejected");
-    assert_eq!(out["requested_matching_mode"], "exact_unique");
-    assert_eq!(out["match_mode"], "trim");
-    assert_eq!(out["candidate_count"], 1);
+    let mut request = apply_patch_request(tmp.path(), patch, false);
+    request.content = Some(
+        serde_json::json!({
+            "patch": patch,
+            "dry_run": false,
+        })
+        .to_string(),
+    );
+
+    let out = line_edit_json(handle_file_request(&policy, &request));
+    assert_eq!(out["error_kind"], "invalid_payload");
     assert_eq!(out["state_changed"], false);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+        "old\n"
+    );
 }
 
 #[test]

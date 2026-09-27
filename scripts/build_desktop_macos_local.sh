@@ -40,6 +40,12 @@ for command in git node npm cargo python3; do
 done
 [ -x /usr/bin/lipo ] || fail "required command not found: /usr/bin/lipo"
 
+NODE_VERSION="$(node --version)"
+case "$NODE_VERSION" in
+    v22.*) ;;
+    *) fail "Node.js 22 is required; got $NODE_VERSION" ;;
+esac
+
 cd "$ROOT"
 if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
     fail "worktree must be clean so bundled runtime identity is exact; commit or stash local changes first"
@@ -68,6 +74,7 @@ printf '  source:   %s\n' "$SOURCE_SHA"
 printf '  version:  %s\n' "$VERSION"
 printf '  platform: %s\n' "$PLATFORM"
 
+npm ci --prefix frontend
 npm ci --prefix apps/desktop
 
 cargo build --locked --profile dogfood \
@@ -94,6 +101,9 @@ python3 scripts/prepare_desktop_bundle_macos.py \
 # bundle output so the candidate selection below is unambiguous.
 rm -rf "$TAURI_TARGET/release/bundle/dmg"
 export APPLE_SIGNING_IDENTITY="-"
+# Match CI/release create-dmg behavior: skip Finder AppleScript decoration in
+# non-interactive local packaging as well.
+export CI="true"
 export CARGO_TARGET_DIR="$TAURI_TARGET"
 
 (

@@ -29,6 +29,12 @@
 #[cfg(not(any(unix, windows)))]
 compile_error!("webcodex-process supports only unix and windows targets");
 
+mod program;
+
+pub use program::{
+    find_executable_in_path, is_executable_file, resolve_program_in_path, ResolvedProgram,
+};
+
 #[cfg(unix)]
 mod unix;
 

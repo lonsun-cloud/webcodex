@@ -12,7 +12,7 @@
 ## 先判断用户要哪种体验
 
 1. 用户想正常/长期/日常使用 WebCodex，或没有明确要求“只临时试一下”：使用[完整使用指南](PERSONAL_SETUP.zh-CN.md)，建立普通 Server + Runner。
-2. 用户明确只想几分钟体验一个仓库、不想配置长期 runtime：使用 **`webcodex share`**。这是临时、单项目、受限体验。
+2. 用户明确只想几分钟体验一个仓库、不想配置长期 runtime：使用 **`webcodex share`**。这是临时、单项目的普通 Adaptive Runtime，并由 project-scoped authentication 限制可见范围。
 3. 用户已经有 WebCodex Server URL：优先使用该 Server 已提供的正常 enrollment 方式；自托管 managed Server 用 pairing + `webcodex login`，只有 operator 明确提供 shared-key credential 时才使用 `webcodex connect <server>`。
 4. 用户需要生产托管、多用户、OAuth、systemd/Docker、私有 CA 等运维能力：再进入[部署指南](DEPLOYMENT.zh-CN.md)。
 

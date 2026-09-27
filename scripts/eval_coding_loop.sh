@@ -391,6 +391,7 @@ print(json.dumps({
     "include_workspace": True,
     "include_checkpoints": False,
     "include_validation": True,
+    "diagnostic": True,
     "limit": 50,
 }, separators=(",", ":")))
 PY
@@ -1054,7 +1055,7 @@ EOF
 # Coding Loop Eval
 
 This disposable project is used by the WebCodex coding-loop eval harness.
-It contains the phrase coding-loop eval so search_project_text has a stable match.
+It contains the phrase coding-loop eval so search_project_texts has a stable match.
 EOF
         cat >.gitignore <<'EOF'
 /target/
@@ -1164,21 +1165,25 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "pattern": "coding-loop eval",
-    "path": ".",
-    "limit": 10,
+    "queries": [{
+        "pattern": "coding-loop eval",
+        "path": ".",
+        "limit": 10,
+    }],
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "search_project_text" "$params"
-    assert_success "search_project_text succeeds" "$LAST_BODY"
+    call_tool "search_project_texts" "$params"
+    assert_success "search_project_texts succeeds" "$LAST_BODY"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
 out = data.get("output") or {}
-matches = out.get("matches")
+items = out.get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+matches = (item.get("output") or {}).get("matches")
 ok = (
     data.get("success") is True
     and isinstance(matches, list)
@@ -1195,9 +1200,9 @@ ok = (
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "search_project_text returns structured match records"
+        case_ok "search_project_texts returns structured match records"
     else
-        case_fail "search_project_text structured match records missing"
+        case_fail "search_project_texts structured match records missing"
     fi
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
@@ -1207,15 +1212,17 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "README.md",
-    "start_line": 1,
-    "limit": 6,
+    "items": [{
+        "path": "README.md",
+        "start_line": 1,
+        "limit": 6,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files succeeds" "$LAST_BODY"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1263,42 +1270,51 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 1,
-    "limit": 8,
+    "items": [{
+        "path": "src/lib.rs",
+        "start_line": 1,
+        "limit": 8,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file with line numbers succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files with line numbers succeeds" "$LAST_BODY"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
 out = data.get("output") or {}
+items = out.get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+read_out = item.get("output") or {}
 ok = (
     data.get("success") is True
-    and out.get("format") == "numbered"
-    and isinstance(out.get("text"), str)
-    and "1 | pub fn greeting" in out.get("text", "")
+    and read_out.get("format") == "numbered"
+    and isinstance(read_out.get("text"), str)
+    and "1 | pub fn greeting" in read_out.get("text", "")
 )
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "read_file returned stable line-number metadata"
+        case_ok "read_files returned stable line-number metadata"
     else
-        case_fail "read_file line-number metadata missing"
+        case_fail "read_files line-number metadata missing"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
-import hashlib
+    local read_revision
+    read_revision="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
+    if [[ "$read_revision" =~ ^[0-9]+$ ]]; then
+        case_ok "read_files returned a valid read_revision mutation fence"
+    else
+        case_fail "read_files did not return a valid read_revision"
+    fi
+
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$read_revision" <<'PY'
 import json
 import sys
-
-with open(sys.argv[3], "rb") as handle:
-    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
@@ -1306,7 +1322,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": current_sha,
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",
@@ -1398,7 +1414,36 @@ run_case_failed_call_recovery() {
         return
     fi
 
+    # Read both the mutation target and another path. Reusing README.md's valid
+    # revision for src/lib.rs creates a deterministic path-mismatch failure in
+    # the model-facing read-revision contract without modifying either file.
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "project": sys.argv[1],
+    "session_id": sys.argv[2],
+    "items": [
+        {"path": "src/lib.rs", "start_line": 1, "limit": 4},
+        {"path": "README.md", "start_line": 1, "limit": 4},
+    ],
+}, separators=(",", ":")))
+PY
+)"
+    call_tool "read_files" "$params"
+    assert_success "read_files establishes deliberate-failure revisions" "$LAST_BODY"
+    local src_revision_before_fail
+    local wrong_path_revision
+    src_revision_before_fail="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
+    wrong_path_revision="$(json_get "$LAST_BODY" output.items.1.output.read_revision)"
+    if [[ "$src_revision_before_fail" =~ ^[0-9]+$ && "$wrong_path_revision" =~ ^[0-9]+$ ]]; then
+        case_ok "deliberate-failure read revisions are valid"
+    else
+        case_fail "deliberate-failure read revisions are missing"
+    fi
+
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$wrong_path_revision" <<'PY'
 import json
 import sys
 
@@ -1408,7 +1453,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",
@@ -1420,7 +1465,33 @@ PY
 )"
     call_tool "apply_text_edits" "$params"
     assert_failure_error_kind \
-        "apply_text_edits wrong sha guard reports sha256_conflict" "$LAST_BODY" "sha256_conflict"
+        "apply_text_edits mismatched read revision reports read_revision_path_mismatch" \
+        "$LAST_BODY" "read_revision_path_mismatch"
+    if python3 - "$LAST_BODY" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+out = data.get("output") or {}
+recovery = out.get("recovery") or {}
+arguments = recovery.get("arguments") or {}
+items = arguments.get("items") or []
+ok = (
+    data.get("success") is False
+    and out.get("error_kind") == "read_revision_path_mismatch"
+    and out.get("state_changed") is False
+    and recovery.get("tool") == "read_files"
+    and len(items) == 1
+    and isinstance(items[0], dict)
+    and items[0].get("path") == "src/lib.rs"
+)
+sys.exit(0 if ok else 1)
+PY
+    then
+        case_ok "failed edit returns read_files recovery metadata and no mutation"
+    else
+        case_fail "failed edit recovery metadata does not match read-revision contract"
+    fi
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1429,37 +1500,47 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 1,
-    "limit": 4,
+    "items": [{
+        "path": "src/lib.rs",
+        "start_line": 1,
+        "limit": 4,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file after failed edit succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files after failed edit succeeds" "$LAST_BODY"
+    local recovery_read_revision
+    recovery_read_revision="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
-text = (data.get("output") or {}).get("text", "")
-ok = data.get("success") is True and '"hello"' in text and "should not apply" not in text
+items = (data.get("output") or {}).get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+read_out = item.get("output") or {}
+text = read_out.get("text", "")
+revision = read_out.get("read_revision")
+ok = (
+    data.get("success") is True
+    and '"hello"' in text
+    and "should not apply" not in text
+    and isinstance(revision, int)
+    and revision > 0
+)
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "failed edit did not corrupt src/lib.rs"
+        case_ok "failed edit left src/lib.rs unchanged and reread returned a valid revision"
     else
-        case_fail "failed edit changed src/lib.rs unexpectedly"
+        case_fail "failed edit changed src/lib.rs or recovery revision is missing"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
-import hashlib
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$recovery_read_revision" <<'PY'
 import json
 import sys
-
-with open(sys.argv[3], "rb") as handle:
-    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
@@ -1467,7 +1548,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": current_sha,
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",

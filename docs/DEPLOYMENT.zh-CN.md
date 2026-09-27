@@ -316,7 +316,8 @@ package 时默认将其设为 private；维护者
 | `transport` | 配置 `[quic]` 时优先用 `auto`。 |
 | `project_registry_dir` | 项目注册文件目录。 |
 | `[policy]` | 本地执行边界（`allowed_roots` 等）。 |
-| `[skills].roots` | 可选的 Runner 本机绝对只读 Skill roots；直接 live discovery，不复制进 managed Skill Store。 |
+| `[skills].roots` | **自 v0.4.2 起可用。** 可选的 Runner 本机绝对 live Skill roots；WebCodex 不修改其中内容，受支持脚本可经 `run_skill_resource` 执行，也不会复制进 managed Skill Store。 |
+| `[instructions].files` | 可选 Runner 本机绝对 instruction 文件；应用于该 Runner 上每个 Project。无隐式默认路径；路径列表可 hot reload，文件内容本身 live。 |
 | `[shell]` | 可选 shell profile 定义与有界 persistent-shell 限制。 |
 | `[ssh.resources.<name>]` | 可选命名 SSH 目标，用于 Session 绑定的 `run_shell` / `run_job`。 |
 
@@ -340,6 +341,13 @@ max_output_bytes = 262144
 重启、且不会假装已经在线生效的 startup-only 变更。Unix service reload/SIGHUP 仍保留为
 调用同一 reload primitive 的兼容 trigger，但 first-class config control 不依赖它。身份、
 server/auth、项目来源、并发、能力与传输等字段在被报告为 restart-only 时仍需要重启。
+
+`[instructions].files` 明确属于 hot-reloadable 字段：完成 check/reload 后，新 Project
+bootstrap 会立即使用新的路径列表，不需要重启 Runner。已配置 instruction 文件的内容
+发生变化时甚至不需要 config reload，下一次 bootstrap 会直接重新读取。Configured
+instruction path 不会扩大 `[policy].allowed_roots` 或普通 Project filesystem authority，
+startup projection 也不会暴露 native absolute path。当前行为是 Runner-level 的手工
+`runner.toml` 配置，对该 Runner 上每个 Project 生效；Desktop 文件选择/上传 UI 后续再做。
 
 `[plugins]` 支持 live reload：generic Runner config reload 与 `plugin_tool reload` 共用同一个
 Plugin candidate admission/atomic-commit primitive。Plugin provider Tool 始终是 Runner-local
@@ -417,7 +425,9 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` 限制 OAuth client 最多可以请求哪些权限。WebCodex 新增 permission 时不会静默扩大已有 client。要修改现有 client，请把期望保留的完整、非空 allow-list 提交到 `POST /api/oauth/clients/update_scopes`。真实变化会让旧 OAuth grant 失效并要求重新授权；提交相同 canonical list 是 no-op。安全模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。
 
-如果启用 ChatGPT MCP host-file import，请把精确的 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`。重新创建 client 会生成新 id，因此应把更新这个设置作为一次显式 trust rotation。Client display name 与 redirect URI 不能替代该精确 client id。
+ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
+
+对于绑定到 loopback、并通过 OpenAI Secure Tunnel 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，仅当请求由允许的本地 credential 认证时才信任 ChatGPT host-file rewrite：普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential。该 Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生 credential 并私下完成注入；不要复制或暴露它。非 loopback bind 和其它 credential class 都会忽略该 flag；network-accessible Server 应保持未设置。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；RFC 7591 DCR 只有显式开启时才
@@ -426,17 +436,28 @@ refresh-token scope，不授予额外 WebCodex 权限。
 
 ## GPT Actions 与 MCP
 
-- **MCP：** 用 user API token（`wc_pat_*`）把客户端连接到
-  `https://your-domain.example/mcp`；启用 OAuth 时用 OAuth 流程。
+- **MCP：** 用 user API token（`wc_pat_*`）连接
+  `https://your-domain.example/mcp`；启用 OAuth 时使用 OAuth 流程。MCP 仍是
+  ChatGPT 的主要接入方式。
 - **GPT Actions：** 把 `https://your-domain.example/openapi.json` 以 HTTP Bearer
-  认证导入 Custom GPT。
+  认证导入 Custom GPT。普通 runtime Server 会投影同一个 canonical Adaptive
+  Runtime model surface：当前 Adaptive Direct 工具直接成为 snake_case Action
+  operation，受支持的 long-tail 工具统一通过 `call_runtime_tool`；MCP-only 协议
+  presentation 不会伪装成 Action 能力。
 
-两者使用同一个 user API token 与同一个 ToolRuntime。OpenAPI schema 有意排除
-users、token、pairing/enrollment、setup、doctor、npm、server 管理与 audit
-endpoint。这些请用 `webcodex` 完成。
+如果是从旧 generic Action facade 升级，请重新导入 `/openapi.json` 获取新的
+canonical operation names。旧 REST route 可以为了兼容继续存在，但不会进入新的
+model-facing schema。
 
-MCP 与 GPT Actions 见 [MCP.md](MCP.zh-CN.md) 与客户端特定设置
+MCP 与 GPT Actions 最终进入同一个 ToolRuntime authority path；GPT Actions 不会建立第二套 scope、Project authority、permission、Runner capability 或 retry policy。Project-scoped `share` / `run` 部署同样暴露普通 Adaptive Runtime，由 ProjectGrant visibility 把访问限制在对应 Project。
+
+详见 [GPT Actions](GPT_ACTIONS.zh-CN.md)、[MCP](MCP.zh-CN.md) 与
 [AI 接入指南](AI_ONBOARDING.zh-CN.md)。
+
+如果 ChatGPT 返回 conversation-level developer-MCP `FORBIDDEN`，不要直接把它当作
+Server 或 Runner 已离线的证据。先使用下面的 operator checks 独立验证部署，再按照
+[故障排查](TROUBLESHOOTING.zh-CN.md) 中的 Host 分层决策树判断；不要在 Runner 本来
+健康时仅因为该 Host error 就旋转 credential、重新注册 project 或反复重启 Runner。
 
 ## 运维
 
@@ -448,7 +469,7 @@ MCP 与 GPT Actions 见 [MCP.md](MCP.zh-CN.md) 与客户端特定设置
 | --- | --- |
 | 未设置 / 空 | `trusted_agent`（自托管单运维者部署的默认值）。 |
 | `trusted_agent` | 项目工作、shell、jobs、git、校验在硬安全检查后自动执行，无审批中断。Push/tag/publish/release/deploy 仍要求用户任务显式包含该动作。 |
-| `restricted` | 有后果的工具在人工批准前被拒绝（`webcodex task approve/deny`）。 |
+| `restricted` | 有后果的 runtime 工具由 permission policy 拒绝；不存在独立 Connector command approval queue。 |
 
 `trusted_agent` 永不放松硬安全边界（项目根、只读会话、路径策略、凭据脱敏、
 job 取消语义）。`WEBCODEX_PERMISSION_MODE` 支持明确映射：`dev_auto_approve` → `trusted_agent`，
@@ -474,22 +495,17 @@ webcodex ops smoke-preflight --server-url "$SERVER_URL" \
 1. `webcodex ops status ... --strict` 通过。
 2. `POST /api/runtime/status` 返回 `service=webcodex` 与预期公网 URL。
 3. `list_runners` 显示至少一个在线 Runner。
-4. `listProjects` 显示 `agent:<client_id>:<project_id>` id。
+4. `list_projects` 显示 `agent:<client_id>:<project_id>` id。
 5. 已知项目上的只读项目工具可用。
 6. 写入/替换/校验测试只针对一次性 smoke 项目。
 
 ### Runtime console
 
-Server 在 `/console` 提供 host-local 浏览器 console。它展示项目就绪状态、工作队列、
-Workflow Session 活动、当前可见 Runner 与近期变更性活动。对于 Connector task，同机
-人类可以发送 task guidance、处理待审批操作、取消工作，并对稳定结果执行 Accept 或
-Reject；这些动作与 CLI 使用相同的权限边界，在线模型仍然不能接受自己的工作。Console
-还会展示不含 secret 的客户端连接目标，并把 ChatGPT Developer Mode MCP custom app
-作为 ChatGPT 主路径。Credential 不会由 console API 返回。
+Server 在 `/runtime` 提供 Runtime Console。它通过与 ToolRuntime 相同的 authorization path 展示普通 runtime、Project、Runner、Job、Workflow Session、collaboration 与近期 activity。Project-scoped credential 只能看到自己的 ProjectGrant-visible Runner/Project；知道其它 Project/Runner id 也不会扩大可见性。旧 `/console` Project Review Console 以及 task/result/approval API 已删除。Runtime Console API 不会返回 credential。
 
 ### Runtime job API 信任模型
 
-`job_status`、`job_log`、`list_jobs` 与 `job_tail` 面向受信的单运维者部署。它们
+`observe_jobs`、`list_jobs` 与 `job_tail` 面向受信的单运维者部署。它们
 不是互不信任用户之间的租户边界。不要把单个 runtime 暴露给多个不受信用户，除非
 为无项目 job API 增加 job-owner 隔离；否则请使用独立的 server/runtime 实例。
 

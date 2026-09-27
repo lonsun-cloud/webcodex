@@ -1,0 +1,1 @@
+document.querySelectorAll("form").forEach((form)=>{form.addEventListener("submit",(event)=>{event.preventDefault();const status=document.querySelector("#status");if(status){status.textContent="Local fixture only: submit intercepted. No application was sent.";}});});

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn mcp_initialize_returns_protocol_and_server_info() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
         rpc("initialize", Some(Value::from(1)), json!({})),
@@ -16,10 +16,6 @@ async fn mcp_initialize_returns_protocol_and_server_info() {
             assert_eq!(value["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
             assert_eq!(value["result"]["serverInfo"]["name"], "webcodex");
             assert!(value["result"]["serverInfo"]["version"].is_string());
-            assert_eq!(
-                value["result"]["serverInfo"]["runtimeExposure"],
-                crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
-            );
             assert_eq!(
                 value["result"]["capabilities"]["tools"]["listChanged"],
                 false
@@ -176,7 +172,7 @@ async fn mcp_legacy_protocol_does_not_expose_tasks_extension_methods() {
             rpc(
                 method,
                 Some(Value::from(62)),
-                json!({ "taskId": "wc_exec_ffffffffffffffffffffffffffffffff" }),
+                json!({ "taskId": "wc_exec_________________" }),
             ),
             None,
         )
@@ -190,7 +186,7 @@ async fn mcp_legacy_protocol_does_not_expose_tasks_extension_methods() {
 
 #[tokio::test]
 async fn mcp_stateless_tools_list_uses_2026_result_shape() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
         rpc(
@@ -225,15 +221,21 @@ async fn mcp_stateless_tools_list_uses_2026_result_shape() {
             let ack = &read_files["inputSchema"]["properties"]["ack_session_message_ids"];
             assert_eq!(ack["type"], "array");
             assert_eq!(ack["maxItems"], 8);
-            assert_eq!(ack["items"]["pattern"], "^wc_msg_[A-Za-z0-9_]+$");
+            assert!(
+                ack["items"].get("pattern").is_none(),
+                "compact Stateless discovery intentionally omits the opaque wc_msg_* regex"
+            );
             let description = ack["description"].as_str().unwrap();
-            assert!(description.contains("current model context still retains"));
-            assert!(description.contains("ACK neither resolves"));
+            assert!(description.contains("wc_msg_*"));
+            assert!(description.contains("retained in model context"));
+            assert!(description.contains("never resolves or authorizes"));
             let resolution = &read_files["inputSchema"]["properties"]["session_message_resolution"];
             assert_eq!(resolution["type"], "object");
-            assert_eq!(
-                resolution["properties"]["message_id"]["pattern"],
-                "^wc_msg_[A-Za-z0-9_]+$"
+            assert!(
+                resolution["properties"]["message_id"]
+                    .get("pattern")
+                    .is_none(),
+                "compact Stateless discovery intentionally omits the opaque wc_msg_* regex"
             );
             assert_eq!(resolution["properties"]["resolution"]["minLength"], 1);
             assert_eq!(
@@ -241,9 +243,9 @@ async fn mcp_stateless_tools_list_uses_2026_result_shape() {
                 crate::tool_runtime::sessions::MAX_MESSAGE_RESOLUTION_CHARS
             );
             let resolution_description = resolution["description"].as_str().unwrap();
-            assert!(resolution_description.contains("same WebCodex call"));
-            assert!(resolution_description.contains("explicit recording Session"));
-            assert!(resolution_description.contains("atomic completion path"));
+            assert!(resolution_description.contains("exact wc_msg_*"));
+            assert!(resolution_description.contains("ACK separately if required"));
+            assert!(resolution_description.contains("Independent of call success"));
             assert!(!resolution_description.contains("recording_session_id"));
             assert!(!resolution_description.contains("complete_session_message"));
             let context_request = &read_files["inputSchema"]["properties"]["context_request"];
@@ -253,18 +255,12 @@ async fn mcp_stateless_tools_list_uses_2026_result_shape() {
             assert!(context_request["items"].get("enum").is_none());
             assert_eq!(context_request["items"]["maxLength"], 64);
             let request_description = context_request["description"].as_str().unwrap();
-            assert!(request_description.contains("after this tool's main effect/observation"));
-            assert!(request_description.contains("grants no authority"));
+            assert!(request_description.contains("Post-result sidecar keys"));
+            assert!(request_description.contains("no authority"));
             assert!(!request_description.contains("memory_read"));
-            let context_ack =
-                &read_files["inputSchema"]["properties"]["ack_session_context_revision"];
-            assert_eq!(context_ack["type"], "integer");
-            assert_eq!(context_ack["minimum"], 0);
-            let context_description = context_ack["description"].as_str().unwrap();
-            assert!(context_description.contains("latest Session context revision"));
-            assert!(context_description.contains("known behind revision"));
-            assert!(context_description.contains("compact current Session handoff"));
-            assert!(context_description.contains("nonblocking"));
+            assert!(read_files["inputSchema"]["properties"]
+                .get("ack_session_context_revision")
+                .is_none());
         }
         other => panic!("expected Ok for stateless tools/list, got {:?}", other),
     }

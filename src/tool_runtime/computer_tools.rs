@@ -1,9 +1,17 @@
 use super::files::{validate_artifact_file_path, validate_artifact_mime_for_path};
+use super::sessions::SessionTransport;
 use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
-use super::tool_call::ComputerSnapshotRegion;
-use super::{RecoveryKind, RecoveryTool, ToolCall, ToolResult, ToolRuntime};
+use super::specialized::{
+    SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
+};
+use super::tool_call::{ComputerControlToolCall, ComputerObserveToolCall, ComputerSnapshotRegion};
+use super::{RecoveryKind, SuggestedToolCall, ToolCall, ToolResult, ToolRuntime};
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
-use crate::auth::AuthContext;
+use crate::auth::{
+    AuthContext, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
+    SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
+    SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ,
+};
 use crate::runner_http::RunnerFeature;
 use crate::runner_protocol::{ShellCommandExecutionState, ShellFileOpRequest};
 use base64::{engine::general_purpose, Engine as _};
@@ -29,6 +37,24 @@ const DEFAULT_ACCESSIBILITY_DEPTH: usize = 6;
 const DEFAULT_ACCESSIBILITY_NODES: usize = 128;
 const MAX_ACCESSIBILITY_CHILD_COUNT: u64 = 1_000_000;
 const MAX_IMAGE_DIMENSION: u64 = 4096;
+
+fn effective_snapshot_dimension_bound(value: Option<u32>) -> Result<Option<u32>, ()> {
+    match value {
+        None => Ok(None),
+        Some(0) => Err(()),
+        Some(value) => Ok(Some(value.min(MAX_IMAGE_DIMENSION as u32))),
+    }
+}
+
+fn effective_snapshot_dimension_bounds(
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<(Option<u32>, Option<u32>), ()> {
+    Ok((
+        effective_snapshot_dimension_bound(max_width)?,
+        effective_snapshot_dimension_bound(max_height)?,
+    ))
+}
 const COMPUTER_WAIT_SECS: u64 = 30;
 const MAX_COMPUTER_TARGETS: usize = 64;
 const DEFAULT_FIND_ELEMENTS_LIMIT: usize = 8;
@@ -93,10 +119,7 @@ fn valid_application_id(application_id: &str) -> bool {
         return false;
     };
     application_id.len() <= MAX_APPLICATION_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn valid_display_id(display_id: &str) -> bool {
@@ -104,10 +127,7 @@ fn valid_display_id(display_id: &str) -> bool {
         return false;
     };
     display_id.len() <= MAX_DISPLAY_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn validate_input_text(text: &str) -> Result<usize, &'static str> {
@@ -120,15 +140,167 @@ fn validate_input_text(text: &str) -> Result<usize, &'static str> {
     Ok(text_bytes)
 }
 
+fn computer_observe_policy(call: &ComputerObserveToolCall) -> SpecializedOperationPolicy {
+    use ComputerObserveToolCall::*;
+    match call {
+        Displays { .. } | SnapshotDisplay { .. } => SpecializedOperationPolicy::read_all(
+            SpecializedSource::Computer,
+            call.action_name(),
+            &[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_DISPLAY_READ],
+        ),
+        ReadClipboard { .. } => SpecializedOperationPolicy::read_all(
+            SpecializedSource::Computer,
+            call.action_name(),
+            &[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_CLIPBOARD_READ],
+        ),
+        Targets
+        | Windows { .. }
+        | Applications { .. }
+        | AccessibilityStatus { .. }
+        | AccessibilityTree { .. }
+        | FindElements { .. }
+        | ElementState { .. }
+        | SnapshotWindow { .. } => SpecializedOperationPolicy::read(
+            SpecializedSource::Computer,
+            call.action_name(),
+            SCOPE_COMPUTER_READ,
+        ),
+    }
+}
+
+fn computer_control_policy(call: &ComputerControlToolCall) -> SpecializedOperationPolicy {
+    use ComputerControlToolCall::*;
+    match call {
+        LaunchApplication { .. } => SpecializedOperationPolicy::consequential(
+            SpecializedSource::Computer,
+            call.action_name(),
+            SCOPE_COMPUTER_LAUNCH,
+            "computer_control",
+        ),
+        PointerMove { .. } | PointerClick { .. } => SpecializedOperationPolicy::consequential_all(
+            SpecializedSource::Computer,
+            call.action_name(),
+            &[
+                SCOPE_COMPUTER_READ,
+                SCOPE_COMPUTER_DISPLAY_READ,
+                SCOPE_COMPUTER_CONTROL,
+                SCOPE_COMPUTER_POINTER_CONTROL,
+            ],
+            "computer_control",
+        ),
+        WriteClipboard { .. } => SpecializedOperationPolicy::consequential_all(
+            SpecializedSource::Computer,
+            call.action_name(),
+            &[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_CLIPBOARD_WRITE],
+            "computer_control",
+        ),
+        ActivateWindow { .. }
+        | Press { .. }
+        | Focus { .. }
+        | ScrollToElement { .. }
+        | Key { .. }
+        | InputText { .. } => SpecializedOperationPolicy::consequential(
+            SpecializedSource::Computer,
+            call.action_name(),
+            SCOPE_COMPUTER_CONTROL,
+            "computer_control",
+        ),
+    }
+}
+
+fn computer_specialized_terminal(result: &ToolResult) -> (&str, Option<&str>) {
+    let dispatch_certainty = result
+        .output
+        .get("execution_state")
+        .and_then(Value::as_str)
+        .unwrap_or(if result.success {
+            "completed"
+        } else {
+            "not_started"
+        });
+    let failure_kind = result
+        .output
+        .get("failure_kind")
+        .or_else(|| result.output.get("error_kind"))
+        .and_then(Value::as_str);
+    (dispatch_certainty, failure_kind)
+}
+
 impl ToolRuntime {
+    pub(crate) async fn invoke_computer_observe_gateway(
+        &self,
+        call: ComputerObserveToolCall,
+        recording_session_id: Option<&str>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+    ) -> Result<ToolResult, SpecializedGovernanceDenial> {
+        let policy = computer_observe_policy(&call);
+        let identity = json!({"action": call.action_name()});
+        let permit = self
+            .govern_specialized_invocation(
+                "computer_observe",
+                policy,
+                transport,
+                recording_session_id,
+                auth,
+                &identity,
+            )
+            .await?;
+        let result = self
+            .dispatch_computer_tool(ToolCall::ComputerObserve(call), auth)
+            .await;
+        let (dispatch_certainty, failure_kind) = computer_specialized_terminal(&result);
+        self.finish_specialized_invocation(
+            permit,
+            result.success,
+            dispatch_certainty,
+            failure_kind,
+        );
+        Ok(result)
+    }
+
+    pub(crate) async fn invoke_computer_control_gateway(
+        &self,
+        call: ComputerControlToolCall,
+        recording_session_id: Option<&str>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+    ) -> Result<ToolResult, SpecializedGovernanceDenial> {
+        let policy = computer_control_policy(&call);
+        let identity = json!({"action": call.action_name()});
+        let permit = self
+            .govern_specialized_invocation(
+                "computer_control",
+                policy,
+                transport,
+                recording_session_id,
+                auth,
+                &identity,
+            )
+            .await?;
+        let result = self
+            .dispatch_computer_tool(ToolCall::ComputerControl(call), auth)
+            .await;
+        let (dispatch_certainty, failure_kind) = computer_specialized_terminal(&result);
+        self.finish_specialized_invocation(
+            permit,
+            result.success,
+            dispatch_certainty,
+            failure_kind,
+        );
+        Ok(result)
+    }
+
     pub(super) async fn dispatch_computer_tool(
         &self,
         call: ToolCall,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         match call {
-            ToolCall::ComputerListTargets => self.computer_list_targets(auth).await,
-            ToolCall::ComputerListWindows { client_id, limit } => {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Targets) => {
+                self.computer_list_targets(auth).await
+            }
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Windows { client_id, limit }) => {
                 let limit = limit.unwrap_or(MAX_WINDOWS).clamp(1, MAX_WINDOWS);
                 self.dispatch_computer_request(
                     &client_id,
@@ -141,7 +313,7 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerListDisplays { client_id, limit } => {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Displays { client_id, limit }) => {
                 let limit = limit.unwrap_or(MAX_DISPLAYS).clamp(1, MAX_DISPLAYS);
                 self.dispatch_computer_request(
                     &client_id,
@@ -154,7 +326,10 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerListApplications { client_id, limit } => {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Applications {
+                client_id,
+                limit,
+            }) => {
                 let limit = limit.unwrap_or(MAX_APPLICATIONS).clamp(1, MAX_APPLICATIONS);
                 self.dispatch_computer_request(
                     &client_id,
@@ -167,14 +342,15 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerLaunchApplication {
+            ToolCall::ComputerControl(ComputerControlToolCall::LaunchApplication {
                 client_id,
                 application_id,
-            } => {
+            }) => {
                 if !valid_application_id(&application_id) {
                     return computer_application_effect_not_started(
                         "invalid_application",
                         "application_id is invalid",
+                        &client_id,
                         &application_id,
                     );
                 }
@@ -189,7 +365,9 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerAccessibilityStatus { client_id } => {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::AccessibilityStatus {
+                client_id,
+            }) => {
                 self.dispatch_computer_request(
                     &client_id,
                     "computer_accessibility_status",
@@ -201,12 +379,12 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerAccessibilityTree {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::AccessibilityTree {
                 client_id,
                 surface_id,
                 max_depth,
                 max_nodes,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -231,7 +409,7 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerFindElements {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::FindElements {
                 client_id,
                 surface_id,
                 role,
@@ -240,7 +418,7 @@ impl ToolRuntime {
                 focused,
                 enabled,
                 limit,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -302,11 +480,11 @@ impl ToolRuntime {
                     limit,
                 )
             }
-            ToolCall::ComputerElementState {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::ElementState {
                 client_id,
                 surface_id,
                 element_id,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -327,10 +505,10 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerActivateWindow {
+            ToolCall::ComputerControl(ComputerControlToolCall::ActivateWindow {
                 client_id,
                 surface_id,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -345,12 +523,23 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerControl {
-                client_id,
-                surface_id,
-                element_id,
-                action,
-            } => {
+            ToolCall::ComputerControl(
+                call @ (ComputerControlToolCall::Press { .. }
+                | ComputerControlToolCall::Focus { .. }),
+            ) => {
+                let (client_id, surface_id, element_id, action) = match call {
+                    ComputerControlToolCall::Press {
+                        client_id,
+                        surface_id,
+                        element_id,
+                    } => (client_id, surface_id, element_id, "press"),
+                    ComputerControlToolCall::Focus {
+                        client_id,
+                        surface_id,
+                        element_id,
+                    } => (client_id, surface_id, element_id, "focus"),
+                    _ => unreachable!("matched Computer element-control action"),
+                };
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -359,9 +548,6 @@ impl ToolRuntime {
                     || element_id.len() > MAX_ELEMENT_ID_BYTES
                 {
                     return computer_error("invalid_element", "element_id is invalid");
-                }
-                if !matches!(action.as_str(), "press" | "focus") {
-                    return computer_error("invalid_request", "computer control action is invalid");
                 }
                 self.dispatch_computer_request(
                     &client_id,
@@ -378,11 +564,11 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerScrollToElement {
+            ToolCall::ComputerControl(ComputerControlToolCall::ScrollToElement {
                 client_id,
                 surface_id,
                 element_id,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -403,12 +589,12 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerKeyInput {
+            ToolCall::ComputerControl(ComputerControlToolCall::Key {
                 client_id,
                 surface_id,
                 key,
                 modifiers,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -427,7 +613,7 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerReadClipboard { client_id } => {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::ReadClipboard { client_id }) => {
                 self.dispatch_computer_request(
                     &client_id,
                     "computer_read_clipboard",
@@ -439,7 +625,10 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerWriteClipboard { client_id, text } => {
+            ToolCall::ComputerControl(ComputerControlToolCall::WriteClipboard {
+                client_id,
+                text,
+            }) => {
                 if let Err(message) = validate_clipboard_write_text(&text) {
                     return computer_effect_not_started(message);
                 }
@@ -454,14 +643,15 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerPointerMove {
+            ToolCall::ComputerControl(ComputerControlToolCall::PointerMove {
                 client_id,
                 display_id,
                 snapshot_generation,
                 x,
                 y,
-            } => {
+            }) => {
                 let context = PointerRequestContext {
+                    client_id: client_id.clone(),
                     display_id: display_id.clone(),
                     snapshot_generation,
                     x,
@@ -492,14 +682,15 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerPointerClick {
+            ToolCall::ComputerControl(ComputerControlToolCall::PointerClick {
                 client_id,
                 display_id,
                 snapshot_generation,
                 x,
                 y,
-            } => {
+            }) => {
                 let context = PointerRequestContext {
+                    client_id: client_id.clone(),
                     display_id: display_id.clone(),
                     snapshot_generation,
                     x,
@@ -530,12 +721,12 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerInputText {
+            ToolCall::ComputerControl(ComputerControlToolCall::InputText {
                 client_id,
                 surface_id,
                 element_id,
                 text,
-            } => {
+            }) => {
                 if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_BYTES {
                     return computer_error("invalid_surface", "surface_id is invalid");
                 }
@@ -563,13 +754,13 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerSnapshot {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotWindow {
                 client_id,
                 surface_id,
                 region,
                 max_width,
                 max_height,
-            } => {
+            }) => {
                 self.capture_computer_snapshot(
                     &client_id,
                     &surface_id,
@@ -580,24 +771,25 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::ComputerSnapshotDisplay {
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
                 client_id,
                 display_id,
                 max_width,
                 max_height,
-            } => {
+            }) => {
                 if !valid_display_id(&display_id) {
                     return computer_error("invalid_display", "display_id is invalid");
                 }
-                if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
-                    || max_height
-                        .is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
-                {
-                    return computer_error(
-                        "invalid_request",
-                        "display snapshot output dimension bound is invalid",
-                    );
-                }
+                let (max_width, max_height) =
+                    match effective_snapshot_dimension_bounds(max_width, max_height) {
+                        Ok(bounds) => bounds,
+                        Err(()) => {
+                            return computer_error(
+                                "invalid_request",
+                                "display snapshot output dimension bound is invalid",
+                            )
+                        }
+                    };
                 self.dispatch_computer_request(
                     &client_id,
                     "computer_snapshot_display",
@@ -653,14 +845,16 @@ impl ToolRuntime {
                 return computer_error("invalid_request", "snapshot region is invalid");
             }
         }
-        if max_width.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
-            || max_height.is_some_and(|value| value == 0 || value > MAX_IMAGE_DIMENSION as u32)
-        {
-            return computer_error(
-                "invalid_request",
-                "snapshot output dimension bound is invalid",
-            );
-        }
+        let (max_width, max_height) =
+            match effective_snapshot_dimension_bounds(max_width, max_height) {
+                Ok(bounds) => bounds,
+                Err(()) => {
+                    return computer_error(
+                        "invalid_request",
+                        "snapshot output dimension bound is invalid",
+                    )
+                }
+            };
         let advanced = region.is_some() || max_width.is_some() || max_height.is_some();
         let (kind, payload) = if advanced {
             (
@@ -1078,6 +1272,7 @@ impl ToolRuntime {
             .map(str::to_string);
         let is_pointer = matches!(kind, "computer_pointer_move" | "computer_pointer_click");
         let pointer_context = is_pointer.then(|| PointerRequestContext {
+            client_id: client_id.to_string(),
             display_id: expected_display_id.clone().unwrap_or_default(),
             snapshot_generation: payload
                 .get("snapshot_generation")
@@ -1104,6 +1299,7 @@ impl ToolRuntime {
                 return computer_application_effect_not_started(
                     "invalid_client",
                     "client_id is invalid",
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1163,6 +1359,7 @@ impl ToolRuntime {
                 return computer_application_effect_not_started(
                     "client_access_denied",
                     "caller cannot access the target Runner for application launch",
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1193,6 +1390,7 @@ impl ToolRuntime {
                 return computer_application_effect_not_started(
                     "capability_unavailable",
                     &format!("target Runner does not support {required_capability}"),
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1245,6 +1443,7 @@ impl ToolRuntime {
                 return computer_application_effect_not_started(
                     "invalid_request",
                     "could not encode application launch request",
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1286,6 +1485,7 @@ impl ToolRuntime {
                 return computer_application_effect_not_started(
                     "not_started",
                     &format!("application launch request was not dispatched: {error}"),
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 )
             }
@@ -1325,6 +1525,7 @@ impl ToolRuntime {
                     return computer_application_effect_delivery_failure(
                         "Runner response channel closed before a terminal application launch result was received",
                         request_dispatched,
+                        client_id,
                         expected_application_id.as_deref().unwrap_or_default(),
                     );
                 }
@@ -1359,6 +1560,7 @@ impl ToolRuntime {
                     return computer_application_effect_delivery_failure(
                         "Runner did not return a terminal application launch result in time",
                         request_dispatched,
+                        client_id,
                         expected_application_id.as_deref().unwrap_or_default(),
                     );
                 }
@@ -1393,7 +1595,11 @@ impl ToolRuntime {
         if let Some(error) = response.error.as_deref() {
             let error_kind = classify_runner_error(error);
             if is_text_input {
-                return computer_text_input_runner_error(error, response.request_dispatched);
+                return computer_text_input_runner_error(
+                    error,
+                    response.request_dispatched,
+                    client_id,
+                );
             }
             if is_pointer {
                 return computer_pointer_runner_error(
@@ -1415,6 +1621,7 @@ impl ToolRuntime {
                 return computer_application_launch_runner_error(
                     error,
                     response.request_dispatched,
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1424,9 +1631,10 @@ impl ToolRuntime {
             if is_effect && error_kind == "runner_error" {
                 return computer_effect_delivery_failure(error, response.request_dispatched);
             }
-            return computer_error(
+            return computer_error_with_client(
                 error_kind,
                 &computer_error_recovery_message(error_kind, error),
+                Some(client_id),
             );
         }
         if response.exit_code != Some(0) {
@@ -1441,6 +1649,7 @@ impl ToolRuntime {
                 return computer_application_effect_delivery_failure(
                     "Runner application launch ended without a structured terminal result",
                     response.request_dispatched,
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 );
             }
@@ -1479,6 +1688,7 @@ impl ToolRuntime {
                 return computer_application_effect_delivery_failure(
                     "Runner returned invalid JSON after possible application launch dispatch",
                     response.request_dispatched,
+                    client_id,
                     expected_application_id.as_deref().unwrap_or_default(),
                 )
             }
@@ -1538,6 +1748,7 @@ impl ToolRuntime {
                 } else {
                     computer_application_effect_outcome_unknown(
                         "Runner reported successful application launch but returned inconsistent metadata",
+                        client_id,
                         expected_application_id.as_deref().unwrap_or_default(),
                     )
                 }
@@ -1660,7 +1871,7 @@ fn computer_snapshot_artifact_lifecycle_failure(
     let message = format!(
         "{message}; the create-only artifact may already exist. Read metadata for this exact project/path and compare SHA-256, byte count, and MIME before deciding whether another attempt is safe"
     );
-    ToolResult::err_with_output(
+    let result = ToolResult::err_with_output(
         message.clone(),
         json!({
             "error_kind": "outcome_unknown",
@@ -1671,12 +1882,12 @@ fn computer_snapshot_artifact_lifecycle_failure(
             "expected_sha256": sha256,
             "expected_file_bytes": file_bytes,
             "expected_mime_type": mime_type,
-            "reconcile_with": "read_project_artifact_metadata",
         }),
-    )
-    .with_recovery(
-        RecoveryKind::Reconcile,
-        Some(RecoveryTool::ReadProjectArtifactMetadata),
+    );
+    computer_suggested_recovery(
+        result,
+        "read_project_artifact_metadata",
+        json!({"project": project, "path": path}),
     )
 }
 
@@ -1707,16 +1918,16 @@ fn computer_snapshot_artifact_definite_failure(
 fn computer_error_recovery_message(error_kind: &str, error: &str) -> String {
     match error_kind {
         "stale_element" => format!(
-            "{error}; reacquire a fresh element_id with computer_find_elements on the same surface"
+            "{error}; reacquire a fresh element_id with computer_observe(action=find_elements) on the same surface"
         ),
         "stale_surface" => format!(
-            "{error}; reacquire a fresh surface_id with computer_list_windows before continuing"
+            "{error}; reacquire a fresh surface_id with computer_observe(action=windows) before continuing"
         ),
         "stale_application" => format!(
-            "{error}; reacquire a fresh application_id with computer_list_applications before another launch"
+            "{error}; reacquire a fresh application_id with computer_observe(action=applications) before another launch"
         ),
         "stale_display" => format!(
-            "{error}; reacquire a fresh display_id with computer_list_displays before continuing"
+            "{error}; reacquire a fresh display_id with computer_observe(action=displays) before continuing"
         ),
         _ => error.to_string(),
     }
@@ -1839,36 +2050,101 @@ fn filter_accessibility_tree(
     }))
 }
 
-fn computer_error(kind: &str, message: &str) -> ToolResult {
+fn computer_suggested_recovery(
+    mut result: ToolResult,
+    tool: &'static str,
+    arguments: Value,
+) -> ToolResult {
+    result
+        .output
+        .as_object_mut()
+        .expect("Computer recovery output is an object")
+        .insert(
+            "suggested_call".to_string(),
+            SuggestedToolCall::new(tool, arguments).to_value(),
+        );
+    result
+}
+
+fn computer_observe_suggested_recovery(
+    result: ToolResult,
+    action: &'static str,
+    mut arguments: Value,
+) -> ToolResult {
+    arguments
+        .as_object_mut()
+        .expect("Computer observe recovery arguments are an object")
+        .insert("action".to_string(), json!(action));
+    computer_suggested_recovery(result, "computer_observe", arguments)
+}
+
+fn computer_reconcile_recovery(
+    mut result: ToolResult,
+    recovery_kind: RecoveryKind,
+    reconcile_with: &str,
+) -> ToolResult {
+    result
+        .output
+        .as_object_mut()
+        .expect("Computer recovery output is an object")
+        .insert("reconcile_with".to_string(), json!(reconcile_with));
+    result.with_recovery(recovery_kind)
+}
+
+fn computer_error_with_client(kind: &str, message: &str, client_id: Option<&str>) -> ToolResult {
     let result = ToolResult::err_with_output(
         message.to_string(),
         json!({"error_kind": kind, "message": bounded_text(message)}),
     );
     match kind {
-        "stale_element" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerFindElements),
-        ),
-        "stale_surface" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListWindows),
-        ),
-        "stale_application" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListApplications),
-        ),
-        "stale_display" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListDisplays),
-        ),
-        "invalid_request" => result.with_recovery(RecoveryKind::FixInput, None),
-        "permission_denied" => result.with_recovery(RecoveryKind::UserAction, None),
+        // The original finder filters are not retained here. Knowing only the
+        // canonical gateway family is insufficient to manufacture a safe finder call.
+        "stale_element" => {
+            computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+        }
+        "stale_surface" => match client_id {
+            Some(client_id) => computer_observe_suggested_recovery(
+                result,
+                "windows",
+                json!({"client_id": client_id}),
+            ),
+            None => {
+                computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+            }
+        },
+        "stale_application" => match client_id {
+            Some(client_id) => computer_observe_suggested_recovery(
+                result,
+                "applications",
+                json!({"client_id": client_id}),
+            ),
+            None => {
+                computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+            }
+        },
+        "stale_display" => match client_id {
+            Some(client_id) => computer_observe_suggested_recovery(
+                result,
+                "displays",
+                json!({"client_id": client_id}),
+            ),
+            None => {
+                computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+            }
+        },
+        "invalid_request" => result.with_recovery(RecoveryKind::FixInput),
+        "permission_denied" => result.with_recovery(RecoveryKind::UserAction),
         _ => result,
     }
 }
 
+fn computer_error(kind: &str, message: &str) -> ToolResult {
+    computer_error_with_client(kind, message, None)
+}
+
 #[derive(Clone, Debug)]
 struct PointerRequestContext {
+    client_id: String,
     display_id: String,
     snapshot_generation: u32,
     x: u32,
@@ -1901,16 +2177,23 @@ fn computer_pointer_effect_not_started(
     }
     let result = ToolResult::err_with_output(message.to_string(), output);
     match error_kind {
-        "stale_display" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListDisplays),
+        "stale_display" => computer_observe_suggested_recovery(
+            result,
+            "displays",
+            json!({"client_id": context.client_id}),
         ),
-        "stale_snapshot_generation" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerSnapshotDisplay),
-        ),
-        "invalid_request" => result.with_recovery(RecoveryKind::FixInput, None),
-        "permission_denied" => result.with_recovery(RecoveryKind::UserAction, None),
+        "stale_snapshot_generation" if valid_display_id(&context.display_id) => {
+            computer_observe_suggested_recovery(
+                result,
+                "snapshot_display",
+                json!({"client_id": context.client_id, "display_id": context.display_id}),
+            )
+        }
+        "stale_snapshot_generation" => {
+            computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+        }
+        "invalid_request" => result.with_recovery(RecoveryKind::FixInput),
+        "permission_denied" => result.with_recovery(RecoveryKind::UserAction),
         _ => result,
     }
 }
@@ -1920,21 +2203,18 @@ fn computer_pointer_effect_spent_not_started(
     context: &PointerRequestContext,
 ) -> ToolResult {
     let safe_message = format!(
-        "{message}; snapshot_generation is spent. Reconcile with a fresh computer_snapshot_display observation before another pointer effect"
+        "{message}; snapshot_generation is spent. Reconcile with computer_observe(action=snapshot_display) before another pointer effect"
     );
-    let mut result = computer_pointer_effect_not_started("not_started", &safe_message, context);
-    result
-        .output
-        .as_object_mut()
-        .expect("pointer spent not-started output is an object")
-        .insert(
-            "reconcile_with".to_string(),
-            json!("computer_snapshot_display"),
-        );
-    result.with_recovery(
-        RecoveryKind::Reobserve,
-        Some(RecoveryTool::ComputerSnapshotDisplay),
-    )
+    let result = computer_pointer_effect_not_started("not_started", &safe_message, context);
+    if valid_display_id(&context.display_id) {
+        computer_observe_suggested_recovery(
+            result,
+            "snapshot_display",
+            json!({"client_id": context.client_id, "display_id": context.display_id}),
+        )
+    } else {
+        computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+    }
 }
 
 fn computer_pointer_effect_outcome_unknown(
@@ -1942,9 +2222,9 @@ fn computer_pointer_effect_outcome_unknown(
     context: &PointerRequestContext,
 ) -> ToolResult {
     let safe_message = format!(
-        "{message}; do not blindly retry. Reconcile with a fresh computer_snapshot_display observation first"
+        "{message}; do not blindly retry. Reconcile with computer_observe(action=snapshot_display) first"
     );
-    ToolResult::err_with_output(
+    let result = ToolResult::err_with_output(
         safe_message.clone(),
         json!({
             "error_kind": "outcome_unknown",
@@ -1953,13 +2233,17 @@ fn computer_pointer_effect_outcome_unknown(
             "x": context.x,
             "y": context.y,
             "execution_state": "outcome_unknown",
-            "reconcile_with": "computer_snapshot_display",
         }),
-    )
-    .with_recovery(
-        RecoveryKind::Reobserve,
-        Some(RecoveryTool::ComputerSnapshotDisplay),
-    )
+    );
+    if valid_display_id(&context.display_id) {
+        computer_observe_suggested_recovery(
+            result,
+            "snapshot_display",
+            json!({"client_id": context.client_id, "display_id": context.display_id}),
+        )
+    } else {
+        computer_reconcile_recovery(result, RecoveryKind::Reobserve, "computer_observe")
+    }
 }
 
 fn computer_pointer_effect_delivery_failure(
@@ -2027,8 +2311,8 @@ fn computer_clipboard_write_not_started(
     output.insert("state_changed".to_string(), json!(false));
     let result = ToolResult::err_with_output(message.to_string(), Value::Object(output));
     match error_kind {
-        "invalid_request" => result.with_recovery(RecoveryKind::FixInput, None),
-        "permission_denied" => result.with_recovery(RecoveryKind::UserAction, None),
+        "invalid_request" => result.with_recovery(RecoveryKind::FixInput),
+        "permission_denied" => result.with_recovery(RecoveryKind::UserAction),
         _ => result,
     }
 }
@@ -2048,7 +2332,7 @@ fn computer_clipboard_write_outcome_unknown(
         output.insert("state_changed".to_string(), json!(state_changed));
     }
     ToolResult::err_with_output(safe_message, Value::Object(output))
-        .with_recovery(RecoveryKind::Reobserve, None)
+        .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn computer_clipboard_write_delivery_failure(
@@ -2104,7 +2388,7 @@ fn computer_effect_outcome_unknown(message: &str) -> ToolResult {
             "execution_state": "outcome_unknown"
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, None)
+    .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn computer_effect_delivery_failure(message: &str, request_dispatched: Option<bool>) -> ToolResult {
@@ -2128,6 +2412,7 @@ fn computer_effect_validated_result(result: ToolResult, inconsistent_message: &s
 fn computer_application_effect_not_started(
     error_kind: &str,
     message: &str,
+    client_id: &str,
     application_id: &str,
 ) -> ToolResult {
     let application_id = valid_application_id(application_id).then(|| application_id.to_string());
@@ -2142,87 +2427,100 @@ fn computer_application_effect_not_started(
         }),
     );
     match error_kind {
-        "stale_application" => result.with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListApplications),
+        "stale_application" => computer_observe_suggested_recovery(
+            result,
+            "applications",
+            json!({"client_id": client_id}),
         ),
-        "invalid_request" => result.with_recovery(RecoveryKind::FixInput, None),
-        "permission_denied" => result.with_recovery(RecoveryKind::UserAction, None),
+        "invalid_request" => result.with_recovery(RecoveryKind::FixInput),
+        "permission_denied" => result.with_recovery(RecoveryKind::UserAction),
         _ => result,
     }
 }
 
-fn computer_application_effect_outcome_unknown(message: &str, application_id: &str) -> ToolResult {
+fn computer_application_effect_outcome_unknown(
+    message: &str,
+    client_id: &str,
+    application_id: &str,
+) -> ToolResult {
     let safe_message = format!(
-        "{message}; do not blindly retry. Reconcile with a fresh computer_list_windows observation first"
+        "{message}; do not blindly retry. Reconcile with computer_observe(action=windows) first"
     );
-    ToolResult::err_with_output(
+    let result = ToolResult::err_with_output(
         safe_message.clone(),
         json!({
             "error_kind": "outcome_unknown",
             "message": bounded_text(&safe_message),
             "application_id": application_id,
             "execution_state": "outcome_unknown",
-            "reconcile_with": "computer_list_windows",
         }),
-    )
-    .with_recovery(
-        RecoveryKind::Reobserve,
-        Some(RecoveryTool::ComputerListWindows),
-    )
+    );
+    computer_observe_suggested_recovery(result, "windows", json!({"client_id": client_id}))
 }
 
 fn computer_application_effect_delivery_failure(
     message: &str,
     request_dispatched: Option<bool>,
+    client_id: &str,
     application_id: &str,
 ) -> ToolResult {
     if request_dispatched == Some(false) {
-        computer_application_effect_not_started("not_started", message, application_id)
+        computer_application_effect_not_started("not_started", message, client_id, application_id)
     } else {
-        computer_application_effect_outcome_unknown(message, application_id)
+        computer_application_effect_outcome_unknown(message, client_id, application_id)
     }
 }
 
 fn computer_application_launch_runner_error(
     error: &str,
     request_dispatched: Option<bool>,
+    client_id: &str,
     application_id: &str,
 ) -> ToolResult {
     match classify_runner_error(error) {
         "stale_application" => computer_application_effect_not_started(
             "stale_application",
-            "application_id is stale; run computer_list_applications again before another launch",
+            "application_id is stale; run computer_observe(action=applications) again before another launch",
+            client_id,
             application_id,
         ),
         "invalid_request" => computer_application_effect_not_started(
             "invalid_request",
             "Runner rejected the application launch request before native dispatch",
+            client_id,
             application_id,
         ),
         "unsupported_platform" => computer_application_effect_not_started(
             "unsupported_platform",
             "application launch is unsupported by the target platform",
+            client_id,
             application_id,
         ),
         "application_failed" => computer_application_effect_not_started(
             "application_failed",
             "Native application identity could not be revalidated before native dispatch",
+            client_id,
             application_id,
         ),
         "outcome_unknown" => computer_application_effect_outcome_unknown(
             "Runner reported an uncertain native application launch outcome",
+            client_id,
             application_id,
         ),
         _ => computer_application_effect_delivery_failure(
             "Runner application launch ended without a recognized structured result",
             request_dispatched,
+            client_id,
             application_id,
         ),
     }
 }
 
-fn computer_text_input_runner_error(error: &str, request_dispatched: Option<bool>) -> ToolResult {
+fn computer_text_input_runner_error(
+    error: &str,
+    request_dispatched: Option<bool>,
+    client_id: &str,
+) -> ToolResult {
     let error_kind = classify_runner_error(error);
     match error_kind {
         "outcome_unknown" => computer_effect_outcome_unknown(
@@ -2236,7 +2534,11 @@ fn computer_text_input_runner_error(error: &str, request_dispatched: Option<bool
             error_kind,
             "Runner denied the bounded computer text input request",
         ),
-        "stale_surface" => computer_error(error_kind, "Computer text input surface is stale"),
+        "stale_surface" => computer_error_with_client(
+            error_kind,
+            "Computer text input surface is stale",
+            Some(client_id),
+        ),
         "stale_element" => computer_error(error_kind, "Computer text input element is stale"),
         "unsupported_platform" => computer_error(
             error_kind,

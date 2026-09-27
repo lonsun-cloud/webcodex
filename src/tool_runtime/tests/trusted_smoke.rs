@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CLIENT: &str = "smoke-agent";
+const TRUSTED_SMOKE_DISPATCH_DEADLINE_SECS: u64 = 30;
 
 /// Service any pending fake-agent request locally: shell/git commands run via
 /// `sh -c`; native file writes actually write into the fixture repo.
@@ -30,11 +31,11 @@ async fn dispatch_with_local_agent(
             runtime.dispatch_with_auth(call, Some(&bootstrap)).await
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(TRUSTED_SMOKE_DISPATCH_DEADLINE_SECS);
     while !task.is_finished() {
         assert!(
             Instant::now() < deadline,
-            "trusted smoke dispatch did not finish within the 10-second test deadline"
+            "trusted smoke dispatch did not finish within the {TRUSTED_SMOKE_DISPATCH_DEADLINE_SECS}-second test deadline"
         );
         poll_calls.fetch_add(1, Ordering::SeqCst);
         let request = runtime
@@ -158,8 +159,8 @@ async fn trusted_agent_smoke_full_chain_has_zero_approval_interruptions() {
             base_ref: None,
             instruction: "trusted agent smoke".to_string(),
             session_id: None,
-            include_project_instructions: true,
-            include_workflow_guidance: true,
+            guidance_profile: Default::default(),
+            include_extension_catalog: false,
         },
         &poll_calls,
     )
@@ -182,7 +183,7 @@ async fn trusted_agent_smoke_full_chain_has_zero_approval_interruptions() {
             content: "#!/bin/sh\ntest -f marker.txt\n".to_string(),
             session_id: Some(session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         },
         &poll_calls,
     )
@@ -195,10 +196,12 @@ async fn trusted_agent_smoke_full_chain_has_zero_approval_interruptions() {
     let failing = dispatch_with_local_agent(
         &runtime,
         ToolCall::RunShell {
+            login: false,
             project: project.clone(),
             command: "sh check.sh".to_string(),
             session_id: Some(session_id.clone()),
             timeout_secs: Some(30),
+            sync_wait_secs: Some(30),
             cwd: None,
             purpose: Some(ExecutionPurpose::Validation),
             shell: None,
@@ -223,7 +226,7 @@ async fn trusted_agent_smoke_full_chain_has_zero_approval_interruptions() {
             content: "present\n".to_string(),
             session_id: Some(session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         },
         &poll_calls,
     )
@@ -236,10 +239,12 @@ async fn trusted_agent_smoke_full_chain_has_zero_approval_interruptions() {
     let passing = dispatch_with_local_agent(
         &runtime,
         ToolCall::RunShell {
+            login: false,
             project: project.clone(),
             command: "sh check.sh".to_string(),
             session_id: Some(session_id.clone()),
             timeout_secs: Some(30),
+            sync_wait_secs: Some(30),
             cwd: None,
             purpose: Some(ExecutionPurpose::Validation),
             shell: None,

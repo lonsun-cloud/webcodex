@@ -175,8 +175,14 @@ mod select_lines_tests {
     }
 }
 
-pub(super) fn retain_ordinary_result_stream(value: Option<String>) -> Option<String> {
-    retain_result_stream_to(value, ORDINARY_RESULT_STREAM_RETENTION_BYTES)
+pub(super) fn retain_ordinary_result_stream_with_evidence(
+    value: Option<String>,
+) -> (Option<String>, bool) {
+    retain_result_stream_to_with_evidence(value, ORDINARY_RESULT_STREAM_RETENTION_BYTES)
+}
+
+pub(super) fn combine_result_stream_truncation(runner_reported: bool, server_side: bool) -> bool {
+    runner_reported || server_side
 }
 
 fn retain_live_job_stream(value: Option<String>) -> Option<String> {
@@ -184,21 +190,57 @@ fn retain_live_job_stream(value: Option<String>) -> Option<String> {
 }
 
 pub(super) fn retain_result_stream_to(value: Option<String>, max_bytes: usize) -> Option<String> {
-    value.map(|s| {
-        if s.len() <= max_bytes {
-            s
-        } else {
-            let mut start = s.len() - max_bytes;
-            while start < s.len() && !s.is_char_boundary(start) {
-                start += 1;
-            }
-            format!(
-                "[output truncated to last {} bytes]\n{}",
-                max_bytes,
-                &s[start..]
-            )
-        }
-    })
+    retain_result_stream_to_with_evidence(value, max_bytes).0
+}
+
+pub(super) fn retain_result_stream_to_with_evidence(
+    value: Option<String>,
+    max_bytes: usize,
+) -> (Option<String>, bool) {
+    let Some(s) = value else {
+        return (None, false);
+    };
+    if s.len() <= max_bytes {
+        return (Some(s), false);
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    (
+        Some(format!(
+            "[output truncated to last {} bytes]\n{}",
+            max_bytes,
+            &s[start..]
+        )),
+        true,
+    )
+}
+
+#[cfg(test)]
+mod result_retention_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_result_retention_reports_server_side_truncation() {
+        let (small, small_truncated) =
+            retain_result_stream_to_with_evidence(Some("small".to_string()), 8);
+        assert_eq!(small.as_deref(), Some("small"));
+        assert!(!small_truncated);
+
+        let (large, large_truncated) =
+            retain_result_stream_to_with_evidence(Some("0123456789".to_string()), 4);
+        assert!(large_truncated);
+        assert!(large.unwrap().ends_with("6789"));
+    }
+
+    #[test]
+    fn runner_and_server_truncation_evidence_is_combined_with_or() {
+        assert!(!combine_result_stream_truncation(false, false));
+        assert!(combine_result_stream_truncation(true, false));
+        assert!(combine_result_stream_truncation(false, true));
+        assert!(combine_result_stream_truncation(true, true));
+    }
 }
 
 pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
@@ -248,6 +290,7 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         codex: job.codex.clone(),
         result,
         validation_progress: job.validation_progress.clone(),
+        test_count_evidence: job.test_count_evidence.clone(),
         activity: job.activity,
         validation: job.validation.clone(),
         recovery_state: job.recovery.public_state().map(str::to_string),
@@ -255,9 +298,9 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         reconciled_at: job.recovery.reconciled_at,
         recovery_reason_code: job.recovery.public_reason().map(str::to_string),
         // General lifecycle views do not project log bodies, so they retain a
-        // cursor-less legacy token. `job_log_for_auth` replaces this with a
-        // cursor-aware v2 token for its frozen returned log snapshot.
-        observation_token: webcodex_core::job_observation::JobObservationToken::new_legacy(
+        // cursor-less baseline token. `job_log_for_auth` replaces this with a
+        // cursor-aware token for its frozen returned log snapshot.
+        observation_token: webcodex_core::job_observation::JobObservationToken::new_baseline(
             job.job_id.clone(),
             job.observation.epoch.to_string(),
             job.observation
@@ -473,6 +516,9 @@ pub(super) fn is_final_job_status(status: &str) -> bool {
 pub(super) fn observe_job_terminal(job: &mut ShellJobRecord, now: i64) {
     if job.lifecycle.is_terminal() && job.observation.terminal_observed_at.is_none() {
         job.observation.terminal_observed_at = Some(now);
+        if let Some(candidates) = &job.observation.terminal_event_candidates {
+            candidates.lock().unwrap().insert(job.job_id.clone());
+        }
     }
 }
 
@@ -486,6 +532,11 @@ pub(super) fn notify_job_update(job: &ShellJobRecord) {
     use std::sync::atomic::Ordering;
     job.observation.revision.fetch_add(1, Ordering::Relaxed);
     job.observation.notify.notify_waiters();
+    if job.lifecycle.is_terminal() {
+        if let Some(candidates) = &job.observation.receipt_candidates {
+            candidates.lock().unwrap().insert(job.job_id.clone());
+        }
+    }
 }
 
 pub(super) fn is_runner_active_job_status(status: &str) -> bool {

@@ -71,7 +71,7 @@ const SEARCH_PROJECT_TEXT_RG_EXCLUDE_GLOBS: &[&str] = &[
     "!**/*.key",
 ];
 
-pub(crate) const MAX_SEARCH_CONTEXT_LINES: usize = 20;
+pub(crate) const MAX_SEARCH_CONTEXT_LINES: usize = 80;
 pub(crate) const MAX_SEARCH_GLOBS: usize = 32;
 pub(crate) const MAX_SEARCH_GLOB_BYTES: usize = 256;
 pub(crate) const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 30;
@@ -217,7 +217,7 @@ impl SearchOptions {
         if !exclude_globs.is_empty() {
             requested_features.push("exclude_globs".to_string());
         }
-        if result_mode != SearchResultMode::Matches {
+        if result_mode == SearchResultMode::Count {
             requested_features.push(format!("result_mode={}", result_mode.as_str()));
         }
 
@@ -245,7 +245,7 @@ impl SearchOptions {
     pub(crate) fn requires_ripgrep(&self) -> bool {
         !self.include_globs.is_empty()
             || !self.exclude_globs.is_empty()
-            || self.result_mode != SearchResultMode::Matches
+            || self.result_mode == SearchResultMode::Count
     }
 }
 
@@ -565,12 +565,10 @@ exit "$status""#,
 /// byte only as proof of truncation and never exposes it. A record cut mid-line
 /// is dropped and reports `truncation_reason = "output_bytes"`.
 ///
-/// Kept at 32 KiB, not larger: unit tests execute the same command through
-/// [`run_command_sync`](crate::tool_runtime::helpers::run_command_sync), whose
-/// polling loop does not drain stdout while waiting. Output over the ~64 KiB
-/// Linux pipe buffer would block the producer until the hard timeout. 32 KiB
-/// plus the backend marker stays comfortably under that buffer while still
-/// bounding any single over-long record well below the transport cap.
+/// Kept at 32 KiB so a single over-long record remains well below the Runner
+/// transport cap while still leaving useful room for the bounded marker and
+/// result metadata. The test harness drains subprocess pipes concurrently, so
+/// this production budget does not depend on host-specific pipe capacity.
 pub(crate) const SEARCH_OUTPUT_BYTE_BUDGET: usize = 32 * 1024;
 
 fn search_output_line_budget(options: &SearchOptions) -> usize {
@@ -618,7 +616,7 @@ fn ripgrep_search_command(options: &SearchOptions) -> String {
             options.context_before, options.context_after
         ),
         SearchResultMode::FilesWithMatches => "--files-with-matches".to_string(),
-        SearchResultMode::Count => "--count --null".to_string(),
+        SearchResultMode::Count => "--with-filename --count --null".to_string(),
     };
     // Deliberately no `--sort path`: a global sort forces ripgrep to scan and
     // buffer the whole search space before emitting anything, so a small
@@ -635,18 +633,24 @@ fn grep_search_command(options: &SearchOptions) -> String {
         SearchPatternMode::Regex => "-E ",
         SearchPatternMode::Literal => "-F ",
     };
+    let mode_args = match options.result_mode {
+        SearchResultMode::Matches => format!(
+            "-rHnI --null -B {} -A {}",
+            options.context_before, options.context_after
+        ),
+        SearchResultMode::FilesWithMatches => "-rlI".to_string(),
+        SearchResultMode::Count => unreachable!("count mode requires ripgrep"),
+    };
     format!(
-        "grep -rnI --null {pattern_mode_arg}{excludes} -B {before} -A {after} -e {pattern} -- {target} 2>/dev/null",
+        "grep {mode_args} {pattern_mode_arg}{excludes} -e {pattern} -- {target} 2>/dev/null",
         excludes = search_project_text_exclude_args(),
-        before = options.context_before,
-        after = options.context_after,
         pattern = shell_escape_simple(&options.pattern),
         target = shell_escape_simple(&options.path),
     )
 }
 
 /// Build one bounded capability-selecting command for every search mode. Basic
-/// matches calls retain grep fallback; requests that need full capabilities
+/// matches and files-with-matches calls retain grep fallback; requests that need full capabilities
 /// emit a machine-readable marker when ripgrep is unavailable.
 pub(crate) fn search_project_text_command(options: &SearchOptions) -> String {
     search_project_text_command_with_head_fallbacks(
@@ -828,6 +832,36 @@ struct SearchFileCount {
     match_count: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct CountParseEvidence {
+    data_record_seen: bool,
+    parsed_record_count: usize,
+    safe_record_seen: bool,
+    filtered_record_seen: bool,
+    malformed_record_seen: bool,
+}
+
+impl CountParseEvidence {
+    fn parsed_record_seen(self) -> bool {
+        self.parsed_record_count > 0
+    }
+
+    fn projection_complete(self) -> bool {
+        !self.filtered_record_seen
+            && !self.malformed_record_seen
+            && (!self.parsed_record_seen() || self.safe_record_seen)
+    }
+}
+
+#[derive(Debug)]
+struct ParsedFileCounts {
+    files: Vec<SearchFileCount>,
+    returned_match_count: u64,
+    limit_truncated: bool,
+    bytes_truncated: bool,
+    evidence: CountParseEvidence,
+}
+
 #[derive(Debug)]
 enum SearchResultData {
     Matches(Vec<SearchMatch>),
@@ -836,6 +870,7 @@ enum SearchResultData {
         files: Vec<SearchFileCount>,
         returned_match_count: u64,
         count_complete: bool,
+        evidence: CountParseEvidence,
     },
 }
 
@@ -890,6 +925,7 @@ fn search_result_has_records(result: &SearchResult) -> bool {
 struct SearchBackendStatus {
     backend: String,
     feature_unavailable: bool,
+    path_not_found: bool,
     marker_present: bool,
     marker_invalid: bool,
     payload_start: usize,
@@ -899,6 +935,7 @@ fn missing_search_backend_status(marker_invalid: bool) -> SearchBackendStatus {
     SearchBackendStatus {
         backend: "grep".to_string(),
         feature_unavailable: false,
+        path_not_found: false,
         marker_present: false,
         marker_invalid,
         payload_start: 0,
@@ -945,12 +982,18 @@ fn parse_search_backend_status(stdout: &str) -> SearchBackendStatus {
     {
         return missing_search_backend_status(true);
     }
+    let path_not_found = match marker.get("path_status") {
+        None => false,
+        Some(value) if value.as_str() == Some("not_found") => true,
+        Some(_) => return missing_search_backend_status(true),
+    };
     SearchBackendStatus {
         backend: backend.to_string(),
         feature_unavailable: marker
             .get("feature_unavailable")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        path_not_found,
         marker_present: true,
         marker_invalid: false,
         payload_start,
@@ -1231,13 +1274,15 @@ fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool, bool)
     )
 }
 
-fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, bool, bool) {
+fn parse_file_counts(stdout: &str, limit: usize) -> ParsedFileCounts {
     let (lines, bytes_truncated) = split_complete_search_lines(stdout);
     let mut counts = Vec::<(String, u64)>::new();
+    let mut evidence = CountParseEvidence::default();
     for line in lines {
         if serde_json::from_str::<Value>(line).is_ok() {
             continue;
         }
+        evidence.data_record_seen = true;
         let parsed = line
             .split_once('\0')
             .or_else(|| line.rsplit_once(':'))
@@ -1245,29 +1290,38 @@ fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, 
                 Some((path, count.trim_end_matches('\r').parse::<u64>().ok()?))
             });
         let Some((path, count)) = parsed else {
+            evidence.malformed_record_seen = true;
             continue;
         };
+        evidence.parsed_record_count = evidence.parsed_record_count.saturating_add(1);
+        if count == 0 {
+            evidence.malformed_record_seen = true;
+            continue;
+        }
         let Some(path) = normalize_search_record_path(path) else {
+            evidence.filtered_record_seen = true;
             continue;
         };
+        evidence.safe_record_seen = true;
         if let Some((_, existing)) = counts.iter_mut().find(|(existing, _)| existing == &path) {
             *existing = existing.saturating_add(count);
         } else {
             counts.push((path, count));
         }
     }
-    let limit_truncated = counts.len() > limit;
+    let limit_truncated = evidence.parsed_record_count > limit;
     counts.truncate(limit);
     let returned_match_count = counts.iter().map(|(_, count)| *count).sum();
-    (
-        counts
+    ParsedFileCounts {
+        files: counts
             .into_iter()
             .map(|(path, match_count)| SearchFileCount { path, match_count })
             .collect(),
         returned_match_count,
         limit_truncated,
         bytes_truncated,
-    )
+        evidence,
+    }
 }
 
 fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -> SearchResult {
@@ -1292,18 +1346,20 @@ fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -
             )
         }
         SearchResultMode::Count => {
-            let (files, returned_match_count, limit_truncated, bytes_truncated) =
-                parse_file_counts(stdout, options.limit);
+            let parsed = parse_file_counts(stdout, options.limit);
+            let count_complete = !parsed.limit_truncated
+                && !parsed.bytes_truncated
+                && !result_retention_truncated
+                && parsed.evidence.projection_complete();
             (
                 SearchResultData::Count {
-                    files,
-                    returned_match_count,
-                    count_complete: !limit_truncated
-                        && !bytes_truncated
-                        && !result_retention_truncated,
+                    files: parsed.files,
+                    returned_match_count: parsed.returned_match_count,
+                    count_complete,
+                    evidence: parsed.evidence,
                 },
-                limit_truncated,
-                bytes_truncated,
+                parsed.limit_truncated,
+                parsed.bytes_truncated,
             )
         }
     };
@@ -1364,8 +1420,19 @@ pub(crate) fn search_project_text_output_with_agent_error(
             exit_code,
         );
     }
+    if backend_status.path_not_found {
+        return search_failure_tool_result(
+            options,
+            "search_path_not_found",
+            "path_resolution",
+            "not_found",
+            "search_project_text path was not found",
+            None,
+            None,
+        );
+    }
     if backend_status.feature_unavailable {
-        let message = "ripgrep is required for the requested search_project_text features; grep fallback supports only basic matches requests";
+        let message = "ripgrep is required for the requested search_project_text features; grep fallback supports matches and files_with_matches without globs";
         let mut result = search_failure_tool_result(
             options,
             "search_backend_feature_unavailable",
@@ -1421,16 +1488,20 @@ pub(crate) fn search_project_text_output_with_agent_error(
     }
 
     let result = parse_search_result(stdout, options, backend_status.backend.clone());
-    // Search status is part of the evidence contract: 0 means at least one
-    // match, 1 means a completed no-match scan, and 141 means bounded output
-    // stopped after at least one complete record. If parsed safe records
-    // disagree, output was malformed, transport-incomplete, or entirely
-    // rejected by the path/privacy filter. Returning an empty success in any
-    // of those cases would falsely claim proven absence.
+    // Search status is backend evidence, not a statement about the final safe
+    // projection. Count mode therefore distinguishes parseable backend count
+    // records from records later removed by path/privacy filtering. A malformed
+    // count stream still fails closed; a filtered-but-parseable stream remains
+    // an incomplete observation rather than a false no-match or protocol error.
     let has_records = search_result_has_records(&result);
-    let status_consistent = match exit_code {
-        Some(1) => !has_records,
-        Some(0 | 141) => has_records,
+    let status_consistent = match (&result.data, exit_code) {
+        (SearchResultData::Count { evidence, .. }, Some(1)) => !evidence.data_record_seen,
+        (SearchResultData::Count { evidence, .. }, Some(0 | 141)) => {
+            !evidence.malformed_record_seen
+                && (evidence.parsed_record_seen() || result.truncation_reason.is_some())
+        }
+        (_, Some(1)) => !has_records,
+        (_, Some(0 | 141)) => has_records,
         _ => true,
     };
     if !status_consistent {
@@ -1481,6 +1552,7 @@ fn search_result_json(
             files,
             returned_match_count,
             count_complete,
+            evidence: _,
         } => {
             output["returned_file_count"] = json!(files.len());
             output["returned_match_count"] = json!(returned_match_count);
@@ -1551,63 +1623,6 @@ fn empty_search_project_text_output(project: &str, options: &SearchOptions) -> T
 /// Maximum accepted size for `write_project_file` `content`.
 
 impl ToolRuntime {
-    /// `search_project_text`: bounded rg-first text search with grep fallback.
-    /// Excludes sensitive/build paths by default. Each match carries a
-    /// project-relative path, 1-based line number, preview line, and bounded
-    /// context arrays.
-    pub(crate) async fn search_project_text(
-        &self,
-        project: String,
-        pattern: String,
-        pattern_mode: Option<SearchPatternMode>,
-        path: Option<String>,
-        limit: Option<usize>,
-        context_before: Option<usize>,
-        context_after: Option<usize>,
-        include_globs: Option<Vec<String>>,
-        exclude_globs: Option<Vec<String>>,
-        result_mode: Option<SearchResultMode>,
-        timeout_secs: Option<i64>,
-    ) -> ToolResult {
-        let request = SearchRequest {
-            pattern,
-            path,
-            limit,
-            context_before,
-            context_after,
-            include_globs,
-            exclude_globs,
-            result_mode,
-            timeout_secs,
-        };
-        // Preserve the single-query validation-before-resolution ordering.
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        self.search_one_resolved_project_text(&proj, &project, options, None)
-            .await
-    }
-
-    pub(crate) async fn search_project_text_resolved(
-        &self,
-        resolved: &ResolvedProject,
-        output_project: &str,
-        request: SearchRequest,
-        pattern_mode: Option<SearchPatternMode>,
-    ) -> ToolResult {
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        self.search_one_resolved_project_text(&resolved.config, output_project, options, None)
-            .await
-    }
-
     pub(crate) async fn search_one_resolved_project_text(
         &self,
         proj: &ProjectConfig,
@@ -1659,6 +1674,7 @@ impl ToolRuntime {
             .runner_registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id,
                     cwd: Some(proj.path.clone()),
                     command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
@@ -2281,7 +2297,7 @@ mod tests {
         .unwrap();
         let command = search_project_text_command(&options);
         assert!(command.contains("--fixed-strings"));
-        assert!(command.contains("grep -rnI --null -F"));
+        assert!(command.contains("grep -rHnI --null -B 0 -A 0 -F"));
         let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
         assert_eq!(exit_code, 0, "stderr: {stderr}");
         let result =
@@ -2558,6 +2574,6 @@ mod tests {
             timeout_secs: None,
         })
         .unwrap();
-        assert_eq!((options.context_before, options.context_after), (20, 20));
+        assert_eq!((options.context_before, options.context_after), (21, 80));
     }
 }

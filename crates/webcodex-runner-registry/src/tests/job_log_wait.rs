@@ -38,14 +38,13 @@ fn wait_job_update(
         status: status.to_string(),
         stdout_chunk: stdout_chunk.map(str::to_string),
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: finished.then_some(0),
         duration_ms: finished.then_some(2_000),
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished,
     }
@@ -82,6 +81,7 @@ async fn start_wait_job(registry: &RunnerRegistry) -> crate::runner_protocol::Sh
     registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: Some("/tmp".to_string()),
@@ -199,12 +199,13 @@ async fn job_log_wait_epoch_mismatch_refreshes_immediately() {
 }
 
 #[tokio::test]
-async fn job_log_wait_rejects_wrong_job_malformed_and_oversized_tokens() {
+async fn job_log_wait_resets_cross_job_and_rejects_malformed_tokens() {
     let registry = RunnerRegistry::default();
     let first = start_wait_job(&registry).await;
     let second = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".into(),
                 client_id: Some("oe".into()),
                 cwd: Some("/tmp".into()),
@@ -221,19 +222,59 @@ async fn job_log_wait_rejects_wrong_job_malformed_and_oversized_tokens() {
         )
         .await
         .unwrap();
-    let wrong = registry
+    // Same epoch, same revision; A's cursor 3 is valid within B's retained
+    // [1, 4] range. Accepting it would silently omit B's first two lines.
+    registry
+        .update_job(wait_job_update(
+            "inst-wait",
+            &first.job_id,
+            1,
+            "running",
+            Some("a1\na2\n"),
+            false,
+        ))
+        .await
+        .unwrap();
+    registry
+        .update_job(wait_job_update(
+            "inst-wait",
+            &second.job_id,
+            1,
+            "running",
+            Some("b1\nb2\nb3\n"),
+            false,
+        ))
+        .await
+        .unwrap();
+    let (a, _, _, _, _, _) = registry
+        .job_log_for_auth(None, &first.job_id, None, None, Some(10), None, None)
+        .await
+        .unwrap();
+    let (b, output, _, _, _, observed) = registry
         .job_log_for_auth(
             None,
             &second.job_id,
             None,
             None,
-            None,
-            first.observation_token.as_deref(),
+            Some(10),
+            a.observation_token.as_deref(),
             Some(1),
         )
         .await
-        .unwrap_err();
-    assert!(wrong.contains("different Job"));
+        .unwrap();
+    let a_token =
+        crate::job_observation::JobObservationToken::parse(a.observation_token.as_deref().unwrap())
+            .unwrap();
+    let b_token =
+        crate::job_observation::JobObservationToken::parse(b.observation_token.as_deref().unwrap())
+            .unwrap();
+    assert_eq!(a_token.revision, b_token.revision);
+    assert_eq!(a_token.stdout_cursor, Some(3));
+    assert_eq!(output.as_deref(), Some("b1\nb2\nb3\n"));
+    assert_eq!(
+        observed.log_delta_status,
+        crate::job_observation::JobLogDeltaStatus::Reset
+    );
     let malformed = registry
         .job_log_for_auth(None, &first.job_id, None, None, None, Some("bad"), Some(1))
         .await
@@ -252,7 +293,7 @@ async fn job_log_wait_rejects_wrong_job_malformed_and_oversized_tokens() {
         )
         .await
         .unwrap_err();
-    assert!(oversized.contains("exceeds 192"));
+    assert!(oversized.contains("exceeds 62"));
 }
 
 #[tokio::test]
@@ -344,7 +385,7 @@ async fn job_log_wait_stale_or_replayed_sequence_does_not_change_token() {
 }
 
 #[tokio::test]
-async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
+async fn job_log_wait_sequenced_update_changes_token_even_when_snapshot_is_same() {
     let registry = RunnerRegistry::default();
     let job = start_wait_job(&registry).await;
     registry
@@ -357,14 +398,21 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             status: "running".into(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: Some("same\n".into()),
-            stderr_tail: None,
-            log_snapshot: None,
+            log_snapshot: Some(ShellJobLogSnapshot {
+                stdout: ShellJobStreamSnapshot {
+                    tail: "same\n".into(),
+                    first_retained_line: 1,
+                    next_line: 2,
+                    truncated: false,
+                },
+                stderr: ShellJobStreamSnapshot::default(),
+            }),
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -386,14 +434,21 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             status: "running".into(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: Some("same\n".into()),
-            stderr_tail: None,
-            log_snapshot: None,
+            log_snapshot: Some(ShellJobLogSnapshot {
+                stdout: ShellJobStreamSnapshot {
+                    tail: "same\n".into(),
+                    first_retained_line: 1,
+                    next_line: 2,
+                    truncated: false,
+                },
+                stderr: ShellJobStreamSnapshot::default(),
+            }),
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -437,7 +492,7 @@ async fn job_log_wait_recovery_transition_between_calls_is_immediate() {
 }
 
 #[tokio::test]
-async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
+async fn job_log_wait_unsequenced_update_between_calls_and_noop_update() {
     let registry = RunnerRegistry::default();
     let capabilities = RunnerCapabilities {
         async_jobs: true,
@@ -468,6 +523,7 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("legacy".to_string()),
                 cwd: Some("/tmp".to_string()),
@@ -485,27 +541,29 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
         .await
         .unwrap();
     let token0 = job.observation_token.clone().unwrap();
-    let update = || RunnerJobUpdateRequest {
+    let update = |stdout_chunk: Option<&str>| RunnerJobUpdateRequest {
         client_id: "legacy".to_string(),
         runner_instance_id: "legacy-inst".to_string(),
         update_seq: None,
         job_id: job.job_id.clone(),
         request_id: None,
         status: "running".to_string(),
-        stdout_chunk: None,
+        stdout_chunk: stdout_chunk.map(str::to_string),
         stderr_chunk: None,
-        stdout_tail: Some("legacy output\n".to_string()),
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: None,
         duration_ms: None,
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished: false,
     };
-    registry.update_job(update()).await.unwrap();
+    registry
+        .update_job(update(Some("legacy output\n")))
+        .await
+        .unwrap();
     let (info, stdout, _, _, _, wait) = registry
         .job_log_for_auth(None, &job.job_id, None, None, None, Some(&token0), Some(5))
         .await
@@ -514,14 +572,14 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
     assert!(wait.changed);
     assert_eq!(stdout.as_deref(), Some("legacy output\n"));
     let token1 = info.observation_token.unwrap();
-    registry.update_job(update()).await.unwrap();
+    registry.update_job(update(None)).await.unwrap();
     let current = registry.get_job(&job.job_id).await.unwrap();
     let response_token = crate::job_observation::JobObservationToken::parse(&token1).unwrap();
     let lifecycle_token = crate::job_observation::JobObservationToken::parse(
         current.observation_token.as_deref().unwrap(),
     )
     .unwrap();
-    assert_eq!(response_token.epoch, lifecycle_token.epoch);
+    assert_eq!(response_token.binding, lifecycle_token.binding);
     assert_eq!(response_token.revision, lifecycle_token.revision);
     assert_eq!(response_token.stdout_cursor, Some(2));
     assert_eq!(response_token.stderr_cursor, Some(1));
@@ -564,6 +622,7 @@ async fn job_log_wait_activity_only_legacy_transition_advances_revision_and_wake
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".into(),
                 client_id: Some("activity-legacy".into()),
                 cwd: Some("/tmp".into()),
@@ -589,14 +648,13 @@ async fn job_log_wait_activity_only_legacy_transition_advances_revision_and_wake
         status: "running".into(),
         stdout_chunk: None,
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: None,
         duration_ms: None,
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished: false,
     };
@@ -767,14 +825,13 @@ async fn agent_job_log_observation_is_baseline_then_independent_deltas() {
             status: "running".into(),
             stdout_chunk: None,
             stderr_chunk: Some("stderr 1\nstderr 2\n".into()),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -965,14 +1022,13 @@ async fn agent_job_log_replays_partial_lines_until_each_stream_completes() {
             status: "running".into(),
             stdout_chunk: None,
             stderr_chunk: Some("err".into()),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -1003,14 +1059,13 @@ async fn agent_job_log_replays_partial_lines_until_each_stream_completes() {
             status: "completed".into(),
             stdout_chunk: None,
             stderr_chunk: Some("or\n".into()),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(2_000),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })
@@ -1083,7 +1138,7 @@ async fn agent_job_log_resets_when_retention_advances_past_token_cursor() {
 }
 
 #[tokio::test]
-async fn agent_job_log_bounded_wait_uses_v2_delta_and_timeout_is_empty() {
+async fn agent_job_log_bounded_wait_uses_compact_delta_and_timeout_is_empty() {
     let registry = RunnerRegistry::default();
     let job = start_wait_job(&registry).await;
     let (baseline_job, _, _, _, _, _) = registry
@@ -1144,4 +1199,17 @@ async fn agent_job_log_bounded_wait_uses_v2_delta_and_timeout_is_empty() {
     );
     assert_eq!(stdout.as_deref(), Some(""));
     assert_eq!(stderr.as_deref(), Some(""));
+}
+
+#[test]
+fn compact_job_allocation_retries_only_occupied_ids() {
+    let first = format!("wc_job_{}", webcodex_core::compact::random_suffix::<12>());
+    let next = format!("wc_job_{}", webcodex_core::compact::random_suffix::<12>());
+    let jobs = std::collections::HashMap::from([(first.clone(), 7)]);
+    let mut candidates = [first.clone(), next.clone()].into_iter();
+    let result = crate::job_updates::allocate_job_id(&jobs, || candidates.next().unwrap()).unwrap();
+    assert_eq!(result, next);
+    assert_eq!(result.len(), 23);
+    assert_eq!(jobs[&first], 7);
+    assert!(crate::job_updates::allocate_job_id(&jobs, || first.clone()).is_err());
 }

@@ -59,35 +59,43 @@ impl CheckpointStore {
             .join(format!("{checkpoint_id}.json")))
     }
 
-    fn write(
+    fn create(&self, resolved_project: &str, checkpoint: &mut Value) -> Result<PathBuf, String> {
+        self.create_with(resolved_project, checkpoint, || {
+            format!(
+                "{CHECKPOINT_ID_PREFIX}{}",
+                webcodex_core::compact::random_suffix::<12>()
+            )
+        })
+    }
+
+    fn create_with(
         &self,
         resolved_project: &str,
-        checkpoint_id: &str,
-        checkpoint: &Value,
+        checkpoint: &mut Value,
+        mut generate: impl FnMut() -> String,
     ) -> Result<PathBuf, String> {
-        let path = self.checkpoint_path(resolved_project, checkpoint_id)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| "checkpoint path has no parent".to_string())?;
-        fs::create_dir_all(parent)
+        let parent = self.project_dir(resolved_project);
+        fs::create_dir_all(&parent)
             .map_err(|err| format!("failed to create checkpoint dir: {err}"))?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("checkpoint.json");
-        let tmp = path.with_file_name(format!(
-            ".{file_name}.tmp-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let data = serde_json::to_vec_pretty(checkpoint)
-            .map_err(|err| format!("failed to serialize checkpoint: {err}"))?;
-        fs::write(&tmp, data)
-            .and_then(|_| fs::rename(&tmp, &path))
-            .map_err(|err| {
-                let _ = fs::remove_file(&tmp);
-                format!("failed to write checkpoint: {err}")
-            })?;
-        Ok(path)
+        for _ in 0..16 {
+            let checkpoint_id = generate();
+            let path = self.checkpoint_path(resolved_project, &checkpoint_id)?;
+            checkpoint["checkpoint_id"] = json!(checkpoint_id);
+            let data = serde_json::to_vec_pretty(checkpoint)
+                .map_err(|err| format!("failed to serialize checkpoint: {err}"))?;
+            let tmp = parent.join(format!(".checkpoint.tmp-{}", uuid::Uuid::new_v4().simple()));
+            // Publish the complete file without replacing another checkpoint.
+            // Same-directory hard linking arbitrates concurrent creators atomically.
+            fs::write(&tmp, data).map_err(|err| format!("failed to write checkpoint: {err}"))?;
+            let published = fs::hard_link(&tmp, &path);
+            let _ = fs::remove_file(&tmp);
+            match published {
+                Ok(()) => return Ok(path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("failed to publish checkpoint: {err}")),
+            }
+        }
+        Err("checkpoint identity allocation exhausted".to_string())
     }
 
     fn load(
@@ -253,7 +261,6 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
         };
-        let checkpoint_id = format!("{CHECKPOINT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let include_untracked = include_untracked.unwrap_or(false);
         let helper_output = match self
             .run_checkpoint_create(&resolved.config, include_untracked)
@@ -274,7 +281,6 @@ impl ToolRuntime {
         }
         let mut checkpoint = helper_output;
         checkpoint["version"] = json!(CHECKPOINT_VERSION);
-        checkpoint["checkpoint_id"] = json!(checkpoint_id);
         checkpoint["project"] = json!(project);
         checkpoint["project_input"] = json!(resolved.input);
         checkpoint["resolved_project"] = json!(resolved.resolved_id);
@@ -286,11 +292,10 @@ impl ToolRuntime {
         checkpoint["validation"] = metadata.validation;
         checkpoint["created_at"] = json!(chrono::Utc::now().timestamp());
 
-        let storage_path = match self.checkpoint_store.write(
-            checkpoint["resolved_project"].as_str().unwrap_or_default(),
-            checkpoint["checkpoint_id"].as_str().unwrap_or_default(),
-            &checkpoint,
-        ) {
+        let storage_path = match self
+            .checkpoint_store
+            .create(&resolved.resolved_id, &mut checkpoint)
+        {
             Ok(path) => path,
             Err(err) => return ToolResult::err(err),
         };
@@ -895,15 +900,37 @@ fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
     let Some(rest) = checkpoint_id.strip_prefix(CHECKPOINT_ID_PREFIX) else {
         return Err("checkpoint_id must start with wc_ckpt_".to_string());
     };
-    if rest.is_empty() || rest.len() > 64 {
-        return Err("checkpoint_id has invalid length".to_string());
-    }
-    if !rest
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    {
-        return Err("checkpoint_id contains invalid characters".to_string());
+    if webcodex_core::compact::decode::<12>(rest).is_none() {
+        return Err("checkpoint_id must have a canonical compact suffix".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_publication_retries_collision_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(temp.path());
+        let occupied = "wc_ckpt_AAAAAAAAAAAAAAAA";
+        let fresh = "wc_ckpt_AAAAAAAAAAAAAAAB";
+        let mut first = json!({"title": "preserve"});
+        let path = store
+            .create_with("project", &mut first, || occupied.into())
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut candidates = [occupied, fresh].into_iter();
+        let mut second = json!({"title": "new"});
+        let created = store
+            .create_with("project", &mut second, || candidates.next().unwrap().into())
+            .unwrap();
+        assert_eq!(second["checkpoint_id"], fresh);
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert_eq!(created.file_stem().unwrap().len(), 24);
+        assert!(store
+            .create_with("project", &mut second, || occupied.into())
+            .is_err());
+    }
 }

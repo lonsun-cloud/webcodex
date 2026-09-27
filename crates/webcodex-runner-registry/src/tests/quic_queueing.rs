@@ -8,6 +8,7 @@ async fn registry_allows_quic_run_queueing() {
     let (_request_id, _rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "quic-run".to_string(),
                 cwd: None,
                 command: "echo hi".to_string(),
@@ -105,8 +106,8 @@ async fn registry_allows_quic_v1_file_and_project_ops_queueing() {
                 pattern: None,
                 expected_sha256: None,
                 expected_prefix: None,
-                start_line: None,
-                end_line: None,
+                start_line: Some(1),
+                end_line: Some(1),
                 line: None,
                 create_dirs: false,
                 wait_timeout_secs: 0,
@@ -138,6 +139,7 @@ async fn registry_allows_quic_v1_start_job_queueing() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("quic-job".to_string()),
                 cwd: None,
@@ -187,6 +189,7 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("quic-stop".to_string()),
                 cwd: None,

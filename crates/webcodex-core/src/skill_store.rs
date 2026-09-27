@@ -33,86 +33,6 @@ pub const MAX_SKILL_STORE_READ_TEXT_BYTES: usize = 48 * 1024;
 pub const MAX_SKILL_STORE_VERSIONS_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum SkillStoreRequest {
-    ListActive,
-    Versions {
-        skill_key: String,
-        #[serde(default)]
-        offset: usize,
-        limit: usize,
-    },
-    Read {
-        skill_id: String,
-        path: String,
-        start_line: usize,
-        limit: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_package_revision: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_definition_revision: Option<String>,
-    },
-    Install {
-        skill_key: String,
-        /// Authorized source Project identity used as part of install intent.
-        source_project_id: String,
-        /// Runner-native source project root derived by Control after project
-        /// authorization. This never appears in model-facing results/audit.
-        source_project_root: String,
-        artifact_path: String,
-        expected_artifact_sha256: String,
-        idempotency_key: String,
-        #[serde(default)]
-        activate: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_state_revision: Option<String>,
-    },
-    Activate {
-        skill_key: String,
-        package_revision: String,
-        expected_state_revision: String,
-        idempotency_key: String,
-    },
-    RemoveRevision {
-        skill_key: String,
-        package_revision: String,
-        expected_state_revision: String,
-        idempotency_key: String,
-    },
-}
-
-impl SkillStoreRequest {
-    /// Revision inventory belongs to the management surface even though it is
-    /// read-only. Active guidance discovery/read remains a separate capability.
-    pub fn requires_management_capability(&self) -> bool {
-        matches!(
-            self,
-            Self::Versions { .. }
-                | Self::Install { .. }
-                | Self::Activate { .. }
-                | Self::RemoveRevision { .. }
-        )
-    }
-
-    pub fn is_mutation(&self) -> bool {
-        matches!(
-            self,
-            Self::Install { .. } | Self::Activate { .. } | Self::RemoveRevision { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunnerSkillDescriptor {
-    pub skill_id: String,
-    pub skill_key: String,
-    pub name: String,
-    pub description: String,
-    pub package_revision: String,
-    pub definition_revision: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSkillVersion {
     pub package_revision: String,
     pub definition_revision: String,
@@ -121,13 +41,6 @@ pub struct RunnerSkillVersion {
     pub file_count: usize,
     pub total_bytes: usize,
     pub installed_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillStoreListActiveResponse {
-    pub format: String,
-    pub namespace_revision: String,
-    pub skills: Vec<RunnerSkillDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,27 +56,6 @@ pub struct SkillStoreVersionsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     pub versions: Vec<RunnerSkillVersion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillStoreReadResponse {
-    pub format: String,
-    pub skill_id: String,
-    pub skill_key: String,
-    pub name: String,
-    pub description: String,
-    pub package_revision: String,
-    pub definition_revision: String,
-    pub path: String,
-    pub sha256: String,
-    pub text: String,
-    pub start_line: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_line: Option<usize>,
-    pub returned_lines: usize,
-    pub has_more: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_start_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,11 +120,13 @@ pub fn valid_lower_sha256(value: &str) -> bool {
 pub fn valid_package_revision(value: &str) -> bool {
     value
         .strip_prefix("wc_skillpkg_")
-        .is_some_and(valid_lower_sha256)
+        .and_then(crate::compact::decode::<32>)
+        .is_some()
 }
 
 pub fn valid_state_revision(value: &str) -> bool {
     value
         .strip_prefix("wc_skillstate_")
-        .is_some_and(valid_lower_sha256)
+        .and_then(crate::compact::decode::<32>)
+        .is_some()
 }

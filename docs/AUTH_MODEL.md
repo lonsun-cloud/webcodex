@@ -21,7 +21,7 @@ Do not copy the Server bootstrap token to a client, and do not use a Runner toke
 | Personal API token (PAT) | `wc_pat_...` | MCP, GPT Actions, and runtime API access for a managed user |
 | Runner token | `wc_agent_...` | `webcodex-runner` transport only |
 | Shared key | `wck_...` | Hosted shared-key MCP/runtime access and the matching Runner group |
-| Project Credential | protected project-private file | One project-first Connector/share environment |
+| Project Credential | protected project-private file | One ProjectGrant's ordinary runtime API/MCP access |
 | OAuth access token | `wc_oat_...` | Delegated MCP/GPT access when OAuth is enabled |
 | Account credential | `wc_acct_...` | Advanced managed-account token creation only |
 
@@ -77,7 +77,9 @@ The protected profile stores the key after creation; repeated `connect` reuses i
 
 ## Project Credential
 
-`webcodex setup` and temporary project-first flows use a protected Project Credential tied to one project environment. It is not a general user/admin token and must not be reused for unrelated projects.
+`webcodex setup` and temporary project-first flows use a protected Project Credential tied to one ProjectGrant. It is not a general user/admin token and must not be reused for unrelated projects. ProjectGrant Runner visibility plus canonical Project resolution prevents a credential from listing, resolving, or calling Projects from another grant. Direct Adaptive tools and `call_runtime_tool` use the same authority boundary.
+
+Project-scoped credentials also cannot expand the Runner Project registry with ordinary `register_project`, `create_project`, or `unregister_project` operations. Path-based coding may reuse only an exact caller-visible registered Project; `work_on_project(mode=worktree)` is the canonical exception that may derive a managed worktree Project from that already-authorized source Project.
 
 After verification, WebCodex keeps the non-secret authorization metadata it needs internally. It is not another credential the user needs to copy or manage.
 

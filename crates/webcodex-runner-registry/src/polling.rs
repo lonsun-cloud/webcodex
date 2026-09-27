@@ -1,6 +1,7 @@
 use super::jobs::{
-    assert_active_instance_locked, observe_job_terminal, replace_log_limited, request_preview,
-    retain_ordinary_result_stream, retain_result_stream_to,
+    assert_active_instance_locked, combine_result_stream_truncation, observe_job_terminal,
+    replace_log_limited, request_preview, retain_ordinary_result_stream_with_evidence,
+    retain_result_stream_to_with_evidence,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
 use super::state::JobLifecycleState;
@@ -17,7 +18,7 @@ use webcodex_core::plugin::{
     validate_response_for_request as validate_plugin_gateway_response, PluginDispatchState,
     PluginGatewayResponse,
 };
-use webcodex_core::runner_operation::{RunnerJobOperation, RunnerOperation};
+use webcodex_core::runner_operation::{RunnerFileOperation, RunnerJobOperation, RunnerOperation};
 use webcodex_core::runner_protocol::{
     RunnerPersistentShellResultRequest, RunnerPollRequest, RunnerRequest, RunnerResultPayload,
     ShellCommandExecutionState, ShellRunResponse,
@@ -92,6 +93,71 @@ impl RunnerRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
+            let stale_instruction_error =
+                inner.pending_by_id.get(&request_id).and_then(|pending| {
+                    match (
+                        &pending.operation,
+                        pending.expected_instruction_runner_instance_id.as_deref(),
+                    ) {
+                        (RunnerOperation::RunnerInstruction(_), Some(expected)) => {
+                            let Some(runner) = inner.runners.get(&body.client_id) else {
+                                return Some((
+                                "runner_replaced",
+                                "Exact Runner disappeared before instruction observation dispatch"
+                                    .to_string(),
+                            ));
+                            };
+                            if runner.runner_instance_id != expected {
+                                return Some((
+                                    "runner_replaced",
+                                    "Exact Runner changed before instruction observation dispatch"
+                                        .to_string(),
+                                ));
+                            }
+                            (!runner
+                                .runner_features
+                                .supports(RunnerFeature::InstructionRuntime))
+                            .then_some((
+                                "capability_unavailable",
+                                "Runner instruction-runtime capability changed before dispatch"
+                                    .to_string(),
+                            ))
+                        }
+                        (RunnerOperation::RunnerInstruction(_), None) => Some((
+                            "runner_replaced",
+                            "Runner instruction exact-process fence is missing".to_string(),
+                        )),
+                        (_, Some(_)) => Some((
+                            "runner_replaced",
+                            "Runner instruction exact-process fence is inconsistent".to_string(),
+                        )),
+                        _ => None,
+                    }
+                });
+            if let Some((code, message)) = stale_instruction_error {
+                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
+                    continue;
+                };
+                if let Some(waiter) = pending.waiter.take() {
+                    let _ = waiter.send(ShellRunResponse {
+                        success: false,
+                        request_id: request_id.clone(),
+                        client_id: body.client_id.clone(),
+                        cwd: None,
+                        command_preview: String::new(),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        duration_ms: None,
+                        error: Some(format!("{code}: {message}")),
+                        request_dispatched: Some(false),
+                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
+                    });
+                }
+                continue;
+            }
             let stale_runner_config_error =
                 inner.pending_by_id.get(&request_id).and_then(|pending| {
                     match (
@@ -147,6 +213,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(format!("{code}: {message}")),
                         request_dispatched: Some(false),
@@ -209,6 +277,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(format!("{code}: {message}")),
                         request_dispatched: Some(false),
@@ -297,6 +367,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error.clone()),
                         request_dispatched: Some(false),
@@ -376,6 +448,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(message.clone()),
                         request_dispatched: Some(false),
@@ -396,72 +470,44 @@ impl RunnerRegistry {
                 inner.persistent_waiters.remove(&request_id);
                 continue;
             }
-            let stale_skill_store_error =
-                inner.pending_by_id.get(&request_id).and_then(|pending| {
-                    match (&pending.operation, pending.skill_store_fence.as_ref()) {
-                        (RunnerOperation::SkillStore(_), Some(fence)) if !fence.configured_roots => {
-                            let Some(runner) = inner.runners.get(&body.client_id) else {
-                                return Some(
-                                    "stale_runner: Skill store target Runner disappeared before dispatch"
-                                        .to_string(),
-                                );
-                            };
-                            if runner.runner_instance_id != fence.runner_instance_id {
-                                return Some(
-                                    "stale_runner: Skill store target Runner changed before dispatch"
-                                        .to_string(),
-                                );
-                            }
-                            let required = if fence.management {
-                                RunnerFeature::SkillStoreManage
-                            } else {
-                                RunnerFeature::SkillStoreRead
-                            };
-                            (!runner.runner_features.supports(required)).then(|| {
-                                format!(
-                                    "skill_store_capability_unavailable: exact Runner no longer advertises {} before dispatch",
-                                    required.as_wire_name()
-                                )
-                            })
+            let stale_skill_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
+                match (&pending.operation, pending.skill_fence.as_ref()) {
+                    (RunnerOperation::Skill(_), Some(fence)) => {
+                        let Some(runner) = inner.runners.get(&body.client_id) else {
+                            return Some(
+                                "stale_runner: Skill target Runner disappeared before dispatch"
+                                    .to_string(),
+                            );
+                        };
+                        if runner.runner_instance_id != fence.runner_instance_id {
+                            return Some(
+                                "stale_runner: Skill target Runner changed before dispatch"
+                                    .to_string(),
+                            );
                         }
-                        (RunnerOperation::ConfiguredSkillRoots(_), Some(fence))
-                            if fence.configured_roots && !fence.management =>
-                        {
-                            let Some(runner) = inner.runners.get(&body.client_id) else {
-                                return Some(
-                                    "stale_runner: configured Skill roots target Runner disappeared before dispatch"
-                                        .to_string(),
-                                );
-                            };
-                            if runner.runner_instance_id != fence.runner_instance_id {
-                                return Some(
-                                    "stale_runner: configured Skill roots target Runner changed before dispatch"
-                                        .to_string(),
-                                );
-                            }
-                            (!runner
-                                .runner_features
-                                .supports(RunnerFeature::ConfiguredSkillRootsRead))
-                            .then(|| {
-                                "configured_skill_roots_capability_unavailable: exact Runner no longer advertises configured_skill_roots_read before dispatch"
-                                    .to_string()
-                            })
-                        }
-                        (RunnerOperation::SkillStore(_) | RunnerOperation::ConfiguredSkillRoots(_), None) => Some(
-                            "stale_runner: Skill source exact dispatch fence is missing".to_string(),
-                        ),
-                        (RunnerOperation::SkillStore(_) | RunnerOperation::ConfiguredSkillRoots(_), Some(_)) => Some(
-                            "stale_runner: Skill source dispatch fence mode does not match the request kind"
-                                .to_string(),
-                        ),
-                        (_, Some(_)) => Some(
-                            "stale_runner: Skill source dispatch fence is attached to the wrong request kind"
-                                .to_string(),
-                        ),
-                        (_, None) => None,
+                        let required = if fence.management {
+                            RunnerFeature::SkillManagement
+                        } else {
+                            RunnerFeature::SkillRuntime
+                        };
+                        (!runner.runner_features.supports(required)).then(|| {
+                            format!(
+                                "skill_capability_unavailable: exact Runner no longer advertises {} before dispatch",
+                                required.as_wire_name()
+                            )
+                        })
                     }
-                });
-            if let Some(error) = stale_skill_store_error {
+                    (RunnerOperation::Skill(_), None) => Some(
+                        "stale_runner: Skill exact dispatch fence is missing".to_string(),
+                    ),
+                    (_, Some(_)) => Some(
+                        "stale_runner: Skill dispatch fence is attached to the wrong request kind"
+                            .to_string(),
+                    ),
+                    (_, None) => None,
+                }
+            });
+            if let Some(error) = stale_skill_error {
                 let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
                     continue;
                 };
@@ -475,6 +521,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error),
                         request_dispatched: Some(false),
@@ -542,24 +590,45 @@ impl RunnerRegistry {
                     pending.expected_project_cwd.as_deref(),
                 ) {
                     (Some(project_id), Some(project_cwd)) => match inner.runners.get(&body.client_id) {
+                        Some(runner)
+                            if pending
+                                .expected_project_runner_instance_id
+                                .as_deref()
+                                .is_some_and(|expected| runner.runner_instance_id != expected) =>
+                        {
+                            Some(
+                                "stale_runner: target Runner changed before project file dispatch"
+                                    .to_string(),
+                            )
+                        }
                         Some(runner) if runner.owner != pending.expected_runner_owner => Some(
                             "stale_authority: target Runner owner changed before dispatch".to_string(),
                         ),
-                        Some(runner)
-                            if !runner.runner_features.supports(RunnerFeature::FileWrite) =>
-                        {
-                            Some(
-                            "stale_authority: target Runner no longer advertises file_write before dispatch"
-                                .to_string(),
-                            )
-                        }
-                        Some(runner)
-                            if runner.projects.iter().any(|project| {
+                        Some(runner) => {
+                            let required_feature = match &pending.operation {
+                                RunnerOperation::File(RunnerFileOperation::Read(_)) => {
+                                    RunnerFeature::FileRead
+                                }
+                                _ => RunnerFeature::FileWrite,
+                            };
+                            if !runner.runner_features.supports(required_feature) {
+                                Some(format!(
+                                    "stale_authority: target Runner no longer advertises {} before dispatch",
+                                    required_feature.as_wire_name()
+                                ))
+                            } else if runner.projects.iter().any(|project| {
                                 !project.disabled
                                     && project.id == project_id
                                     && project.path == project_cwd
-                            }) => None,
-                        Some(_) | None => Some(format!(
+                            }) {
+                                None
+                            } else {
+                                Some(format!(
+                                    "stale_project: target project {project_id} is no longer registered at the resolved path"
+                                ))
+                            }
+                        }
+                        None => Some(format!(
                             "stale_project: target project {project_id} is no longer registered at the resolved path"
                         )),
                     },
@@ -583,6 +652,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error),
                         request_dispatched: Some(false),
@@ -593,18 +664,29 @@ impl RunnerRegistry {
                 inner.persistent_waiters.remove(&request_id);
                 continue;
             }
-            let Some((request, operation, job_id)) =
+            let Some(dispatch_transport) = inner
+                .runners
+                .get(&body.client_id)
+                .map(|runner| runner.transport)
+            else {
+                return Err(format!("unknown shell client: {}", body.client_id));
+            };
+            let Some((request, operation, job_id, queue_wait)) =
                 inner.pending_by_id.get_mut(&request_id).map(|pending| {
                     pending.dispatched = true;
+                    pending.dispatched_transport = Some(dispatch_transport);
                     (
                         pending.request.clone(),
                         pending.operation.clone(),
                         pending.job_id.clone(),
+                        pending.enqueued_at.elapsed(),
                     )
                 })
             else {
                 continue;
             };
+            self.telemetry
+                .runner_request_dequeued(&request_id, dispatch_transport, queue_wait);
             if matches!(
                 &operation,
                 RunnerOperation::Job(RunnerJobOperation::Stop { .. })
@@ -705,8 +787,17 @@ impl RunnerRegistry {
         {
             return Err("unexpected Plugin gateway result for non-Plugin request".to_string());
         }
+        let request_round_trip = pending.enqueued_at.elapsed();
+        let dispatched_transport = pending.dispatched_transport;
         self.telemetry
             .runner_result_accepted(&body.request_id, &payload);
+        if let Some(transport) = dispatched_transport {
+            self.telemetry.runner_request_round_trip(
+                &body.request_id,
+                transport,
+                request_round_trip,
+            );
+        }
         let trace_request_id = body.request_id.clone();
         let RunnerResultPayload {
             result: body,
@@ -839,15 +930,26 @@ impl RunnerRegistry {
         // independently without silently constraining the other first.
         let raw_stdout = body.stdout;
         let raw_stderr = body.stderr;
-        let stdout = if pending.operation.is_large_native_image_request() {
-            retain_result_stream_to(
+        let (stdout, server_stdout_truncated) = if pending.operation.is_large_native_image_request()
+        {
+            retain_result_stream_to_with_evidence(
                 raw_stdout.clone(),
                 webcodex_core::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
             )
+        } else if pending.operation.is_large_internal_artifact_chunk_request() {
+            retain_result_stream_to_with_evidence(
+                raw_stdout.clone(),
+                webcodex_core::artifact_policy::MAX_INTERNAL_ARTIFACT_CHUNK_RESPONSE_BYTES,
+            )
         } else {
-            retain_ordinary_result_stream(raw_stdout.clone())
+            retain_ordinary_result_stream_with_evidence(raw_stdout.clone())
         };
-        let stderr = retain_ordinary_result_stream(raw_stderr.clone());
+        let (stderr, server_stderr_truncated) =
+            retain_ordinary_result_stream_with_evidence(raw_stderr.clone());
+        let stdout_truncated =
+            combine_result_stream_truncation(body.stdout_truncated, server_stdout_truncated);
+        let stderr_truncated =
+            combine_result_stream_truncation(body.stderr_truncated, server_stderr_truncated);
         let success = matches!(
             command_execution_state,
             None | Some(ShellCommandExecutionState::Completed)
@@ -883,6 +985,8 @@ impl RunnerRegistry {
             exit_code: body.exit_code,
             stdout,
             stderr,
+            stdout_truncated,
+            stderr_truncated,
             duration_ms: body.duration_ms,
             error,
             request_dispatched: Some(pending.dispatched),

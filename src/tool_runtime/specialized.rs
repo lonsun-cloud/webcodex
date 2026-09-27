@@ -38,6 +38,10 @@ pub(crate) async fn try_dispatch_specialized_gateway(
         request.tool_name.as_str(),
         crate::plugin_gateway::PLUGIN_TOOL_NAME
             | crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
+            | "browser_observe"
+            | "browser_act"
+            | "computer_observe"
+            | "computer_control"
     ) {
         return None;
     }
@@ -75,6 +79,46 @@ pub(crate) async fn try_dispatch_specialized_gateway(
         )
         .await
         .map(|invocation| invocation.to_tool_result()),
+        ToolCall::BrowserObserve(call) => {
+            runtime
+                .invoke_browser_observe_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
+        ToolCall::BrowserAct(call) => {
+            runtime
+                .invoke_browser_act_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
+        ToolCall::ComputerObserve(call) => {
+            runtime
+                .invoke_computer_observe_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
+        ToolCall::ComputerControl(call) => {
+            runtime
+                .invoke_computer_control_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
         _ => unreachable!("specialized gateway name must parse to its canonical ToolCall"),
     };
     Some(match invocation {
@@ -128,6 +172,8 @@ pub(crate) async fn try_dispatch_specialized_gateway(
 pub(crate) enum SpecializedSource {
     Plugin,
     SshResource,
+    Browser,
+    Computer,
 }
 
 impl SpecializedSource {
@@ -135,6 +181,8 @@ impl SpecializedSource {
         match self {
             Self::Plugin => "plugin",
             Self::SshResource => "ssh-resource",
+            Self::Browser => "browser",
+            Self::Computer => "computer",
         }
     }
 }
@@ -161,10 +209,43 @@ impl SpecializedEffect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecializedAuthorityRequirement {
+    Scope(&'static str),
+    All(&'static [&'static str]),
+}
+
+impl SpecializedAuthorityRequirement {
+    pub(crate) fn first_missing(self, auth: Option<&AuthContext>) -> Option<&'static str> {
+        let scope_missing = |scope: &'static str| match auth {
+            Some(auth) => !auth.has_scope(scope),
+            None => crate::auth::scopes::scope_requires_explicit_unauthenticated_authority(scope),
+        };
+        match self {
+            Self::Scope(scope) => scope_missing(scope).then_some(scope),
+            Self::All(scopes) => scopes.iter().copied().find(|scope| scope_missing(*scope)),
+        }
+    }
+
+    fn audit_projection(self) -> Value {
+        match self {
+            Self::Scope(scope) => json!({"policy": "require", "scopes": [scope]}),
+            Self::All(scopes) => json!({"policy": "require_all", "scopes": scopes}),
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::Scope(scope) => scope.to_string(),
+            Self::All(scopes) => scopes.join(", "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpecializedOperationPolicy {
     pub(crate) source: SpecializedSource,
     pub(crate) operation: &'static str,
-    pub(crate) required_scope: &'static str,
+    pub(crate) authority: SpecializedAuthorityRequirement,
     pub(crate) effect: SpecializedEffect,
     pub(crate) risk: &'static str,
     /// Management operations which mutate durable/local state are write-like.
@@ -180,10 +261,34 @@ impl SpecializedOperationPolicy {
         operation: &'static str,
         required_scope: &'static str,
     ) -> Self {
+        Self::read_with_authority(
+            source,
+            operation,
+            SpecializedAuthorityRequirement::Scope(required_scope),
+        )
+    }
+
+    pub(crate) fn read_all(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scopes: &'static [&'static str],
+    ) -> Self {
+        Self::read_with_authority(
+            source,
+            operation,
+            SpecializedAuthorityRequirement::All(required_scopes),
+        )
+    }
+
+    fn read_with_authority(
+        source: SpecializedSource,
+        operation: &'static str,
+        authority: SpecializedAuthorityRequirement,
+    ) -> Self {
         Self {
             source,
             operation,
-            required_scope,
+            authority,
             effect: SpecializedEffect::Read,
             risk: "specialized_read",
             write_like: false,
@@ -199,7 +304,7 @@ impl SpecializedOperationPolicy {
         Self {
             source,
             operation,
-            required_scope,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
             effect: SpecializedEffect::LocalExecution,
             risk: "specialized_local_execution",
             write_like: false,
@@ -217,11 +322,45 @@ impl SpecializedOperationPolicy {
         Self {
             source,
             operation,
-            required_scope,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
             effect: SpecializedEffect::Management,
             risk: "specialized_management",
             write_like,
             shell_like,
+        }
+    }
+
+    pub(crate) fn consequential_all(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scopes: &'static [&'static str],
+        risk: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            operation,
+            authority: SpecializedAuthorityRequirement::All(required_scopes),
+            effect: SpecializedEffect::Management,
+            risk,
+            write_like: true,
+            shell_like: false,
+        }
+    }
+
+    pub(crate) fn consequential(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scope: &'static str,
+        risk: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            operation,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
+            effect: SpecializedEffect::Management,
+            risk,
+            write_like: true,
+            shell_like: false,
         }
     }
 
@@ -235,8 +374,6 @@ impl SpecializedOperationPolicy {
             change_summary_like: false,
             project_write: false,
             path_hint: SessionPathHint::None,
-            accepts_context_ack: false,
-            advances_context_checkpoint: false,
         }
     }
 
@@ -246,7 +383,7 @@ impl SpecializedOperationPolicy {
             "operation": self.operation,
             "effect": self.effect.as_str(),
             "risk": self.risk,
-            "required_scope": self.required_scope,
+            "authority": self.authority.audit_projection(),
             "permission_required": self.effect.consequential(),
         })
     }
@@ -297,14 +434,14 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         identity: &Value,
     ) -> Result<SpecializedInvocationPermit, SpecializedGovernanceDenial> {
-        if !auth.is_some_and(|auth| auth.has_scope(policy.required_scope)) {
+        if let Some(required_scope) = policy.authority.first_missing(auth) {
             return Err(SpecializedGovernanceDenial::Scope {
-                required_scope: policy.required_scope,
+                required_scope,
                 description: format!(
-                    "{} operation '{}' requires the {} scope",
+                    "{} operation '{}' requires scopes: {}",
                     policy.source.as_str(),
                     policy.operation,
-                    policy.required_scope
+                    policy.authority.description()
                 ),
             });
         }
@@ -350,7 +487,7 @@ impl ToolRuntime {
                 let mut result =
                     session_lifecycle_denied_result(session_id, external_tool_name, denial);
                 result.output["dispatch_certainty"] = Value::String("not_started".to_string());
-                self.sessions.record_model_facing_tool_call_finished(
+                self.sessions.record_tool_call_finished(
                     session_start,
                     false,
                     &denial_terminal_projection(policy, "session_lifecycle_denied"),
@@ -363,7 +500,7 @@ impl ToolRuntime {
                 let mut result =
                     session_guard_denied_result(session_id, external_tool_name, denial);
                 result.output["dispatch_certainty"] = Value::String("not_started".to_string());
-                self.sessions.record_model_facing_tool_call_finished(
+                self.sessions.record_tool_call_finished(
                     session_start,
                     false,
                     &denial_terminal_projection(policy, "session_guard_denied"),
@@ -388,7 +525,7 @@ impl ToolRuntime {
                 let mut result = permission_execution_denied_result(&decision);
                 add_permission_to_result(&mut result, &decision);
                 result.output["dispatch_certainty"] = Value::String("not_started".to_string());
-                self.sessions.record_model_facing_tool_call_finished(
+                self.sessions.record_tool_call_finished(
                     session_start,
                     false,
                     &denial_terminal_projection(policy, "permission_denied"),
@@ -426,7 +563,7 @@ impl ToolRuntime {
             "failure_kind": failure_kind,
             "permission_status": permit.permission.as_ref().map(|decision| decision.status.as_str()),
         });
-        self.sessions.record_model_facing_tool_call_finished(
+        self.sessions.record_tool_call_finished(
             permit.session_start,
             success,
             &terminal,
@@ -439,7 +576,10 @@ impl ToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{AuthContext, AuthKind, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE};
+    use crate::auth::{
+        AuthContext, AuthKind, SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ,
+        SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE,
+    };
     use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -475,6 +615,14 @@ mod tests {
                 .with_owner_authority_fingerprint(Some(fingerprint)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn specialized_scope_checks_preserve_explicit_gateway_authority_without_auth() {
+        assert_eq!(
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INSPECT).first_missing(None),
+            Some(SCOPE_PLUGIN_INSPECT)
+        );
     }
 
     #[tokio::test]
@@ -519,6 +667,112 @@ mod tests {
             panic!("expected Session guard denial");
         };
         assert_eq!(result.output["error_kind"], "session_guard_denied");
+        assert_eq!(result.output["dispatch_certainty"], "not_started");
+    }
+
+    #[tokio::test]
+    async fn browser_read_only_session_allows_observation_and_denies_control_before_dispatch() {
+        let runtime = ToolRuntime::new_for_tests();
+        let auth = auth(
+            "browser-owner",
+            &[
+                SCOPE_BROWSER_READ,
+                SCOPE_BROWSER_CONTROL,
+                SCOPE_BROWSER_LAUNCH,
+            ],
+        );
+        let session = session(&runtime, &auth, crate::tool_runtime::SessionMode::ReadOnly);
+
+        let read = runtime
+            .govern_specialized_invocation(
+                "browser_observe",
+                SpecializedOperationPolicy::read(
+                    SpecializedSource::Browser,
+                    "targets",
+                    SCOPE_BROWSER_READ,
+                ),
+                SessionTransport::Mcp,
+                Some(&session.session_id),
+                Some(&auth),
+                &json!({"action":"targets"}),
+            )
+            .await
+            .expect("read-only Browser observation remains allowed");
+        runtime.finish_specialized_invocation(read, true, "completed", None);
+
+        let denied = runtime
+            .govern_specialized_invocation(
+                "browser_act",
+                SpecializedOperationPolicy::consequential(
+                    SpecializedSource::Browser,
+                    "navigate",
+                    SCOPE_BROWSER_CONTROL,
+                    "browser_control",
+                ),
+                SessionTransport::Mcp,
+                Some(&session.session_id),
+                Some(&auth),
+                &json!({"action":"navigate"}),
+            )
+            .await
+            .expect_err("read-only Session must deny Browser control");
+        let SpecializedGovernanceDenial::Tool(result) = denied else {
+            panic!("expected Browser Session guard denial");
+        };
+        assert_eq!(result.output["error_kind"], "session_guard_denied");
+        assert_eq!(result.output["dispatch_certainty"], "not_started");
+    }
+
+    #[tokio::test]
+    async fn browser_control_permission_is_checked_while_observe_skips_permission() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let runtime = ToolRuntime::new_for_tests().with_permission_evaluator(
+            PermissionEvaluator::with_mode(AuthorityMode::Restricted)
+                .with_eval_counter(counter.clone()),
+        );
+        let auth = auth(
+            "browser-owner",
+            &[SCOPE_BROWSER_READ, SCOPE_BROWSER_CONTROL],
+        );
+        let read = runtime
+            .govern_specialized_invocation(
+                "browser_observe",
+                SpecializedOperationPolicy::read(
+                    SpecializedSource::Browser,
+                    "targets",
+                    SCOPE_BROWSER_READ,
+                ),
+                SessionTransport::Mcp,
+                None,
+                Some(&auth),
+                &json!({}),
+            )
+            .await
+            .expect("Browser observation skips approval");
+        runtime.finish_specialized_invocation(read, true, "completed", None);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        let denied = runtime
+            .govern_specialized_invocation(
+                "browser_act",
+                SpecializedOperationPolicy::consequential(
+                    SpecializedSource::Browser,
+                    "click",
+                    SCOPE_BROWSER_CONTROL,
+                    "browser_control",
+                ),
+                SessionTransport::Mcp,
+                None,
+                Some(&auth),
+                &json!({}),
+            )
+            .await
+            .expect_err("Browser control requires Standard permission");
+        let SpecializedGovernanceDenial::Tool(result) = denied else {
+            panic!("expected Browser permission denial");
+        };
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(result.output["failure_kind"], "permission_denied");
         assert_eq!(result.output["dispatch_certainty"], "not_started");
     }
 

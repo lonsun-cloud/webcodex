@@ -22,26 +22,24 @@ fn mcp_2026_ui_capability_detection_is_explicit_and_mime_aware() {
         }
     });
     assert!(!request_supports_mcp_apps(&incompatible));
-    assert!(model_surface_supports_computer_app(
-        ModelSurface::FullOperatorRuntime
-    ));
-    assert!(!model_surface_supports_computer_app(
-        ModelSurface::LocalCoding
-    ));
 }
 
 #[tokio::test]
 async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    const PUBLIC_URL: &str = "https://self-host.example";
+    let runtime = test_runtime_with_public_url(PUBLIC_URL);
     // The URI is a host cache key. Bump it whenever the App delivery contract
     // changes so a previously failed/blank iframe cannot pin the old resource.
-    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v11");
-    assert!(MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/computer/v10"));
+    assert_eq!(MCP_COMPUTER_UI_RESOURCE_URI, "ui://webcodex/computer/v12");
+    assert!(MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/computer/v11"));
     assert_eq!(MCP_COMPUTER_UI_RESOURCE_TTL_MS, 0);
+    assert!(mcp_computer_app_resource_meta(None)["ui"]
+        .get("domain")
+        .is_none());
     let expected_resource_meta = json!({
         "ui": {
             "prefersBorder": true,
-            "domain": MCP_COMPUTER_UI_DOMAIN,
+            "domain": PUBLIC_URL,
             "csp": {
                 "connectDomains": [],
                 "resourceDomains": []
@@ -85,38 +83,27 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         panic!("expected UI-enabled tools/list");
     };
     let tools = tools["result"]["tools"].as_array().unwrap();
-    let snapshot = tools
+    assert!(tools
         .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
-        .unwrap();
-    assert!(snapshot.get("_meta").is_none());
-    let display_snapshot = tools
-        .iter()
-        .find(|tool| tool["name"] == "computer_snapshot_display")
-        .unwrap();
-    assert!(display_snapshot.get("_meta").is_none());
-    let list_windows = tools
-        .iter()
-        .find(|tool| tool["name"] == "computer_list_windows")
-        .unwrap();
-    assert!(list_windows.get("_meta").is_none());
+        .any(|tool| { tool["name"] == crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME }));
+    assert!(
+        !tools.iter().any(|tool| tool["name"] == "computer_observe"),
+        "Computer observation remains model-visible long tail and must use call_runtime_tool"
+    );
+    for retired in [
+        "computer_snapshot",
+        "computer_snapshot_display",
+        "computer_list_windows",
+    ] {
+        assert!(!tools.iter().any(|tool| tool["name"] == retired));
+    }
 
-    let compact =
-        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
-    let compact_snapshot = compact["tools"]
+    let compact = mcp_tools_list_payload_with_compact_and_app(true, true);
+    assert!(!compact["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
-        .unwrap();
-    assert!(compact_snapshot.get("_meta").is_none());
-    let compact_display_snapshot = compact["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "computer_snapshot_display")
-        .unwrap();
-    assert!(compact_display_snapshot.get("_meta").is_none());
+        .any(|tool| tool["name"] == "computer_observe"));
 
     let resources = handle_mcp_request(
         &runtime,
@@ -271,13 +258,13 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
     let McpOutcome::Ok(tools_without_ui_capability) = tools_without_ui_capability else {
         panic!("expected tools/list without UI capability metadata");
     };
-    let snapshot = tools_without_ui_capability["result"]["tools"]
+    let names = tools_without_ui_capability["result"]["tools"]
         .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
         .unwrap();
-    assert!(snapshot.get("_meta").is_none());
+    assert!(names
+        .iter()
+        .any(|tool| { tool["name"] == crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME }));
+    assert!(!names.iter().any(|tool| tool["name"] == "computer_observe"));
 
     let no_ui_resources = handle_mcp_request(
         &runtime,
@@ -338,7 +325,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
         auth
     }
 
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let auth = snapshot_auth("snapshot-link-owner", true);
     let caller = mcp_artifact_export_caller_binding(Some(&auth)).unwrap();
     let bytes = vec![0xff, 0xd8, 0xff, 0xd9];
@@ -347,11 +334,11 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
 
     for generation in 1..=4u64 {
         let framed = mcp_runtime_tool_result_with_snapshot_resource(
-            "computer_snapshot_display",
+            "computer_observe",
             false,
             ToolResult::ok(json!({
                 "client_id": "msi",
-                "display_id": "display_0123456789abcdef0123456789abcdef",
+                "display_id": "display_iavN7wEjRWeJq83v",
                 "snapshot_generation": generation,
                 "source_width": 1,
                 "source_height": 1,
@@ -364,6 +351,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
                 "content_base64": encoded,
             })),
             Some(caller.clone()),
+            response::McpToolResultPresentation::Standard,
         );
         assert_eq!(framed["isError"], false);
         let content = framed["content"].as_array().unwrap();
@@ -437,16 +425,17 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
         panic!("snapshot resource must be hidden from other callers");
     };
     assert_eq!(hidden["error"]["code"], -32602);
+    assert_eq!(hidden["error"]["data"], json!({ "uri": uri }));
 
     let window_auth = snapshot_auth("snapshot-window-owner", false);
     let window_caller = mcp_artifact_export_caller_binding(Some(&window_auth)).unwrap();
     let window = mcp_runtime_tool_result_with_snapshot_resource(
-        "computer_snapshot",
+        "computer_observe",
         false,
         ToolResult::ok(json!({
             "client_id": "mini",
             "surface": {
-                "surface_id": "surface_0123456789abcdef0123456789abcdef",
+                "surface_id": "surface_iavN7wEjRWeJq83v",
                 "application": "Microsoft Edge",
                 "title": "Snapshot test"
             },
@@ -462,6 +451,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
             "content_base64": encoded,
         })),
         Some(window_caller),
+        response::McpToolResultPresentation::Standard,
     );
     assert_eq!(window["content"][0]["type"], "resource_link");
     assert_eq!(window["content"][0]["name"], "mini-window-snapshot.jpg");
@@ -479,35 +469,36 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
     assert!(matches!(window_read, McpOutcome::Ok(_)));
 }
 
-#[test]
-fn mcp_computer_snapshot_output_schema_matches_native_image_framing() {
-    let runtime_spec = registered_tool_specs()
-        .into_iter()
-        .find(|spec| spec.name == "computer_snapshot")
-        .expect("computer_snapshot runtime spec");
-    let runtime_properties = runtime_spec.output_schema["properties"]["output"]["properties"]
-        .as_object()
-        .expect("runtime computer_snapshot output properties");
-    assert!(runtime_properties.contains_key("content_base64"));
-    assert!(!runtime_properties.contains_key("content_delivery"));
+#[tokio::test]
+async fn mcp_resources_read_not_found_echoes_uri_without_changing_param_errors() {
+    let runtime = test_runtime();
+    let uri = "test://nonexistent-resource-for-conformance-testing";
 
-    for app_enabled in [false, true] {
-        let payload = mcp_tools_list_payload_with_compact_and_app(
-            ModelSurface::FullOperatorRuntime,
-            false,
-            app_enabled,
-        );
-        let tool = payload["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "computer_snapshot")
-            .expect("MCP computer_snapshot descriptor");
-        let properties = tool["outputSchema"]["properties"]["output"]["properties"]
-            .as_object()
-            .expect("MCP computer_snapshot output properties");
-        assert!(!properties.contains_key("content_base64"));
-        assert_eq!(properties["content_delivery"]["type"], "string");
-        assert_eq!(properties["content_delivery"]["const"], "mcp_image");
-    }
+    let unknown = super::super::resources::handle_read(
+        &runtime,
+        json!({ "uri": uri }),
+        Some(json!(2114)),
+        None,
+        true,
+    )
+    .await;
+    let McpOutcome::BadRequest(unknown) = unknown else {
+        panic!("unknown resource must fail as Invalid params");
+    };
+    assert_eq!(unknown["error"]["code"], -32602);
+    assert_eq!(unknown["error"]["data"], json!({ "uri": uri }));
+    assert!(unknown.get("result").is_none());
+
+    let missing =
+        super::super::resources::handle_read(&runtime, json!({}), Some(json!(2115)), None, true)
+            .await;
+    let McpOutcome::BadRequest(missing) = missing else {
+        panic!("missing uri must fail as Invalid params");
+    };
+    assert_eq!(missing["error"]["code"], -32602);
+    assert_eq!(
+        missing["error"]["message"],
+        "Invalid params: uri is required"
+    );
+    assert!(missing["error"].get("data").is_none());
 }

@@ -38,6 +38,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("focused".to_string()),
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -88,8 +89,17 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     );
     assert_eq!(result.output["tests_run_count"], 0);
     assert_eq!(result.output["zero_tests_run"], true);
+    let error = result.error.as_deref().expect("zero-test recovery message");
+    assert!(error.contains("0 tests executed"), "{error}");
+    assert!(error.contains("substring filter"), "{error}");
+    assert!(error.contains("full qualified name"), "{error}");
+    assert!(error.contains("--exact"), "{error}");
+    assert!(error.contains("terminal"), "{error}");
+    assert!(error.contains("no active Job continuation"), "{error}");
+    assert!(result.output.get("job_id").is_none());
+    assert!(result.output.get("continuation").is_none());
     assert_eq!(result.output["test_count_assertion"]["actual_tests_run"], 0);
-    assert_cargo_result_matches_schema("cargo_test", &result);
+    assert_model_cargo_result_matches_schema("cargo_test", &result);
     assert!(
         runtime.list_jobs_for_auth(None, None, None).await.output["jobs"]
             .as_array()
@@ -108,7 +118,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], true);
+    assert!(validation["latest"].get("execution_success").is_none());
     assert_eq!(validation["latest"]["validation_passed"], true);
     assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
@@ -133,6 +143,7 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
             structured_cargo_test_execution_policy: true,
+            structured_cargo_test_lib: true,
             ..Default::default()
         },
     )
@@ -154,6 +165,7 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("focused".to_string()),
+                        lib: Some(true),
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -171,6 +183,11 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
         }
     });
     let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let steps: Vec<crate::runner_protocol::ShellJobValidationStep> =
+        serde_json::from_str(&request.command).expect("validation Job steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].program, "cargo");
+    assert!(steps[0].args.iter().any(|arg| arg == "--lib"));
     let validation = request
         .job_context
         .as_ref()
@@ -181,8 +198,7 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
     assert_eq!(validation.no_run, None);
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["job_id"], job_id);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     runtime
         .runner_registry
@@ -248,13 +264,123 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], true);
+    assert!(validation["latest"].get("execution_success").is_none());
     assert_eq!(validation["latest"]["validation_passed"], true);
     assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
     assert_eq!(
         validation["latest"]["test_count_assertion"]["reason_code"],
         "minimum_not_met"
+    );
+}
+
+#[tokio::test]
+async fn handoff_cargo_test_authoritative_count_passes_session_validation() {
+    let client_id = "vhandoff-authoritative-test-count";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(50));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let session_id = session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoTest {
+                        project,
+                        session_id: Some(session_id),
+                        cwd: None,
+                        filter: Some("focused".to_string()),
+                        lib: None,
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        no_run: None,
+                        require_tests: Some(true),
+                        min_tests: Some(100),
+                        timeout_secs: Some(1800),
+                        sync_wait_secs: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let handoff = task.await.unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
+
+    let mut update = cargo_test_update(
+        client_id,
+        &request.request_id,
+        &job_id,
+        "completed",
+        "retained tail without cargo harness summaries\n",
+        "",
+        Some(0),
+        completed_progress(),
+        true,
+    );
+    update.test_count_evidence = Some(crate::runner_protocol::ShellJobTestCountEvidence {
+        tests_detected: true,
+        tests_run_count: Some(120),
+        status: webcodex_core::validation_evidence::CargoTestCountEvidenceStatus::CompleteSummary,
+    });
+    runtime.runner_registry.update_job(update).await.unwrap();
+
+    let status = runtime
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
+        .await;
+    assert!(status.success, "{:?}", status.error);
+    assert_eq!(status.output["status"], "completed");
+    assert_eq!(status.output["validation"]["tests_run_count"], 120);
+    assert_eq!(status.output["validation"]["passed"], true);
+    assert_eq!(
+        status.output["validation"]["test_count_assertion"]["reason_code"],
+        "minimum_satisfied"
+    );
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let validation = runtime
+        .validation_summary_for_session_with_jobs(&summary, 50, Some(&auth))
+        .await;
+    assert_eq!(validation["status"], "passed", "{validation:#}");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
+    assert_eq!(
+        validation["current_evidence"]["evidence_gap_event_count"],
+        0
+    );
+    assert_eq!(
+        validation["latest"]["test_count_assertion"]["actual_tests_run"],
+        120
+    );
+    assert_eq!(
+        validation["latest"]["test_count_assertion"]["reason_code"],
+        "minimum_satisfied"
     );
 }
 
@@ -295,6 +421,7 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
                             session_id: Some(session_id),
                             cwd: None,
                             filter: Some("focused".to_string()),
+                            lib: None,
                             all_targets: None,
                             all_features: None,
                             no_default_features: None,
@@ -333,7 +460,11 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
             result.success, expect_success,
             "minimum={minimum}: {result:?}"
         );
-        assert_eq!(result.output["exit_code"], 0);
+        if expect_success {
+            assert_sparse_validation_terminal_success(&result);
+        } else {
+            assert_eq!(result.output["exit_code"], 0);
+        }
         assert_eq!(result.output["tests_run_count"], 1);
         assert_eq!(result.output["tests_failed"], 0);
         assert_eq!(
@@ -388,7 +519,7 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(true),
-                summary_only: true,
+                diagnostic: true,
                 limit: Some(50),
             },
             Some(&auth),
@@ -398,7 +529,7 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
     assert_eq!(handoff.output["validation"]["status"], "passed");
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["status"],
-        "passed"
+        "unproven"
     );
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["evidence_gap_event_count"],
@@ -481,6 +612,7 @@ async fn durable_cargo_test_explicit_zero_opt_out_survives_job_reconciliation() 
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("focused".to_string()),
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -509,8 +641,7 @@ async fn durable_cargo_test_explicit_zero_opt_out_survives_job_reconciliation() 
 
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["job_id"], job_id);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     runtime
         .runner_registry

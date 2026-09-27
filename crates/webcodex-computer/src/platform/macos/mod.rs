@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 use xcap::Window;
 
 #[cfg(target_os = "macos")]

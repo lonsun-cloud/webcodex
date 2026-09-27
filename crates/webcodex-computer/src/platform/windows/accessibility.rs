@@ -632,7 +632,7 @@ pub(crate) fn accessibility_tree(
         false,
     )]);
     let mut nodes = Vec::with_capacity(max_nodes.min(64));
-    let mut elements = Vec::with_capacity(max_nodes.min(64));
+    let mut elements: Vec<(String, ElementRecord)> = Vec::with_capacity(max_nodes.min(64));
     let mut truncated = false;
 
     while let Some((current, parent_element_id, depth, path, mut lineage, inherited_protected)) =
@@ -643,7 +643,9 @@ pub(crate) fn accessibility_tree(
             break;
         }
 
-        let element_id = format!("element_{}", Uuid::new_v4().simple());
+        let element_id = crate::allocate_selector("element_", |id| {
+            elements.iter().any(|(existing, _)| existing == id)
+        })?;
         let fingerprint = uia_fingerprint(&context, &current, inherited_protected)?;
         let role = fingerprint.role.clone();
         let subrole = fingerprint.subrole.clone();

@@ -6,6 +6,7 @@
 
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::validation_source::{ValidationFreshness, ValidationSourceState};
 use webcodex_tool_runtime_contracts::tool_audit::{
     assertion_validation_identity, is_structured_validation_target_identity,
     is_validation_execution_identity,
@@ -109,6 +110,7 @@ impl ToolRuntime {
         let mut events = refreshed.events.clone();
         self.append_terminal_generic_job_validation_events(&refreshed, &mut events, auth)
             .await;
+        self.refresh_validation_source_states(&mut events);
         events.sort_by_key(|event| {
             (
                 event.timestamp,
@@ -116,6 +118,43 @@ impl ToolRuntime {
             )
         });
         validation_summary_for_session_events(&refreshed, &events, limit)
+    }
+
+    /// Refresh only the in-memory validation-source projection. This never
+    /// materializes Jobs, appends Session events, or rewrites durable execution
+    /// facts, so read-only presentation surfaces may safely use it too.
+    pub(crate) fn refresh_validation_source_states(&self, events: &mut [SessionEvent]) {
+        // This also sees canonical writes from other Sessions on this Project.
+        for event in events {
+            let project = event
+                .resolved_project
+                .as_deref()
+                .or(event.project.as_deref());
+            if let (Some(project), Some(output)) =
+                (project, event.validation_output_summary.as_mut())
+            {
+                let source = output
+                    .get("source_state")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ValidationSourceState>(value).ok());
+                if let Some(source) = source {
+                    if source.freshness != ValidationFreshness::Stale {
+                        output["source_state"] = json!(self
+                            .validation_sources
+                            .observe(project, source.start_fence.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_validation_source_summary(
+        &self,
+        summary: &SessionSummary,
+    ) -> SessionSummary {
+        let mut refreshed = summary.clone();
+        self.refresh_validation_source_states(&mut refreshed.events);
+        refreshed
     }
 
     /// Preserve generic `run_job` and promoted `run_shell` validation evidence without mixing
@@ -422,8 +461,14 @@ impl ToolRuntime {
                     "no_run",
                     "test_count_assertion",
                     "diagnostics",
+                    "source_state",
                 ] {
-                    if let Some(value) = validation.get(field) {
+                    // A structured terminal count can be independently proven
+                    // even when bounded-log component diagnostics are absent.
+                    // Do not persist JSON nulls as explicit contradictory test
+                    // metadata; absence remains fail-closed in the ledger while
+                    // a non-null authoritative tests_run_count stays usable.
+                    if let Some(value) = validation.get(field).filter(|value| !value.is_null()) {
                         output[field] = value.clone();
                     }
                 }

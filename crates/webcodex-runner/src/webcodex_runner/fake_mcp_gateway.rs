@@ -2,7 +2,7 @@
 // directly with rustc so no closed-source or installed MCP server is needed.
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::thread;
@@ -48,6 +48,15 @@ fn main() -> io::Result<()> {
                 "path-leaked\n"
             },
         )?;
+        #[cfg(windows)]
+        append(
+            marker,
+            if env::var_os("SYSTEMROOT").is_some() {
+                "systemroot-bootstrap-ok\n"
+            } else {
+                "systemroot-bootstrap-missing\n"
+            },
+        )?;
         let cwd_matches = match (args.get(2), env::current_dir()) {
             (Some(expected), Ok(current)) => {
                 std::fs::canonicalize(current).ok() == std::fs::canonicalize(expected).ok()
@@ -70,11 +79,13 @@ fn main() -> io::Result<()> {
         match method.as_str() {
             "initialize" => {
                 append(marker, "initialize\n")?;
-                if scenario == "init_crash" {
+                if scenario == "init_crash"
+                    || (scenario == "init_crash_once" && marker_count(marker, "initialize") == 1)
+                {
                     return Ok(());
                 }
                 if scenario == "init_timeout" {
-                    thread::sleep(Duration::from_secs(3));
+                    thread::sleep(Duration::from_secs(6));
                 }
                 let capabilities = if scenario == "init_missing_tools" {
                     r#"{}"#
@@ -110,11 +121,15 @@ fn main() -> io::Result<()> {
                     continue;
                 }
                 if scenario == "oversized_message" {
+                    let padding_bytes = args
+                        .get(2)
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(7 * 1024 * 1024);
                     send(
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":"{}","tools":[]}}}}"#,
-                            "x".repeat(1024 * 1024)
+                            "x".repeat(padding_bytes)
                         ),
                     )?;
                     continue;
@@ -144,7 +159,9 @@ fn main() -> io::Result<()> {
                 } else {
                     "Persistent fake echo".to_string()
                 };
-                let value_type = if scenario == "schema_change" && lists >= 2 {
+                let value_type = if (scenario == "schema_change" && lists >= 2)
+                    || (scenario == "recover_schema_change" && marker_count(marker, "start") >= 2)
+                {
                     "number"
                 } else {
                     "string"
@@ -155,6 +172,9 @@ fn main() -> io::Result<()> {
                         r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","description":"{description}","inputSchema":{{"type":"object","properties":{{"value":{{"type":"{value_type}"}}}}}}}}]}}}}"#
                     ),
                 )?;
+                if scenario == "exit_after_list" {
+                    return Ok(());
+                }
                 if scenario == "notifications" {
                     send(
                         &mut writer,
@@ -193,7 +213,7 @@ fn main() -> io::Result<()> {
                     continue;
                 }
                 match scenario {
-                    "crash" => return Ok(()),
+                    "crash" | "recover_schema_change" => return Ok(()),
                     "notifications" => {
                         send(
                             &mut writer,
@@ -211,10 +231,10 @@ fn main() -> io::Result<()> {
                         r#"{"jsonrpc":"2.0","id":9000,"method":"sampling/createMessage","params":{}}"#,
                     )?,
                     "timeout" => {
-                        thread::sleep(Duration::from_secs(3));
+                        thread::sleep(Duration::from_secs(6));
                     }
                     "slow" => {
-                        thread::sleep(Duration::from_millis(1_250));
+                        thread::sleep(Duration::from_secs(6));
                         send(
                             &mut writer,
                             &format!(
@@ -236,10 +256,94 @@ fn main() -> io::Result<()> {
                             "y".repeat(192 * 1024)
                         ),
                     )?,
+                    "image_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}}],"isError":false}}}}"#
+                        ),
+                    )?,
+                    "mixed_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"before"}},{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}},{{"type":"text","text":"after"}}],"structuredContent":{{"kind":"mixed"}},"isError":false}}}}"#
+                        ),
+                    )?,
+                    "image_error_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"/9j/","mimeType":"image/jpeg"}}],"structuredContent":{{"code":"IMAGE_ERROR"}},"isError":true}}}}"#
+                        ),
+                    )?,
+                    "max_image_result" => {
+                        let data = format!("iVBORw0KGgoA{}AA==", "AAAA".repeat(1_398_098));
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "oversized_image" => {
+                        let data = "AAAA".repeat(1_398_102);
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "invalid_image_base64" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"%%%","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_data" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA=="}}]}}}}"#
+                        ),
+                    )?,
+                    "invalid_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"text/plain"}}]}}}}"#
+                        ),
+                    )?,
+                    "mismatched_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/jpeg"}}]}}}}"#
+                        ),
+                    )?,
                     "bad_result" => send(
                         &mut writer,
                         &format!(
-                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"image/png"}}]}}}}"#
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"audio","data":"AA==","mimeType":"audio/wav"}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource","resource":{{"uri":"file:///tmp/x","text":"x"}}}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_link_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","uri":"file:///tmp/x","name":"x"}}]}}}}"#
+                        ),
+                    )?,
+                    "unknown_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"video","data":"AA==","mimeType":"video/mp4"}}]}}}}"#
                         ),
                     )?,
                     "oversized_result" => send(
@@ -277,6 +381,12 @@ fn append(path: Option<&Path>, value: &str) -> io::Result<()> {
         .append(true)
         .open(path)?
         .write_all(value.as_bytes())
+}
+
+fn marker_count(path: Option<&Path>, value: &str) -> usize {
+    path.and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| contents.lines().filter(|line| *line == value).count())
+        .unwrap_or(0)
 }
 
 fn string_field(body: &str, field: &str) -> Option<String> {

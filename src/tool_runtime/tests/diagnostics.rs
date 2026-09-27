@@ -34,7 +34,7 @@ fn context(auth: Option<&crate::auth::AuthContext>) -> ToolCallContext<'_> {
 
 fn missing_job_request() -> ToolCallRequest {
     ToolCallRequest {
-        tool_name: "job_status".to_string(),
+        tool_name: "job_tail".to_string(),
         arguments: json!({"job_id": "missing-trace-ref-job"}),
     }
 }
@@ -131,7 +131,7 @@ async fn failed_tool_trace_ref_requires_full_mode_admin_and_operator_capability(
 }
 
 #[tokio::test]
-async fn trace_reader_tool_name_is_fail_closed_outside_operator_protocol_capability() {
+async fn trace_reader_tool_name_is_fail_closed_without_protocol_capability() {
     let runtime = ToolRuntime::new_for_tests();
     let admin = admin_auth();
     let outcome = runtime
@@ -147,7 +147,7 @@ async fn trace_reader_tool_name_is_fail_closed_outside_operator_protocol_capabil
     assert!(matches!(
         outcome.error_status,
         Some(ToolCallErrorStatus::InvalidArguments { ref message })
-            if message.contains("Stateless MCP 2026 operator surfaces")
+            if message.contains("Stateless MCP 2026")
     ));
     assert!(outcome.result.is_none());
 }

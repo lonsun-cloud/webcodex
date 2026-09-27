@@ -81,7 +81,7 @@ fn build_transport_router(
                 )
                 .push(Router::with_path("runtime/status").post(crate::runtime_http::runtime_status))
                 .push(Router::with_path("tools/list").post(crate::runtime_http::tools_list))
-                .push(Router::with_path("projects/list").post(crate::runtime_http::projects_list))
+                .push(Router::with_path("tools/call").post(crate::runtime_http::tools_call))
                 .push(Router::with_path("tokens/list").post(crate::users_http::tokens_list)),
         )
         .push(
@@ -566,7 +566,7 @@ async fn http_runner_tokens_register_hash_enforces_transport_and_client_id_bindi
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/tools/call",
         "/api/tokens/list",
         "/mcp",
     ] {

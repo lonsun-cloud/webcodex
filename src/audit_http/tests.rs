@@ -29,10 +29,15 @@ fn seed_event(
     db: &Arc<Database>,
     session_id: &str,
     endpoint: &str,
-    action_name: &str,
+    operation: &str,
     status: &str,
     summary: Value,
 ) {
+    let action_name = match endpoint {
+        "/api/tools/call" => "callTool",
+        "/api/actions/{tool_name}" => "gpt_action",
+        _ => operation,
+    };
     record_action_event(
         db,
         ActionAuditEventInput {
@@ -40,7 +45,7 @@ fn seed_event(
             session_title: None,
             endpoint: endpoint.to_string(),
             action_name: action_name.to_string(),
-            operation: Some("op".to_string()),
+            operation: Some(operation.to_string()),
             project: Some("demo".to_string()),
             principal_kind: None,
             principal_user_id: None,
@@ -166,8 +171,8 @@ async fn http_audit_sessions_happy_path_returns_seeded_session() {
     seed_event(
         &db,
         "sess-a",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({"project_count": 2}),
     );
@@ -197,8 +202,8 @@ async fn http_audit_sessions_limit_upper_cap_is_two_hundred() {
         seed_event(
             &db,
             &format!("cap-{}", i),
-            "/api/projects/list",
-            "listProjects",
+            "/api/tools/call",
+            "list_projects",
             "success",
             json!({}),
         );
@@ -224,8 +229,8 @@ async fn http_audit_sessions_limit_lower_bound_is_one() {
         seed_event(
             &db,
             &format!("low-{}", i),
-            "/api/projects/list",
-            "listProjects",
+            "/api/tools/call",
+            "list_projects",
             "success",
             json!({}),
         );
@@ -249,16 +254,16 @@ async fn http_audit_sessions_status_filter() {
     seed_event(
         &db,
         "open-1",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({}),
     );
     seed_event(
         &db,
         "closed-1",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({}),
     );
@@ -317,8 +322,8 @@ async fn http_audit_session_happy_path_returns_session_and_events() {
     seed_event(
         &db,
         "sess-detail",
-        "/api/projects/apply_unified_diff",
-        "applyUnifiedDiff",
+        "/api/tools/call",
+        "apply_unified_diff",
         "success",
         json!({"files_changed": 1}),
     );
@@ -334,7 +339,7 @@ async fn http_audit_session_happy_path_returns_session_and_events() {
     assert_eq!(body["session"]["session_id"], "sess-detail");
     let events = body["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["endpoint"], "/api/projects/apply_unified_diff");
+    assert_eq!(events[0]["endpoint"], "/api/tools/call");
     assert_eq!(events[0]["summary"]["files_changed"], 1);
 }
 
@@ -363,16 +368,16 @@ async fn http_audit_stats_happy_path_scoped_to_session() {
     seed_event(
         &db,
         "stats-1",
-        "/api/projects/run_job",
-        "startProjectShellJob",
+        "/api/actions/{tool_name}",
+        "run_job",
         "success",
         json!({}),
     );
     seed_event(
         &db,
         "stats-1",
-        "/api/projects/apply_unified_diff",
-        "applyUnifiedDiff",
+        "/api/actions/{tool_name}",
+        "apply_unified_diff",
         "failed",
         json!({}),
     );
@@ -385,8 +390,7 @@ async fn http_audit_stats_happy_path_scoped_to_session() {
         .await;
     assert_eq!(effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
-    assert_eq!(body["by_endpoint"]["/api/projects/run_job"], 1);
-    assert_eq!(body["by_endpoint"]["/api/projects/apply_unified_diff"], 1);
+    assert_eq!(body["by_endpoint"]["/api/actions/{tool_name}"], 2);
     assert_eq!(body["by_status"]["success"], 1);
     assert_eq!(body["by_status"]["failed"], 1);
     assert_eq!(body["job_count"], 1);
@@ -406,8 +410,8 @@ async fn http_audit_stats_global_over_recent_sessions() {
     seed_event(
         &db,
         "g-1",
-        "/api/projects/git_status",
-        "getProjectGitStatus",
+        "/api/actions/{tool_name}",
+        "git_status",
         "success",
         json!({}),
     );
@@ -428,7 +432,7 @@ async fn http_audit_stats_global_over_recent_sessions() {
         .await;
     assert_eq!(effective_status(&resp), StatusCode::OK);
     let body: Value = resp.take_json().await.unwrap();
-    assert_eq!(body["by_endpoint"]["/api/projects/git_status"], 1);
+    assert_eq!(body["by_endpoint"]["/api/actions/{tool_name}"], 1);
     assert_eq!(body["by_endpoint"]["/api/runtime/status"], 1);
     assert_eq!(body["git_count"], 1);
     assert_eq!(body["report_count"], 1);
@@ -566,8 +570,8 @@ async fn http_audit_responses_do_not_leak_secret_fields_or_values() {
     seed_event(
         &db,
         "leak-1",
-        "/api/projects/apply_unified_diff",
-        "applyUnifiedDiff",
+        "/api/tools/call",
+        "apply_unified_diff",
         "success",
         json!({
             "api_key": "sk-leak-12345",
@@ -638,8 +642,8 @@ async fn http_audit_responses_do_not_leak_secret_fields_or_values() {
     seed_event(
         &db,
         "leak-2",
-        "/api/projects/apply_unified_diff",
-        "applyUnifiedDiff",
+        "/api/tools/call",
+        "apply_unified_diff",
         "success",
         json!({ "command_text": "token=cmd-secret-xyz" }),
     );

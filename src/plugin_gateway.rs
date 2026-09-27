@@ -8,19 +8,25 @@
 pub(crate) use webcodex_core::plugin::*;
 
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
+use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
+#[cfg(test)]
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
 use crate::tool_runtime::{PluginToolCall, ToolResult, ToolRuntime};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
+use webcodex_tool_contracts::PluginToolAction;
 
 pub(crate) const PLUGIN_TOOL_NAME: &str = "plugin_tool";
 const MAX_PLUGIN_BINDINGS: usize = 512;
 const GATEWAY_WAIT_TIMEOUT: Duration = Duration::from_secs(125);
+pub(crate) const MAX_PLUGIN_CATALOG_CONTEXT_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 struct PluginBinding {
@@ -50,7 +56,7 @@ impl PluginGatewayRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let binding = loop {
-            let candidate = format!("wc_pbind_{}", uuid::Uuid::new_v4().simple());
+            let candidate = format!("wc_pbind_{}", webcodex_core::compact::random_suffix::<16>());
             if !store.values.contains_key(&candidate) {
                 break candidate;
             }
@@ -140,18 +146,19 @@ pub(crate) enum PluginOperation {
     Call,
 }
 
-impl PluginOperation {
-    fn parse(action: &str) -> Option<Self> {
+impl From<PluginToolAction> for PluginOperation {
+    fn from(action: PluginToolAction) -> Self {
         match action {
-            "list" => Some(Self::List),
-            "check" => Some(Self::Check),
-            "reload" => Some(Self::Reload),
-            "describe" => Some(Self::Describe),
-            "call" => Some(Self::Call),
-            _ => None,
+            PluginToolAction::List => Self::List,
+            PluginToolAction::Check => Self::Check,
+            PluginToolAction::Reload => Self::Reload,
+            PluginToolAction::Describe => Self::Describe,
+            PluginToolAction::Call => Self::Call,
         }
     }
+}
 
+impl PluginOperation {
     pub(crate) fn policy(self) -> SpecializedOperationPolicy {
         match self {
             Self::List => SpecializedOperationPolicy::read(
@@ -354,8 +361,7 @@ pub(crate) async fn invoke(
     auth: Option<&AuthContext>,
     transport: SessionTransport,
 ) -> Result<PluginInvocationResult, SpecializedGovernanceDenial> {
-    let operation = PluginOperation::parse(&request.action)
-        .expect("PluginToolCall parser admits only the closed action vocabulary");
+    let operation = PluginOperation::from(request.action);
     let policy = operation.policy();
     let audit = audit_request_with_identity(runtime, &request, auth).await;
     let permit = runtime
@@ -902,6 +908,118 @@ fn response_tools(response: PluginGatewayResponse) -> Result<Vec<PluginTool>, Ga
     }
 }
 
+fn response_project_catalog(
+    response: PluginGatewayResponse,
+) -> Result<ProjectPluginCatalog, GatewayError> {
+    if let Some(error) = response.error {
+        return Err(response_error(response.dispatch_state, error));
+    }
+    match response.payload {
+        Some(PluginGatewayResponsePayload::ProjectCatalog { catalog }) => Ok(catalog),
+        _ => Err(GatewayError::local(
+            "invalid_plugin_response",
+            "Runner returned an unexpected project Plugin catalog response",
+        )),
+    }
+}
+
+pub(crate) fn project_plugin_catalog_projection(
+    catalog: &ProjectPluginCatalog,
+    max_bytes: usize,
+) -> Value {
+    const DISCOVERY_HINT: &str =
+        "Use explicit plugin_tool list and describe for broader or current schema discovery.";
+
+    #[derive(Serialize)]
+    struct ProjectionMeasure<'a> {
+        catalog_revision: &'a str,
+        total_count: usize,
+        returned_count: usize,
+        truncated: bool,
+        entries: &'a [ProjectPluginCatalogEntry],
+        discovery_hint: Option<&'static str>,
+    }
+
+    fn value(catalog: &ProjectPluginCatalog, entries: &[ProjectPluginCatalogEntry]) -> Value {
+        let truncated = entries.len() < catalog.total_count;
+        json!({
+            "catalog_revision": catalog.catalog_revision,
+            "total_count": catalog.total_count,
+            "returned_count": entries.len(),
+            "truncated": truncated,
+            "entries": entries,
+            "discovery_hint": truncated.then_some(DISCOVERY_HINT),
+        })
+    }
+
+    let mut returned_count = 0;
+    for candidate_count in 1..=catalog.entries.len() {
+        let entries = &catalog.entries[..candidate_count];
+        let truncated = entries.len() < catalog.total_count;
+        let measure = ProjectionMeasure {
+            catalog_revision: &catalog.catalog_revision,
+            total_count: catalog.total_count,
+            returned_count: entries.len(),
+            truncated,
+            entries,
+            discovery_hint: truncated.then_some(DISCOVERY_HINT),
+        };
+        if serialized_json_len(&measure)
+            .map(|bytes| bytes <= max_bytes)
+            .unwrap_or(false)
+        {
+            returned_count = candidate_count;
+        } else {
+            break;
+        }
+    }
+    value(catalog, &catalog.entries[..returned_count])
+}
+
+fn project_catalog_reason(error: &GatewayError) -> &'static str {
+    match error.code.as_str() {
+        "project_target_unavailable" => "project_target_unavailable",
+        _ => "plugin_runtime_unavailable",
+    }
+}
+
+impl ToolRuntime {
+    pub(crate) async fn project_plugin_catalog(
+        &self,
+        project: &crate::tool_runtime::ResolvedProject,
+        auth: Option<&AuthContext>,
+    ) -> Result<ProjectPluginCatalog, &'static str> {
+        let project_id = crate::tool_runtime::runner_local_project_id(&project.resolved_id)
+            .ok_or("project_target_unavailable")?;
+        let runner = resolve_runner(self, &project.config.client_id, auth)
+            .await
+            .map_err(|error| project_catalog_reason(&error))?;
+        let response = execute_exact(
+            self,
+            &runner,
+            PluginGatewayRequest::ProjectCatalog {
+                project_id: project_id.to_string(),
+            },
+            auth,
+        )
+        .await
+        .map_err(|error| project_catalog_reason(&error))?;
+        response_project_catalog(response).map_err(|error| project_catalog_reason(&error))
+    }
+
+    pub(crate) async fn plugin_project_catalog_context_projection(
+        &self,
+        project: &crate::tool_runtime::ResolvedProject,
+        auth: Option<&AuthContext>,
+    ) -> Result<Value, &'static str> {
+        let catalog = self.project_plugin_catalog(project, auth).await?;
+        Ok(project_plugin_catalog_projection(
+            &catalog,
+            MAX_PLUGIN_CATALOG_CONTEXT_BYTES,
+        ))
+    }
+}
+
 fn response_error(state: PluginDispatchState, error: PluginGatewayError) -> GatewayError {
     GatewayError {
         code: error.code,
@@ -1012,11 +1130,7 @@ fn required_binding(value: Option<&str>) -> Result<&str, GatewayError> {
             "binding is not a valid opaque Plugin binding",
         ));
     };
-    if random.len() != 32
-        || !random
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if webcodex_core::compact::decode::<16>(random).is_none() {
         return Err(GatewayError::local(
             "invalid_arguments",
             "binding is not a valid opaque Plugin binding",
@@ -1266,7 +1380,7 @@ mod tests {
             .any(|action| action == "check"));
         assert_eq!(
             spec["inputSchema"]["properties"]["binding"]["pattern"],
-            "^wc_pbind_[0-9a-f]{32}$"
+            "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
         );
         assert!(spec["description"]
             .as_str()
@@ -1368,16 +1482,16 @@ mod tests {
             SpecializedEffect::Management
         );
         assert_eq!(
-            PluginOperation::Check.policy().required_scope,
-            SCOPE_PLUGIN_MANAGE
+            PluginOperation::Check.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_MANAGE)
         );
         assert!(!PluginOperation::Check.policy().write_like);
         assert!(PluginOperation::Check.policy().shell_like);
         assert!(PluginOperation::Reload.policy().write_like);
         assert!(PluginOperation::Reload.policy().shell_like);
         assert_eq!(
-            PluginOperation::Call.policy().required_scope,
-            SCOPE_PLUGIN_INVOKE
+            PluginOperation::Call.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INVOKE)
         );
     }
 }

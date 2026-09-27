@@ -1,16 +1,32 @@
 //! Audit-safe argument summaries for runtime tool calls.
 
-#[cfg(test)]
-use super::tool_call::ComputerSnapshotRegion;
-use super::tool_call::ToolCall;
-use super::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use webcodex_core::audit_preview::{command_preview, process_preview};
-use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
+use webcodex_core::runner_protocol::{
+    normalize_cargo_packages, normalize_cargo_value, normalize_rust_test_filter,
+};
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
+#[cfg(test)]
+use webcodex_tool_contracts::tool_call::ComputerSnapshotRegion;
+use webcodex_tool_contracts::tool_call::{
+    BrowserActToolCall, BrowserObserveToolCall, ComputerControlToolCall, ComputerObserveToolCall,
+    ToolCall,
+};
+#[cfg(feature = "workspace-checkpoints")]
+use webcodex_tool_contracts::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use webcodex_workflow_session::SessionExecutionContext;
 
 pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value) -> Value {
+    let Ok(call) = ToolCall::from_tool_name(tool_name, arguments.clone()) else {
+        // Malformed requests fail closed. Raw input is never filtered, retried,
+        // or used as an audit fallback.
+        return empty_audit_projection();
+    };
+    session_log_arguments_for_typed_call(tool_name, &call)
+}
+
+pub fn session_log_arguments_for_typed_call(tool_name: &str, call: &ToolCall) -> Value {
     let Some(definition) = webcodex_tool_contracts::lookup_tool_definition(tool_name) else {
         return empty_audit_projection();
     };
@@ -23,9 +39,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
         return empty_audit_projection();
     }
 
-    let Some(call) = audit_tool_call_from_request(definition, tool_name, arguments) else {
-        return empty_audit_projection();
-    };
+    debug_assert_eq!(call.tool_name(), tool_name);
     let mut projected = call.session_log_arguments();
     if request_policy == webcodex_tool_contracts::ToolAuditRequestPolicy::TypedDropNullValues {
         if let Some(projected) = projected.as_object_mut() {
@@ -39,33 +53,203 @@ fn empty_audit_projection() -> Value {
     serde_json::json!({})
 }
 
-fn audit_tool_call_from_request(
-    definition: &webcodex_tool_contracts::ToolDefinition,
-    tool_name: &str,
-    arguments: &Value,
-) -> Option<ToolCall> {
-    if let Ok(call) = ToolCall::from_tool_name(tool_name, arguments.clone()) {
-        return Some(call);
-    }
+fn browser_observe_audit_projection(call: &BrowserObserveToolCall) -> Value {
+    serde_json::to_value(call).unwrap_or_else(|_| {
+        serde_json::json!({
+            "action": call.action_name()
+        })
+    })
+}
 
-    // Audit happens before the authoritative concrete parser so pre-execution
-    // denials can still be recorded. For model-visible tools, retry after
-    // dropping undeclared top-level fields using the canonical ToolDefinition
-    // schema. This preserves existing privacy summaries for malformed requests
-    // without ever persisting the unknown fields themselves.
-    let schema = definition.model_spec?.input_schema;
-    let schema = schema();
-    let allowed = schema.get("properties")?.as_object()?;
-    let source = arguments.as_object()?;
-    let filtered = source
-        .iter()
-        .filter(|(key, _)| allowed.contains_key(*key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<serde_json::Map<_, _>>();
-    if filtered.len() == source.len() {
-        return None;
+fn browser_act_audit_projection(call: &BrowserActToolCall) -> Value {
+    match call {
+        BrowserActToolCall::Launch { client_id } => serde_json::json!({
+            "action": "launch",
+            "client_id": client_id,
+        }),
+        BrowserActToolCall::NewPage {
+            client_id,
+            browser_id,
+        } => serde_json::json!({
+            "action": "new_page",
+            "client_id": client_id,
+            "browser_id": browser_id,
+        }),
+        BrowserActToolCall::Navigate {
+            client_id,
+            browser_id,
+            page_id,
+            ..
+        } => serde_json::json!({
+            "action": "navigate",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "url_present": true,
+        }),
+        BrowserActToolCall::Reload {
+            client_id,
+            browser_id,
+            page_id,
+        } => serde_json::json!({
+            "action": "reload",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+        }),
+        BrowserActToolCall::Click {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+        } => serde_json::json!({
+            "action": "click",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+        }),
+        BrowserActToolCall::InputText {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+            text,
+        } => serde_json::json!({
+            "action": "input_text",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+            "text_present": true,
+            "text_bytes": text.len(),
+        }),
+        BrowserActToolCall::SelectOption {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+            option,
+        } => serde_json::json!({
+            "action": "select_option",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+            "option_present": true,
+            "option_bytes": option.len(),
+        }),
+        BrowserActToolCall::SetValue {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+            value,
+        } => serde_json::json!({
+            "action": "set_value",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+            "value_present": true,
+            "value_bytes": value.len(),
+        }),
+        BrowserActToolCall::UploadFile {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+            project,
+            path,
+        } => serde_json::json!({
+            "action": "upload_file",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+            "project": project,
+            "path_present": true,
+            "path_bytes": path.len(),
+        }),
+        BrowserActToolCall::Key {
+            client_id,
+            browser_id,
+            page_id,
+            key,
+        } => serde_json::json!({
+            "action": "key",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "key": key.as_str(),
+        }),
+        BrowserActToolCall::ClearDiagnostics {
+            client_id,
+            browser_id,
+            page_id,
+        } => serde_json::json!({
+            "action": "clear_diagnostics",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+        }),
+        BrowserActToolCall::ClosePage {
+            client_id,
+            browser_id,
+            page_id,
+        } => serde_json::json!({
+            "action": "close_page",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+        }),
+        BrowserActToolCall::CloseBrowser {
+            client_id,
+            browser_id,
+        } => serde_json::json!({
+            "action": "close_browser",
+            "client_id": client_id,
+            "browser_id": browser_id,
+        }),
     }
-    ToolCall::from_tool_name(tool_name, Value::Object(filtered)).ok()
+}
+
+fn computer_observe_audit_projection(call: &ComputerObserveToolCall) -> Value {
+    let mut projection = serde_json::to_value(call).unwrap_or_else(|_| {
+        serde_json::json!({
+            "action": call.action_name()
+        })
+    });
+    if let Some(object) = projection.as_object_mut() {
+        for field in ["role", "subrole", "label"] {
+            let present = object.remove(field).is_some();
+            if present {
+                object.insert(format!("{field}_present"), Value::Bool(true));
+            }
+        }
+        let region_present = object.remove("region").is_some();
+        if region_present {
+            object.insert("region_present".to_string(), Value::Bool(true));
+        }
+    }
+    projection
+}
+
+fn computer_control_audit_projection(call: &ComputerControlToolCall) -> Value {
+    let mut projection = serde_json::to_value(call).unwrap_or_else(|_| {
+        serde_json::json!({
+            "action": call.action_name()
+        })
+    });
+    if let Some(object) = projection.as_object_mut() {
+        if let Some(text) = object
+            .remove("text")
+            .and_then(|value| value.as_str().map(str::to_owned))
+        {
+            object.insert("text_bytes".to_string(), Value::from(text.len()));
+        }
+    }
+    projection
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +297,7 @@ fn typed_structured_validation_request_audit(
                     "all_features",
                     "no_default_features",
                     "package",
+                    "packages",
                     "timeout_secs",
                 ],
             );
@@ -142,6 +327,9 @@ fn typed_structured_validation_request_audit(
                     "timeout_secs",
                 ],
             );
+            if obj.get("lib").and_then(Value::as_bool) == Some(true) {
+                out.insert("lib".to_string(), Value::Bool(true));
+            }
             out.insert(
                 "filter_present".to_string(),
                 Value::Bool(
@@ -185,12 +373,123 @@ fn typed_structured_validation_request_audit(
 }
 
 #[derive(Debug, Clone, Copy)]
+enum GoalRequestAudit {
+    Create,
+    Prepare,
+    Get,
+    List,
+    Update,
+    AssociateAgentTask,
+    AssociateWorkflowSession,
+}
+
+fn typed_goal_request_audit(kind: GoalRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    match kind {
+        GoalRequestAudit::Create | GoalRequestAudit::Prepare => {
+            if matches!(kind, GoalRequestAudit::Prepare) {
+                copy_keys(obj, &mut out, &["session_id"]);
+            }
+            out.insert(
+                "title_chars".to_string(),
+                Value::from(
+                    obj.get("title")
+                        .and_then(Value::as_str)
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "objective_bytes".to_string(),
+                Value::from(
+                    obj.get("objective")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            copy_keys(obj, &mut out, &["controller_agent_id"]);
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::Get => copy_keys(obj, &mut out, &["goal_id"]),
+        GoalRequestAudit::List => copy_keys(obj, &mut out, &["lifecycle", "offset", "limit"]),
+        GoalRequestAudit::Update => {
+            copy_keys(
+                obj,
+                &mut out,
+                &[
+                    "goal_id",
+                    "expected_revision",
+                    "controller_agent_id",
+                    "lifecycle",
+                ],
+            );
+            out.insert(
+                "title_chars".to_string(),
+                Value::from(
+                    obj.get("title")
+                        .and_then(Value::as_str)
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "objective_bytes".to_string(),
+                Value::from(
+                    obj.get("objective")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "terminal_reason_bytes".to_string(),
+                Value::from(
+                    obj.get("terminal_reason")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::AssociateAgentTask => {
+            copy_keys(obj, &mut out, &["goal_id", "task_id"]);
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::AssociateWorkflowSession => {
+            copy_keys(obj, &mut out, &["goal_id", "session_id"]);
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
 enum AgentTaskRequestAudit {
     Create,
     List,
     Read,
     Assign,
     StartAttempt,
+    StartEndpointContinuation,
     StartCodingRun,
     ReconcileCodingRun,
     HeartbeatAttempt,
@@ -257,6 +556,22 @@ fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
+        AgentTaskRequestAudit::StartEndpointContinuation => {
+            copy_keys(
+                obj,
+                &mut out,
+                &[
+                    "task_id",
+                    "attempt_id",
+                    "assignee_agent_id",
+                    "attempt_controller_generation",
+                ],
+            );
+            out.insert(
+                "attempt_fence_present".to_string(),
+                Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
+            );
+        }
         AgentTaskRequestAudit::StartCodingRun => {
             copy_keys(
                 obj,
@@ -302,6 +617,18 @@ fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value
             out.insert(
                 "attempt_fence_present".to_string(),
                 Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
+            );
+            out.insert(
+                "active_turn_proof_present".to_string(),
+                Value::Bool(
+                    obj.get("active_turn_wake_id")
+                        .and_then(Value::as_str)
+                        .is_some()
+                        && obj
+                            .get("active_turn_consume_token")
+                            .and_then(Value::as_str)
+                            .is_some(),
+                ),
             );
         }
         AgentTaskRequestAudit::CompleteAttempt => {
@@ -825,6 +1152,18 @@ pub fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Value {
             project_declared_result_fields(fields, output)
         }
         webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::BrowserObservation,
+        ) => browser_observation_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::BrowserControl,
+        ) => browser_control_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::ComputerObservation,
+        ) => computer_observation_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::ComputerControl,
+        ) => computer_control_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
             webcodex_tool_contracts::ToolAuditSemanticResultPolicy::CodingAgentObservation,
         ) => coding_agent_observation_result_audit(output),
     }
@@ -904,6 +1243,209 @@ fn project_declared_result_fields(
             ),
         };
         projected.insert(key.to_string(), value);
+    }
+    Value::Object(projected)
+}
+
+fn copy_existing_audit_value(
+    projected: &mut serde_json::Map<String, Value>,
+    output: &Value,
+    key: &'static str,
+) {
+    if let Some(value) = output.get(key) {
+        projected.insert(key.to_string(), value.clone());
+    }
+}
+
+fn browser_observation_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in [
+        "execution_state",
+        "state_changed",
+        "error_kind",
+        "count",
+        "total_count",
+        "truncated",
+        "retained_count",
+        "console_retained",
+        "console_count",
+        "console_truncated",
+        "network_retained",
+        "network_count",
+        "network_truncated",
+        "browser_id",
+        "page_id",
+        "snapshot_generation",
+        "node_count",
+        "mime_type",
+        "width",
+        "height",
+        "file_bytes",
+        "sha256",
+    ] {
+        copy_existing_audit_value(&mut projected, output, key);
+    }
+    for (source, target) in [
+        ("targets", "target_count"),
+        ("browsers", "browser_count"),
+        ("pages", "page_count"),
+        ("nodes", "projected_node_count"),
+    ] {
+        if let Some(count) = output.get(source).and_then(Value::as_array).map(Vec::len) {
+            projected.insert(target.to_string(), Value::from(count));
+        }
+    }
+    Value::Object(projected)
+}
+
+fn browser_control_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in [
+        "execution_state",
+        "state_changed",
+        "error_kind",
+        "browser_id",
+        "page_id",
+        "page_count",
+    ] {
+        copy_existing_audit_value(&mut projected, output, key);
+    }
+    Value::Object(projected)
+}
+
+fn computer_observation_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+
+    if output.get("targets").is_some() {
+        for key in ["count", "total_count", "truncated"] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("windows").is_some()
+        || output.get("displays").is_some()
+        || output.get("applications").is_some()
+    {
+        for key in ["count", "truncated"] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("trusted").is_some() {
+        for key in ["platform", "trusted"] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("nodes").is_some() {
+        for key in [
+            "surface_id",
+            "observation_generation",
+            "node_count",
+            "truncated",
+            "max_depth",
+            "max_nodes",
+        ] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("elements").is_some() {
+        for key in [
+            "surface_id",
+            "observation_generation",
+            "count",
+            "scanned_nodes",
+            "truncated",
+        ] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("content_base64").is_some() {
+        if output.get("display_id").is_some() {
+            for key in [
+                "display_id",
+                "snapshot_generation",
+                "source_width",
+                "source_height",
+                "width",
+                "height",
+                "mime_type",
+                "file_bytes",
+                "sha256",
+                "captured_at_unix_ms",
+            ] {
+                copy_existing_audit_value(&mut projected, output, key);
+            }
+        } else {
+            if let Some(surface_id) = output.pointer("/surface/surface_id") {
+                projected.insert("surface_id".to_string(), surface_id.clone());
+            }
+            for key in [
+                "source_width",
+                "source_height",
+                "width",
+                "height",
+                "mime_type",
+                "file_bytes",
+                "captured_at_unix_ms",
+            ] {
+                copy_existing_audit_value(&mut projected, output, key);
+            }
+            projected.insert(
+                "region_present".to_string(),
+                Value::Bool(output.get("region").is_some()),
+            );
+        }
+    } else if output.get("available").is_some() {
+        for key in ["available", "text_bytes", "success"] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    } else if output.get("element_id").is_some() {
+        for key in ["surface_id", "element_id", "observation_generation"] {
+            copy_existing_audit_value(&mut projected, output, key);
+        }
+    }
+
+    for key in ["error_kind", "execution_state"] {
+        copy_existing_audit_value(&mut projected, output, key);
+    }
+    Value::Object(projected)
+}
+
+fn computer_control_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    let keys: &[&str] = if output.get("application_id").is_some() {
+        &[
+            "application_id",
+            "success",
+            "error_kind",
+            "execution_state",
+            "state_changed",
+        ]
+    } else if output.get("display_id").is_some() && output.get("x").is_some() {
+        &[
+            "display_id",
+            "snapshot_generation",
+            "x",
+            "y",
+            "success",
+            "error_kind",
+            "execution_state",
+            "state_changed",
+        ]
+    } else if output.get("text_bytes").is_some() && output.get("element_id").is_none() {
+        &[
+            "text_bytes",
+            "success",
+            "error_kind",
+            "execution_state",
+            "state_changed",
+        ]
+    } else if output.get("key").is_some() {
+        &["surface_id", "key", "modifiers", "success"]
+    } else if output.get("element_id").is_some() && output.get("text_bytes").is_some() {
+        &["surface_id", "element_id", "text_bytes", "success"]
+    } else if output.get("element_id").is_some() && output.get("action").is_some() {
+        &["surface_id", "element_id", "action", "success"]
+    } else if output.get("element_id").is_some() {
+        &["surface_id", "element_id", "success"]
+    } else {
+        &["surface_id", "success"]
+    };
+    for key in keys {
+        copy_existing_audit_value(&mut projected, output, key);
     }
     Value::Object(projected)
 }
@@ -1008,12 +1550,7 @@ pub struct GenericValidationIdentity {
 }
 
 fn validation_like_purpose(purpose: Option<&str>) -> bool {
-    purpose.is_some_and(|purpose| {
-        matches!(
-            purpose,
-            "validation" | "test" | "build" | "format" | "release"
-        )
-    })
+    purpose.is_some_and(is_validation_like_execution_purpose)
 }
 
 fn generic_validation_digest<'a>(
@@ -1063,36 +1600,40 @@ fn canonical_cargo_validation_target(
         }
         "check" | "test" => {
             let is_test = subcommand == "test";
-            let mut package: Option<String> = None;
+            let mut packages = Vec::new();
             let mut features: Option<String> = None;
             let mut filter: Option<String> = None;
             let mut all_targets = false;
             let mut all_features = false;
             let mut no_default_features = false;
             let mut no_run = false;
+            let mut lib = false;
             let mut index = 0;
             while index < rest.len() {
                 let arg = &rest[index];
                 match arg.as_str() {
                     "-p" | "--package" | "--features" => {
                         let value = rest.get(index + 1)?.clone();
-                        let slot = if arg == "--features" {
-                            &mut features
+                        if arg == "--features" {
+                            if features.replace(value).is_some() {
+                                return None;
+                            }
                         } else {
-                            &mut package
-                        };
-                        if slot.replace(value).is_some() {
-                            return None;
+                            if is_test && !packages.is_empty() {
+                                return None;
+                            }
+                            packages.push(value);
                         }
                         index += 2;
                         continue;
                     }
                     "--all-targets" if !all_targets => all_targets = true,
+                    "--lib" if is_test && !lib => lib = true,
                     "--all-features" if !all_features => all_features = true,
                     "--no-default-features" if !no_default_features => no_default_features = true,
                     "--no-run" if is_test && !no_run => no_run = true,
-                    _ if arg.starts_with("--package=") && package.is_none() => {
-                        package = Some(arg.trim_start_matches("--package=").to_string());
+                    _ if arg.starts_with("--package=") && (!is_test || packages.is_empty()) => {
+                        packages.push(arg.trim_start_matches("--package=").to_string());
                     }
                     _ if arg.starts_with("--features=") && features.is_none() => {
                         features = Some(arg.trim_start_matches("--features=").to_string());
@@ -1104,15 +1645,23 @@ fn canonical_cargo_validation_target(
                 }
                 index += 1;
             }
-            let package = match package {
-                Some(value) => normalize_cargo_value(&value).ok()?,
-                None => None,
-            };
+            let packages = normalize_cargo_packages(
+                None,
+                (!packages.is_empty()).then_some(packages.as_slice()),
+            )
+            .ok()?;
             let features = match features {
                 Some(value) => normalize_cargo_value(&value).ok()?,
                 None => None,
             };
-            input.insert("package".to_string(), serde_json::json!(package));
+            if is_test {
+                input.insert(
+                    "package".to_string(),
+                    serde_json::json!(packages.and_then(|mut values| values.pop())),
+                );
+            } else {
+                input.insert("packages".to_string(), serde_json::json!(packages));
+            }
             input.insert("features".to_string(), serde_json::json!(features));
             input.insert("all_targets".to_string(), Value::Bool(all_targets));
             input.insert("all_features".to_string(), Value::Bool(all_features));
@@ -1126,6 +1675,9 @@ fn canonical_cargo_validation_target(
                     None => None,
                 };
                 input.insert("filter".to_string(), serde_json::json!(filter));
+                if lib {
+                    input.insert("lib".to_string(), Value::Bool(true));
+                }
                 input.insert("no_run".to_string(), Value::Bool(no_run));
                 "cargo_test"
             } else {
@@ -1231,6 +1783,98 @@ pub fn run_script_validation_identity(
 }
 
 #[cfg(test)]
+mod execution_purpose_classification_tests {
+    use super::{run_process_validation_identity, run_script_validation_identity};
+
+    #[test]
+    fn generic_validation_identity_uses_canonical_execution_purpose_classification() {
+        let args = vec!["--check".to_string()];
+        for purpose in ["validation", "test", "build", "format", "release"] {
+            assert!(
+                run_process_validation_identity(
+                    "custom-validator",
+                    &args,
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_some(),
+                "run_process {purpose}"
+            );
+            assert!(
+                run_script_validation_identity(
+                    "sh",
+                    "custom-validator --check",
+                    &[],
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_some(),
+                "run_script {purpose}"
+            );
+        }
+
+        for purpose in ["diagnostic", "operation", "other"] {
+            assert!(
+                run_process_validation_identity(
+                    "custom-validator",
+                    &args,
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_none(),
+                "run_process {purpose}"
+            );
+            assert!(
+                run_script_validation_identity(
+                    "sh",
+                    "custom-validator --check",
+                    &[],
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_none(),
+                "run_script {purpose}"
+            );
+        }
+        assert!(
+            run_process_validation_identity("custom-validator", &args, None, Some("."), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_multi_package_cargo_check_matches_structured_identity() {
+        let args = vec![
+            "check".to_string(),
+            "--all-targets".to_string(),
+            "-p".to_string(),
+            "package-b".to_string(),
+            "-p".to_string(),
+            "package-a".to_string(),
+        ];
+        let native =
+            run_process_validation_identity("cargo", &args, None, Some("."), Some("validation"))
+                .expect("canonical Cargo validation identity");
+        let structured = webcodex_core::validation_identity::structured_validation_target_identity(
+            webcodex_core::validation_identity::ToolValidationIdentityKind::CargoCheck,
+            &serde_json::json!({
+                "cwd": ".",
+                "all_targets": true,
+                "packages": ["package-a", "package-b"]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(native.validation_tool, Some("cargo_check"));
+        assert_eq!(native.identity, structured);
+    }
+}
+
+#[cfg(test)]
 mod computer_privacy_tests {
     use super::*;
     use serde_json::json;
@@ -1271,7 +1915,7 @@ mod computer_privacy_tests {
         let malformed = json!({"secret": "MALFORMED_READ_SECRET"});
         let malformed_before = malformed.clone();
         assert_eq!(
-            session_log_arguments_for_tool_request("read_file", &malformed),
+            session_log_arguments_for_tool_request("read_files", &malformed),
             json!({})
         );
         assert_eq!(malformed, malformed_before);
@@ -1292,7 +1936,7 @@ mod computer_privacy_tests {
         const PROJECT_PATH: &str = "/private/native/project/root";
         const JOB_TOKEN: &str = "wjob-private-observation-token";
 
-        let plugin_binding = format!("wc_pbind_{}", "a".repeat(32));
+        let plugin_binding = "wc_pbind_qqqqqqqqqqqqqqqqqqqqqg".to_string();
         let plugin = json!({
             "action": "call",
             "binding": plugin_binding,
@@ -1316,7 +1960,7 @@ mod computer_privacy_tests {
         let ssh = json!({
             "action": "register",
             "runner": "private-runner",
-            "binding": format!("wc_sbind_{}", "b".repeat(32)),
+            "binding": "wc_sbind_u7u7u7u7u7u7u7u7u7u7uw".to_string(),
             "name": "private-ssh-name",
             "target": SSH_TARGET,
             "default_cwd": SSH_CWD
@@ -1360,15 +2004,18 @@ mod computer_privacy_tests {
         assert!(!register_serialized.contains(PROJECT_PATH));
         assert!(!register_serialized.contains("PRIVATE PROJECT DESCRIPTION"));
 
-        let job_log = json!({
-            "job_id": "job-safe",
-            "after_observation_token": JOB_TOKEN,
+        let observe_jobs = json!({
+            "items": [{
+                "job_id": "job-safe",
+                "after_observation_token": JOB_TOKEN
+            }],
             "tail_lines": 20,
             "wait_secs": 1
         });
-        let job_summary = session_log_arguments_for_tool_request("job_log", &job_log);
-        assert_eq!(job_summary["job_id"], "job-safe");
-        assert_eq!(job_summary["token_present"], true);
+        let job_summary = session_log_arguments_for_tool_request("observe_jobs", &observe_jobs);
+        assert_eq!(job_summary["item_count"], 1);
+        assert_eq!(job_summary["token_count"], 1);
+        assert_eq!(job_summary["job_ids"], json!(["job-safe"]));
         assert!(!serde_json::to_string(&job_summary)
             .unwrap()
             .contains(JOB_TOKEN));
@@ -1395,17 +2042,140 @@ mod computer_privacy_tests {
     }
 
     #[test]
+    fn agent_continuation_app_audit_omits_host_binding_and_resume_secrets() {
+        let args = json!({
+            "agent_id": "wc_agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7",
+            "expected_controller_generation": 7,
+            "binding_id": "wc_host_binding_PRIVATE_BINDING",
+            "wake_id": "wc_wake_zMzMzMzMzMzMzMzM",
+            "attempt_id": "wc_wake_attempt_3d3d3d3d3d3d3d3d"
+        });
+        let arguments =
+            session_log_arguments_for_tool_request("agent_continuation_wake_prepare", &args);
+        let arguments_text = serde_json::to_string(&arguments).unwrap();
+        assert_eq!(arguments["agent_id"], args["agent_id"]);
+        assert_eq!(arguments["wake_id"], args["wake_id"]);
+        assert!(!arguments_text.contains("PRIVATE_BINDING"));
+        assert!(!arguments_text.contains("binding_id"));
+
+        let result = json!({
+            "agent_id": args["agent_id"],
+            "endpoint_id": args["endpoint_id"],
+            "wake_id": args["wake_id"],
+            "attempt_id": args["attempt_id"],
+            "wake_revision": 9,
+            "dispatch_observation": "dispatch_prepared",
+            "state_changed": true,
+            "app_protocol": {
+                "binding_id": "wc_host_binding_PRIVATE_BINDING",
+                "automatic_message": "consume_token=wc_wake_consume_PRIVATE_TOKEN\nPRIVATE MESSAGE BODY"
+            }
+        });
+        let projected = session_log_result_for_tool("agent_continuation_wake_prepare", &result);
+        let projected_text = serde_json::to_string(&projected).unwrap();
+        assert_eq!(projected["wake_id"], args["wake_id"]);
+        assert_eq!(projected["dispatch_observation"], "dispatch_prepared");
+        for forbidden in [
+            "PRIVATE_BINDING",
+            "PRIVATE_TOKEN",
+            "PRIVATE MESSAGE BODY",
+            "automatic_message",
+            "app_protocol",
+        ] {
+            assert!(
+                !projected_text.contains(forbidden),
+                "audit leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_terminal_continuation_app_audit_omits_binding_and_private_message() {
+        let wait_id = "wc_job_wait_q6urq6urq6urq6ur";
+        let binding_id = format!(
+            "wc_host_binding_{}",
+            webcodex_core::compact::encode([0xc1; 16])
+        );
+        let attempt_id = format!(
+            "wc_job_delivery_{}",
+            webcodex_core::compact::encode([0xc2; 12])
+        );
+        let prepare_input = json!({
+            "wait_id": wait_id,
+            "binding_id": binding_id
+        });
+        let prepare_args = session_log_arguments_for_tool_request(
+            "job_terminal_continuation_prepare",
+            &prepare_input,
+        );
+        let prepare_args_text = serde_json::to_string(&prepare_args).unwrap();
+        assert_eq!(prepare_args["wait_id"], wait_id);
+        assert!(!prepare_args_text.contains(&binding_id));
+        assert!(!prepare_args_text.contains("binding_id"));
+        assert!(!prepare_args_text.contains("attempt_id"));
+
+        let finish_input = json!({
+            "wait_id": wait_id,
+            "binding_id": binding_id,
+            "attempt_id": attempt_id,
+            "outcome": "dispatch_accepted"
+        });
+        let finish_args = session_log_arguments_for_tool_request(
+            "job_terminal_continuation_finish",
+            &finish_input,
+        );
+        let finish_args_text = serde_json::to_string(&finish_args).unwrap();
+        assert_eq!(finish_args["wait_id"], wait_id);
+        assert_eq!(finish_args["attempt_id"], attempt_id);
+        assert_eq!(finish_args["outcome"], "dispatch_accepted");
+        assert!(!finish_args_text.contains(&binding_id));
+        assert!(!finish_args_text.contains("binding_id"));
+
+        let result = json!({
+            "wait_id": wait_id,
+            "job_id": "wc_job_private",
+            "delivery_state": "prepared",
+            "attempt_id": attempt_id,
+            "dispatch_observation": "dispatch_prepared",
+            "state_changed": true,
+            "app_protocol": {
+                "automatic_message": "PRIVATE MESSAGE BODY /private/path TOKEN=secret",
+                "binding_id": binding_id
+            }
+        });
+        let projected = session_log_result_for_tool("job_terminal_continuation_prepare", &result);
+        let projected_text = serde_json::to_string(&projected).unwrap();
+        assert_eq!(projected["wait_id"], wait_id);
+        assert_eq!(projected["attempt_id"], attempt_id);
+        assert_eq!(projected["dispatch_observation"], "dispatch_prepared");
+        for forbidden in [
+            "PRIVATE MESSAGE BODY",
+            "/private/path",
+            "TOKEN=secret",
+            "automatic_message",
+            "app_protocol",
+            "binding_id",
+        ] {
+            assert!(
+                !projected_text.contains(forbidden),
+                "Job terminal App audit leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn computer_application_list_ledger_omits_names_ids_and_native_identity() {
         let output = json!({
             "applications": [{
-                "application_id": "application_0123456789abcdef0123456789abcdef",
+                "application_id": "application_iavN7wEjRWeJq83v",
                 "display_name": "Private App",
                 "native_identity": "never-allowed"
             }],
             "count": 1,
             "truncated": false
         });
-        let summary = session_log_result_for_tool("computer_list_applications", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary, json!({"count": 1, "truncated": false}));
         assert!(!serialized.contains("Private App"));
@@ -1465,7 +2235,7 @@ mod computer_privacy_tests {
             "skill_read_file",
             &json!({
                 "project": "agent:test:demo",
-                "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+                "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
                 "definition_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "path": "SKILL.md",
                 "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -1495,7 +2265,7 @@ mod computer_privacy_tests {
                 "expected_artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "idempotency_key": "PRIVATE_IDEMPOTENCY_KEY",
                 "activate": true,
-                "expected_state_revision": "wc_skillstate_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "expected_state_revision": "wc_skillstate_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s"
             }),
         );
         let args_serialized = serde_json::to_string(&args).unwrap();
@@ -1513,8 +2283,7 @@ mod computer_privacy_tests {
             idempotency_key: "PRIVATE_IDEMPOTENCY_KEY".to_string(),
             activate: Some(true),
             expected_state_revision: Some(
-                "wc_skillstate_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .to_string(),
+                "wc_skillstate_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string(),
             ),
             session_id: None,
         }
@@ -1530,10 +2299,10 @@ mod computer_privacy_tests {
             "skill_versions",
             &json!({
                 "project": "agent:test:demo",
-                "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+                "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
                 "skill_key": "demo",
-                "state_revision": "wc_skillstate_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                "active_package_revision": "wc_skillpkg_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "state_revision": "wc_skillstate_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw",
+                "active_package_revision": "wc_skillpkg_3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0",
                 "total_count": 1,
                 "offset": 0,
                 "next_offset": null,
@@ -1552,9 +2321,9 @@ mod computer_privacy_tests {
             "skill_install",
             &json!({
                 "project": "agent:test:demo",
-                "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+                "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
                 "skill_key": "demo",
-                "package_revision": "wc_skillpkg_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "package_revision": "wc_skillpkg_3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0",
                 "definition_revision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 "artifact_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 "file_count": 2,
@@ -1562,7 +2331,7 @@ mod computer_privacy_tests {
                 "installed": true,
                 "activated": false,
                 "replayed": false,
-                "state_revision": "wc_skillstate_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "state_revision": "wc_skillstate_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw",
                 "active_package_revision": null,
                 "raw_skill_body": "PRIVATE_SKILL_BODY",
                 "archive_bytes": "PRIVATE_ZIP_BYTES",
@@ -1616,14 +2385,12 @@ mod computer_privacy_tests {
         assert_eq!(create["idempotency_key_present"], true);
 
         let post = ToolCall::PostConversationMessage {
-            conversation_id: "wc_conv_0123456789abcdef0123456789abcdef".to_string(),
+            conversation_id: "wc_conv_iavN7wEjRWeJq83v".to_string(),
             body: PRIVATE_BODY.to_string(),
             author_agent_id: None,
             endpoint_id: None,
             expected_controller_generation: None,
-            recipient_agent_ids: Some(vec![
-                "wc_dagent_0123456789abcdef0123456789abcdef".to_string()
-            ]),
+            recipient_agent_ids: Some(vec!["wc_dagent_iavN7wEjRWeJq83v".to_string()]),
             reply_to: None,
             idempotency_key: Some(PRIVATE_KEY.to_string()),
             wake_reply_id: None,
@@ -1640,11 +2407,11 @@ mod computer_privacy_tests {
             "post_conversation_message",
             &json!({
                 "message": {
-                    "message_id": "wc_cmsg_0123456789abcdef0123456789abcdef",
-                    "conversation_id": "wc_conv_0123456789abcdef0123456789abcdef",
+                    "message_id": "wc_cmsg_iavN7wEjRWeJq83v",
+                    "conversation_id": "wc_conv_iavN7wEjRWeJq83v",
                     "seq": 4,
                     "body": PRIVATE_BODY,
-                    "deliveries": [{"delivery_id": "wc_delivery_0123456789abcdef0123456789abcdef"}]
+                    "deliveries": [{"delivery_id": "wc_delivery_iavN7wEjRWeJq83v"}]
                 },
                 "replayed": false,
                 "state_changed": true
@@ -1658,21 +2425,21 @@ mod computer_privacy_tests {
             "bootstrap_agent_conversation",
             &json!({
                 "acting_agent": {
-                    "agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
+                    "agent_id": "wc_dagent_iavN7wEjRWeJq83v",
                     "description": PRIVATE_DESCRIPTION,
                     "specialty_labels": [PRIVATE_LABEL]
                 },
                 "endpoint": {
-                    "endpoint_id": "wc_endpoint_0123456789abcdef0123456789abcdef",
+                    "endpoint_id": "wc_endpoint_iavN7wEjRWeJq83v",
                     "controller_generation": 4,
                     "client_attachment_id": "PRIVATE_HOST_ATTACHMENT"
                 },
                 "selected_conversation": {
-                    "conversation_id": "wc_conv_0123456789abcdef0123456789abcdef"
+                    "conversation_id": "wc_conv_iavN7wEjRWeJq83v"
                 },
                 "inbox": {"queued_delivery_count": 2},
                 "wake": {
-                    "wake_id": "wc_wake_0123456789abcdef0123456789abcdef",
+                    "wake_id": "wc_wake_iavN7wEjRWeJq83v",
                     "state": "pending",
                     "consume_token": "PRIVATE_CONSUME_TOKEN",
                     "message_body": PRIVATE_BODY
@@ -1684,8 +2451,8 @@ mod computer_privacy_tests {
                     "callback_secret": "PRIVATE_CALLBACK_SECRET"
                 },
                 "wake_activation": {
-                    "wake_id": "wc_wake_0123456789abcdef0123456789abcdef",
-                    "attempt_id": "wc_wake_attempt_0123456789abcdef0123456789abcdef",
+                    "wake_id": "wc_wake_iavN7wEjRWeJq83v",
+                    "attempt_id": "wc_wake_attempt_iavN7wEjRWeJq83v",
                     "consume_token": "PRIVATE_ACTIVATION_CONSUME_TOKEN",
                     "adapter_kind": "explicit_activation"
                 }
@@ -1710,15 +2477,63 @@ mod computer_privacy_tests {
         assert_eq!(bootstrap["queued_delivery_count"], 2);
 
         let activation_request = ToolCall::BootstrapAgentConversation {
-            agent_id: "wc_dagent_0123456789abcdef0123456789abcdef".to_string(),
-            endpoint_id: "wc_endpoint_0123456789abcdef0123456789abcdef".to_string(),
+            agent_id: "wc_dagent_iavN7wEjRWeJq83v".to_string(),
+            endpoint_id: "wc_endpoint_iavN7wEjRWeJq83v".to_string(),
             expected_controller_generation: 4,
             conversation_id: None,
-            wake_id: Some("wc_wake_0123456789abcdef0123456789abcdef".to_string()),
+            wake_id: Some("wc_wake_iavN7wEjRWeJq83v".to_string()),
             activation_idempotency_key: Some(PRIVATE_KEY.to_string()),
         }
         .session_log_arguments();
         assert!(!activation_request.to_string().contains(PRIVATE_KEY));
+    }
+
+    #[test]
+    fn agent_task_active_turn_heartbeat_audit_omits_raw_proof_and_attempt_fence() {
+        const PRIVATE_FENCE: &str = "wc_agent_task_fence_PRIVATE_FENCE_MUST_NOT_PERSIST";
+        const PRIVATE_WAKE: &str = "wc_wake_PRIVATE_WAKE_MUST_NOT_PERSIST";
+        const PRIVATE_TOKEN: &str = "wc_wake_consume_PRIVATE_TOKEN_MUST_NOT_PERSIST";
+        let request = session_log_arguments_for_tool_request(
+            "heartbeat_agent_task_attempt",
+            &json!({
+                "task_id": "wc_agent_task_iavN7wEjRWeJq83v",
+                "attempt_id": "wc_agent_task_attempt_iavN7wEjRWeJq83v",
+                "assignee_agent_id": "wc_dagent_iavN7wEjRWeJq83v",
+                "attempt_fence": PRIVATE_FENCE,
+                "attempt_controller_generation": 9,
+                "active_turn_wake_id": PRIVATE_WAKE,
+                "active_turn_consume_token": PRIVATE_TOKEN,
+            }),
+        );
+        assert_eq!(request["attempt_fence_present"], true);
+        assert_eq!(request["active_turn_proof_present"], true);
+        assert_eq!(request["attempt_controller_generation"], 9);
+        let request_text = request.to_string();
+        for private in [PRIVATE_FENCE, PRIVATE_WAKE, PRIVATE_TOKEN] {
+            assert!(
+                !request_text.contains(private),
+                "heartbeat audit leaked {private}"
+            );
+        }
+
+        let typed = ToolCall::HeartbeatAgentTaskAttempt {
+            task_id: "wc_agent_task_iavN7wEjRWeJq83v".to_string(),
+            attempt_id: "wc_agent_task_attempt_iavN7wEjRWeJq83v".to_string(),
+            assignee_agent_id: "wc_dagent_iavN7wEjRWeJq83v".to_string(),
+            attempt_fence: PRIVATE_FENCE.to_string(),
+            attempt_controller_generation: 9,
+            active_turn_wake_id: Some(PRIVATE_WAKE.to_string()),
+            active_turn_consume_token: Some(PRIVATE_TOKEN.to_string()),
+        }
+        .session_log_arguments();
+        assert_eq!(typed["active_turn_proof_present"], true);
+        let typed_text = typed.to_string();
+        for private in [PRIVATE_FENCE, PRIVATE_WAKE, PRIVATE_TOKEN] {
+            assert!(
+                !typed_text.contains(private),
+                "typed heartbeat audit leaked {private}"
+            );
+        }
     }
 
     #[test]
@@ -1732,10 +2547,10 @@ mod computer_privacy_tests {
         let request = session_log_arguments_for_tool_request(
             "consume_agent_wake",
             &json!({
-                "agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
-                "endpoint_id": "wc_endpoint_0123456789abcdef0123456789abcdef",
+                "agent_id": "wc_dagent_iavN7wEjRWeJq83v",
+                "endpoint_id": "wc_endpoint_iavN7wEjRWeJq83v",
                 "expected_controller_generation": 7,
-                "wake_id": "wc_wake_0123456789abcdef0123456789abcdef",
+                "wake_id": "wc_wake_iavN7wEjRWeJq83v",
                 "consume_token": PRIVATE_TOKEN,
                 "body": PRIVATE_BODY,
                 "description": PRIVATE_DESCRIPTION,
@@ -1743,17 +2558,17 @@ mod computer_privacy_tests {
                 "idempotency_key": PRIVATE_KEY
             }),
         );
-        assert_eq!(request["consume_token_present"], true);
-        assert_eq!(request["expected_controller_generation"], 7);
+        assert_eq!(request, json!({}));
         let typed_request = ToolCall::ConsumeAgentWake {
-            agent_id: "wc_dagent_0123456789abcdef0123456789abcdef".to_string(),
-            endpoint_id: "wc_endpoint_0123456789abcdef0123456789abcdef".to_string(),
+            agent_id: "wc_dagent_iavN7wEjRWeJq83v".to_string(),
+            endpoint_id: "wc_endpoint_iavN7wEjRWeJq83v".to_string(),
             expected_controller_generation: 7,
-            wake_id: "wc_wake_0123456789abcdef0123456789abcdef".to_string(),
+            wake_id: "wc_wake_iavN7wEjRWeJq83v".to_string(),
             consume_token: PRIVATE_TOKEN.to_string(),
         }
         .session_log_arguments();
         assert_eq!(typed_request["consume_token_present"], true);
+        assert_eq!(typed_request["expected_controller_generation"], 7);
         assert!(!typed_request.to_string().contains(PRIVATE_TOKEN));
         let request_text = request.to_string();
         for private in [
@@ -1772,8 +2587,8 @@ mod computer_privacy_tests {
         let result = session_log_result_for_tool(
             "consume_agent_wake",
             &json!({
-                "wake_id": "wc_wake_0123456789abcdef0123456789abcdef",
-                "target_agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
+                "wake_id": "wc_wake_iavN7wEjRWeJq83v",
+                "target_agent_id": "wc_dagent_iavN7wEjRWeJq83v",
                 "state": "consumed",
                 "already_consumed": false,
                 "consumed_at_unix_ms": 123,
@@ -1809,7 +2624,7 @@ mod computer_privacy_tests {
         let private_body = "PRIVATE_MEMORY_BODY";
         let private_tag = "PRIVATE_MEMORY_TAG";
         let revision = format!("wc_memrev_{}", "a".repeat(64));
-        let memory_id = "wc_mem_0123456789abcdef0123456789abcdef";
+        let memory_id = "wc_mem_iavN7wEjRWeJq83v";
 
         let search_args = session_log_arguments_for_tool_request(
             "memory_search",
@@ -1949,9 +2764,7 @@ mod computer_privacy_tests {
                 "body": private_body,
             }),
         );
-        assert_eq!(purge_args["memory_scope_id"], scope_id);
-        assert_eq!(purge_args["expected_catalog_revision"], catalog_revision);
-        assert!(purge_args.get("confirm").is_none());
+        assert_eq!(purge_args, json!({}));
         assert!(!purge_args.to_string().contains(private_body));
         let typed_purge = ToolCall::MemoryScopePurge {
             memory_scope_id: scope_id.clone(),
@@ -1960,6 +2773,8 @@ mod computer_privacy_tests {
         }
         .session_log_arguments();
         assert!(typed_purge.get("confirm").is_none());
+        assert_eq!(typed_purge["memory_scope_id"], scope_id);
+        assert_eq!(typed_purge["expected_catalog_revision"], catalog_revision);
 
         let scope_list = session_log_result_for_tool(
             "memory_scope_list",
@@ -2038,7 +2853,7 @@ mod computer_privacy_tests {
     fn computer_display_list_ledger_omits_ids_and_native_topology() {
         let output = json!({
             "displays": [{
-                "display_id": "display_0123456789abcdef0123456789abcdef",
+                "display_id": "display_iavN7wEjRWeJq83v",
                 "width": 1920,
                 "height": 1080,
                 "primary": true,
@@ -2049,7 +2864,7 @@ mod computer_privacy_tests {
             "count": 1,
             "truncated": false
         });
-        let summary = session_log_result_for_tool("computer_list_displays", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary, json!({"count": 1, "truncated": false}));
         assert!(!serialized.contains("display_"));
@@ -2060,18 +2875,25 @@ mod computer_privacy_tests {
 
     #[test]
     fn computer_display_snapshot_ledger_omits_image_and_native_topology() {
-        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let display_id = "display_iavN7wEjRWeJq83v";
         let request = json!({
+            "action": "snapshot_display",
             "client_id": "msi",
             "display_id": display_id,
             "max_width": 1024,
             "max_height": 768,
             "global_x": -1920
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_snapshot_display", &request);
-        assert_eq!(request_summary["display_id"], display_id);
-        assert!(request_summary.get("global_x").is_none());
+        let request_summary = session_log_arguments_for_tool_request("computer_observe", &request);
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+            client_id: "msi".to_string(),
+            display_id: display_id.to_string(),
+            max_width: Some(1024),
+            max_height: Some(768),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["display_id"], display_id);
 
         let output = json!({
             "display_id": display_id,
@@ -2090,7 +2912,7 @@ mod computer_privacy_tests {
             "global_x": -1920,
             "scale_factor": 1.25
         });
-        let summary = session_log_result_for_tool("computer_snapshot_display", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["display_id"], display_id);
         assert_eq!(summary["snapshot_generation"], 9);
@@ -2106,28 +2928,41 @@ mod computer_privacy_tests {
     fn computer_clipboard_ledger_omits_body_hashes_and_native_state() {
         const PRIVATE_TEXT: &str = "PRIVATE_CLIPBOARD_TEXT";
         let read_request = json!({
+            "action": "read_clipboard",
             "client_id": "msi",
             "text": PRIVATE_TEXT,
             "hwnd": "PRIVATE_HWND",
         });
         let read_request_summary =
-            session_log_arguments_for_tool_request("computer_read_clipboard", &read_request);
-        assert_eq!(read_request_summary, json!({"client_id":"msi"}));
+            session_log_arguments_for_tool_request("computer_observe", &read_request);
+        assert_eq!(read_request_summary, json!({}));
+        let typed_read = ToolCall::ComputerObserve(ComputerObserveToolCall::ReadClipboard {
+            client_id: "msi".to_string(),
+        })
+        .session_log_arguments();
+        assert_eq!(
+            typed_read,
+            json!({"action":"read_clipboard", "client_id":"msi"})
+        );
 
         let write_request = json!({
+            "action": "write_clipboard",
             "client_id": "msi",
             "text": PRIVATE_TEXT,
             "sha256": "PRIVATE_CLIPBOARD_HASH",
             "native_handle": "PRIVATE_HGLOBAL",
         });
         let write_request_summary =
-            session_log_arguments_for_tool_request("computer_write_clipboard", &write_request);
-        assert_eq!(write_request_summary["client_id"], "msi");
-        assert_eq!(write_request_summary["text_bytes"], PRIVATE_TEXT.len());
-        let request_serialized = serde_json::to_string(&write_request_summary).unwrap();
-        for secret in [PRIVATE_TEXT, "PRIVATE_CLIPBOARD_HASH", "PRIVATE_HGLOBAL"] {
-            assert!(!request_serialized.contains(secret));
-        }
+            session_log_arguments_for_tool_request("computer_control", &write_request);
+        assert_eq!(write_request_summary, json!({}));
+        let typed_write = ToolCall::ComputerControl(ComputerControlToolCall::WriteClipboard {
+            client_id: "msi".to_string(),
+            text: PRIVATE_TEXT.to_string(),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_write["client_id"], "msi");
+        assert_eq!(typed_write["text_bytes"], PRIVATE_TEXT.len());
+        assert!(!typed_write.to_string().contains(PRIVATE_TEXT));
 
         let read_output = json!({
             "available": true,
@@ -2140,7 +2975,7 @@ mod computer_privacy_tests {
             "hwnd": "PRIVATE_HWND",
             "native_owner": "PRIVATE_OWNER",
         });
-        let read_summary = session_log_result_for_tool("computer_read_clipboard", &read_output);
+        let read_summary = session_log_result_for_tool("computer_observe", &read_output);
         assert_eq!(read_summary["available"], true);
         assert_eq!(read_summary["text_bytes"], PRIVATE_TEXT.len());
         let read_serialized = serde_json::to_string(&read_summary).unwrap();
@@ -2164,7 +2999,7 @@ mod computer_privacy_tests {
             "hglobal": "PRIVATE_HGLOBAL",
             "clipboard_owner": "PRIVATE_OWNER",
         });
-        let write_summary = session_log_result_for_tool("computer_write_clipboard", &write_output);
+        let write_summary = session_log_result_for_tool("computer_control", &write_output);
         assert_eq!(write_summary["text_bytes"], PRIVATE_TEXT.len());
         assert_eq!(write_summary["success"], true);
         let write_serialized = serde_json::to_string(&write_summary).unwrap();
@@ -2180,8 +3015,9 @@ mod computer_privacy_tests {
 
     #[test]
     fn computer_pointer_ledger_keeps_only_source_space_and_opaque_lifecycle_metadata() {
-        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let display_id = "display_iavN7wEjRWeJq83v";
         let request = json!({
+            "action": "pointer_click",
             "client_id": "msi",
             "display_id": display_id,
             "snapshot_generation": 11,
@@ -2190,15 +3026,20 @@ mod computer_privacy_tests {
             "global_x": -1599,
             "native_identity": "PRIVATE_NATIVE_ID"
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_pointer_click", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["display_id"], display_id);
-        assert_eq!(request_summary["snapshot_generation"], 11);
-        assert_eq!(request_summary["x"], 321);
-        assert_eq!(request_summary["y"], 654);
-        assert!(!request_serialized.contains("global_x"));
-        assert!(!request_serialized.contains("PRIVATE_NATIVE_ID"));
+        let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerControl(ComputerControlToolCall::PointerClick {
+            client_id: "msi".to_string(),
+            display_id: display_id.to_string(),
+            snapshot_generation: 11,
+            x: 321,
+            y: 654,
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["display_id"], display_id);
+        assert_eq!(typed_request["snapshot_generation"], 11);
+        assert_eq!(typed_request["x"], 321);
+        assert_eq!(typed_request["y"], 654);
 
         let output = json!({
             "display_id": display_id,
@@ -2221,7 +3062,7 @@ mod computer_privacy_tests {
             "cursor_native_x": 160.5,
             "held_buttons": 0
         });
-        let summary = session_log_result_for_tool("computer_pointer_click", &output);
+        let summary = session_log_result_for_tool("computer_control", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["display_id"], display_id);
         assert_eq!(summary["snapshot_generation"], 11);
@@ -2246,7 +3087,7 @@ mod computer_privacy_tests {
 
     #[test]
     fn computer_application_launch_ledger_keeps_only_opaque_lifecycle_metadata() {
-        let application_id = "application_0123456789abcdef0123456789abcdef";
+        let application_id = "application_iavN7wEjRWeJq83v";
         let output = json!({
             "application_id": application_id,
             "success": true,
@@ -2257,7 +3098,7 @@ mod computer_privacy_tests {
             "path": "C:\\Private\\app.exe",
             "display_name": "Private App"
         });
-        let summary = session_log_result_for_tool("computer_launch_application", &output);
+        let summary = session_log_result_for_tool("computer_control", &output);
         assert_eq!(
             summary,
             json!({
@@ -2289,7 +3130,7 @@ mod computer_privacy_tests {
             "count": 1,
             "truncated": false
         });
-        let summary = session_log_result_for_tool("computer_list_windows", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary, json!({"count": 1, "truncated": false}));
         assert!(!serialized.contains("Confidential"));
@@ -2321,7 +3162,7 @@ mod computer_privacy_tests {
             "max_depth": 6,
             "max_nodes": 128
         });
-        let summary = session_log_result_for_tool("computer_accessibility_tree", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["node_count"], 1);
@@ -2336,6 +3177,7 @@ mod computer_privacy_tests {
         let private_role = "PRIVATE ROLE FILTER";
         let private_subrole = "PRIVATE SUBROLE FILTER";
         let request = json!({
+            "action": "find_elements",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "role": private_role,
@@ -2344,8 +3186,7 @@ mod computer_privacy_tests {
             "focused": false,
             "limit": 4,
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_find_elements", &request);
+        let request_summary = session_log_arguments_for_tool_request("computer_observe", &request);
         let request_serialized = serde_json::to_string(&request_summary).unwrap();
         assert_eq!(request_summary["client_id"], "mini");
         assert_eq!(request_summary["surface_id"], "surface_safe");
@@ -2356,7 +3197,7 @@ mod computer_privacy_tests {
         assert!(!request_serialized.contains(private_role));
         assert!(!request_serialized.contains(private_subrole));
 
-        let parsed_summary = ToolCall::ComputerFindElements {
+        let parsed_summary = ToolCall::ComputerObserve(ComputerObserveToolCall::FindElements {
             client_id: "mini".to_string(),
             surface_id: "surface_safe".to_string(),
             role: Some(private_role.to_string()),
@@ -2365,7 +3206,7 @@ mod computer_privacy_tests {
             focused: Some(false),
             enabled: None,
             limit: Some(4),
-        }
+        })
         .session_log_arguments();
         let parsed_serialized = serde_json::to_string(&parsed_summary).unwrap();
         assert_eq!(parsed_summary["role_present"], true);
@@ -2392,7 +3233,7 @@ mod computer_privacy_tests {
             "scanned_nodes": 18,
             "truncated": false
         });
-        let result_summary = session_log_result_for_tool("computer_find_elements", &output);
+        let result_summary = session_log_result_for_tool("computer_observe", &output);
         let result_serialized = serde_json::to_string(&result_summary).unwrap();
         assert_eq!(result_summary["surface_id"], "surface_safe");
         assert_eq!(result_summary["count"], 1);
@@ -2405,12 +3246,12 @@ mod computer_privacy_tests {
     #[test]
     fn computer_element_state_ledger_omits_content_derived_state() {
         let request = json!({
+            "action": "element_state",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "element_id": "element_safe",
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_element_state", &request);
+        let request_summary = session_log_arguments_for_tool_request("computer_observe", &request);
         assert_eq!(request_summary, request);
 
         let output = json!({
@@ -2426,7 +3267,7 @@ mod computer_privacy_tests {
             "can_focus": true,
             "can_input_text": false
         });
-        let summary = session_log_result_for_tool("computer_element_state", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["element_id"], "element_safe");
         assert_eq!(summary["observation_generation"], 9);
@@ -2446,11 +3287,11 @@ mod computer_privacy_tests {
     #[test]
     fn computer_activate_window_ledger_is_exact_metadata_only() {
         let request = json!({
+            "action": "activate_window",
             "client_id": "mini",
             "surface_id": "surface_safe",
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_activate_window", &request);
+        let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
         assert_eq!(request_summary, request);
 
         let output = json!({
@@ -2460,7 +3301,7 @@ mod computer_privacy_tests {
             "application": "PRIVATE APP",
             "title": "PRIVATE WINDOW"
         });
-        let summary = session_log_result_for_tool("computer_activate_window", &output);
+        let summary = session_log_result_for_tool("computer_control", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["success"], true);
@@ -2493,12 +3334,12 @@ mod computer_privacy_tests {
     #[test]
     fn computer_scroll_to_element_ledger_is_metadata_only() {
         let request = json!({
+            "action": "scroll_to_element",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "element_id": "element_safe",
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_scroll_to_element", &request);
+        let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
         assert_eq!(request_summary, request);
 
         let output = json!({
@@ -2509,7 +3350,7 @@ mod computer_privacy_tests {
             "title": "PRIVATE SCROLLED TARGET",
             "value": "SUPER_SECRET_VALUE"
         });
-        let summary = session_log_result_for_tool("computer_scroll_to_element", &output);
+        let summary = session_log_result_for_tool("computer_control", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["element_id"], "element_safe");
@@ -2521,20 +3362,25 @@ mod computer_privacy_tests {
     #[test]
     fn computer_key_input_ledger_is_closed_metadata_only() {
         let request = json!({
+            "action": "key",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "key": "tab",
             "modifiers": ["shift"],
-            "text": "MUST_NOT_PERSIST",
+            "native_key": "MUST_NOT_PERSIST",
             "keycode": 123
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_key_input", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["key"], "tab");
-        assert_eq!(request_summary["modifiers"], json!(["shift"]));
-        assert!(!request_serialized.contains("MUST_NOT_PERSIST"));
-        assert!(request_summary.get("keycode").is_none());
+        let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerControl(ComputerControlToolCall::Key {
+            client_id: "mini".to_string(),
+            surface_id: "surface_safe".to_string(),
+            key: "tab".to_string(),
+            modifiers: Some(vec!["shift".to_string()]),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["key"], "tab");
+        assert_eq!(typed_request["modifiers"], json!(["shift"]));
 
         let output = json!({
             "platform": "macos",
@@ -2545,7 +3391,7 @@ mod computer_privacy_tests {
             "title": "PRIVATE FOCUSED TARGET",
             "value": "SUPER_SECRET_VALUE"
         });
-        let summary = session_log_result_for_tool("computer_key_input", &output);
+        let summary = session_log_result_for_tool("computer_control", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["key"], "tab");
@@ -2559,13 +3405,13 @@ mod computer_privacy_tests {
     fn computer_text_input_request_and_result_never_persist_text() {
         let secret = "不要记录我🙂";
         let request = json!({
+            "action": "input_text",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "element_id": "element_safe",
             "text": secret,
         });
-        let request_summary =
-            session_log_arguments_for_tool_request("computer_input_text", &request);
+        let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
         let request_serialized = serde_json::to_string(&request_summary).unwrap();
         assert_eq!(request_summary["client_id"], "mini");
         assert_eq!(request_summary["surface_id"], "surface_safe");
@@ -2574,12 +3420,12 @@ mod computer_privacy_tests {
         assert!(!request_serialized.contains(secret));
         assert!(request_summary.get("text").is_none());
 
-        let typed = ToolCall::ComputerInputText {
+        let typed = ToolCall::ComputerControl(ComputerControlToolCall::InputText {
             client_id: "mini".to_string(),
             surface_id: "surface_safe".to_string(),
             element_id: "element_safe".to_string(),
             text: secret.to_string(),
-        };
+        });
         let typed_summary = typed.session_log_arguments();
         let typed_serialized = serde_json::to_string(&typed_summary).unwrap();
         assert_eq!(typed_summary["text_bytes"], secret.len());
@@ -2595,7 +3441,7 @@ mod computer_privacy_tests {
             "text": secret,
             "value": secret,
         });
-        let result_summary = session_log_result_for_tool("computer_input_text", &output);
+        let result_summary = session_log_result_for_tool("computer_control", &output);
         let result_serialized = serde_json::to_string(&result_summary).unwrap();
         assert_eq!(result_summary["text_bytes"], secret.len());
         assert_eq!(result_summary["success"], true);
@@ -2607,13 +3453,14 @@ mod computer_privacy_tests {
     #[test]
     fn computer_snapshot_ledger_request_omits_region_coordinates() {
         let request = json!({
+            "action": "snapshot_window",
             "client_id": "mini",
             "surface_id": "surface_safe",
             "region": {"x": 111, "y": 222, "width": 333, "height": 444},
             "max_width": 800,
             "max_height": 600
         });
-        let summary = session_log_arguments_for_tool_request("computer_snapshot", &request);
+        let summary = session_log_arguments_for_tool_request("computer_observe", &request);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["region_present"], true);
         assert_eq!(summary["max_width"], 800);
@@ -2649,7 +3496,7 @@ mod computer_privacy_tests {
             "captured_at_unix_ms": 1700000000000u64,
             "content_base64": "SUPER_SECRET_SCREENSHOT_BYTES"
         });
-        let summary = session_log_result_for_tool("computer_snapshot", &output);
+        let summary = session_log_result_for_tool("computer_observe", &output);
         let serialized = serde_json::to_string(&summary).unwrap();
         assert_eq!(summary["surface_id"], "surface_safe");
         assert_eq!(summary["width"], 900);
@@ -2760,14 +3607,29 @@ mod computer_privacy_tests {
         });
         let request_summary =
             session_log_arguments_for_tool_request("coding_agent_start", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["instruction_bytes"], PROMPT.len());
-        assert_eq!(request_summary["config_count"], 1);
-        assert_eq!(request_summary["idempotency_key_present"], true);
+        assert_eq!(request_summary, json!({}));
+
+        let typed_request = ToolCall::CodingAgentStart {
+            project: "agent:special:demo".to_string(),
+            provider_id: "codex".to_string(),
+            idempotency_key: IDEMPOTENCY.to_string(),
+            instruction: PROMPT.to_string(),
+            config: Some(std::collections::BTreeMap::from([(
+                "mode".to_string(),
+                webcodex_core::coding_agent::CodingAgentConfigValue::String("agent".to_string()),
+            )])),
+            timeout_secs: Some(60),
+            recording_session_id: Some("wc_sess_safe".to_string()),
+        }
+        .session_log_arguments();
+        let request_serialized = serde_json::to_string(&typed_request).unwrap();
+        assert_eq!(typed_request["instruction_bytes"], PROMPT.len());
+        assert_eq!(typed_request["config_count"], 1);
+        assert_eq!(typed_request["idempotency_key_present"], true);
         assert!(!request_serialized.contains(PROMPT));
         assert!(!request_serialized.contains(IDEMPOTENCY));
         assert!(!request_serialized.contains("agent\""));
-        assert!(request_summary.get("recording_session_id").is_none());
+        assert!(typed_request.get("recording_session_id").is_none());
         assert!(!request_serialized.contains("wc_sess_safe"));
 
         let observe_request = json!({
@@ -2814,9 +3676,222 @@ mod computer_privacy_tests {
     }
 }
 
-impl ToolCall {
-    pub fn session_log_arguments(&self) -> Value {
+#[cfg(test)]
+mod browser_privacy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn browser_effect_request_audit_drops_sensitive_text_and_url() {
+        let text_secret = "PASSWORD_SECRET_123";
+        let text = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"input_text",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "element_id":"element_abcdefghijklmnop",
+                "text": text_secret
+            }),
+        );
+        assert_eq!(text["text_present"], true);
+        assert_eq!(text["text_bytes"], text_secret.len());
+        let serialized = serde_json::to_string(&text).unwrap();
+        assert!(!serialized.contains(text_secret));
+        assert!(text.get("text").is_none());
+
+        let option_secret = "PRIVATE_OPTION_SECRET";
+        let option = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"select_option",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "element_id":"element_abcdefghijklmnop",
+                "option":option_secret
+            }),
+        );
+        assert_eq!(option["option_present"], true);
+        assert_eq!(option["option_bytes"], option_secret.len());
+        assert!(!serde_json::to_string(&option)
+            .unwrap()
+            .contains(option_secret));
+        assert!(option.get("option").is_none());
+
+        let value_secret = "PRIVATE_VALUE_SECRET";
+        let value = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"set_value",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "element_id":"element_abcdefghijklmnop",
+                "value":value_secret
+            }),
+        );
+        assert_eq!(value["value_present"], true);
+        assert_eq!(value["value_bytes"], value_secret.len());
+        assert!(!serde_json::to_string(&value)
+            .unwrap()
+            .contains(value_secret));
+        assert!(value.get("value").is_none());
+
+        let private_path = "private/resume-SECRET.pdf";
+        let upload = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"upload_file",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "element_id":"element_abcdefghijklmnop",
+                "project":"agent:msi:resume",
+                "path":private_path
+            }),
+        );
+        assert_eq!(upload["path_present"], true);
+        assert_eq!(upload["path_bytes"], private_path.len());
+        assert_eq!(upload["project"], "agent:msi:resume");
+        assert!(!serde_json::to_string(&upload)
+            .unwrap()
+            .contains(private_path));
+        assert!(upload.get("path").is_none());
+
+        let private_url = "https://example.test/path?token=URL_QUERY_SECRET";
+        let navigate = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"navigate",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "url": private_url
+            }),
+        );
+        assert_eq!(navigate["url_present"], true);
+        assert!(!serde_json::to_string(&navigate)
+            .unwrap()
+            .contains(private_url));
+        assert!(navigate.get("url").is_none());
+    }
+
+    #[test]
+    fn browser_observation_audit_keeps_only_bounded_metadata() {
+        let output = json!({
+            "execution_state":"completed",
+            "state_changed":false,
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "node_count":1,
+            "retained_count":200,
+            "truncated":true,
+            "console_retained":200,
+            "console_count":2,
+            "console_truncated":true,
+            "network_retained":300,
+            "network_count":1,
+            "network_truncated":false,
+            "pages":[{"title":"PAGE_BODY_SECRET","url":"https://example.test/?secret=QUERY_SECRET"}],
+            "nodes":[{"role":"textbox","name":"AX_BODY_SECRET","value":"FORM_VALUE_SECRET","element_id":"element_abcdefghijklmnop"}],
+            "entries":[{"level":"error","text":"CONSOLE_BODY_SECRET"}],
+            "console":[{"level":"error","text":"DIAGNOSTIC_CONSOLE_SECRET"}],
+            "network":[{"method":"GET","url":"https://example.test/?secret=NETWORK_SECRET"}],
+            "content_base64":"BASE64_IMAGE_SECRET",
+            "raw_dom":"RAW_DOM_SECRET",
+            "raw_ax":"RAW_AX_SECRET",
+            "debugger_url":"DEBUGGER_SECRET"
+        });
+        let projected = session_log_result_for_tool("browser_observe", &output);
+        assert_eq!(projected["node_count"], 1);
+        assert_eq!(projected["page_count"], 1);
+        assert_eq!(projected["projected_node_count"], 1);
+        assert_eq!(projected["retained_count"], 200);
+        assert_eq!(projected["console_retained"], 200);
+        assert_eq!(projected["console_count"], 2);
+        assert_eq!(projected["console_truncated"], true);
+        assert_eq!(projected["network_retained"], 300);
+        assert_eq!(projected["network_count"], 1);
+        assert_eq!(projected["network_truncated"], false);
+        let serialized = serde_json::to_string(&projected).unwrap();
+        for private in [
+            "PAGE_BODY_SECRET",
+            "QUERY_SECRET",
+            "AX_BODY_SECRET",
+            "FORM_VALUE_SECRET",
+            "CONSOLE_BODY_SECRET",
+            "DIAGNOSTIC_CONSOLE_SECRET",
+            "NETWORK_SECRET",
+            "BASE64_IMAGE_SECRET",
+            "RAW_DOM_SECRET",
+            "RAW_AX_SECRET",
+            "DEBUGGER_SECRET",
+        ] {
+            assert!(!serialized.contains(private), "audit leaked {private}");
+        }
+        assert!(projected.get("pages").is_none());
+        assert!(projected.get("nodes").is_none());
+        assert!(projected.get("content_base64").is_none());
+        assert!(projected.get("entries").is_none());
+        assert!(projected.get("console").is_none());
+        assert!(projected.get("network").is_none());
+    }
+
+    #[test]
+    fn browser_control_result_audit_drops_page_text_and_url() {
+        let output = json!({
+            "execution_state":"completed",
+            "state_changed":true,
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "title":"PRIVATE_TITLE",
+            "url":"https://example.test/?secret=PRIVATE_QUERY",
+            "value":"PRIVATE_FORM_VALUE"
+        });
+        let projected = session_log_result_for_tool("browser_act", &output);
+        let serialized = serde_json::to_string(&projected).unwrap();
+        for private in ["PRIVATE_TITLE", "PRIVATE_QUERY", "PRIVATE_FORM_VALUE"] {
+            assert!(!serialized.contains(private));
+        }
+    }
+}
+
+/// Audit-safe projection over the canonical typed request.
+///
+/// This policy intentionally remains outside the structural input contract: it
+/// consumes ToolCall but never reparses raw request JSON or defines accepted fields.
+pub trait ToolCallAuditProjection {
+    fn session_log_arguments(&self) -> Value;
+}
+
+impl ToolCallAuditProjection for ToolCall {
+    fn session_log_arguments(&self) -> Value {
         match self {
+            #[cfg(feature = "experimental-code-mode")]
+            Self::CodeModeExec {
+                project,
+                source,
+                timeout_ms,
+                ..
+            }
+            | Self::CodeModeExecEffectful {
+                project,
+                source,
+                timeout_ms,
+                ..
+            }
+            | Self::CodeModeExecMutating {
+                project,
+                source,
+                timeout_ms,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "source_bytes": source.len(),
+                "timeout_ms": timeout_ms,
+            }),
             Self::RunProcess {
                 project,
                 executable,
@@ -3001,126 +4076,10 @@ impl ToolCall {
                 "session_id": session_id,
                 "shell_id": shell_id,
             }),
-            Self::ComputerListTargets => serde_json::json!({}),
-            Self::ComputerListWindows { client_id, limit } => serde_json::json!({
-                "client_id": client_id,
-                "limit": limit,
-            }),
-            Self::ComputerListApplications { client_id, limit } => serde_json::json!({
-                "client_id": client_id,
-                "limit": limit,
-            }),
-            Self::ComputerLaunchApplication {
-                client_id,
-                application_id,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "application_id": application_id,
-            }),
-            Self::ComputerAccessibilityStatus { client_id } => serde_json::json!({
-                "client_id": client_id,
-            }),
-            Self::ComputerAccessibilityTree {
-                client_id,
-                surface_id,
-                max_depth,
-                max_nodes,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "max_depth": max_depth,
-                "max_nodes": max_nodes,
-            }),
-            Self::ComputerFindElements {
-                client_id,
-                surface_id,
-                role,
-                subrole,
-                label,
-                focused,
-                enabled,
-                limit,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "role_present": role.is_some(),
-                "subrole_present": subrole.is_some(),
-                "label_present": label.is_some(),
-                "focused": focused,
-                "enabled": enabled,
-                "limit": limit,
-            }),
-            Self::ComputerElementState {
-                client_id,
-                surface_id,
-                element_id,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "element_id": element_id,
-            }),
-            Self::ComputerActivateWindow {
-                client_id,
-                surface_id,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-            }),
-            Self::ComputerControl {
-                client_id,
-                surface_id,
-                element_id,
-                action,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "element_id": element_id,
-                "action": action,
-            }),
-            Self::ComputerScrollToElement {
-                client_id,
-                surface_id,
-                element_id,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "element_id": element_id,
-            }),
-            Self::ComputerKeyInput {
-                client_id,
-                surface_id,
-                key,
-                modifiers,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "key": key,
-                "modifiers": modifiers,
-            }),
-            Self::ComputerInputText {
-                client_id,
-                surface_id,
-                element_id,
-                text,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "element_id": element_id,
-                "text_bytes": text.len(),
-            }),
-            Self::ComputerSnapshot {
-                client_id,
-                surface_id,
-                region,
-                max_width,
-                max_height,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "surface_id": surface_id,
-                "region_present": region.is_some(),
-                "max_width": max_width,
-                "max_height": max_height,
-            }),
+            Self::BrowserObserve(call) => browser_observe_audit_projection(call),
+            Self::BrowserAct(call) => browser_act_audit_projection(call),
+            Self::ComputerObserve(call) => computer_observe_audit_projection(call),
+            Self::ComputerControl(call) => computer_control_audit_projection(call),
             Self::ComputerSaveSnapshot {
                 project,
                 path,
@@ -3153,18 +4112,46 @@ impl ToolCall {
                 items,
                 tail_lines,
                 wait_secs,
+                wake_on,
+                summary_only,
             } => serde_json::json!({
+                "summary_only": summary_only,
                 "item_count": items.len(),
                 "token_count": items
                     .iter()
                     .filter(|item| item.after_observation_token.is_some())
                     .count(),
+                "observation_ref_count": items
+                    .iter()
+                    .filter(|item| item.observation_ref.is_some())
+                    .count(),
                 "job_ids": items
                     .iter()
-                    .map(|item| item.job_id.as_str())
+                    .filter_map(|item| (!item.job_id.is_empty()).then_some(item.job_id.as_str()))
                     .collect::<Vec<_>>(),
                 "tail_lines": tail_lines,
                 "wait_secs": wait_secs,
+                "wake_on": wake_on,
+            }),
+            Self::WaitForJobTerminal { job_id, .. } => serde_json::json!({
+                "job_id": job_id,
+            }),
+            Self::PresentJobTerminalContinuation { wait_id }
+            | Self::JobTerminalContinuationBind { wait_id, .. }
+            | Self::JobTerminalContinuationState { wait_id, .. }
+            | Self::JobTerminalContinuationPrepare { wait_id, .. }
+            | Self::JobTerminalContinuationUnbind { wait_id, .. } => serde_json::json!({
+                "wait_id": wait_id,
+            }),
+            Self::JobTerminalContinuationFinish {
+                wait_id,
+                attempt_id,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "wait_id": wait_id,
+                "attempt_id": attempt_id,
+                "outcome": outcome,
             }),
             Self::ApplyUnifiedDiff {
                 project,
@@ -3196,11 +4183,9 @@ impl ToolCall {
                     "message_present": true,
                 })
             }
-            Self::GitStatus { project, .. } | Self::GitDiffSummary { project, .. } => {
-                serde_json::json!({
-                    "project": project,
-                })
-            }
+            Self::GitStatus { project, .. } => serde_json::json!({
+                "project": project,
+            }),
             Self::GitReviewSummary {
                 project,
                 base_commit,
@@ -3219,18 +4204,22 @@ impl ToolCall {
             }
             Self::GitLog {
                 project,
+                head_commit,
                 limit,
                 skip,
                 ..
-            } => serde_json::json!({
-                "project": project,
-                "limit": limit,
-                "skip": skip,
-            }),
-            Self::GitDiff { project, args, .. } => serde_json::json!({
-                "project": project,
-                "args_count": args.as_ref().map(Vec::len),
-            }),
+            } => {
+                let head_commit = head_commit
+                    .as_deref()
+                    .and_then(normalized_exact_git_commit_for_audit);
+                serde_json::json!({
+                    "project": project,
+                    "head_commit_valid": head_commit.is_some(),
+                    "head_commit": head_commit,
+                    "limit": limit,
+                    "skip": skip,
+                })
+            }
             Self::GitDiffHunks {
                 project,
                 paths,
@@ -3293,6 +4282,7 @@ impl ToolCall {
                 no_default_features,
                 features,
                 package,
+                packages,
                 timeout_secs,
                 sync_wait_secs,
                 ..
@@ -3306,6 +4296,7 @@ impl ToolCall {
                     "no_default_features": no_default_features,
                     "features": features,
                     "package": package,
+                    "packages": packages,
                     "timeout_secs": timeout_secs,
                     "sync_wait_secs": sync_wait_secs,
                 }),
@@ -3314,6 +4305,7 @@ impl ToolCall {
                 project,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -3331,6 +4323,7 @@ impl ToolCall {
                     "project": project,
                     "cwd": cwd,
                     "filter": filter,
+                    "lib": lib,
                     "all_targets": all_targets,
                     "all_features": all_features,
                     "no_default_features": no_default_features,
@@ -3360,20 +4353,6 @@ impl ToolCall {
                     "sync_wait_secs": sync_wait_secs,
                 }),
             ),
-            Self::ReadFile {
-                project,
-                path,
-                start_line,
-                limit,
-                with_line_numbers,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "start_line": start_line,
-                "limit": limit,
-                "with_line_numbers": with_line_numbers,
-            }),
             Self::ReadFiles {
                 project,
                 items,
@@ -3383,6 +4362,148 @@ impl ToolCall {
                 "project": project,
                 "items": items,
                 "with_line_numbers": with_line_numbers,
+            }),
+            Self::PrepareGoalWorkflow {
+                session_id,
+                title,
+                objective,
+                controller_agent_id,
+                idempotency_key,
+                ..
+            } => typed_goal_request_audit(
+                GoalRequestAudit::Prepare,
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "title": title,
+                    "objective": objective,
+                    "controller_agent_id": controller_agent_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::CreateGoal {
+                title,
+                objective,
+                controller_agent_id,
+                idempotency_key,
+                ..
+            } => typed_goal_request_audit(
+                GoalRequestAudit::Create,
+                &serde_json::json!({
+                    "title": title,
+                    "objective": objective,
+                    "controller_agent_id": controller_agent_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::CheckpointGoal {
+                goal_id,
+                expected_revision,
+                completed_step_ids,
+                current_step_id,
+                summary,
+                idempotency_key,
+            } => serde_json::json!({
+                "goal_id": goal_id,
+                "expected_revision": expected_revision,
+                "completed_step_count": completed_step_ids.len(),
+                "current_step_present": current_step_id.is_some(),
+                "summary_bytes": summary.len(),
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
+            Self::GetGoal { goal_id } => typed_goal_request_audit(
+                GoalRequestAudit::Get,
+                &serde_json::json!({"goal_id": goal_id}),
+            ),
+            Self::PresentGoalPlan { goal_id } | Self::GoalPlanSync { goal_id } => {
+                typed_goal_request_audit(
+                    GoalRequestAudit::Get,
+                    &serde_json::json!({"goal_id": goal_id}),
+                )
+            }
+            Self::ListGoals {
+                lifecycle,
+                offset,
+                limit,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::List,
+                &serde_json::json!({
+                    "lifecycle": lifecycle,
+                    "offset": offset,
+                    "limit": limit,
+                }),
+            ),
+            Self::UpdateGoal {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                controller_agent_id,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::Update,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "expected_revision": expected_revision,
+                    "title": title,
+                    "objective": objective,
+                    "controller_agent_id": controller_agent_id,
+                    "lifecycle": lifecycle,
+                    "terminal_reason": terminal_reason,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::AssociateGoalAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::AssociateAgentTask,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "task_id": task_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::AssociateGoalWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::AssociateWorkflowSession,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "session_id": session_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::WaitForAgentEvents {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                mode,
+                events,
+                goal_id,
+                idempotency_key,
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "mode": mode.as_str(),
+                "goal_id": goal_id,
+                "event_count": events.len(),
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
+            Self::ReadAgentWait { wait_id } | Self::AgentWaitState { wait_id } => {
+                serde_json::json!({"wait_id": wait_id})
+            }
+            Self::CancelAgentWait {
+                wait_id,
+                idempotency_key,
+            } => serde_json::json!({
+                "wait_id": wait_id,
+                "idempotency_key_present": !idempotency_key.is_empty(),
             }),
             Self::CreateAgentTask {
                 title,
@@ -3442,6 +4563,22 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::StartAgentTaskEndpointContinuation {
+                task_id,
+                attempt_id,
+                assignee_agent_id,
+                attempt_fence,
+                attempt_controller_generation,
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::StartEndpointContinuation,
+                &serde_json::json!({
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "assignee_agent_id": assignee_agent_id,
+                    "attempt_fence": attempt_fence,
+                    "attempt_controller_generation": attempt_controller_generation,
+                }),
+            ),
             Self::StartAgentTaskCodingRun {
                 project,
                 task_id,
@@ -3482,6 +4619,8 @@ impl ToolCall {
                 assignee_agent_id,
                 attempt_fence,
                 attempt_controller_generation,
+                active_turn_wake_id,
+                active_turn_consume_token,
             } => typed_agent_task_request_audit(
                 AgentTaskRequestAudit::HeartbeatAttempt,
                 &serde_json::json!({
@@ -3490,6 +4629,8 @@ impl ToolCall {
                     "assignee_agent_id": assignee_agent_id,
                     "attempt_fence": attempt_fence,
                     "attempt_controller_generation": attempt_controller_generation,
+                    "active_turn_wake_id": active_turn_wake_id,
+                    "active_turn_consume_token": active_turn_consume_token,
                 }),
             ),
             Self::CompleteAgentTaskAttempt {
@@ -3558,7 +4699,13 @@ impl ToolCall {
                     "specialty_labels": specialty_labels,
                 }),
             ),
-            Self::AttachAgentEndpoint {
+            Self::RotateAgentContinuationEndpoint {
+                agent_id,
+                host,
+                client_attachment_id,
+                idempotency_key,
+            }
+            | Self::AttachAgentEndpoint {
                 agent_id,
                 host,
                 client_attachment_id,
@@ -3572,6 +4719,75 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::PresentAgentContinuation {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+            }
+            | Self::AgentContinuationBind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationRecoverEndpoint {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationState {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationWakeAcquire {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationUnbind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+            }),
+            Self::AgentContinuationWakePrepare {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                wake_id,
+                attempt_id,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "wake_id": wake_id,
+                "attempt_id": attempt_id,
+            }),
+            Self::AgentContinuationWakeFinish {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                wake_id,
+                attempt_id,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "wake_id": wake_id,
+                "attempt_id": attempt_id,
+                "outcome": outcome,
+            }),
             Self::DetachAgentEndpoint { endpoint_id } => typed_communication_request_audit(
                 CommunicationRequestAudit::DetachEndpoint,
                 &serde_json::json!({"endpoint_id": endpoint_id}),
@@ -3799,6 +5015,34 @@ impl ToolCall {
                     "expected_catalog_revision": expected_catalog_revision,
                 }),
             ),
+            Self::SkillLoad { project, name, .. } => serde_json::json!({
+                "project": project,
+                "name_present": !name.is_empty(),
+            }),
+            Self::RunSkillResource {
+                project,
+                skill_id,
+                path,
+                expected_definition_revision,
+                expected_package_revision,
+                args,
+                timeout_secs,
+                sync_wait_secs,
+                cwd,
+                purpose,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "skill_id": skill_id,
+                "path": path,
+                "expected_definition_revision": expected_definition_revision,
+                "expected_package_revision": expected_package_revision,
+                "arg_count": args.len(),
+                "timeout_secs": timeout_secs,
+                "sync_wait_secs": sync_wait_secs,
+                "cwd": cwd,
+                "purpose": purpose,
+            }),
             Self::SkillList {
                 project,
                 query,
@@ -3929,35 +5173,27 @@ impl ToolCall {
                 "max_depth": max_depth,
                 "limit": limit,
             }),
-            Self::SearchProjectText {
-                project,
-                path,
-                limit,
-                context_before,
-                context_after,
-                include_globs,
-                exclude_globs,
-                result_mode,
-                timeout_secs,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "pattern_present": true,
-                "path": path,
-                "limit": limit,
-                "context_before": context_before,
-                "context_after": context_after,
-                "include_glob_count": include_globs.as_ref().map(Vec::len).unwrap_or(0),
-                "exclude_glob_count": exclude_globs.as_ref().map(Vec::len).unwrap_or(0),
-                "result_mode": result_mode,
-                "timeout_secs": timeout_secs,
-            }),
             Self::SearchProjectTexts {
                 project, queries, ..
             } => serde_json::json!({
                 "project": project,
                 "query_count": queries.len(),
                 "patterns_present": !queries.is_empty(),
+            }),
+            Self::SearchAndRead {
+                project,
+                read_before,
+                read_after,
+                max_reads,
+                with_line_numbers,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "query_present": true,
+                "read_before": read_before,
+                "read_after": read_after,
+                "max_reads": max_reads,
+                "with_line_numbers": with_line_numbers,
             }),
             Self::LspStatus { project, .. } => serde_json::json!({
                 "project": project,
@@ -4061,14 +5297,14 @@ impl ToolCall {
                 project,
                 path,
                 overwrite,
-                expected_sha256,
+                expected_read_revision,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "path": path,
                 "content_present": true,
                 "overwrite": overwrite,
-                "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
+                "expected_read_revision_present": expected_read_revision.is_some(),
             }),
             Self::SaveProjectArtifact {
                 project,
@@ -4099,6 +5335,37 @@ impl ToolCall {
                 "overwrite": overwrite,
                 "session_id": session_id,
             }),
+            Self::TransferProjectArtifact {
+                source_project,
+                source_path,
+                destination_project,
+                destination_path,
+                overwrite,
+            } => serde_json::json!({
+                "source_project": source_project,
+                "source_path": source_path,
+                "destination_project": destination_project,
+                "destination_path": destination_path,
+                "overwrite": overwrite,
+            }),
+            Self::ProjectArtifact {
+                project,
+                path,
+                action,
+                allow_missing,
+                offset,
+                length,
+                expected_sha256,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "action": action.as_str(),
+                "allow_missing": allow_missing,
+                "offset": offset,
+                "length": length,
+                "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
+            }),
             Self::ReadProjectArtifactMetadata {
                 project,
                 path,
@@ -4115,6 +5382,7 @@ impl ToolCall {
                 encoding,
                 offset,
                 length,
+                expected_sha256,
                 as_image,
                 ..
             } => serde_json::json!({
@@ -4123,6 +5391,7 @@ impl ToolCall {
                 "encoding": encoding,
                 "offset": offset,
                 "length": length,
+                "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
                 "as_image": as_image,
             }),
             Self::ArtifactUploadBegin {
@@ -4197,10 +5466,11 @@ impl ToolCall {
                     "kinds": kind_list,
                     "paths": changes.iter().map(|change| change.path.as_str()).collect::<Vec<_>>(),
                     "destination_paths": changes.iter().filter_map(|change| change.to_path.as_deref()).collect::<Vec<_>>(),
-                    "expected_sha256_count": changes.iter().filter(|change| change.expected_sha256.is_some()).count(),
+                    "expected_read_revision_count": changes.iter().filter(|change| change.expected_read_revision.is_some()).count(),
                     "dry_run": dry_run,
                 })
             }
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointCreate {
                 project,
                 title,
@@ -4244,10 +5514,12 @@ impl ToolCall {
                     "validation_status": validation_status,
                 })
             }
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointList { project, limit, .. } => serde_json::json!({
                 "project": project,
                 "limit": limit,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointShow {
                 project,
                 checkpoint_id,
@@ -4258,6 +5530,7 @@ impl ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "include_diff_stat": include_diff_stat,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointRestore {
                 project,
                 checkpoint_id,
@@ -4268,6 +5541,7 @@ impl ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointDelete {
                 project,
                 checkpoint_id,
@@ -4278,6 +5552,17 @@ impl ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            Self::RecordExternalObservation {
+                project,
+                session_id,
+                ..
+            }
+            | Self::ListExternalObservations {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project, "session_id": session_id,
+            }),
             Self::PostSessionMessage {
                 session_id,
                 kind,
@@ -4286,6 +5571,7 @@ impl ToolCall {
                 reply_to,
                 priority,
                 requires_ack,
+                delivery_key: _,
             } => serde_json::json!({
                 "session_id": session_id,
                 "kind": kind,
@@ -4293,6 +5579,23 @@ impl ToolCall {
                 "body_bytes": message.len(),
                 "tags_count": tags.len(),
                 "reply_to": reply_to,
+                "priority": priority,
+                "requires_ack": requires_ack,
+            }),
+            Self::PostPeerMessage {
+                peer_id,
+                kind,
+                message,
+                tags,
+                priority,
+                requires_ack,
+                delivery_key: _,
+            } => serde_json::json!({
+                "peer_id": peer_id,
+                "kind": kind,
+                "body_present": !message.is_empty(),
+                "body_bytes": message.len(),
+                "tags_count": tags.len(),
                 "priority": priority,
                 "requires_ack": requires_ack,
             }),
@@ -4360,7 +5663,7 @@ impl ToolCall {
                 include_workspace,
                 include_checkpoints,
                 include_validation,
-                summary_only,
+                diagnostic,
                 limit,
             } => serde_json::json!({
                 "session_id": session_id,
@@ -4368,8 +5671,15 @@ impl ToolCall {
                 "include_workspace": include_workspace,
                 "include_checkpoints": include_checkpoints,
                 "include_validation": include_validation,
-                "summary_only": summary_only,
+                "diagnostic": diagnostic,
                 "limit": limit,
+            }),
+            Self::SessionHandoffState {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
             }),
             Self::StartSession {
                 project,
@@ -4395,9 +5705,9 @@ impl ToolCall {
                 mode,
                 base_ref,
                 instruction,
-                include_project_instructions,
-                include_workflow_guidance,
+                guidance_profile: _,
                 session_id,
+                include_extension_catalog,
             } => serde_json::json!({
                 "project": project,
                 "client_id": client_id,
@@ -4406,8 +5716,7 @@ impl ToolCall {
                 "base_ref_present": base_ref.is_some(),
                 "instruction_present": true,
                 "instruction_summary": command_preview(instruction),
-                "include_project_instructions": include_project_instructions,
-                "include_workflow_guidance": include_workflow_guidance,
+                "include_extension_catalog": include_extension_catalog,
                 "session_id": session_id,
             }),
             Self::UpdateSessionContext {
@@ -4437,6 +5746,39 @@ impl ToolCall {
                 "include_hygiene": include_hygiene,
                 "include_handoff": include_handoff,
                 "include_validation_summary": include_validation_summary,
+            }),
+            Self::PresentWorkResult {
+                project,
+                session_id,
+            }
+            | Self::WorkResultState {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+            }),
+            Self::WorkResultSendMessage {
+                project,
+                session_id,
+                message,
+                delivery_key,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "message_chars": message.chars().count(),
+                "delivery_key_present": !delivery_key.is_empty(),
+            }),
+            Self::ChangesFileDiff {
+                project,
+                session_id,
+                snapshot_id,
+                path,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "snapshot_id": snapshot_id,
+                "path": path,
             }),
             Self::ListProjects {
                 client_id,
@@ -4540,26 +5882,6 @@ impl ToolCall {
                 "cwd": cwd,
                 "purpose": purpose,
             }),
-            Self::JobStatus {
-                job_id,
-                include_command_preview,
-            } => serde_json::json!({
-                "job_id": job_id,
-                "include_command_preview": include_command_preview,
-            }),
-            Self::JobLog {
-                job_id,
-                offset,
-                tail_lines,
-                after_observation_token,
-                wait_secs,
-            } => serde_json::json!({
-                "job_id": job_id,
-                "offset": offset,
-                "tail_lines": tail_lines,
-                "token_present": after_observation_token.is_some(),
-                "wait_secs": wait_secs,
-            }),
             Self::JobTail {
                 job_id,
                 tail_lines,
@@ -4587,52 +5909,7 @@ impl ToolCall {
                 "limit": limit,
                 "offset": offset,
             }),
-            Self::ExportProjectArtifact { project, path, .. } => serde_json::json!({
-                "project": project,
-                "path": path,
-            }),
-            Self::ComputerListDisplays { client_id, limit } => serde_json::json!({
-                "client_id": client_id,
-                "limit": limit,
-            }),
-            Self::ComputerReadClipboard { client_id } => serde_json::json!({
-                "client_id": client_id,
-            }),
-            Self::ComputerWriteClipboard { client_id, text } => serde_json::json!({
-                "client_id": client_id,
-                "text_bytes": text.len(),
-            }),
-            Self::ComputerPointerMove {
-                client_id,
-                display_id,
-                snapshot_generation,
-                x,
-                y,
-            }
-            | Self::ComputerPointerClick {
-                client_id,
-                display_id,
-                snapshot_generation,
-                x,
-                y,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "display_id": display_id,
-                "snapshot_generation": snapshot_generation,
-                "x": x,
-                "y": y,
-            }),
-            Self::ComputerSnapshotDisplay {
-                client_id,
-                display_id,
-                max_width,
-                max_height,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "display_id": display_id,
-                "max_width": max_width,
-                "max_height": max_height,
-            }),
+
             Self::RegisterProject {
                 client_id,
                 id,
@@ -4728,6 +6005,13 @@ impl ToolCall {
                 "compact": compact,
                 "summary_only": summary_only,
                 "client_id_present": client_id.is_some(),
+            }),
+            Self::CurrentWindowActivity {
+                limit,
+                include_nonmeaningful,
+            } => serde_json::json!({
+                "limit": limit,
+                "include_nonmeaningful": include_nonmeaningful,
             }),
             Self::WorkspaceHygieneCheck {
                 project,

@@ -17,6 +17,9 @@ pub const SCOPE_COMMUNICATION_READ: &str = "communication:read";
 pub const SCOPE_COMMUNICATION_MANAGE: &str = "communication:manage";
 pub const SCOPE_JOB_RUN: &str = "job:run";
 pub const SCOPE_JOB_DETACH: &str = "job:detach";
+pub const SCOPE_BROWSER_READ: &str = "browser:read";
+pub const SCOPE_BROWSER_CONTROL: &str = "browser:control";
+pub const SCOPE_BROWSER_LAUNCH: &str = "browser:launch";
 pub const SCOPE_COMPUTER_READ: &str = "computer:read";
 pub const SCOPE_COMPUTER_CONTROL: &str = "computer:control";
 pub const SCOPE_COMPUTER_LAUNCH: &str = "computer:launch";
@@ -107,6 +110,9 @@ pub const AGENT_SCOPES: &[&str] = &[
 ];
 
 pub const KNOWN_SCOPES: &[&str] = &[
+    SCOPE_BROWSER_READ,
+    SCOPE_BROWSER_CONTROL,
+    SCOPE_BROWSER_LAUNCH,
     SCOPE_COMPUTER_POINTER_CONTROL,
     SCOPE_COMPUTER_CLIPBOARD_READ,
     SCOPE_COMPUTER_CLIPBOARD_WRITE,

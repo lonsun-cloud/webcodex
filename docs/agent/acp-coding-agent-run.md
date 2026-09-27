@@ -388,7 +388,7 @@ be treated as uncertain unless exact protocol recovery proves otherwise.
 
 ## 5. Configuration semantics
 
-### `config` omitted or `{}` means no WebCodex override
+### `config` omitted or `{}` means no caller run-level override
 
 P0 corrects an important earlier assumption. For WebCodex:
 
@@ -398,7 +398,10 @@ or
 config = {}
 ```
 
-means **send no `session/set_config_option` calls**.
+means **send no caller-requested `session/set_config_option` calls**. If the Runner
+has a non-empty `[acp.forced_config]` policy, it may still send
+`session/set_config_option` calls to enforce that operator-owned policy before
+prompt dispatch.
 
 It does not mean "the ACP adapter behaves exactly like a bare local Codex CLI".
 The adapter itself may have defaults. In real dogfood, `codex-acp 1.6.2`
@@ -407,8 +410,7 @@ WebCodex override.
 
 Therefore the precise inheritance contract is:
 
-> WebCodex inherits the selected Runner-owned ACP provider's effective defaults
-> by abstaining from run-level ACP config overrides.
+> Without Runner-global forced policy, WebCodex inherits the selected Runner-owned ACP provider's effective defaults by abstaining from caller run-level ACP config overrides. A configured global forced policy is operator-owned policy and is enforced separately.
 
 The Run should record a bounded sanitized snapshot of the effective advertised
 config ids/current values needed for diagnosis. It must not claim that those
@@ -416,17 +418,23 @@ values came directly from `~/.codex`, an account, or organization policy.
 
 ### Explicit run-level overrides
 
-For a non-empty caller `config` object P1 must perform this order:
+For a non-empty caller `config` object, Runner-global forced policy remains
+independent and takes precedence. P1 must perform this order:
 
 1. start/initialize the exact configured provider;
 2. create the private ACP session;
 3. obtain the session's advertised config options;
-4. reject any caller key not currently advertised;
-5. reject any value not legal for that advertised option;
-6. apply Runner/operator allow/deny policy for remotely overridable options;
-7. call `session/set_config_option` only for approved explicit overrides;
-8. validate the returned refreshed config options;
-9. only then dispatch the prompt.
+4. reject any caller value that conflicts with a forced key;
+5. validate and apply every forced key/value against the live options, requiring
+   each refreshed response to reflect the forced value;
+6. for each non-forced caller key, require both live legality and the
+   Runner/operator allowlist before applying the explicit override;
+7. validate each returned refreshed config option set;
+8. re-check and re-assert forced values after caller overrides in case a provider
+   changed another option as a side effect;
+9. require every forced value to be legal and current immediately before prompt
+   dispatch;
+10. only then dispatch the prompt.
 
 An invalid override is `not_started` with `recovery_kind=fix_input`; it must not
 partially begin the coding prompt.
@@ -542,7 +550,7 @@ configuration, but it must not translate that into a claim of WebCodex Project
 isolation unless WebCodex separately enforces such isolation.
 
 The P1 product description should therefore say **operator-configured delegated
-local coding agent**. It must not promise parity with WebCodex `read_file` /
+local coding agent**. It must not promise parity with WebCodex `read_files` /
 `apply_text_edits` filesystem isolation.
 
 ## 8. Permission-request exceptional path
@@ -999,8 +1007,10 @@ The P0 architecture baseline is therefore:
 1. `CodingAgentRun` is a separate protocol execution primitive, not a Job alias.
 2. Workflow Session is optional evidence provenance, never Run authority.
 3. Raw ACP session ids stay Runner-private.
-4. Default WebCodex config inheritance means **no ACP config override calls**;
-   effective behavior is whatever the configured provider advertises.
+4. Without Runner-global forced policy, default WebCodex config inheritance means
+   **no ACP config override calls**; effective behavior is whatever the configured
+   provider advertises. A configured forced policy is separate operator-owned
+   admission policy and is enforced before prompt dispatch.
 5. Explicit config is validated against live advertised options and Runner policy
    before prompt dispatch.
 6. ACP permission callbacks are real and exceptional; never auto-allow them and
@@ -1024,3 +1034,36 @@ The P0 architecture baseline is therefore:
     prompt/reasoning/tool bodies out of ordinary durable telemetry/audit.
 14. P1 is one exact Codex vertical slice with typed closed Server<->Runner
     protocol and three eventual model tools, not a generic agent framework.
+
+
+## Runner-global forced ACP configuration
+
+Runner configuration may define a provider-neutral global forced policy:
+
+    [acp.forced_config]
+    model = "provider-model"
+    feature_flag = true
+
+The map is empty by default. Keys and values are provider-defined live ACP
+configuration, not WebCodex model or effort enums.
+
+This policy is admission policy, not best-effort configuration. For every new
+ACP session the Runner validates every forced key/value against that session's
+live session/new configOptions, applies it with session/set_config_option, and
+requires the returned configuration state to reflect the requested value. A
+globally forced key may not also appear in any provider's
+allowed_config_options.
+
+A caller may repeat the exact forced value. A conflicting caller value fails
+closed before prompt dispatch. After caller-allowed options are applied, the
+Runner re-checks and re-asserts forced values in case another setting changed
+them as a provider-side effect, then performs one final forced-current check
+immediately before the prompt-dispatch path.
+
+The policy applies to every configured ACP provider on the Runner. If a provider
+does not advertise a forced key/value, a Run targeting that provider fails
+before prompt dispatch; the policy is never silently ignored for that provider.
+
+The first version accepts stable ACP string/select and boolean values. Integer
+forced values are rejected. The ACP section remains Runner
+startup/restart-owned; forced-policy changes do not hot-reload.

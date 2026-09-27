@@ -21,10 +21,6 @@ fn register_project_writes_valid_toml_into_project_registry_dir() {
     let value = project_ok(handle_project_op(&policy, &project_registry_dir, &req));
     assert_eq!(value["created_config"], true);
     assert_eq!(value["overwritten"], false);
-    assert_eq!(
-        value["project_record_path"], value["projects_config_path"],
-        "legacy projects_config_path must remain an additive alias"
-    );
     let expected_record_path =
         std::fs::canonicalize(project_registry_dir.join("demo.toml")).unwrap();
     assert_eq!(

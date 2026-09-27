@@ -59,7 +59,9 @@ pub(crate) fn paths_from_sanitized_arguments(arguments: &Value, cap: usize) -> V
                 }
             }
         };
-        push(&arguments["path"]);
+        for key in ["path", "source_path", "destination_path"] {
+            push(&arguments[key]);
+        }
         for key in ["paths", "destination_paths"] {
             if let Some(list) = arguments[key].as_array() {
                 for value in list {
@@ -92,6 +94,20 @@ mod tests {
             vec!["a.rs", "b.rs", "c.rs", "d.rs"]
         );
         assert!(paths_from_sanitized_arguments(&json!({}), 16).is_empty());
+    }
+
+    #[test]
+    fn paths_extraction_includes_cross_project_transfer_paths() {
+        let arguments = json!({
+            "source_project": "agent:source:project",
+            "source_path": "paper/source.pdf",
+            "destination_project": "agent:destination:project",
+            "destination_path": "artifacts/source.pdf"
+        });
+        assert_eq!(
+            paths_from_sanitized_arguments(&arguments, 16),
+            vec!["paper/source.pdf", "artifacts/source.pdf"]
+        );
     }
 
     #[test]

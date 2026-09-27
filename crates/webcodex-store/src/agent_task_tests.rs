@@ -1,9 +1,16 @@
 use super::agent_task::*;
+use super::agent_wait::{
+    AgentWaitEventSelector, AgentWaitMode, AgentWaitState, NewAgentWait,
+    AGENT_WAIT_EVENT_KIND_AGENT_TASK_TERMINAL,
+};
+use super::agent_wake::{AgentWakeState, AGENT_WAKE_CONSUME_TOKEN_PREFIX};
 use super::communication::{
     CommunicationPrincipal, NewAgentEndpoint, NewAgentIdentity, NewConversation,
     NewConversationMessage, COMMUNICATION_PRINCIPAL_DIGEST_PREFIX,
 };
+use super::goal::{GoalCorrelationKind, GoalLifecycle, NewGoal};
 use super::Database;
+use crate::server_instance::ServerInstanceGuard;
 use rusqlite::params;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,6 +89,209 @@ fn start(
 ) -> AgentTaskAttemptStartMutation {
     db.start_agent_task_attempt_at(owner, task_id, assignee, key, now)
         .unwrap()
+}
+
+struct EndpointTakeoverFixture {
+    assignee: String,
+    task_id: String,
+    task_attempt_id: String,
+    task_attempt_fence: String,
+    task_attempt_controller_generation: i64,
+    pre_dispatch_lease_expires_at_unix_ms: i64,
+    dispatch_grace_expires_at_unix_ms: i64,
+    endpoint_id: String,
+    endpoint_controller_generation: i64,
+    wake_id: String,
+    wake_attempt_id: String,
+    wake_claim_fence: String,
+    consume_token: String,
+}
+
+fn attempt_lease_expires_at(db: &Database, attempt_id: &str) -> i64 {
+    db.conn_for_tests()
+        .query_row(
+            "SELECT lease_expires_at_unix_ms FROM wc_agent_task_attempts WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn prepared_endpoint_takeover_fixture(
+    db: &Database,
+    owner: &CommunicationPrincipal,
+    label: &str,
+    started_at: i64,
+) -> EndpointTakeoverFixture {
+    let assignee = agent(db, owner, &format!("{label}-agent"));
+    let task_id = create_assigned_task(db, owner, &assignee, &format!("{label}-task"));
+    let started = start(
+        db,
+        owner,
+        &task_id,
+        &assignee,
+        &format!("{label}-attempt"),
+        started_at,
+    );
+    let pre_dispatch_lease_expires_at_unix_ms = started_at + DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS;
+    assert_eq!(
+        started.attempt.lease_expires_at_unix_ms, pre_dispatch_lease_expires_at_unix_ms,
+        "A4b starts with the ordinary short pre-dispatch Attempt lease"
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            started_at + 1,
+        )
+        .unwrap();
+    let endpoint = db
+        .attach_agent_endpoint(
+            owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "ChatGPT".to_string(),
+                client_attachment_id: Some(format!("{label}-view")),
+                wake_capable: true,
+                idempotency_key: format!("{label}-endpoint"),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = db
+        .claim_next_agent_wake(
+            owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "mcp_app",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.wake.wake_id, execution.execution.wake_id);
+    db.prepare_agent_wake_dispatch(
+        owner,
+        &assignee,
+        &endpoint.endpoint_id,
+        endpoint.controller_generation,
+        &claim.wake.wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+        &claim.consume_token,
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(db, &started.attempt.attempt_id),
+        pre_dispatch_lease_expires_at_unix_ms,
+        "claim and prepare do not extend the short pre-dispatch lease"
+    );
+    let task_attempt_controller_generation = db
+        .read_agent_task(owner, &task_id)
+        .unwrap()
+        .summary
+        .latest_attempt
+        .unwrap()
+        .attempt_controller_generation;
+    EndpointTakeoverFixture {
+        assignee,
+        task_id,
+        task_attempt_id: started.attempt.attempt_id,
+        task_attempt_fence: started.attempt_fence,
+        task_attempt_controller_generation,
+        pre_dispatch_lease_expires_at_unix_ms,
+        dispatch_grace_expires_at_unix_ms: started_at + 2 + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS,
+        endpoint_id: endpoint.endpoint_id,
+        endpoint_controller_generation: endpoint.controller_generation,
+        wake_id: claim.wake.wake_id,
+        wake_attempt_id: claim.attempt.attempt_id,
+        wake_claim_fence: claim.claim_fence,
+        consume_token: claim.consume_token,
+    }
+}
+
+fn dispatched_endpoint_takeover_fixture(
+    db: &Database,
+    owner: &CommunicationPrincipal,
+    label: &str,
+    started_at: i64,
+) -> EndpointTakeoverFixture {
+    let fixture = prepared_endpoint_takeover_fixture(db, owner, label, started_at);
+    db.complete_agent_wake_delivery_at(
+        owner,
+        &fixture.assignee,
+        &fixture.endpoint_id,
+        fixture.endpoint_controller_generation,
+        &fixture.wake_id,
+        &fixture.wake_attempt_id,
+        &fixture.wake_claim_fence,
+        started_at + 2,
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(db, &fixture.task_attempt_id),
+        fixture.dispatch_grace_expires_at_unix_ms,
+        "first durable Host dispatch outcome establishes only the bounded scheduling grace"
+    );
+    fixture
+}
+
+fn dispatch_and_consume_next_wake(
+    db: &Database,
+    owner: &CommunicationPrincipal,
+    assignee: &str,
+    endpoint_id: &str,
+    endpoint_controller_generation: i64,
+) -> (String, String, String) {
+    let claim = db
+        .claim_next_agent_wake(
+            owner,
+            assignee,
+            endpoint_id,
+            endpoint_controller_generation,
+            "active_turn_negative_proof_test",
+        )
+        .unwrap()
+        .expect("pending Wake");
+    let trigger_kind = claim.wake.trigger_kind.clone();
+    let wake_id = claim.wake.wake_id.clone();
+    let consume_token = claim.consume_token.clone();
+    db.prepare_agent_wake_dispatch(
+        owner,
+        assignee,
+        endpoint_id,
+        endpoint_controller_generation,
+        &wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+        &consume_token,
+    )
+    .unwrap();
+    db.complete_agent_wake_delivery(
+        owner,
+        assignee,
+        endpoint_id,
+        endpoint_controller_generation,
+        &wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+    )
+    .unwrap();
+    let consumed = db
+        .consume_agent_wake(
+            owner,
+            assignee,
+            endpoint_id,
+            endpoint_controller_generation,
+            &wake_id,
+            &consume_token,
+        )
+        .unwrap();
+    assert_eq!(consumed.state, AgentWakeState::Consumed);
+    (trigger_kind, wake_id, consume_token)
 }
 
 fn coding_binding_intent(label: &str) -> AgentTaskCodingRunBindingIntent {
@@ -209,6 +419,13 @@ fn coding_run_binding_is_unique_replayable_and_fenced_before_dispatch() {
         AgentTaskCodingRunDispatchState::Prepared
     );
     assert!(!prepared.replayed);
+    assert_eq!(
+        db.read_agent_task(&owner, &task_id)
+            .unwrap()
+            .summary
+            .execution_kind,
+        Some(AgentTaskExecutionKind::CodingAgentRun)
+    );
 
     let replay =
         prepare_coding_binding(&db, &owner, &task_id, &assignee, &started, &intent, now + 3);
@@ -484,8 +701,69 @@ fn backend_terminal_truth_reconciles_exact_attempt_after_ordinary_lease_expiry()
     let db = Database::open(&temp.path().join("agent-task-coding-terminal.db")).unwrap();
     let owner = principal('4');
     let assignee = agent(&db, &owner, "coding-terminal-agent");
+    let goal_controller = agent(&db, &owner, "coding-terminal-controller");
+    let waiter = agent(&db, &owner, "coding-terminal-waiter");
+    let wait_endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: waiter.clone(),
+                host: "ChatGPT".to_string(),
+                client_attachment_id: Some("coding-terminal-wait-view".to_string()),
+                wake_capable: true,
+                idempotency_key: "coding-terminal-wait-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
     let now = wall_now_ms();
     let task_id = create_assigned_task(&db, &owner, &assignee, "coding-terminal-task");
+    let agent_wait = db
+        .create_agent_wait(
+            &owner,
+            NewAgentWait {
+                target_agent_id: waiter.clone(),
+                goal_id: None,
+                endpoint_id: wait_endpoint.endpoint_id.clone(),
+                expected_controller_generation: wait_endpoint.controller_generation,
+                mode: AgentWaitMode::Any,
+                events: vec![AgentWaitEventSelector {
+                    kind: AGENT_WAIT_EVENT_KIND_AGENT_TASK_TERMINAL.to_string(),
+                    task_id: task_id.clone(),
+                }],
+                idempotency_key: "coding-terminal-agent-wait".to_string(),
+            },
+        )
+        .unwrap()
+        .agent_wait;
+    assert_eq!(agent_wait.state, AgentWaitState::Waiting);
+    let goal_id = db
+        .create_goal_at(
+            &owner,
+            NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
+                title: "Coding terminal Goal".to_string(),
+                objective: "Re-evaluate high-level intent after backend terminal truth."
+                    .to_string(),
+                controller_agent_id: Some(goal_controller.clone()),
+                idempotency_key: "coding-terminal-goal".to_string(),
+            },
+            now,
+        )
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    db.associate_goal_reference_at(
+        &owner,
+        &goal_id,
+        GoalCorrelationKind::AgentTask,
+        &task_id,
+        "coding-terminal-goal-link",
+        now + 1,
+    )
+    .unwrap();
     let started = start(
         &db,
         &owner,
@@ -543,12 +821,57 @@ fn backend_terminal_truth_reconciles_exact_attempt_after_ordinary_lease_expiry()
         )
         .unwrap();
     assert!(reconciled.state_changed);
+    assert_eq!(reconciled.attention_event_count, 1);
+    assert_eq!(
+        reconciled.attention_target_agent_ids,
+        vec![goal_controller.clone()]
+    );
+    assert_eq!(reconciled.wait_target_agent_ids, vec![waiter.clone()]);
+    let resumed_wait = db.read_agent_wait(&owner, &agent_wait.wait_id).unwrap();
+    assert_eq!(resumed_wait.state, AgentWaitState::Triggered);
+    assert_eq!(resumed_wait.match_count, 1);
+    assert_eq!(resumed_wait.matches[0].task_id, task_id);
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row(
+                "SELECT COUNT(*) FROM wc_agent_wakes
+                 WHERE trigger_kind = 'agent_wait_events' AND source_wait_id = ?1 AND state = 'pending'",
+                [agent_wait.wait_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "terminal CodingAgent reconciliation must durably trigger the Agent Wait in the same transaction"
+    );
     assert_eq!(reconciled.task.state, AgentTaskState::Succeeded);
     assert_eq!(reconciled.attempt.state, AgentTaskAttemptState::Succeeded);
     assert_eq!(
         reconciled.binding.dispatch_state,
         AgentTaskCodingRunDispatchState::Terminal
     );
+    let attention_count: i64 = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*)
+             FROM wc_agent_attention_events e
+             JOIN wc_agent_wakes w ON w.source_event_id = e.event_id
+             WHERE e.kind = 'agent_task_terminal' AND e.goal_id = ?1
+               AND e.task_id = ?2 AND e.task_attempt_id = ?3
+               AND e.target_agent_id = ?4 AND e.terminal_task_state = 'succeeded'
+               AND w.trigger_kind = 'attention_event' AND w.state = 'pending'",
+            params![
+                goal_id,
+                task_id,
+                started.attempt.attempt_id,
+                goal_controller
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attention_count, 1);
+    let goal = db.read_goal(&owner, &goal_id).unwrap();
+    assert_eq!(goal.summary.lifecycle, GoalLifecycle::Active);
+    assert_eq!(goal.summary.revision, 2);
 
     let replay_observation = db
         .record_agent_task_coding_run_observation(
@@ -573,6 +896,160 @@ fn backend_terminal_truth_reconciles_exact_attempt_after_ordinary_lease_expiry()
         )
         .unwrap();
     assert!(!replay.state_changed);
+    assert_eq!(replay.attention_event_count, 0);
+    let replay_attention_count: i64 = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_agent_attention_events
+             WHERE goal_id = ?1 AND task_attempt_id = ?2",
+            params![goal_id, started.attempt.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replay_attention_count, 1);
+}
+
+#[test]
+fn backend_terminal_truth_routes_goal_scoped_wait_without_duplicate_attention() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-coding-goal-scoped-wait.db")).unwrap();
+    let owner = principal('5');
+    let worker = agent(&db, &owner, "coding-goal-scoped-worker");
+    let controller = agent(&db, &owner, "coding-goal-scoped-controller");
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: controller.clone(),
+                host: "ChatGPT".to_string(),
+                client_attachment_id: Some("coding-goal-scoped-controller-view".to_string()),
+                wake_capable: true,
+                idempotency_key: "coding-goal-scoped-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let now = wall_now_ms();
+    let task_id = create_assigned_task(&db, &owner, &worker, "coding-goal-scoped-task");
+    let goal_id = db
+        .create_goal_at(
+            &owner,
+            NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
+                title: "Coding Goal-scoped rendezvous".to_string(),
+                objective: "Route exact terminal attention through the explicit rendezvous."
+                    .to_string(),
+                controller_agent_id: Some(controller.clone()),
+                idempotency_key: "coding-goal-scoped-goal".to_string(),
+            },
+            now,
+        )
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    db.associate_goal_reference_at(
+        &owner,
+        &goal_id,
+        GoalCorrelationKind::AgentTask,
+        &task_id,
+        "coding-goal-scoped-link",
+        now + 1,
+    )
+    .unwrap();
+    let agent_wait = db
+        .create_agent_wait(
+            &owner,
+            NewAgentWait {
+                target_agent_id: controller.clone(),
+                goal_id: Some(goal_id.clone()),
+                endpoint_id: endpoint.endpoint_id.clone(),
+                expected_controller_generation: endpoint.controller_generation,
+                mode: AgentWaitMode::All,
+                events: vec![AgentWaitEventSelector {
+                    kind: AGENT_WAIT_EVENT_KIND_AGENT_TASK_TERMINAL.to_string(),
+                    task_id: task_id.clone(),
+                }],
+                idempotency_key: "coding-goal-scoped-wait".to_string(),
+            },
+        )
+        .unwrap()
+        .agent_wait;
+    assert_eq!(agent_wait.state, AgentWaitState::Waiting);
+    assert_eq!(agent_wait.match_count, 0);
+
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &worker,
+        "coding-goal-scoped-start",
+        now + 2,
+    );
+    let intent = coding_binding_intent("goal-scoped-terminal-completed");
+    prepare_coding_binding(&db, &owner, &task_id, &worker, &started, &intent, now + 3);
+    db.claim_agent_task_coding_run_dispatch(
+        &owner,
+        &task_id,
+        &started.attempt.attempt_id,
+        &worker,
+        &started.attempt_fence,
+        1,
+        &intent.binding_intent_fingerprint,
+    )
+    .unwrap();
+    let completed = coding_observation(&intent, "completed", "completed", 9);
+    db.record_agent_task_coding_run_observation(
+        &owner,
+        &task_id,
+        &started.attempt.attempt_id,
+        &completed,
+    )
+    .unwrap();
+
+    let reconciled = db
+        .terminalize_agent_task_coding_run(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &completed,
+            Some("bounded coding result"),
+            Some("coding_agent_completed"),
+        )
+        .unwrap();
+    assert!(reconciled.state_changed);
+    assert_eq!(reconciled.attention_event_count, 0);
+    assert!(reconciled.attention_target_agent_ids.is_empty());
+    assert_eq!(
+        reconciled.wait_target_agent_ids,
+        vec![controller.clone()],
+        "CodingAgent terminal reconciliation must schedule only the explicit scoped Wait"
+    );
+    let triggered = db.read_agent_wait(&owner, &agent_wait.wait_id).unwrap();
+    assert_eq!(triggered.state, AgentWaitState::Triggered);
+    assert_eq!(triggered.match_count, 1);
+    assert_eq!(triggered.goal_id.as_deref(), Some(goal_id.as_str()));
+    let attention_count: i64 = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_agent_attention_events
+             WHERE goal_id = ?1 AND task_id = ?2 AND task_attempt_id = ?3",
+            params![goal_id, task_id, started.attempt.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attention_count, 0);
+    let wait_wake_count: i64 = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM wc_agent_wakes
+             WHERE trigger_kind = 'agent_wait_events' AND source_wait_id = ?1 AND state = 'pending'",
+            [agent_wait.wait_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wait_wake_count, 1);
 }
 
 #[test]
@@ -2289,7 +2766,7 @@ fn source_conversation_is_correlation_only_and_foreign_exact_ids_are_existence_h
         )
         .unwrap();
     let foreign_error = db.read_agent_task(&foreign, &task_id).unwrap_err();
-    let missing_id = format!("{AGENT_TASK_ID_PREFIX}{}", "f".repeat(32));
+    let missing_id = format!("{AGENT_TASK_ID_PREFIX}{}", "f".repeat(16));
     let missing_error = db.read_agent_task(&foreign, &missing_id).unwrap_err();
     assert_eq!(foreign_error.code(), "agent_task_not_found");
     assert_eq!(foreign_error.code(), missing_error.code());
@@ -2318,7 +2795,10 @@ fn random_fence_and_stale_controller_generation_fail_closed() {
     let assignee = agent(&db, &owner, "fence-agent");
     let task_id = create_assigned_task(&db, &owner, &assignee, "fence-task");
     let started = start(&db, &owner, &task_id, &assignee, "fence-start", T0 + 90);
-    let random_fence = format!("{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}", "0".repeat(32));
+    let random_fence = format!(
+        "{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}",
+        webcodex_core::compact::encode([0x00; 16])
+    );
     let fence_error = db
         .heartbeat_agent_task_attempt_at(
             &owner,
@@ -2459,4 +2939,2143 @@ fn replay_record_and_effect_commit_atomically_for_create_start_and_completion() 
         T0 + 104,
     )
     .unwrap();
+}
+
+#[test]
+fn endpoint_continuation_start_is_endpoint_independent_replay_safe_and_payload_free() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-start.db")).unwrap();
+    let owner = principal('e');
+    let assignee = agent(&db, &owner, "endpoint-start-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-start-task");
+    let now = wall_now_ms();
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-start-attempt",
+        now,
+    );
+    let before_messages: i64 = db
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM wc_conversation_messages", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let before_deliveries: i64 = db
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM wc_agent_deliveries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    let first = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            now + 1,
+        )
+        .unwrap();
+    assert!(first.state_changed);
+    assert!(!first.replayed);
+    assert_eq!(first.execution.wake_state, AgentWakeState::Pending);
+    assert_eq!(first.execution.endpoint_id, None);
+    assert_eq!(first.execution.endpoint_controller_generation, None);
+    let projected = db.read_agent_task(&owner, &task_id).unwrap();
+    assert!(projected.summary.execution_bound);
+    assert_eq!(
+        projected.summary.execution_kind,
+        Some(AgentTaskExecutionKind::AgentEndpoint)
+    );
+    assert_eq!(
+        projected.summary.execution_status,
+        Some(AgentTaskExecutionStatus::NotStarted)
+    );
+    assert_eq!(
+        projected.summary.recovery_kind,
+        AgentTaskExecutionRecoveryKind::None
+    );
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row("SELECT COUNT(*) FROM wc_conversation_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        before_messages,
+        "Task-origin execution must not synthesize a Conversation Message",
+    );
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row("SELECT COUNT(*) FROM wc_agent_deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        before_deliveries,
+        "Task-origin execution must not synthesize an Inbox Delivery",
+    );
+
+    let replay = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            now + 2,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(!replay.state_changed);
+    assert_eq!(replay.execution.wake_id, first.execution.wake_id);
+
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "task-host".to_string(),
+                client_attachment_id: Some("task-host-view".to_string()),
+                wake_capable: true,
+                idempotency_key: "task-host-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.wake.wake_id, first.execution.wake_id);
+    assert_eq!(claim.wake.trigger_kind, "agent_task_attempt");
+    assert_eq!(claim.wake.latest_conversation_id, None);
+    assert_eq!(claim.wake.queued_delivery_count_snapshot, None);
+
+    let task_after_claim = db.read_agent_task(&owner, &task_id).unwrap();
+    let attempt_after_claim = task_after_claim.summary.latest_attempt.unwrap();
+    assert_eq!(attempt_after_claim.attempt_controller_generation, 2);
+
+    let replay_after_claim = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 3,
+        )
+        .unwrap();
+    assert!(replay_after_claim.replayed);
+    assert_eq!(
+        replay_after_claim.execution.wake_state,
+        AgentWakeState::Claimed
+    );
+    assert_eq!(
+        replay_after_claim.execution.endpoint_id.as_deref(),
+        Some(endpoint.endpoint_id.as_str())
+    );
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row(
+                "SELECT COUNT(*) FROM wc_agent_wakes WHERE source_task_attempt_id = ?1",
+                [started.attempt.attempt_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "exact start replay must never mint a second Task Wake",
+    );
+    let prepared = db
+        .prepare_agent_wake_dispatch(
+            &owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            &claim.wake.wake_id,
+            &claim.attempt.attempt_id,
+            &claim.claim_fence,
+            &claim.consume_token,
+        )
+        .unwrap();
+    let hint = &prepared.envelope.resume_hint;
+    for field in [
+        "agent_id=",
+        "endpoint_id=",
+        "controller_generation=",
+        "wake_id=",
+        "consume_token=",
+        "task_id=",
+        "attempt_id=",
+        "attempt_fence=",
+        "attempt_controller_generation=",
+    ] {
+        assert!(
+            hint.contains(field),
+            "missing exact continuation field {field}"
+        );
+    }
+    let bootstrap_pos = hint
+        .find("bootstrap_agent_conversation")
+        .expect("Task continuation must bootstrap the exact Wake");
+    let consume_pos = hint
+        .find("consume_agent_wake")
+        .expect("Task continuation must consume the exact Wake promptly");
+    let read_pos = hint
+        .find("read_agent_task")
+        .expect("Task continuation must read authoritative Task state after takeover");
+    assert!(bootstrap_pos < consume_pos && consume_pos < read_pos);
+    for required_semantic in [
+        "bounded 30-minute active-turn reservation",
+        "still current",
+        "same assignee/fence/generation",
+        "complete_agent_task_attempt",
+        "heartbeat_agent_task_attempt",
+        "active-turn proof",
+    ] {
+        assert!(hint.contains(required_semantic));
+    }
+    for removed_prose in [
+        "First call heartbeat_agent_task_attempt",
+        "short stale/fence preflight",
+        "Never infer or retarget",
+        "Agent/Conversation authority grants",
+        "Endpoint lease and TaskAttempt lease remain independent",
+    ] {
+        assert!(
+            !hint.contains(removed_prose),
+            "duplicated authority prose returned: {removed_prose}"
+        );
+    }
+    assert!(
+        hint.chars().count() <= 1_024,
+        "Task resume hint too long: {}",
+        hint.chars().count()
+    );
+    assert!(!hint.contains("Durable work"));
+    assert!(!hint.contains("Perform bounded durable work without assuming a window or Endpoint."));
+}
+
+#[test]
+fn endpoint_dispatch_outcomes_grant_bounded_one_shot_scheduling_grace() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-dispatch-grace.db")).unwrap();
+    let owner = principal('7');
+    let started_at = wall_now_ms();
+
+    let accepted = prepared_endpoint_takeover_fixture(&db, &owner, "dispatch-accepted", started_at);
+    let accepted_at = started_at + 10;
+    db.complete_agent_wake_delivery_at(
+        &owner,
+        &accepted.assignee,
+        &accepted.endpoint_id,
+        accepted.endpoint_controller_generation,
+        &accepted.wake_id,
+        &accepted.wake_attempt_id,
+        &accepted.wake_claim_fence,
+        accepted_at,
+    )
+    .unwrap();
+    let accepted_grace = accepted_at + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &accepted.task_attempt_id),
+        accepted_grace,
+        "accepted Host dispatch grants scheduling grace, not the 30-minute active-turn reservation"
+    );
+    db.complete_agent_wake_delivery_at(
+        &owner,
+        &accepted.assignee,
+        &accepted.endpoint_id,
+        accepted.endpoint_controller_generation,
+        &accepted.wake_id,
+        &accepted.wake_attempt_id,
+        &accepted.wake_claim_fence,
+        accepted_at + 120_000,
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&db, &accepted.task_attempt_id),
+        accepted_grace,
+        "dispatch ACK replay must not slide scheduling grace"
+    );
+
+    let unknown =
+        prepared_endpoint_takeover_fixture(&db, &owner, "dispatch-unknown", started_at + 1_000);
+    let unknown_at = started_at + 1_010;
+    db.mark_agent_wake_delivery_unknown_at(
+        &owner,
+        &unknown.assignee,
+        &unknown.endpoint_id,
+        unknown.endpoint_controller_generation,
+        &unknown.wake_id,
+        &unknown.wake_attempt_id,
+        &unknown.wake_claim_fence,
+        unknown_at,
+    )
+    .unwrap();
+    let unknown_grace = unknown_at + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &unknown.task_attempt_id),
+        unknown_grace,
+        "delivery_unknown receives the same bounded one-shot scheduling grace"
+    );
+    db.mark_agent_wake_delivery_unknown_at(
+        &owner,
+        &unknown.assignee,
+        &unknown.endpoint_id,
+        unknown.endpoint_controller_generation,
+        &unknown.wake_id,
+        &unknown.wake_attempt_id,
+        &unknown.wake_claim_fence,
+        unknown_at + 60_000,
+    )
+    .unwrap();
+    db.complete_agent_wake_delivery_at(
+        &owner,
+        &unknown.assignee,
+        &unknown.endpoint_id,
+        unknown.endpoint_controller_generation,
+        &unknown.wake_id,
+        &unknown.wake_attempt_id,
+        &unknown.wake_claim_fence,
+        unknown_at + 120_000,
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&db, &unknown.task_attempt_id),
+        unknown_grace,
+        "delivery outcome replay/reconciliation must never slide the first scheduling reservation"
+    );
+}
+
+#[test]
+fn prepared_task_wake_host_binding_loss_gets_one_shot_dispatch_grace() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-binding-loss-grace.db")).unwrap();
+    let owner = principal('6');
+    let started_at = wall_now_ms();
+    let fixture = prepared_endpoint_takeover_fixture(&db, &owner, "binding-loss", started_at);
+    let recovery_at = started_at + 10;
+
+    {
+        let mut conn = db.conn_for_tests();
+        let transaction = conn.transaction().unwrap();
+        super::agent_wake::reconcile_wakes_for_endpoint_loss(
+            &transaction,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            recovery_at,
+            false,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        db.agent_wake(&fixture.wake_id).unwrap().unwrap().state,
+        AgentWakeState::DeliveryUnknown
+    );
+    let grace_expiry = recovery_at + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        grace_expiry,
+        "same-generation Host binding loss records dispatch uncertainty and the bounded scheduling grace"
+    );
+    assert_eq!(
+        db.read_agent_task(&owner, &fixture.task_id)
+            .unwrap()
+            .summary
+            .latest_attempt
+            .unwrap()
+            .attempt_controller_generation,
+        fixture.task_attempt_controller_generation,
+        "process-local Host binding loss must not fabricate a controller-generation replacement"
+    );
+
+    {
+        let mut conn = db.conn_for_tests();
+        let transaction = conn.transaction().unwrap();
+        super::agent_wake::reconcile_wakes_for_endpoint_loss(
+            &transaction,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            recovery_at + 60_000,
+            false,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        grace_expiry,
+        "recovery replay must not slide scheduling grace"
+    );
+    let consume_at = recovery_at + 60_001;
+    let consumed = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            consume_at,
+        )
+        .unwrap();
+    assert!(consumed.state_changed);
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        consume_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS,
+        "exact consume after same-generation Host binding loss remains the active-turn takeover boundary"
+    );
+}
+
+#[test]
+fn server_takeover_preserves_prepared_task_dispatch_uncertainty_with_bounded_grace() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-server-takeover-grace.db")).unwrap();
+    let owner = principal('5');
+    let started_at = wall_now_ms();
+    let fixture = prepared_endpoint_takeover_fixture(&db, &owner, "server-takeover", started_at);
+    let recovery_at = started_at + 10;
+    let ownership = ServerInstanceGuard::acquire(&db).unwrap();
+
+    db.recover_agent_wakes_for_server_takeover(&ownership, recovery_at)
+        .unwrap();
+    assert_eq!(
+        db.agent_wake(&fixture.wake_id).unwrap().unwrap().state,
+        AgentWakeState::DeliveryUnknown
+    );
+    let grace_expiry = recovery_at + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        grace_expiry,
+        "Server takeover restores durable dispatch uncertainty without inventing active-turn liveness"
+    );
+    assert_eq!(
+        db.read_agent_task(&owner, &fixture.task_id)
+            .unwrap()
+            .summary
+            .latest_attempt
+            .unwrap()
+            .attempt_controller_generation,
+        fixture.task_attempt_controller_generation
+    );
+
+    db.recover_agent_wakes_for_server_takeover(&ownership, recovery_at + 60_000)
+        .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        grace_expiry,
+        "Server takeover replay must not slide scheduling grace"
+    );
+    let consume_at = recovery_at + 60_001;
+    let consumed = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            consume_at,
+        )
+        .unwrap();
+    assert!(consumed.state_changed);
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        consume_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS,
+        "exact consume after Server takeover uses durable post-fence binding truth, not reconstructed liveness"
+    );
+}
+
+#[test]
+fn endpoint_dispatch_grace_fails_closed_for_expired_or_wrong_exact_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-dispatch-grace-fences.db")).unwrap();
+    let owner = principal('8');
+    let started_at = wall_now_ms();
+    let fixture = prepared_endpoint_takeover_fixture(&db, &owner, "dispatch-fence", started_at);
+    let pre_dispatch_lease = fixture.pre_dispatch_lease_expires_at_unix_ms;
+
+    for (endpoint_id, generation, wake_id) in [
+        (
+            "wc_endpoint_0000000000000000",
+            fixture.endpoint_controller_generation,
+            fixture.wake_id.as_str(),
+        ),
+        (
+            fixture.endpoint_id.as_str(),
+            fixture.endpoint_controller_generation + 1,
+            fixture.wake_id.as_str(),
+        ),
+        (
+            fixture.endpoint_id.as_str(),
+            fixture.endpoint_controller_generation,
+            "wc_wake_0000000000000000",
+        ),
+    ] {
+        assert!(db
+            .complete_agent_wake_delivery_at(
+                &owner,
+                &fixture.assignee,
+                endpoint_id,
+                generation,
+                wake_id,
+                &fixture.wake_attempt_id,
+                &fixture.wake_claim_fence,
+                started_at + 20,
+            )
+            .is_err());
+        assert_eq!(
+            attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+            pre_dispatch_lease,
+            "wrong Endpoint/generation/Wake must fail closed without extending the Attempt"
+        );
+    }
+
+    let successor = start(
+        &db,
+        &owner,
+        &fixture.task_id,
+        &fixture.assignee,
+        "dispatch-fence-successor",
+        pre_dispatch_lease + 1,
+    );
+    assert_eq!(successor.attempt.attempt_number, 2);
+    db.complete_agent_wake_delivery_at(
+        &owner,
+        &fixture.assignee,
+        &fixture.endpoint_id,
+        fixture.endpoint_controller_generation,
+        &fixture.wake_id,
+        &fixture.wake_attempt_id,
+        &fixture.wake_claim_fence,
+        pre_dispatch_lease + 2,
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        pre_dispatch_lease,
+        "expired and superseded Attempt must not be revived when a post-fence dispatch outcome arrives"
+    );
+}
+
+#[test]
+fn endpoint_dispatch_grace_expiry_requires_explicit_new_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-dispatch-grace-expiry.db")).unwrap();
+    let owner = principal('9');
+    let started_at = wall_now_ms();
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "dispatch-expiry", started_at);
+    let grace_expiry = fixture.dispatch_grace_expires_at_unix_ms;
+
+    let consumed = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            grace_expiry,
+        )
+        .unwrap();
+    assert!(consumed.state_changed);
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        grace_expiry,
+        "consume at/after grace expiry may ACK the Wake but cannot revive or promote the Attempt"
+    );
+    let successor = start(
+        &db,
+        &owner,
+        &fixture.task_id,
+        &fixture.assignee,
+        "dispatch-expiry-successor",
+        grace_expiry + 1,
+    );
+    assert_eq!(successor.attempt.attempt_number, 2);
+}
+
+#[test]
+fn endpoint_exact_consume_promotes_takeover_lease_once_and_survives_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("agent-task-endpoint-takeover.db");
+    let db = Database::open(&path).unwrap();
+    let owner = principal('0');
+    let started_at = wall_now_ms();
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "takeover", started_at);
+    assert_eq!(
+        fixture.pre_dispatch_lease_expires_at_unix_ms,
+        started_at + DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS
+    );
+    assert_eq!(
+        fixture.dispatch_grace_expires_at_unix_ms,
+        started_at + 2 + AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS
+    );
+
+    let takeover_at = wall_now_ms();
+    assert!(takeover_at < fixture.dispatch_grace_expires_at_unix_ms);
+    let consumed = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            takeover_at,
+        )
+        .unwrap();
+    assert!(!consumed.already_consumed);
+    assert!(consumed.state_changed);
+    let promoted_lease = takeover_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        promoted_lease
+    );
+
+    let replay = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            takeover_at + 120_000,
+        )
+        .unwrap();
+    assert!(replay.already_consumed);
+    assert!(!replay.state_changed);
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        promoted_lease,
+        "consume replay must not slide the active-turn lease"
+    );
+
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&reopened, &fixture.task_attempt_id),
+        promoted_lease,
+        "promoted lease must remain ordinary durable Attempt state after reopen"
+    );
+    let completion_at = fixture.dispatch_grace_expires_at_unix_ms + 1;
+    assert!(completion_at < promoted_lease);
+    let completed = reopened
+        .complete_agent_task_attempt_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            AgentTaskState::Succeeded,
+            Some("completed after original short lease"),
+            None,
+            "takeover-complete",
+            completion_at,
+        )
+        .unwrap();
+    assert_eq!(completed.task.state, AgentTaskState::Succeeded);
+}
+
+#[test]
+fn ordinary_heartbeat_stays_short_and_non_a4b_proof_cannot_upgrade() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-ordinary-heartbeat.db")).unwrap();
+    let owner = principal('a');
+    let assignee = agent(&db, &owner, "ordinary-heartbeat-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "ordinary-heartbeat-task");
+    let started_at = T0 + 20_000;
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "ordinary-heartbeat-start",
+        started_at,
+    );
+    assert_eq!(
+        started.attempt.lease_expires_at_unix_ms,
+        started_at + DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS
+    );
+
+    let heartbeat_at = started_at + 1_000;
+    let heartbeat = db
+        .heartbeat_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            heartbeat_at,
+        )
+        .unwrap();
+    assert!(heartbeat.state_changed);
+    assert_eq!(
+        heartbeat.attempt.lease_expires_at_unix_ms,
+        heartbeat_at + DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS,
+        "ordinary/pre-takeover heartbeat must retain the short Server-owned window"
+    );
+    let repeated = db
+        .heartbeat_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            heartbeat_at,
+        )
+        .unwrap();
+    assert!(!repeated.state_changed);
+    assert_eq!(
+        repeated.attempt.lease_expires_at_unix_ms,
+        heartbeat.attempt.lease_expires_at_unix_ms
+    );
+
+    let fake_wake = "wc_wake_3d3d3d3d3d3d3d3d".to_string();
+    let fake_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xee; 16])
+    );
+    let before_invalid_proof = attempt_lease_expires_at(&db, &started.attempt.attempt_id);
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            started.attempt.attempt_controller_generation,
+            Some(&fake_wake),
+            Some(&fake_token),
+            heartbeat_at + 1,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_active_turn_proof_invalid"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&db, &started.attempt.attempt_id),
+        before_invalid_proof,
+        "a non-A4b Attempt cannot upgrade merely by presenting shaped proof values"
+    );
+}
+
+#[test]
+fn consumed_endpoint_active_turn_proof_renews_repeated_bounded_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-active-turn-renewal.db")).unwrap();
+    let owner = principal('b');
+    let started_at = wall_now_ms();
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "renew", started_at);
+    let takeover_at = wall_now_ms();
+    assert!(takeover_at < fixture.dispatch_grace_expires_at_unix_ms);
+    db.consume_agent_wake_at(
+        &owner,
+        &fixture.assignee,
+        &fixture.endpoint_id,
+        fixture.endpoint_controller_generation,
+        &fixture.wake_id,
+        &fixture.consume_token,
+        takeover_at,
+    )
+    .unwrap();
+    let first_reservation = takeover_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS;
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        first_reservation
+    );
+
+    let early = db
+        .heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at,
+        )
+        .unwrap();
+    assert!(!early.state_changed);
+    assert_eq!(early.attempt.lease_expires_at_unix_ms, first_reservation);
+
+    let short_heartbeat = db
+        .heartbeat_agent_task_attempt_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            takeover_at + 1_000,
+        )
+        .unwrap();
+    assert!(!short_heartbeat.state_changed);
+    assert_eq!(
+        short_heartbeat.attempt.lease_expires_at_unix_ms,
+        first_reservation
+    );
+
+    let mut previous = first_reservation;
+    for minutes_after_takeover in [29_i64, 58, 87, 116] {
+        let renewal_at = takeover_at + minutes_after_takeover * 60_000;
+        assert!(
+            renewal_at < previous,
+            "renew before the current reservation expires"
+        );
+        let renewed = db
+            .heartbeat_agent_task_attempt_with_active_turn_proof_at(
+                &owner,
+                &fixture.task_id,
+                &fixture.task_attempt_id,
+                &fixture.assignee,
+                &fixture.task_attempt_fence,
+                fixture.task_attempt_controller_generation,
+                Some(&fixture.wake_id),
+                Some(&fixture.consume_token),
+                renewal_at,
+            )
+            .unwrap();
+        assert!(renewed.state_changed);
+        assert_eq!(
+            renewed.attempt.lease_expires_at_unix_ms,
+            renewal_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS,
+            "each renewal grants exactly one bounded Server-owned 30-minute reservation"
+        );
+        assert!(renewed.attempt.lease_expires_at_unix_ms > previous);
+        previous = renewed.attempt.lease_expires_at_unix_ms;
+    }
+    assert!(previous > takeover_at + 2 * 60 * 60_000);
+}
+
+#[test]
+fn active_turn_proof_rejects_every_unconsumed_task_wake_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-active-turn-unconsumed.db")).unwrap();
+    let owner = principal('c');
+    let pending_assignee = agent(&db, &owner, "proof-pending-agent");
+    let pending_task = create_assigned_task(&db, &owner, &pending_assignee, "proof-pending-task");
+    let now = wall_now_ms();
+    let pending_attempt = start(
+        &db,
+        &owner,
+        &pending_task,
+        &pending_assignee,
+        "proof-pending-start",
+        now,
+    );
+    let pending_execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &pending_task,
+            &pending_attempt.attempt.attempt_id,
+            &pending_assignee,
+            &pending_attempt.attempt_fence,
+            pending_attempt.attempt.attempt_controller_generation,
+            now + 1,
+        )
+        .unwrap();
+    let fake_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xaa; 16])
+    );
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &pending_task,
+            &pending_attempt.attempt.attempt_id,
+            &pending_assignee,
+            &pending_attempt.attempt_fence,
+            pending_attempt.attempt.attempt_controller_generation,
+            Some(&pending_execution.execution.wake_id),
+            Some(&fake_token),
+            now + 2,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_active_turn_proof_invalid",
+        "pending Wake is not model-turn takeover proof"
+    );
+
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "proof-states", now + 10);
+    let wake_attempt_id: String = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT claimed_attempt_id FROM wc_agent_wakes WHERE wake_id = ?1",
+            [&fixture.wake_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let lease_before = attempt_lease_expires_at(&db, &fixture.task_attempt_id);
+    for state in ["claimed", "prepared", "delivered", "delivery_unknown"] {
+        db.conn_for_tests()
+            .execute(
+                "UPDATE wc_agent_wakes SET state = ?2 WHERE wake_id = ?1",
+                params![fixture.wake_id, state],
+            )
+            .unwrap();
+        db.conn_for_tests()
+            .execute(
+                "UPDATE wc_agent_wake_attempts SET state = ?2 WHERE attempt_id = ?1",
+                params![wake_attempt_id, state],
+            )
+            .unwrap();
+        assert_eq!(
+            db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+                &owner,
+                &fixture.task_id,
+                &fixture.task_attempt_id,
+                &fixture.assignee,
+                &fixture.task_attempt_fence,
+                fixture.task_attempt_controller_generation,
+                Some(&fixture.wake_id),
+                Some(&fixture.consume_token),
+                now + 20,
+            )
+            .unwrap_err()
+            .code(),
+            "agent_task_active_turn_proof_invalid",
+            "{state} Wake must not renew an active turn"
+        );
+        assert_eq!(
+            attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+            lease_before
+        );
+    }
+}
+
+#[test]
+fn active_turn_proof_fails_closed_for_wrong_identity_authority_and_controller_loss() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-active-turn-fencing.db")).unwrap();
+    let owner = principal('d');
+    let foreign = principal('e');
+    let started_at = wall_now_ms();
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "renew-fence", started_at);
+    let takeover_at = wall_now_ms();
+    db.consume_agent_wake_at(
+        &owner,
+        &fixture.assignee,
+        &fixture.endpoint_id,
+        fixture.endpoint_controller_generation,
+        &fixture.wake_id,
+        &fixture.consume_token,
+        takeover_at,
+    )
+    .unwrap();
+    let lease_before = attempt_lease_expires_at(&db, &fixture.task_attempt_id);
+    let wrong_wake = "wc_wake_________________".to_string();
+    let wrong_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xff; 16])
+    );
+    for (wake_id, token) in [
+        (wrong_wake.as_str(), fixture.consume_token.as_str()),
+        (fixture.wake_id.as_str(), wrong_token.as_str()),
+    ] {
+        assert_eq!(
+            db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+                &owner,
+                &fixture.task_id,
+                &fixture.task_attempt_id,
+                &fixture.assignee,
+                &fixture.task_attempt_fence,
+                fixture.task_attempt_controller_generation,
+                Some(wake_id),
+                Some(token),
+                takeover_at + 1,
+            )
+            .unwrap_err()
+            .code(),
+            "agent_task_active_turn_proof_invalid"
+        );
+    }
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &foreign,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at + 1,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_not_found"
+    );
+    let wrong_fence = format!(
+        "{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}",
+        webcodex_core::compact::encode([0x00; 16])
+    );
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &wrong_fence,
+            fixture.task_attempt_controller_generation,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at + 1,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation + 1,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at + 1,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        lease_before
+    );
+
+    db.detach_agent_endpoint(&owner, &fixture.endpoint_id)
+        .unwrap();
+    let current_generation = db
+        .read_agent_task(&owner, &fixture.task_id)
+        .unwrap()
+        .summary
+        .latest_attempt
+        .unwrap()
+        .attempt_controller_generation;
+    assert!(current_generation > fixture.task_attempt_controller_generation);
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at + 2,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale",
+        "old online turn is fenced by Attempt-local controller generation"
+    );
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            current_generation,
+            Some(&fixture.wake_id),
+            Some(&fixture.consume_token),
+            takeover_at + 2,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_active_turn_proof_invalid",
+        "advancing the Attempt generation does not let the old consumed Wake regain carrier authority"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        lease_before
+    );
+}
+
+#[test]
+fn active_turn_proof_never_revives_expired_terminal_or_superseded_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-active-turn-terminal.db")).unwrap();
+    let owner = principal('f');
+
+    let expired = dispatched_endpoint_takeover_fixture(&db, &owner, "renew-expired", wall_now_ms());
+    let expired_takeover = wall_now_ms();
+    db.consume_agent_wake_at(
+        &owner,
+        &expired.assignee,
+        &expired.endpoint_id,
+        expired.endpoint_controller_generation,
+        &expired.wake_id,
+        &expired.consume_token,
+        expired_takeover,
+    )
+    .unwrap();
+    let expired_lease = attempt_lease_expires_at(&db, &expired.task_attempt_id);
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &expired.task_id,
+            &expired.task_attempt_id,
+            &expired.assignee,
+            &expired.task_attempt_fence,
+            expired.task_attempt_controller_generation,
+            Some(&expired.wake_id),
+            Some(&expired.consume_token),
+            expired_lease,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+    let successor = start(
+        &db,
+        &owner,
+        &expired.task_id,
+        &expired.assignee,
+        "renew-expired-successor",
+        expired_lease + 1,
+    );
+    assert_eq!(successor.attempt.attempt_number, 2);
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &expired.task_id,
+            &expired.task_attempt_id,
+            &expired.assignee,
+            &expired.task_attempt_fence,
+            expired.task_attempt_controller_generation,
+            Some(&expired.wake_id),
+            Some(&expired.consume_token),
+            expired_lease + 2,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+
+    let terminal =
+        dispatched_endpoint_takeover_fixture(&db, &owner, "renew-terminal", wall_now_ms());
+    let terminal_takeover = wall_now_ms();
+    db.consume_agent_wake_at(
+        &owner,
+        &terminal.assignee,
+        &terminal.endpoint_id,
+        terminal.endpoint_controller_generation,
+        &terminal.wake_id,
+        &terminal.consume_token,
+        terminal_takeover,
+    )
+    .unwrap();
+    let terminal_lease = attempt_lease_expires_at(&db, &terminal.task_attempt_id);
+    db.complete_agent_task_attempt_at(
+        &owner,
+        &terminal.task_id,
+        &terminal.task_attempt_id,
+        &terminal.assignee,
+        &terminal.task_attempt_fence,
+        terminal.task_attempt_controller_generation,
+        AgentTaskState::Succeeded,
+        Some("done"),
+        None,
+        "renew-terminal-complete",
+        terminal_takeover + 1,
+    )
+    .unwrap();
+    assert!(db
+        .heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &terminal.task_id,
+            &terminal.task_attempt_id,
+            &terminal.assignee,
+            &terminal.task_attempt_fence,
+            terminal.task_attempt_controller_generation,
+            Some(&terminal.wake_id),
+            Some(&terminal.consume_token),
+            terminal_takeover + 2,
+        )
+        .is_err());
+    assert_eq!(
+        attempt_lease_expires_at(&db, &terminal.task_attempt_id),
+        terminal_lease
+    );
+}
+
+#[test]
+fn active_turn_proof_survives_restart_but_expiry_remains_authoritative() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("agent-task-active-turn-restart.db");
+    let owner = principal('9');
+    let started_at = wall_now_ms();
+    let (fixture, takeover_at, first_reservation) = {
+        let db = Database::open(&path).unwrap();
+        let fixture =
+            dispatched_endpoint_takeover_fixture(&db, &owner, "renew-restart", started_at);
+        let takeover_at = wall_now_ms();
+        db.consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            takeover_at,
+        )
+        .unwrap();
+        let first_reservation = takeover_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS;
+        (fixture, takeover_at, first_reservation)
+    };
+
+    let renewal_at = takeover_at + 29 * 60_000;
+    assert!(renewal_at < first_reservation);
+    let renewed_expiry = {
+        let reopened = Database::open(&path).unwrap();
+        let renewed = reopened
+            .heartbeat_agent_task_attempt_with_active_turn_proof_at(
+                &owner,
+                &fixture.task_id,
+                &fixture.task_attempt_id,
+                &fixture.assignee,
+                &fixture.task_attempt_fence,
+                fixture.task_attempt_controller_generation,
+                Some(&fixture.wake_id),
+                Some(&fixture.consume_token),
+                renewal_at,
+            )
+            .unwrap();
+        assert!(renewed.state_changed);
+        assert_eq!(
+            renewed.attempt.lease_expires_at_unix_ms,
+            renewal_at + AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS
+        );
+        renewed.attempt.lease_expires_at_unix_ms
+    };
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        attempt_lease_expires_at(&reopened, &fixture.task_attempt_id),
+        renewed_expiry,
+        "renewal proof and resulting reservation are durable across Server restart"
+    );
+    assert_eq!(
+        reopened
+            .heartbeat_agent_task_attempt_with_active_turn_proof_at(
+                &owner,
+                &fixture.task_id,
+                &fixture.task_attempt_id,
+                &fixture.assignee,
+                &fixture.task_attempt_fence,
+                fixture.task_attempt_controller_generation,
+                Some(&fixture.wake_id),
+                Some(&fixture.consume_token),
+                renewed_expiry,
+            )
+            .unwrap_err()
+            .code(),
+        "agent_task_attempt_stale"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&reopened, &fixture.task_attempt_id),
+        renewed_expiry
+    );
+}
+
+#[test]
+fn inbox_and_attention_wake_consumes_never_become_active_turn_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-active-turn-nontask-wake.db")).unwrap();
+    let owner = principal('7');
+    let main = dispatched_endpoint_takeover_fixture(&db, &owner, "renew-nontask", wall_now_ms());
+    let takeover_at = wall_now_ms();
+    db.consume_agent_wake_at(
+        &owner,
+        &main.assignee,
+        &main.endpoint_id,
+        main.endpoint_controller_generation,
+        &main.wake_id,
+        &main.consume_token,
+        takeover_at,
+    )
+    .unwrap();
+    let main_lease = attempt_lease_expires_at(&db, &main.task_attempt_id);
+
+    let conversation_id = db
+        .create_conversation(
+            &owner,
+            NewConversation {
+                title: Some("active-turn inbox negative proof".to_string()),
+                agent_ids: vec![main.assignee.clone()],
+                idempotency_key: "active-turn-inbox-conversation".to_string(),
+            },
+        )
+        .unwrap()
+        .conversation
+        .conversation
+        .conversation_id;
+    db.post_conversation_message(
+        &owner,
+        NewConversationMessage {
+            conversation_id,
+            body: "wake the Agent inbox".to_string(),
+            author_agent_id: None,
+            endpoint_id: None,
+            expected_controller_generation: None,
+            recipient_agent_ids: Some(vec![main.assignee.clone()]),
+            reply_to: None,
+            idempotency_key: Some("active-turn-inbox-message".to_string()),
+            wake_reply_id: None,
+            reply_operation_index: None,
+        },
+    )
+    .unwrap();
+    let (inbox_trigger, inbox_wake, inbox_token) = dispatch_and_consume_next_wake(
+        &db,
+        &owner,
+        &main.assignee,
+        &main.endpoint_id,
+        main.endpoint_controller_generation,
+    );
+    assert_eq!(inbox_trigger, "inbox_changed");
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &main.task_id,
+            &main.task_attempt_id,
+            &main.assignee,
+            &main.task_attempt_fence,
+            main.task_attempt_controller_generation,
+            Some(&inbox_wake),
+            Some(&inbox_token),
+            takeover_at + 1,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_active_turn_proof_invalid"
+    );
+
+    let attention_task = create_assigned_task(
+        &db,
+        &owner,
+        &main.assignee,
+        "active-turn-attention-source-task",
+    );
+    let goal_id = db
+        .create_goal_at(
+            &owner,
+            NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
+                title: "Active-turn negative attention Goal".to_string(),
+                objective:
+                    "Generate an attention_event Wake that must never renew another TaskAttempt."
+                        .to_string(),
+                controller_agent_id: None,
+                idempotency_key: "active-turn-attention-goal".to_string(),
+            },
+            takeover_at + 2,
+        )
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    db.associate_goal_reference_at(
+        &owner,
+        &goal_id,
+        GoalCorrelationKind::AgentTask,
+        &attention_task,
+        "active-turn-attention-link",
+        takeover_at + 3,
+    )
+    .unwrap();
+    let attention_attempt = start(
+        &db,
+        &owner,
+        &attention_task,
+        &main.assignee,
+        "active-turn-attention-start",
+        takeover_at + 4,
+    );
+    db.complete_agent_task_attempt_at(
+        &owner,
+        &attention_task,
+        &attention_attempt.attempt.attempt_id,
+        &main.assignee,
+        &attention_attempt.attempt_fence,
+        attention_attempt.attempt.attempt_controller_generation,
+        AgentTaskState::Succeeded,
+        Some("terminal source"),
+        None,
+        "active-turn-attention-complete",
+        takeover_at + 5,
+    )
+    .unwrap();
+    let (attention_trigger, attention_wake, attention_token) = dispatch_and_consume_next_wake(
+        &db,
+        &owner,
+        &main.assignee,
+        &main.endpoint_id,
+        main.endpoint_controller_generation,
+    );
+    assert_eq!(attention_trigger, "attention_event");
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
+            &owner,
+            &main.task_id,
+            &main.task_attempt_id,
+            &main.assignee,
+            &main.task_attempt_fence,
+            main.task_attempt_controller_generation,
+            Some(&attention_wake),
+            Some(&attention_token),
+            takeover_at + 6,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_active_turn_proof_invalid"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&db, &main.task_attempt_id),
+        main_lease,
+        "non-Task Wake consumption cannot renew the active-turn reservation"
+    );
+}
+
+#[test]
+fn endpoint_consume_failures_and_expired_source_never_promote_or_revive_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-stale-takeover.db")).unwrap();
+    let owner = principal('1');
+    let started_at = wall_now_ms();
+    let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "stale-takeover", started_at);
+    let initial_lease = fixture.dispatch_grace_expires_at_unix_ms;
+
+    let wrong_endpoint = "wc_endpoint_________________".to_string();
+    assert!(db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &wrong_endpoint,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            started_at + 10,
+        )
+        .is_err());
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        initial_lease
+    );
+
+    assert!(db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation + 1,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            started_at + 20,
+        )
+        .is_err());
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        initial_lease
+    );
+
+    let wrong_token = "wc_wake_consume_7u7u7u7u7u7u7u7u7u7u7g".to_string();
+    assert_eq!(
+        db.consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &wrong_token,
+            started_at + 30,
+        )
+        .unwrap_err()
+        .code(),
+        "wake_consume_token_mismatch"
+    );
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        initial_lease
+    );
+
+    let consumed = db
+        .consume_agent_wake_at(
+            &owner,
+            &fixture.assignee,
+            &fixture.endpoint_id,
+            fixture.endpoint_controller_generation,
+            &fixture.wake_id,
+            &fixture.consume_token,
+            initial_lease,
+        )
+        .unwrap();
+    assert!(!consumed.already_consumed);
+    assert_eq!(consumed.state, AgentWakeState::Consumed);
+    assert_eq!(
+        attempt_lease_expires_at(&db, &fixture.task_attempt_id),
+        initial_lease,
+        "consume after Attempt expiry must ACK the dispatched Wake without reviving work"
+    );
+
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            initial_lease,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+    assert_eq!(
+        db.complete_agent_task_attempt_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            AgentTaskState::Succeeded,
+            Some("late completion must fail"),
+            None,
+            "late-stale-completion",
+            initial_lease,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale"
+    );
+
+    let successor = start(
+        &db,
+        &owner,
+        &fixture.task_id,
+        &fixture.assignee,
+        "stale-takeover-successor",
+        initial_lease + 1,
+    );
+    assert_eq!(successor.attempt.attempt_number, 2);
+    assert_ne!(successor.attempt.attempt_id, fixture.task_attempt_id);
+    assert_eq!(
+        db.heartbeat_agent_task_attempt_at(
+            &owner,
+            &fixture.task_id,
+            &fixture.task_attempt_id,
+            &fixture.assignee,
+            &fixture.task_attempt_fence,
+            fixture.task_attempt_controller_generation,
+            initial_lease + 2,
+        )
+        .unwrap_err()
+        .code(),
+        "agent_task_attempt_stale",
+        "a later Attempt permanently fences the old owner"
+    );
+}
+
+#[test]
+fn endpoint_continuation_pre_dispatch_carrier_replacement_advances_attempt_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-carrier.db")).unwrap();
+    let owner = principal('f');
+    let assignee = agent(&db, &owner, "endpoint-carrier-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-carrier-task");
+    let now = wall_now_ms();
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-carrier-attempt",
+        now,
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 1,
+        )
+        .unwrap();
+    let endpoint_one = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "task-host-one".to_string(),
+                client_attachment_id: None,
+                wake_capable: true,
+                idempotency_key: "task-endpoint-one".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let first_claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint_one.endpoint_id,
+            endpoint_one.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.read_agent_task(&owner, &task_id)
+            .unwrap()
+            .summary
+            .latest_attempt
+            .unwrap()
+            .attempt_controller_generation,
+        2
+    );
+
+    db.set_agent_endpoint_wake_capability(
+        &owner,
+        &assignee,
+        &endpoint_one.endpoint_id,
+        endpoint_one.controller_generation,
+        false,
+    )
+    .unwrap();
+    let released = db
+        .agent_wake(&execution.execution.wake_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.state, AgentWakeState::Pending);
+    let replay_after_loss = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(replay_after_loss.execution.endpoint_id, None);
+
+    let endpoint_two = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "task-host-two".to_string(),
+                client_attachment_id: None,
+                wake_capable: true,
+                idempotency_key: "task-endpoint-two".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let second_claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint_two.endpoint_id,
+            endpoint_two.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_claim.wake.wake_id, first_claim.wake.wake_id);
+    assert_eq!(
+        db.read_agent_task(&owner, &task_id)
+            .unwrap()
+            .summary
+            .latest_attempt
+            .unwrap()
+            .attempt_controller_generation,
+        3,
+        "each new pre-dispatch carrier claim must fence the previous Attempt carrier generation",
+    );
+}
+
+#[test]
+fn endpoint_continuation_post_fence_endpoint_loss_fences_old_attempt_controller() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-post-fence-loss.db")).unwrap();
+    let owner = principal('8');
+    let assignee = agent(&db, &owner, "endpoint-post-fence-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-post-fence-task");
+    let now = wall_now_ms();
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-post-fence-attempt",
+        now,
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 1,
+        )
+        .unwrap();
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "post-fence-host".to_string(),
+                client_attachment_id: None,
+                wake_capable: true,
+                idempotency_key: "post-fence-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .unwrap();
+    db.prepare_agent_wake_dispatch(
+        &owner,
+        &assignee,
+        &endpoint.endpoint_id,
+        endpoint.controller_generation,
+        &claim.wake.wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+        &claim.consume_token,
+    )
+    .unwrap();
+    let before_loss = db
+        .read_agent_task(&owner, &task_id)
+        .unwrap()
+        .summary
+        .latest_attempt
+        .unwrap()
+        .attempt_controller_generation;
+
+    db.detach_agent_endpoint(&owner, &endpoint.endpoint_id)
+        .unwrap();
+
+    let wake = db
+        .agent_wake(&execution.execution.wake_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(wake.state, AgentWakeState::DeliveryUnknown);
+    let task = db.read_agent_task(&owner, &task_id).unwrap();
+    let after_loss = task
+        .summary
+        .latest_attempt
+        .unwrap()
+        .attempt_controller_generation;
+    assert_eq!(after_loss, before_loss + 1);
+    let stale = db
+        .heartbeat_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            before_loss,
+            now + 2,
+        )
+        .unwrap_err();
+    assert_eq!(stale.code(), "agent_task_attempt_stale");
+}
+
+#[test]
+fn endpoint_continuation_retires_when_attempt_expires_before_host_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-expiry.db")).unwrap();
+    let owner = principal('9');
+    let assignee = agent(&db, &owner, "endpoint-expiry-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-expiry-task");
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-expiry-attempt",
+        T0 + 10,
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            T0 + 11,
+        )
+        .unwrap();
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "late-task-host".to_string(),
+                client_attachment_id: None,
+                wake_capable: true,
+                idempotency_key: "late-task-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    assert!(
+        db.claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .is_none(),
+        "expired Task Wake must retire before any Host carrier can claim it",
+    );
+    assert_eq!(
+        db.agent_wake(&execution.execution.wake_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentWakeState::Retired
+    );
+    let task = db.read_agent_task(&owner, &task_id).unwrap();
+    assert_eq!(task.summary.state, AgentTaskState::Ready);
+    assert_eq!(
+        task.summary.latest_attempt.as_ref().unwrap().state,
+        AgentTaskAttemptState::Expired
+    );
+
+    let replay = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            wall_now_ms(),
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.execution.wake_state, AgentWakeState::Retired);
+
+    let second = db
+        .start_agent_task_attempt(
+            &owner,
+            &task_id,
+            &assignee,
+            "endpoint-expiry-second-attempt",
+        )
+        .unwrap();
+    assert_eq!(second.attempt.attempt_number, 2);
+    assert_ne!(second.attempt.attempt_id, started.attempt.attempt_id);
+}
+
+#[test]
+fn endpoint_continuation_and_coding_run_backends_are_mutually_exclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-backend-exclusion.db")).unwrap();
+    let owner = principal('a');
+    let assignee = agent(&db, &owner, "backend-exclusion-agent");
+    let now = wall_now_ms();
+
+    let endpoint_task = create_assigned_task(&db, &owner, &assignee, "endpoint-first-task");
+    let endpoint_attempt = start(
+        &db,
+        &owner,
+        &endpoint_task,
+        &assignee,
+        "endpoint-first-attempt",
+        now,
+    );
+    db.start_agent_task_endpoint_continuation_at(
+        &owner,
+        &endpoint_task,
+        &endpoint_attempt.attempt.attempt_id,
+        &assignee,
+        &endpoint_attempt.attempt_fence,
+        1,
+        now + 1,
+    )
+    .unwrap();
+    let coding_after_endpoint = db
+        .agent_task_coding_run_start_context_at(
+            &owner,
+            "agent:special:reference-only",
+            &endpoint_task,
+            &endpoint_attempt.attempt.attempt_id,
+            &assignee,
+            &endpoint_attempt.attempt_fence,
+            1,
+            now + 2,
+        )
+        .unwrap_err();
+    assert_eq!(
+        coding_after_endpoint.code(),
+        "agent_task_execution_backend_conflict"
+    );
+
+    let coding_task = create_assigned_task(&db, &owner, &assignee, "coding-first-task");
+    let coding_attempt = start(
+        &db,
+        &owner,
+        &coding_task,
+        &assignee,
+        "coding-first-attempt",
+        now + 3,
+    );
+    let intent = coding_binding_intent("backend-exclusion-coding");
+    prepare_coding_binding(
+        &db,
+        &owner,
+        &coding_task,
+        &assignee,
+        &coding_attempt,
+        &intent,
+        now + 4,
+    );
+    let endpoint_after_coding = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &coding_task,
+            &coding_attempt.attempt.attempt_id,
+            &assignee,
+            &coding_attempt.attempt_fence,
+            1,
+            now + 5,
+        )
+        .unwrap_err();
+    assert_eq!(
+        endpoint_after_coding.code(),
+        "agent_task_execution_backend_conflict"
+    );
+}
+
+#[test]
+fn endpoint_continuation_terminal_completion_retires_pre_dispatch_wake() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-terminal.db")).unwrap();
+    let owner = principal('b');
+    let assignee = agent(&db, &owner, "endpoint-terminal-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-terminal-task");
+    let now = wall_now_ms();
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-terminal-attempt",
+        now,
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 1,
+        )
+        .unwrap();
+
+    let completed = db
+        .complete_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            AgentTaskState::Succeeded,
+            Some("completed without Host dispatch"),
+            None,
+            "endpoint-terminal-completion",
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(completed.task.state, AgentTaskState::Succeeded);
+    assert_eq!(completed.attempt.state, AgentTaskAttemptState::Succeeded);
+    assert_eq!(
+        db.agent_wake(&execution.execution.wake_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentWakeState::Retired
+    );
+    let replay = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 3,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.execution.wake_state, AgentWakeState::Retired);
+}
+
+#[test]
+fn endpoint_continuation_consumed_wake_stays_consumed_after_task_completion_but_execution_is_terminal(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("agent-task-endpoint-consumed-terminal.db")).unwrap();
+    let owner = principal('c');
+    let assignee = agent(&db, &owner, "endpoint-consumed-terminal-agent");
+    let task_id = create_assigned_task(&db, &owner, &assignee, "endpoint-consumed-terminal-task");
+    let now = wall_now_ms();
+    let started = start(
+        &db,
+        &owner,
+        &task_id,
+        &assignee,
+        "endpoint-consumed-terminal-attempt",
+        now,
+    );
+    let execution = db
+        .start_agent_task_endpoint_continuation_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            1,
+            now + 1,
+        )
+        .unwrap();
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: assignee.clone(),
+                host: "consumed-task-host".to_string(),
+                client_attachment_id: None,
+                wake_capable: true,
+                idempotency_key: "consumed-task-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &assignee,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "task_host_adapter",
+        )
+        .unwrap()
+        .unwrap();
+    db.prepare_agent_wake_dispatch(
+        &owner,
+        &assignee,
+        &endpoint.endpoint_id,
+        endpoint.controller_generation,
+        &claim.wake.wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+        &claim.consume_token,
+    )
+    .unwrap();
+    db.complete_agent_wake_delivery(
+        &owner,
+        &assignee,
+        &endpoint.endpoint_id,
+        endpoint.controller_generation,
+        &claim.wake.wake_id,
+        &claim.attempt.attempt_id,
+        &claim.claim_fence,
+    )
+    .unwrap();
+    db.consume_agent_wake(
+        &owner,
+        &assignee,
+        &endpoint.endpoint_id,
+        endpoint.controller_generation,
+        &claim.wake.wake_id,
+        &claim.consume_token,
+    )
+    .unwrap();
+
+    let completed = db
+        .complete_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &started.attempt.attempt_id,
+            &assignee,
+            &started.attempt_fence,
+            2,
+            AgentTaskState::Succeeded,
+            Some("completed after consumed Host continuation"),
+            None,
+            "endpoint-consumed-terminal-completion",
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(
+        completed.task.execution_status,
+        Some(AgentTaskExecutionStatus::Terminal)
+    );
+    assert_eq!(completed.attempt.state, AgentTaskAttemptState::Succeeded);
+    assert_eq!(
+        db.agent_wake(&execution.execution.wake_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentWakeState::Consumed,
+        "Task completion must not rewrite a post-dispatch consumed Wake into pre-dispatch retirement"
+    );
+    let read = db.read_agent_task(&owner, &task_id).unwrap();
+    assert_eq!(read.summary.state, AgentTaskState::Succeeded);
+    assert_eq!(
+        read.summary.execution_status,
+        Some(AgentTaskExecutionStatus::Terminal)
+    );
 }

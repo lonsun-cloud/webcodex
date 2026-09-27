@@ -1,10 +1,13 @@
+import { displayProjectPath } from "../../../../../frontend/src/ui/projectPresentation";
 import { useMemo, useState } from "react";
+import { FolderOpen, Globe2, Share2 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
 import { useLocale } from "../../i18n/locale";
 import { TunnelConfigDiagnostics } from "../connection/TunnelConfigDiagnostics";
 import { PowerShellInstallGuidance } from "../settings/PowerShellInstallGuidance";
 import {
+  desktopCommandDiagnostics,
   desktopErrorPresentation,
   normalizeDesktopError,
 } from "../../i18n/presentation";
@@ -49,7 +52,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
   const canReuseRemoteEnrollment = Boolean(
     mode === "remote" &&
       !remoteEnrollmentNeedsRefresh &&
-      state.project?.runtime_project_id &&
+      (state.workspace_runner?.client_id || state.project?.runtime_project_id) &&
       state.topology?.experience === "full" &&
       state.topology.server.kind === "remote" &&
       sameServerOrigin(serverUrl, state.topology.server.url),
@@ -78,7 +81,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
       if (mode === "local") {
         let next = await desktopApi.configureLocal(project.path);
         onState(next);
-        if (connectAfterSetup && next.openai_tunnel_configured && next.readiness.runtime_ready && !next.regular_tunnel) {
+        if (connectAfterSetup && next.openai_tunnel_configured && next.readiness.runtime_ready && !next.connections?.profiles.some(profile => profile.id === "default" && (profile.lifecycle === "starting" || profile.lifecycle === "running"))) {
           next = await desktopApi.startRegularTunnel();
           onState(next);
         }
@@ -129,14 +132,17 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
         <div className="entry-grid">
           <button className="entry-card recommended" onClick={() => setMode("local")} data-webcodex-action="choose-local-setup">
             <span className="entry-badge">{t("first.recommended")}</span>
+            <span className="entry-icon" aria-hidden="true"><FolderOpen /></span>
             <strong>{t("first.localTitle")}</strong>
             <span>{t("first.localDescription")}</span>
           </button>
           <button className="entry-card" onClick={() => setMode("remote")} data-webcodex-action="choose-remote-setup">
+            <span className="entry-icon" aria-hidden="true"><Globe2 /></span>
             <strong>{t("first.remoteTitle")}</strong>
             <span>{t("first.remoteDescription")}</span>
           </button>
           <button className="entry-card" onClick={() => setMode("share")} data-webcodex-action="choose-quick-share-setup">
+            <span className="entry-icon" aria-hidden="true"><Share2 /></span>
             <strong>{t("first.shareTitle")}</strong>
             <span>{t("first.shareDescription")}</span>
           </button>
@@ -146,10 +152,12 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
   }
 
   const presentation = error ? desktopErrorPresentation(error, t) : null;
+  const diagnostics = error ? desktopCommandDiagnostics(error) : null;
   const serverInvalid = error?.code === "server_url_invalid" || error?.code === "server_unreachable";
   const pairingInvalid = error?.code === "pairing_code_invalid";
 
   return (
+    <>
     <form
       className="setup-shell"
       aria-labelledby="setup-title"
@@ -169,7 +177,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
       <div className="project-picker-card">
         <div>
           <span className="section-kicker">{t("setup.project")}</span>
-          <strong>{project ? project.path : t("setup.chooseProject")}</strong>
+          <strong>{project ? displayProjectPath(project.path) : t("setup.chooseProject")}</strong>
           {mode === "local" && !project && (
             <span className="project-meta">{t("setup.projectRequired")}</span>
           )}
@@ -188,13 +196,6 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
       </div>
 
       <PowerShellInstallGuidance state={state} onState={onState} />
-
-      {mode === "local" && (
-        <details className="setup-tunnel-details">
-          <summary>{t("workspace.optionalTunnel")}</summary>
-          <TunnelConfigDiagnostics state={state} onState={onState} />
-        </details>
-      )}
 
       {mode === "remote" && (
         <div className="form-card">
@@ -269,7 +270,7 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
         </fieldset>
       )}
 
-      {mode === "local" && state.openai_tunnel_configured && !state.regular_tunnel && (
+      {mode === "local" && state.openai_tunnel_configured && !state.connections?.profiles.some(profile => profile.id === "default" && (profile.lifecycle === "starting" || profile.lifecycle === "running")) && (
         <label className="setup-choice-card" htmlFor="setup-connect-chatgpt">
           <input
             id="setup-connect-chatgpt"
@@ -300,6 +301,15 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
             <summary>{t("common.details")}</summary>
             <code>{error.code}</code>
             <p>{error.message}</p>
+            {diagnostics && (
+              <dl className="error-diagnostics">
+                {diagnostics.phase && <><dt>phase</dt><dd><code>{diagnostics.phase}</code></dd></>}
+                {diagnostics.logicalCommand && <><dt>command</dt><dd><code>{diagnostics.logicalCommand}</code></dd></>}
+                {diagnostics.executable && <><dt>executable</dt><dd><code>{diagnostics.executable}</code></dd></>}
+                {diagnostics.exitCode !== undefined && <><dt>exit code</dt><dd><code>{diagnostics.exitCode}</code></dd></>}
+                {diagnostics.reasonCode && <><dt>reason</dt><dd><code>{diagnostics.reasonCode}</code></dd></>}
+              </dl>
+            )}
           </details>
           {error.code === "project_not_loaded" && (
             <div className="setup-recovery-actions">
@@ -337,6 +347,11 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
         </span>
       </div>
     </form>
+    {mode === "local" && <details className="setup-tunnel-details">
+      <summary>{t("workspace.optionalTunnel")}</summary>
+      <TunnelConfigDiagnostics state={state} onState={onState} />
+    </details>}
+    </>
   );
 }
 

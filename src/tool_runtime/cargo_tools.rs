@@ -42,30 +42,40 @@ impl ToolRuntime {
                 no_default_features,
                 features,
                 package,
+                packages,
                 timeout_secs,
                 sync_wait_secs,
             } => {
-                self.cargo_check_with_context(
-                    project,
-                    cwd,
-                    all_targets,
-                    all_features,
-                    no_default_features,
-                    features,
-                    package,
-                    timeout_secs,
-                    sync_wait_secs,
-                    session_id,
-                    ssh_resource,
-                    auth,
-                )
-                .await
+                match crate::runner_protocol::normalize_cargo_packages(
+                    package.as_deref(),
+                    packages.as_deref(),
+                ) {
+                    Ok(packages) => {
+                        self.cargo_check_with_context(
+                            project,
+                            cwd,
+                            all_targets,
+                            all_features,
+                            no_default_features,
+                            features,
+                            packages,
+                            timeout_secs,
+                            sync_wait_secs,
+                            session_id,
+                            ssh_resource,
+                            auth,
+                        )
+                        .await
+                    }
+                    Err(error) => ToolResult::err(error),
+                }
             }
             ToolCall::CargoTest {
                 project,
                 session_id,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -81,6 +91,7 @@ impl ToolRuntime {
                     project,
                     cwd,
                     filter,
+                    lib,
                     all_targets,
                     all_features,
                     no_default_features,

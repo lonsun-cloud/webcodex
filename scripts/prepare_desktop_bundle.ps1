@@ -10,10 +10,15 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$SourceSha,
     [Parameter(Mandatory = $true)][Int64]$BuiltAt,
-    [Parameter(Mandatory = $true)][string]$OutputDir
+    [Parameter(Mandatory = $true)][string]$OutputDir,
+    [bool]$GitDirty = $false
 )
 
 $ErrorActionPreference = "Stop"
+
+function Resolve-InputPath([string]$Path) {
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
 
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
     throw "invalid Desktop bundle version '$Version'"
@@ -25,8 +30,8 @@ if ($BuiltAt -le 0) {
     throw "BuiltAt must be a positive Unix timestamp"
 }
 
-$BinDir = [System.IO.Path]::GetFullPath($BinDir)
-$OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
+$BinDir = Resolve-InputPath $BinDir
+$OutputDir = Resolve-InputPath $OutputDir
 if (Test-Path -LiteralPath $OutputDir) {
     throw "Desktop bundle output already exists: $OutputDir"
 }
@@ -34,6 +39,7 @@ if (Test-Path -LiteralPath $OutputDir) {
 $runtimeDir = Join-Path $OutputDir "resources\webcodex-runtime"
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 $shortSource = $SourceSha.Substring(0, 12).ToLowerInvariant()
+$dirtyText = if ($GitDirty) { "true" } else { "false" }
 $binaryNames = @("webcodex", "webcodex-server", "webcodex-runner")
 $resourceMap = [ordered]@{}
 $fileMetadata = [ordered]@{}
@@ -60,7 +66,7 @@ try {
             throw "$name.exe --version failed while staging Desktop resources (exit code $exitCode)"
         }
         $line = $line[0].TrimEnd()
-        $expected = "$name $Version (commit $shortSource, dirty=false, built_at=$BuiltAt)"
+        $expected = "$name $Version (commit $shortSource, dirty=$dirtyText, built_at=$BuiltAt)"
         if ($line -ne $expected) {
             throw "unexpected $name.exe identity: '$line' (expected '$expected')"
         }
@@ -110,7 +116,7 @@ try {
     $metadataPath = Join-Path $OutputDir "desktop-bundle.json"
     [System.IO.File]::WriteAllText($metadataPath, ($metadata | ConvertTo-Json -Depth 8) + "`n", $utf8)
 
-    Write-Output "Desktop runtime staged from exact source $($SourceSha.ToLowerInvariant())"
+    Write-Output "Desktop runtime staged from source $($SourceSha.ToLowerInvariant()) dirty=$dirtyText"
     Write-Output "Tauri config overlay: $overlayPath"
     Write-Output "Runtime resources: $runtimeDir"
 } catch {

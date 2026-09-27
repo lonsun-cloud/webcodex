@@ -1,11 +1,7 @@
-mod language;
-mod navigation;
-mod position;
-mod protocol;
-mod supervisor;
+mod adapter;
 
-pub(crate) use navigation::handle_lsp_operation;
-pub(crate) use supervisor::LspSupervisor;
+pub(crate) use adapter::handle_lsp_operation;
+pub(crate) use webcodex_lsp::LspSupervisor;
 
 // The documented Windows ManagedChild spawn path uses a system-wide Toolhelp
 // thread snapshot. Fake LSP tests use deliberately tight protocol deadlines,
@@ -30,7 +26,7 @@ fn serialize_fake_lsp_test() -> FakeLspTestSerialGuard {
 }
 
 #[cfg(test)]
-mod test_support;
+mod navigation_test_support;
 
 #[cfg(test)]
 #[path = "navigation_tests.rs"]

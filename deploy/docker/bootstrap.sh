@@ -388,9 +388,9 @@ verify_files_against_receipt() {
 validate_committed_env() {
     [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || fail "$ENV_FILE is missing or unsafe"
     if [ "$MODE" = image ]; then
-        expected_lines=8
-    else
         expected_lines=7
+    else
+        expected_lines=6
     fi
     lines=$(wc -l < "$ENV_FILE" | tr -d ' ')
     [ "$lines" -eq "$expected_lines" ] || fail "$ENV_FILE does not match the canonical bootstrap layout"
@@ -399,7 +399,6 @@ validate_committed_env() {
         "WEBCODEX_HOST_IP=$HOST_IP" \
         "WEBCODEX_HOST_PORT=$HOST_PORT" \
         "RUST_LOG=info" \
-        "WEBCODEX_MCP_MODEL_SURFACE=local-coding-v1" \
         "COMPOSE_FILE=$COMPOSE_FILE"; do
         [ "$(grep -Fxc "$expected" "$ENV_FILE" || true)" -eq 1 ] \
             || fail "$ENV_FILE does not match the installation receipt"
@@ -530,7 +529,6 @@ commit_secret_env() {
         printf 'WEBCODEX_HOST_IP=%s\n' "$HOST_IP"
         printf 'WEBCODEX_HOST_PORT=%s\n' "$HOST_PORT"
         printf 'RUST_LOG=info\n'
-        printf 'WEBCODEX_MCP_MODEL_SURFACE=local-coding-v1\n'
         printf 'COMPOSE_FILE=%s\n' "$COMPOSE_FILE"
         if [ "$MODE" = image ]; then
             printf 'WEBCODEX_SERVER_IMAGE=%s\n' "$SERVER_IMAGE"
@@ -628,7 +626,7 @@ Installation receipt:    $RECEIPT_FILE
 
 Reverse-proxy upstream: http://127.0.0.1:$HOST_PORT
 Public URL:            $PUBLIC_URL
-Console:               $PUBLIC_URL/console
+Console:               $PUBLIC_URL/runtime
 OpenAPI:               $PUBLIC_URL/openapi.json
 MCP:                   $PUBLIC_URL/mcp
 

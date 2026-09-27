@@ -288,6 +288,20 @@ fn validate_snapshot(
     validate_context(client_id, projects, require_project_membership, snapshot)?;
     validate_stream_snapshot(&snapshot.stdout, "stdout")?;
     validate_stream_snapshot(&snapshot.stderr, "stderr")?;
+    if let Some(evidence) = snapshot.test_count_evidence.as_ref() {
+        let cargo_test = snapshot
+            .context
+            .validation
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata.tool == "cargo_test"
+                    && metadata.kind == "test"
+                    && metadata.no_run != Some(true)
+            });
+        if !cargo_test || !lifecycle.is_terminal() || !evidence.is_valid() {
+            return Err("job inventory test_count_evidence is inconsistent".to_string());
+        }
+    }
     if snapshot.context.validation_steps.is_empty() && snapshot.validation_progress.is_some() {
         return Err("job inventory validation_progress is unexpected".to_string());
     }
@@ -511,6 +525,40 @@ fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
         && job.structured_execution == context.structured_execution
 }
 
+fn receipt_terminal_validation_enrichment_matches(
+    job: &ShellJobRecord,
+    runner_instance_id: &str,
+    snapshot: &ShellJobSnapshot,
+) -> bool {
+    let context = &snapshot.context;
+    job.lifecycle.is_terminal()
+        && job.observation.receipt_expires_at.is_some()
+        && job.runner_instance_id == runner_instance_id
+        && parse_job_lifecycle(&snapshot.status).ok() == Some(job.lifecycle)
+        && snapshot.update_seq == job.last_update_seq
+        && job.request_id.as_deref() == Some(snapshot.request_id.as_str())
+        && job.project_id == context.runtime_project_id
+        && job.session_id == context.workflow_session_id
+        && job.ssh_resource == context.ssh_resource
+        && job.cwd == context.cwd
+        && job.project_cwd == context.project_cwd
+        && job.purpose == context.purpose
+        && job.shell == context.shell
+        && job.command_preview == context.command_preview
+        && job.validation_steps == context.validation_steps
+        && job.structured_execution == context.structured_execution
+        && job.started_at == snapshot.started_at
+        && job.ended_at == snapshot.ended_at
+        && job.exit_code == snapshot.exit_code
+        && job.duration_ms == snapshot.duration_ms
+        && job.error == snapshot.error
+        && job.command_execution_state == snapshot.command_execution_state
+        && job.validation_progress == snapshot.validation_progress
+        && job.validation.is_none()
+        && job.test_count_evidence.is_none()
+        && context.validation.is_some()
+}
+
 fn detached_instance_transfer_allowed(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
     job.kind == "run_detached_process"
         && job
@@ -550,6 +598,13 @@ pub(super) fn preflight_inventory_locked(
                 "job inventory job_id {} belongs to a different runner",
                 snapshot.job_id
             ));
+        }
+        if existing.lifecycle.is_terminal() && existing.observation.receipt_expires_at.is_some() {
+            // Historical receipts have no live lease. Reconciliation may later
+            // enrich validation provenance only when the same Runner instance
+            // proves the exact retained terminal execution; otherwise inventory
+            // remains non-authoritative for this historical record.
+            continue;
         }
         let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
             && detached_instance_transfer_allowed(existing, snapshot);
@@ -644,11 +699,13 @@ fn remove_job_control_requests(
     }
 }
 
-fn record_from_snapshot(
+pub(crate) fn record_from_snapshot(
     client_id: &str,
     runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
+    receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     snapshot: &ShellJobSnapshot,
     now: i64,
 ) -> ShellJobRecord {
@@ -658,6 +715,7 @@ fn record_from_snapshot(
         request_id: Some(snapshot.request_id.clone()),
         client_id: client_id.to_string(),
         auth_group,
+        owner_at_admission: None,
         runner_instance_id: runner_instance_id.to_string(),
         kind: context
             .structured_execution
@@ -692,6 +750,7 @@ fn record_from_snapshot(
         validation_steps: context.validation_steps.clone(),
         validation: context.validation.clone(),
         validation_progress: snapshot.validation_progress.clone(),
+        test_count_evidence: snapshot.test_count_evidence.clone(),
         activity: snapshot.activity,
         visibility: super::state::ShellJobVisibility::Public,
         last_update_seq: snapshot.update_seq,
@@ -702,7 +761,11 @@ fn record_from_snapshot(
             reason: Some(JobRecoveryReason::ServerRestartReconciliation),
             recovering_since: None,
         },
-        observation: JobObservationState::new(observation_epoch),
+        observation: JobObservationState {
+            receipt_candidates,
+            terminal_event_candidates,
+            ..JobObservationState::new(observation_epoch)
+        },
     };
     observe_job_terminal(&mut record, now);
     record
@@ -725,6 +788,7 @@ fn apply_snapshot(
     job.command_execution_state = snapshot.command_execution_state;
     job.structured_execution = snapshot.context.structured_execution.clone();
     job.validation_progress = snapshot.validation_progress.clone();
+    job.test_count_evidence = snapshot.test_count_evidence.clone();
     job.activity = snapshot.activity;
     job.validation = snapshot.context.validation.clone();
     replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
@@ -945,6 +1009,8 @@ pub async fn recovery_timeout_sweep(registry: &RunnerRegistry) {
     prune_projected_structured_terminal_suppressions_locked(&mut inner, now);
     expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
     registry.prune_expired_terminal_jobs_locked(&mut inner, now);
+    drop(inner);
+    registry.prune_job_receipts(now);
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +1029,8 @@ pub(super) fn reconcile_inventory_locked(
     runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
+    receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     inventory: &ShellJobInventory,
     now: i64,
 ) -> ReconciliationSummary {
@@ -1029,9 +1097,20 @@ pub(super) fn reconcile_inventory_locked(
             });
         if let Some(existing) = inner.jobs_by_id.get_mut(&snapshot.job_id) {
             if existing.lifecycle.is_terminal() {
-                // A server-authoritative terminal state (deadline, replacement,
-                // or a previously accepted terminal result) never revives or
-                // changes terminal class.
+                // A Server-authoritative terminal state never revives or changes
+                // terminal class. A receipt-restored record may, however, regain
+                // the validation provenance the receipt deliberately omitted when
+                // the exact same Runner terminal snapshot proves the same execution.
+                if receipt_terminal_validation_enrichment_matches(
+                    existing,
+                    runner_instance_id,
+                    snapshot,
+                ) {
+                    existing.validation = snapshot.context.validation.clone();
+                    existing.test_count_evidence = snapshot.test_count_evidence.clone();
+                    notify_job_update(existing);
+                    summary.updated += 1;
+                }
                 continue;
             }
             let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
@@ -1064,9 +1143,15 @@ pub(super) fn reconcile_inventory_locked(
                 runner_instance_id,
                 auth_group.clone(),
                 observation_epoch.clone(),
+                receipt_candidates.clone(),
+                terminal_event_candidates.clone(),
                 snapshot,
                 now,
             );
+            record.owner_at_admission = inner
+                .runners
+                .get(client_id)
+                .and_then(|runner| runner.owner.clone());
             replace_log_from_snapshot(&mut record.stdout, &snapshot.stdout);
             replace_log_from_snapshot(&mut record.stderr, &snapshot.stderr);
             notify_job_update(&record);

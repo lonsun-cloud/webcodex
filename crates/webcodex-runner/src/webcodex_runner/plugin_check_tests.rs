@@ -197,8 +197,10 @@ fn check_success_is_disposable_and_preserves_committed_plugin_state() {
         .next()
         .unwrap();
     assert!(wait_until(Duration::from_secs(2), || {
-        !crate::job_manager_tests::process_running(candidate_pid)
-            && !crate::job_manager_tests::process_running(descendant_pid)
+        !crate::webcodex_runner::job_manager::job_manager_tests::process_running(candidate_pid)
+            && !crate::webcodex_runner::job_manager::job_manager_tests::process_running(
+                descendant_pid,
+            )
     }));
 }
 
@@ -312,6 +314,7 @@ fn initialize_eof_keeps_raw_stderr_runner_local() {
 }
 
 #[test]
+#[cfg(feature = "runner-real-process-tests")]
 #[ignore = "runner real-process lane: disposable plugin checks clean up failed candidate process trees"]
 fn runner_real_process_plugin_check_failures_are_structured_diagnostic_results_and_cleanup_process_trees(
 ) {
@@ -363,12 +366,12 @@ fn runner_real_process_plugin_check_failures_are_structured_diagnostic_results_a
 
         for pid in fixture.marker_pids("candidate-pid:") {
             assert!(wait_until(Duration::from_secs(2), || {
-                !crate::job_manager_tests::process_running(pid)
+                !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
             }));
         }
         for pid in fixture.marker_pids("descendant-pid:") {
             assert!(wait_until(Duration::from_secs(2), || {
-                !crate::job_manager_tests::process_running(pid)
+                !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
             }));
         }
     }
@@ -450,7 +453,7 @@ fn check_tool_validation_failures_have_safe_actionable_diagnostics() {
         }
         for pid in fixture.marker_pids("candidate-pid:") {
             assert!(wait_until(Duration::from_secs(2), || {
-                !crate::job_manager_tests::process_running(pid)
+                !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
             }));
         }
     }
@@ -565,13 +568,14 @@ fn candidate_gate_serializes_check_and_reload_without_blocking_current_providers
     assert_eq!(providers[0].provider_instance_id, dynamic_v1);
     for pid in fixture.marker_pids("descendant-pid:") {
         assert!(wait_until(Duration::from_secs(2), || {
-            !crate::job_manager_tests::process_running(pid)
+            !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
         }));
     }
     fixture.manager.shutdown();
 }
 
 #[test]
+#[cfg(feature = "runner-real-process-tests")]
 #[ignore = "runner real-process lane: plugin shutdown interrupts blocked candidate and reaps its tree"]
 fn runner_real_process_plugin_shutdown_interrupts_blocked_check_candidate_and_reaps_tree() {
     let fixture = CheckFixture::new("candidate_block_list_tree", 10);
@@ -601,7 +605,7 @@ fn runner_real_process_plugin_shutdown_interrupts_blocked_check_candidate_and_re
     );
     for pid in fixture.marker_pids("descendant-pid:") {
         assert!(wait_until(Duration::from_secs(2), || {
-            !crate::job_manager_tests::process_running(pid)
+            !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
         }));
     }
 }
@@ -634,6 +638,7 @@ fn runner_config(
         quic: None,
         shell,
         skills: SkillsConfig::default(),
+        instructions: crate::webcodex_runner::config::InstructionsConfig::default(),
         ssh: SshConfig::default(),
         tool_providers: ToolProvidersConfig::default(),
         mcp_gateway: McpGatewayConfig::default(),

@@ -34,7 +34,6 @@ mod consistency;
 mod definitions;
 mod discovery;
 mod edits;
-mod flattened_args;
 mod migration;
 mod outputs;
 mod policy;

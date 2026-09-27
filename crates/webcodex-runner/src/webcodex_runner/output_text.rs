@@ -64,19 +64,26 @@ pub(crate) fn normalize_output_text(
     normalize_output_text_with_policy(bytes, raw_truncated, max_output_bytes, source.policy())
 }
 
-pub(crate) fn normalize_captured_output_text(
+pub(crate) fn normalize_captured_output_text_with_truncation(
     bytes: &[u8],
     raw_truncated: bool,
     max_output_bytes: usize,
     source: OutputTextSource,
     encoding: CapturedOutputEncoding,
-) -> String {
-    normalize_output_text_with_policy_and_encoding(
-        bytes,
-        raw_truncated,
-        max_output_bytes,
-        source.policy(),
-        Some(encoding),
+) -> (String, bool) {
+    let decoded = match source.policy() {
+        DecodePolicy::Utf8Lossy => String::from_utf8_lossy(bytes).into_owned(),
+        DecodePolicy::WindowsLocal => decode_windows_local(bytes, Some(encoding)),
+    };
+    let decoded = if source.policy() == DecodePolicy::WindowsLocal {
+        normalize_windows_line_endings(&decoded)
+    } else {
+        decoded
+    };
+    let presentation_truncated = decoded.len() > max_output_bytes;
+    (
+        bound_presented_text(&decoded, max_output_bytes, raw_truncated),
+        raw_truncated || presentation_truncated,
     )
 }
 
@@ -116,12 +123,18 @@ fn normalize_output_text_with_policy_and_encoding(
 
 /// Append Runner-generated text without allowing it to bypass the same final
 /// UTF-8 output budget as captured child output.
-pub(crate) fn append_bounded_text(target: &mut String, suffix: &str, max_output_bytes: usize) {
+pub(crate) fn append_bounded_text(
+    target: &mut String,
+    suffix: &str,
+    max_output_bytes: usize,
+) -> bool {
     if !target.is_empty() && !target.ends_with('\n') {
         target.push('\n');
     }
     target.push_str(suffix);
+    let truncated = target.len() > max_output_bytes;
     *target = bound_presented_text(target, max_output_bytes, false);
+    truncated
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

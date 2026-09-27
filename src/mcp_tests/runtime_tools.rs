@@ -4,15 +4,15 @@ use super::*;
 // runtime_status via MCP tools/list and tools/call
 // =========================================================================
 
-// This test asserts the default full tools/list schema, including outputSchema.
-// Serialize it with other process-global compact-schema env tests so a concurrent
-// WEBCODEX_MCP_COMPACT_SCHEMAS mutation cannot change the observed contract.
+// An explicit compact-schema=false override keeps full outputSchema projection.
+// Serialize it with process-global env tests so a concurrent override cannot
+// change the observed contract.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux_flags() {
     let mut env = crate::test_support::TestEnvGuard::new();
-    env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+    let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
         rpc("tools/list", Some(Value::from(10)), json!({})),
@@ -35,22 +35,27 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         "retired start_coding_task must stay out of MCP tools/list"
     );
     let description = tool("work_on_project")["description"].as_str().unwrap();
-    assert!(
-        description.contains("Canonical model entry"),
-        "{description}"
-    );
-    assert!(
-        description.contains("ordinary coding/review"),
-        "{description}"
-    );
-    assert!(description.contains("Git not required"), "{description}");
-    assert!(description.contains("mode=worktree"), "{description}");
-    assert!(description.contains("exact Git base"), "{description}");
-    assert!(description.contains("ordinary Project"), "{description}");
-    assert!(
-        description.contains("without bypassing Project authority"),
-        "{description}"
-    );
+    let normalized_description = description.to_ascii_lowercase();
+    for phrase in [
+        "canonical bootstrap",
+        "ordinary coding/review",
+        "mode=worktree",
+        "exact git base",
+        "fresh workflow session",
+        "exact resume",
+        "primary result stays compact",
+        "context_request",
+        "project.instructions",
+        "webcodex.workflow",
+        "skills",
+        "plugin",
+        "without bypassing project authority",
+    ] {
+        assert!(
+            normalized_description.contains(phrase),
+            "work_on_project description should mention {phrase}: {description}"
+        );
+    }
 
     let work_schema = &tool("work_on_project")["inputSchema"];
     assert!(
@@ -60,6 +65,8 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
     let work_props = work_schema["properties"]
         .as_object()
         .expect("work_on_project MCP properties");
+    assert!(!work_props.contains_key("include_project_instructions"));
+    assert!(!work_props.contains_key("include_workflow_guidance"));
     assert!(
         !work_props.contains_key("role"),
         "work_on_project must not grow a role wire field"
@@ -71,16 +78,31 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         "mode",
         "base_ref",
         "instruction",
-        "include_project_instructions",
-        "include_workflow_guidance",
+        "guidance_profile",
+        "include_extension_catalog",
         "session_id",
     ] {
         assert!(work_props.contains_key(field), "MCP schema missing {field}");
     }
-    assert_eq!(work_props["include_project_instructions"]["default"], true);
-    assert_eq!(work_props["include_workflow_guidance"]["default"], true);
+    assert_eq!(work_props["guidance_profile"]["default"], "direct");
+    assert_eq!(
+        work_props["guidance_profile"]["enum"],
+        if cfg!(feature = "experimental-code-mode") {
+            json!(["direct", "host_code_mode", "code_mode"])
+        } else {
+            json!(["direct", "host_code_mode"])
+        }
+    );
+    assert_eq!(work_props["include_extension_catalog"]["default"], true);
     assert_eq!(work_props["mode"]["enum"], json!(["checkout", "worktree"]));
     assert_eq!(work_props["mode"]["default"], "checkout");
+    assert!(
+        !work_schema["required"]
+            .as_array()
+            .expect("work_on_project required fields")
+            .contains(&json!("guidance_profile")),
+        "guidance_profile must remain optional in the MCP schema"
+    );
     assert_eq!(work_schema["required"], json!(["instruction"]));
     assert_eq!(work_schema["additionalProperties"], false);
     for keyword in [
@@ -99,14 +121,15 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         );
     }
 
-    let finish_props = tool("finish_coding_task")["inputSchema"]["properties"]
+    let finish_schema = webcodex_tool_contracts::input_schema_for_tool("finish_coding_task");
+    let finish_props = finish_schema["properties"]
         .as_object()
         .expect("finish_coding_task inputSchema properties");
     assert!(
         finish_props.contains_key("include_workspace"),
         "MCP finish_coding_task schema should expose include_workspace"
     );
-    let finish_required = tool("finish_coding_task")["inputSchema"]["required"]
+    let finish_required = finish_schema["required"]
         .as_array()
         .expect("finish_coding_task required fields");
     assert!(
@@ -116,15 +139,29 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         "include_workspace must not be required in MCP schema"
     );
 
-    let update = tool("update_session_context");
+    let registered = crate::tool_runtime::registered_tool_specs();
+    let registered_tool = |name: &str| {
+        registered
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("missing registered ToolSpec {name}"))
+    };
+    assert!(tools
+        .iter()
+        .all(|tool| tool["name"] != "update_session_context"));
+    let update = registered_tool("update_session_context");
     assert_eq!(
-        update["inputSchema"]["required"],
+        update.input_schema["required"],
         json!(["project", "session_id", "execution_context"])
     );
-    assert_eq!(update["inputSchema"]["additionalProperties"], false);
+    assert_eq!(update.input_schema["additionalProperties"], false);
     assert_eq!(
-        update["inputSchema"]["properties"]["execution_context"]["additionalProperties"],
+        update.input_schema["properties"]["execution_context"]["additionalProperties"],
         false
+    );
+    assert_eq!(
+        crate::model_surface::adaptive_runtime_tool_invocation_route("update_session_context"),
+        ("gateway", Some("call_runtime_tool"))
     );
 
     let runtime_props = tool("runtime_status")["inputSchema"]["properties"]
@@ -138,8 +175,13 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         assert_eq!(runtime_props[field]["type"], "boolean");
     }
 
-    let overview = tool("project_overview");
-    let overview_props = overview["inputSchema"]["properties"]
+    assert!(tools.iter().all(|tool| tool["name"] != "project_overview"));
+    let overview = registered_tool("project_overview");
+    assert_eq!(
+        crate::model_surface::adaptive_runtime_tool_invocation_route("project_overview"),
+        ("gateway", Some("call_runtime_tool"))
+    );
+    let overview_props = overview.input_schema["properties"]
         .as_object()
         .expect("project_overview inputSchema properties");
     for field in ["project", "path", "max_depth", "limit"] {
@@ -148,7 +190,7 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
             "MCP project_overview schema should expose {field}"
         );
     }
-    let overview_output = overview["outputSchema"]["properties"]["output"]["properties"]
+    let overview_output = overview.output_schema["properties"]["output"]["properties"]
         .as_object()
         .expect("project_overview outputSchema properties");
     for field in ["project_types", "key_files", "top_level", "scan"] {
@@ -161,9 +203,8 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
 
 #[tokio::test]
 async fn mcp_tools_call_runtime_status_returns_content() {
-    // runtime_status is not part of the local_coding surface; select the full
-    // operator surface so the call reaches dispatch.
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    // runtime_status is part of the canonical Adaptive direct set.
+    let runtime = test_runtime();
     let outcome = handle_mcp_request(
         &runtime,
         rpc(
@@ -229,4 +270,109 @@ async fn mcp_tools_call_show_changes_returns_structured_tool_error() {
         value["result"]["structuredContent"]["output"]["error_kind"],
         "unknown_project"
     );
+}
+
+#[test]
+fn mcp_suggested_call_output_schema_tracks_adaptive_route() {
+    let adaptive = mcp_tools_list_payload_with_compact(false);
+    let adaptive_work = adaptive["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "work_on_project")
+        .expect("Adaptive work_on_project");
+    let adaptive_call =
+        &adaptive_work["outputSchema"]["properties"]["output"]["properties"]["suggested_call"];
+    assert_eq!(
+        adaptive_call["properties"]["tool"]["const"],
+        crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(
+        adaptive_call["properties"]["arguments"]["properties"]["tool"]["const"],
+        "list_runners"
+    );
+    assert!(
+        crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(
+            "skill_versions",
+            true
+        )
+    );
+    assert!(
+        !crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(
+            "skill_versions",
+            false
+        ),
+        "ModelHidden Skill management recovery must require the stateless operator-extension admission context"
+    );
+}
+
+#[tokio::test]
+async fn adaptive_mcp_work_on_project_recovery_is_immediately_gateway_callable() {
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root.path())
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    let path = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let runtime = test_runtime();
+
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(1493)),
+            mcp_2026_params(json!({
+                "name": "work_on_project",
+                "arguments": {
+                    "client_id": "missing-493-runner",
+                    "path": path,
+                    "instruction": "recover the unknown Runner"
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::Ok(value) => value,
+        other => panic!("expected MCP tool result, got {other:?}"),
+    };
+    let suggested = &value["result"]["structuredContent"]["output"]["suggested_call"];
+    assert_eq!(
+        suggested["tool"],
+        crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(suggested["arguments"]["tool"], "list_runners");
+    assert_eq!(
+        suggested["arguments"]["arguments"],
+        json!({"include_projects": false, "summary_only": true})
+    );
+
+    let projected_tool = suggested["tool"].as_str().unwrap().to_string();
+    let projected_arguments = suggested["arguments"].clone();
+    let recovery = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(1494)),
+            mcp_2026_params(json!({
+                "name": projected_tool,
+                "arguments": projected_arguments
+            })),
+        ),
+        None,
+    )
+    .await;
+    let recovery = match recovery {
+        McpOutcome::Ok(value) => value,
+        other => panic!("projected recovery must pass MCP gateway admission: {other:?}"),
+    };
+    assert_eq!(recovery["result"]["structuredContent"]["success"], true);
 }

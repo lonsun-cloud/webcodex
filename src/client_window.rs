@@ -1,8 +1,9 @@
 //! Stable, host- or transport-owned chat-window identity.
 //!
 //! The raw host/transport value is never persisted or returned by a tool. Runtime
-//! and connector state use only the domain-separated SHA-256 key below, always
-//! together with the authenticated subject and exact project identity.
+//! state uses only the domain-separated SHA-256 key below together with the
+//! authenticated subject. Project-coupled observations additionally bind the exact
+//! Project; principal-scoped Peer communication deliberately does not.
 
 use salvo::http::header::{HeaderValue, SET_COOKIE};
 use salvo::prelude::{Request, Response};
@@ -13,6 +14,8 @@ const OPENAI_CONVERSATION_HEADER: &str = "openai-conversation-id";
 const WINDOW_COOKIE: &str = "webcodex_window";
 const WINDOW_COOKIE_MAX_AGE_SECS: i64 = 60 * 60 * 24 * 90;
 const MAX_OPAQUE_ID_BYTES: usize = 256;
+pub(crate) const PEER_ID_PREFIX: &str = "wc_peer_";
+const PEER_WINDOW_KEY_PREFIX_HEX_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClientWindow {
@@ -36,6 +39,11 @@ impl ClientWindow {
 
     pub(crate) fn key(&self) -> &str {
         &self.key
+    }
+
+    pub(crate) fn peer_id(&self) -> String {
+        peer_id_from_window_key(&self.key)
+            .expect("ClientWindow keys are canonical lowercase SHA-256 hex")
     }
 
     pub(crate) fn source(&self) -> &'static str {
@@ -94,6 +102,32 @@ pub(crate) fn stateless_mcp_window(params: &serde_json::Value) -> McpWindow {
         identity,
         issued_session_id: None,
     }
+}
+
+pub(crate) fn peer_id_from_window_key(window_key: &str) -> Option<String> {
+    if window_key.len() != 64
+        || !window_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(format!(
+        "{PEER_ID_PREFIX}{}",
+        &window_key[..PEER_WINDOW_KEY_PREFIX_HEX_LEN]
+    ))
+}
+
+pub(crate) fn peer_window_key_prefix(peer_id: &str) -> Option<&str> {
+    let suffix = peer_id.strip_prefix(PEER_ID_PREFIX)?;
+    if suffix.len() != PEER_WINDOW_KEY_PREFIX_HEX_LEN
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(suffix)
 }
 
 pub(crate) fn set_mcp_session_header(res: &mut Response, session_id: &str) {

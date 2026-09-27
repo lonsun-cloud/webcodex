@@ -798,6 +798,11 @@ pub(super) fn build_router_with_session_and_registry(
                 .push(Router::with_path("create").post(oauth_clients_create))
                 .push(Router::with_path("list").post(oauth_clients_list))
                 .push(Router::with_path("update_scopes").post(oauth_clients_update_scopes))
+                .push(Router::with_path("add_redirect_uri").post(oauth_clients_add_redirect_uri))
+                .push(
+                    Router::with_path("remove_redirect_uri")
+                        .post(oauth_clients_remove_redirect_uri),
+                )
                 .push(Router::with_path("revoke").post(oauth_clients_revoke)),
         )
         .push(

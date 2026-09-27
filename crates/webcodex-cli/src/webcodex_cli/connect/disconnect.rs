@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use webcodex_admin::{build_server_http_client, ServerHttpOptions};
+use webcodex_admin::ServerHttpOptions;
 
 use super::super::connections::{canonical_server_url, ensure_real_directory_tree};
-use super::super::http::{post_json_authed, ApiCall};
+use super::super::http::call_runtime_tool_status;
 use super::super::profiles::{
     client_output_dir_for_profile, client_state_dir_for_profile, default_client_base_dir,
     default_client_state_base_dir, validate_client_profile,
@@ -332,15 +332,26 @@ async fn unregister_live_project(
 ) -> Result<String, LiveUnregisterError> {
     let server =
         canonical_server_url(&config.server_url).map_err(LiveUnregisterError::NoUnregister)?;
-    let list = post_json_authed(ApiCall {
-        server_url: &server.url,
+    let (list_status, list_content_type, list_body) = call_runtime_tool_status(
+        &server.url,
         server_http,
-        token: observer_token,
-        path: "/api/projects/list",
-        body: json!({}),
-    })
+        Some(observer_token),
+        "list_projects",
+        json!({}),
+    )
     .await
     .map_err(LiveUnregisterError::NoUnregister)?;
+    if !(200..300).contains(&list_status) {
+        return Err(LiveUnregisterError::NoUnregister(format!(
+            "canonical list_projects failed before unregister dispatch: HTTP {list_status} ({list_content_type})"
+        )));
+    }
+    let list = list_body.ok_or_else(|| {
+        LiveUnregisterError::NoUnregister(
+            "canonical list_projects returned no JSON body; unregister was not dispatched"
+                .to_string(),
+        )
+    })?;
     let projects = list
         .pointer("/output/projects")
         .or_else(|| list.get("projects"))
@@ -400,40 +411,44 @@ async fn post_live_unregister(
     runtime_project_id: &str,
     expected_revision: &str,
 ) -> Result<Value, LiveUnregisterError> {
-    let url = format!(
-        "{}/api/projects/unregister",
-        server_url.trim_end_matches('/')
-    );
-    let client = build_server_http_client(server_http).map_err(|_| {
-        LiveUnregisterError::NoUnregister(
-            "failed to configure Server HTTP client; unregister was not dispatched".to_string(),
-        )
-    })?;
-    let response = client
-        .post(url)
-        .bearer_auth(token)
-        .json(&json!({
+    let (status, _content_type, parsed) = call_runtime_tool_status(
+        server_url,
+        server_http,
+        Some(token),
+        "unregister_project",
+        json!({
             "project": runtime_project_id,
             "expected_revision": expected_revision,
-        }))
-        .send()
-        .await
-        .map_err(|_| {
-            LiveUnregisterError::OutcomeUnknown(
-                "Server transport did not return an unregister response",
-            )
-        })?;
-    let status = response.status();
-    let text = response.text().await.map_err(|_| {
-        LiveUnregisterError::OutcomeUnknown("Server unregister response could not be read")
+        }),
+    )
+    .await
+    .map_err(|_| {
+        LiveUnregisterError::OutcomeUnknown(
+            "Server transport did not return an unregister response",
+        )
     })?;
-    if !status.is_success() {
-        let parsed = serde_json::from_str::<Value>(&text).ok();
-        let code = parsed
-            .as_ref()
-            .and_then(|value| value.pointer("/error/code"))
-            .and_then(Value::as_str);
-        if matches!(code, Some("operation_indeterminate" | "operation_failed")) {
+    let Some(parsed) = parsed else {
+        return Err(LiveUnregisterError::OutcomeUnknown(
+            "Server unregister response was not valid JSON",
+        ));
+    };
+    if !(200..300).contains(&status) || parsed.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        let output = parsed.get("output").unwrap_or(&Value::Null);
+        let code = output
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .or_else(|| output.get("error_code").and_then(Value::as_str))
+            .or_else(|| output.get("error_kind").and_then(Value::as_str));
+        let execution_state = output.get("execution_state").and_then(Value::as_str);
+        let error = parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if execution_state == Some("outcome_unknown")
+            || matches!(code, Some("operation_indeterminate" | "operation_failed"))
+            || error.contains("operation_indeterminate")
+        {
             return Err(LiveUnregisterError::OutcomeUnknown(
                 "Server could not prove a terminal unregister outcome",
             ));
@@ -443,18 +458,17 @@ async fn post_live_unregister(
                 "Server rejected unregister without a project removal outcome: {code}"
             )));
         }
-        if matches!(status.as_u16(), 400 | 401 | 403) {
+        if matches!(status, 400 | 401 | 403) {
             return Err(LiveUnregisterError::NoUnregister(format!(
-                "Server rejected unregister before Runner dispatch: HTTP {}",
-                status.as_u16()
+                "Server rejected unregister before Runner dispatch: HTTP {status}"
             )));
         }
         return Err(LiveUnregisterError::OutcomeUnknown(
             "Server returned an unclassified unregister failure",
         ));
     }
-    serde_json::from_str(&text).map_err(|_| {
-        LiveUnregisterError::OutcomeUnknown("Server unregister response was not valid JSON")
+    parsed.get("output").cloned().ok_or_else(|| {
+        LiveUnregisterError::OutcomeUnknown("canonical unregister_project response omitted output")
     })
 }
 
@@ -704,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_disconnect_accepts_legacy_agent_toml_only() {
+    async fn offline_disconnect_accepts_legacy_only_agent_toml() {
         let tmp = canonical_test_tempdir();
         let config = tmp.path().join("config");
         let state = tmp.path().join("state");
@@ -729,8 +743,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.outcome, "local_unregistered");
+        assert_eq!(result.runner_action, "not_running");
         assert!(profile_dir.join("agent.toml").is_file());
         assert!(!profile_dir.join("runner.toml").exists());
+        assert!(!profile_dir.join("project-registry/repo.toml").exists());
     }
 
     #[tokio::test]
@@ -760,7 +776,8 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("runner.toml"));
         assert!(error.contains("agent.toml"));
-        assert!(error.contains("refusing to guess"));
+        assert!(error.contains("legacy"), "{error}");
+        assert!(error.contains("remove or archive"), "{error}");
         assert!(profile_dir.join("project-registry/repo.toml").is_file());
     }
 
@@ -812,18 +829,20 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 let (path, body) = if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     (
-                        "/api/projects/list",
+                        "/api/tools/call",
                         json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}),
                     )
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     assert!(text.contains("agent:client:repo"), "{text}");
                     assert!(text.contains("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "{text}");
                     (
-                        "/api/projects/unregister",
-                        json!({"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}),
+                        "/api/tools/call",
+                        json!({"success":true,"output":{"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}}),
                     )
                 };
                 let _ = path;
@@ -909,12 +928,14 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 let payload = if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}).to_string()
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     std::fs::remove_file(&registration_for_server).unwrap();
-                    json!({"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}).to_string()
+                    json!({"success":true,"output":{"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}}).to_string()
                 };
                 write!(
                     stream,
@@ -1002,7 +1023,8 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     let payload = json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}).to_string();
                     write!(
                         stream,
@@ -1012,7 +1034,8 @@ mod tests {
                     )
                     .unwrap();
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     assert!(text.contains("agent:client:repo"), "{text}");
                     std::fs::remove_file(&registration_for_server).unwrap();
                     // Simulate Runner authoritative removal followed by a lost
@@ -1064,7 +1087,8 @@ mod tests {
             let mut request = vec![0u8; 16 * 1024];
             let read = stream.read(&mut request).unwrap();
             let text = String::from_utf8_lossy(&request[..read]);
-            assert!(text.starts_with("POST /api/projects/list "), "{text}");
+            assert!(text.starts_with("POST /api/tools/call "), "{text}");
+            assert!(text.contains(r#""tool":"list_projects""#), "{text}");
             let payload = json!({"success":true,"output":{"projects":[]}}).to_string();
             write!(
                 stream,

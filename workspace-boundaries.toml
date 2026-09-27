@@ -11,7 +11,6 @@ entrypoint = 5
 [root_test_support]
 feature = "root-test-support"
 providers = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -28,7 +27,7 @@ layer = "composition"
 role = "Server composition and protocol adapters."
 normal = [
     "webcodex-admin",
-    "webcodex-connector-runtime",
+    "webcodex-code-mode",
     "webcodex-core",
     "webcodex-persistent-shell",
     "webcodex-runner-config",
@@ -41,7 +40,6 @@ normal = [
     "webcodex-workspace",
 ]
 dev = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -49,7 +47,6 @@ dev = [
 ]
 build = []
 test_support = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -60,6 +57,14 @@ test_support = [
 layer = "leaf"
 role = "Standalone operator/admin HTTP client support."
 normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-browser]
+layer = "domain"
+role = "First-class bounded CDP browser runtime built on process lifecycle primitives."
+normal = ["webcodex-process"]
 dev = []
 build = []
 test_support = []
@@ -77,34 +82,38 @@ dev = []
 build = []
 test_support = []
 
-[packages.webcodex-computer]
-layer = "leaf"
-role = "Platform-native computer-use primitives."
+[packages.webcodex-code-mode]
+layer = "runtime"
+role = "Experimental transport-neutral Code Mode frontend/runtime and bounded V8 orchestration."
 normal = []
 dev = []
 build = []
 test_support = []
 
-[packages.webcodex-connector-runtime]
-layer = "application"
-role = "Project-bound connector application service coordinating domain crates."
-normal = [
-    "webcodex-core",
-    "webcodex-runner-config",
-    "webcodex-runner-registry",
-    "webcodex-store",
-    "webcodex-tool-contracts",
-    "webcodex-validation",
-    "webcodex-workspace",
-]
-dev = ["webcodex-store"]
+[packages.webcodex-computer]
+layer = "leaf"
+role = "Platform-native computer-use primitives."
+normal = ["webcodex-core"]
+dev = []
 build = []
-test_support = ["webcodex-store"]
+test_support = []
 
 [packages.webcodex-core]
 layer = "leaf"
 role = "Shared contracts and low-level helpers with no workspace dependencies."
 normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-lsp]
+layer = "domain"
+role = "Native bounded Language Server Protocol lifecycle and semantic navigation."
+normal = [
+    "webcodex-core",
+    "webcodex-process",
+    "webcodex-runner-config",
+]
 dev = []
 build = []
 test_support = []
@@ -129,8 +138,10 @@ test_support = []
 layer = "runtime"
 role = "Runner executable/runtime composition for local project execution."
 normal = [
+    "webcodex-browser",
     "webcodex-computer",
     "webcodex-core",
+    "webcodex-lsp",
     "webcodex-persistent-shell",
     "webcodex-process",
     "webcodex-runner-config",
@@ -174,15 +185,15 @@ test_support = []
 
 [packages.webcodex-tool-runtime-contracts]
 layer = "runtime"
-role = "Tool runtime call, result, audit, and input contracts."
+role = "Tool runtime result, recorder metadata, and audit contracts."
 normal = [
     "webcodex-core",
     "webcodex-tool-contracts",
     "webcodex-workflow-session",
 ]
-dev = ["webcodex-tool-contracts"]
+dev = []
 build = []
-test_support = ["webcodex-tool-contracts"]
+test_support = []
 
 [packages.webcodex-validation]
 layer = "domain"

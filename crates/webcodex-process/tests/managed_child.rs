@@ -1,6 +1,6 @@
 //! Integration tests for `webcodex-process`.
 //!
-//! These tests run the real `process_tree_helper` binary on both Windows and
+//! These tests run the real `process-tree-helper` binary on both Windows and
 //! Unix. Liveness is probed via platform-native APIs (OpenProcess +
 //! GetExitCodeProcess on Windows, `kill(pid, 0)` on Unix) rather than by
 //! shelling out to `tasklist` / `ps`, so the tests are self-contained.
@@ -15,7 +15,7 @@ use webcodex_process::{GracefulTermination, ManagedChild, SpawnOptions};
 
 /// Path to the compiled helper binary, provided by Cargo for integration tests.
 fn helper() -> &'static str {
-    env!("CARGO_BIN_EXE_process_tree_helper")
+    env!("CARGO_BIN_EXE_process-tree-helper")
 }
 
 /// Reads newline-delimited lines from a pipe on a background thread so tests

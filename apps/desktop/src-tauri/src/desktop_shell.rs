@@ -18,6 +18,7 @@ pub enum CloseDisposition {
 pub enum NavigationTarget {
     Activity,
     Settings,
+    Connections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

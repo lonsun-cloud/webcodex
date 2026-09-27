@@ -32,7 +32,7 @@
 
 ## 我遇到了问题
 
-- [故障排查](TROUBLESHOOTING.zh-CN.md) —— 安装、连接、运行和 Runner 问题
+- [故障排查](TROUBLESHOOTING.zh-CN.md) —— ChatGPT/MCP Host、安装、连接、运行和 Runner 问题
 - [安全说明](../SECURITY.md) —— 安全模型和使用建议
 
 ## 我想理解或扩展 WebCodex
@@ -43,6 +43,8 @@
 - [Computer Use roadmap](COMPUTER_USE.md) —— semantic-first desktop automation 方向与验证优先级
 
 ## 我想参与开发或发布
+
+- [Desktop 开发与打包](DESKTOP_DEVELOPMENT.zh-CN.md) —— 从源码运行 Desktop，并本地构建/验证 Windows 与 macOS 原生安装包
 
 下面 `docs/agent/` 中的页面属于 maintainer/internal contract。它们会有意保留
 protocol field、兼容名称和实现 invariant；普通用户不需要为了使用 WebCodex 而学习

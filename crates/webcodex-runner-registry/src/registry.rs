@@ -1,8 +1,7 @@
-use crate::state::RunnerRegistryInner;
+use crate::receipts::ReceiptRegistryState;
 use crate::{NoopRunnerRegistryTelemetry, RunnerAccess, RunnerRegistryTelemetry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::sync::Mutex;
 
 /// Server-side retained bytes for one stdout or stderr stream in an ordinary
 /// completed Runner result. This is not a polling/WebSocket/QUIC wire limit.
@@ -66,13 +65,29 @@ impl Default for SharedKeyRegistrationLimits {
     }
 }
 
+/// One-shot, per-registry deterministic handoff fault. Absent from production;
+/// the gate lets tests deliver canonical terminal/cleanup updates at the race.
+#[cfg(any(test, feature = "root-test-support"))]
+#[derive(Debug)]
+pub(crate) struct HiddenHandoffFault {
+    observation: bool,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunnerRegistry {
-    pub(crate) inner: Arc<Mutex<RunnerRegistryInner>>,
+    pub(crate) inner: Arc<ReceiptRegistryState>,
     pub(crate) observation_epoch: Arc<str>,
     pub(crate) shared_key_limits: SharedKeyRegistrationLimits,
     pub(crate) telemetry: Arc<dyn RunnerRegistryTelemetry>,
     pub(crate) cleanup_intents: Arc<StdMutex<HashMap<String, Option<RunnerAccess>>>>,
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub(crate) hidden_handoff_fault: Arc<StdMutex<Option<HiddenHandoffFault>>>,
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub(crate) project_job_scan_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub(crate) filtered_job_refresh_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for RunnerRegistry {
@@ -84,12 +99,71 @@ impl Default for RunnerRegistry {
 impl RunnerRegistry {
     pub fn with_telemetry(telemetry: Arc<dyn RunnerRegistryTelemetry>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RunnerRegistryInner::default())),
+            inner: Arc::new(ReceiptRegistryState::new(None)),
             observation_epoch: Arc::from(uuid::Uuid::new_v4().to_string()),
             shared_key_limits: SharedKeyRegistrationLimits::default(),
             telemetry,
             cleanup_intents: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "root-test-support"))]
+            hidden_handoff_fault: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "root-test-support"))]
+            project_job_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "root-test-support"))]
+            filtered_job_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn pause_next_hidden_handoff_failure_for_test(
+        &self,
+        observation: bool,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut slot = self.hidden_handoff_fault.lock().unwrap();
+        assert!(slot.is_none(), "one handoff fault per fixture");
+        *slot = Some(HiddenHandoffFault {
+            observation,
+            reached: reached.clone(),
+            release: release.clone(),
+        });
+        (reached, release)
+    }
+
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub(crate) async fn hidden_handoff_failure_for_test(
+        &self,
+        observation: bool,
+    ) -> Result<(), String> {
+        let fault = {
+            let mut slot = self.hidden_handoff_fault.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|fault| fault.observation == observation)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(fault) = fault {
+            fault.reached.notify_one();
+            fault.release.notified().await;
+            return Err("injected handoff observation failure".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn project_job_scan_count_for_test(&self) -> usize {
+        self.project_job_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn filtered_job_refresh_count_for_test(&self) -> usize {
+        self.filtered_job_refresh_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(any(test, feature = "root-test-support"))]

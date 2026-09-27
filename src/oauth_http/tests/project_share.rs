@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn project_share_scope_ceiling_is_connector_only() {
+fn project_share_scope_ceiling_is_project_runtime_only() {
     let allowed = "runtime:read session:collaborate project:read project:write job:run";
     let normalized = normalize_project_share_oauth_scopes(Some(allowed), allowed).unwrap();
     assert_eq!(normalized, allowed);

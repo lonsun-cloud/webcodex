@@ -100,10 +100,11 @@ pub(super) fn validate_http_protocol(
         ));
     }
     if body_version != Some(MCP_STATELESS_PROTOCOL_VERSION) {
-        return Err(header_mismatch(
+        return Err(rpc_error(
             id,
+            -32602,
             format!(
-                "Header mismatch: {MCP_PROTOCOL_VERSION_HEADER} does not match params._meta protocolVersion"
+                "Invalid params: params._meta io.modelcontextprotocol/protocolVersion is required and must equal {MCP_STATELESS_PROTOCOL_VERSION}"
             ),
         ));
     }

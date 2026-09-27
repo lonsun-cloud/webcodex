@@ -90,70 +90,6 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
     }
 }
 
-fn decoded_job_operation(request: RunnerRequest) -> RunnerJobOperation {
-    match request.decode_operation().expect("valid typed Job fixture") {
-        RunnerOperation::Job(operation) => operation,
-        _ => panic!("expected Job operation"),
-    }
-}
-
-#[test]
-fn raw_shell_job_lifecycle_distinguishes_terminal_truth_without_error_text_matching() {
-    assert_eq!(
-        raw_shell_job_terminal_lifecycle("completed", Some(0)),
-        ShellCommandExecutionState::Completed
-    );
-    assert_eq!(
-        raw_shell_job_terminal_lifecycle("failed", Some(7)),
-        ShellCommandExecutionState::Completed
-    );
-    assert_eq!(
-        raw_shell_job_terminal_lifecycle("stopped", Some(-1)),
-        ShellCommandExecutionState::Completed
-    );
-    assert_eq!(
-        raw_shell_job_terminal_lifecycle("timeout", Some(-1)),
-        ShellCommandExecutionState::TimedOut
-    );
-    assert_eq!(
-        raw_shell_job_terminal_lifecycle("failed", None),
-        ShellCommandExecutionState::OutcomeUnknown
-    );
-}
-
-#[test]
-fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
-    let temp = tempfile::tempdir().unwrap();
-    let operation = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
-    assert_eq!(
-        job_prestart_lifecycle(&operation),
-        Some(ShellCommandExecutionState::NotStarted)
-    );
-}
-
-#[test]
-fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
-    let temp = tempfile::tempdir().unwrap();
-    let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
-    assert_eq!(
-        post_spawn_interruption_lifecycle(&shell),
-        Some(ShellCommandExecutionState::OutcomeUnknown)
-    );
-
-    let step = ShellJobValidationStep {
-        name: "check".to_string(),
-        program: "cargo".to_string(),
-        args: vec!["check".to_string(), "--all-targets".to_string()],
-        env: Vec::new(),
-    };
-    let mut validation = shell_job_request(temp.path(), "");
-    validation.kind = "start_validation_job".to_string();
-    validation.command = serde_json::to_string(&[step]).unwrap();
-    validation.job_context.as_mut().unwrap().validation_steps = vec!["check".to_string()];
-    let validation = decoded_job_operation(validation);
-    assert_eq!(post_spawn_interruption_lifecycle(&validation), None);
-}
-
 #[test]
 fn shell_job_success_and_failure_results_are_structured() {
     let tmp = tempfile::tempdir().unwrap();
@@ -261,6 +197,7 @@ fn shell_job_rejects_cwd_symlink_escape() {
         .is_some_and(|error| error.contains("outside allowed_roots")));
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: waits on a real shell timeout"]
 fn runner_real_process_shell_job_timeout_returns_timeout_error() {
@@ -294,7 +231,7 @@ fn long_lived_descendant_command(pid_file: &Path) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: waits on a real shell timeout"]
 fn runner_real_process_shell_job_timeout_reaps_descendant_process_group() {
@@ -330,7 +267,7 @@ fn runner_real_process_shell_job_timeout_reaps_descendant_process_group() {
     assert_descendant_reaped(&pid_file);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: waits on a real shell timeout"]
 fn runner_real_process_shell_job_timeout_profile_reaps_descendant_process_group() {

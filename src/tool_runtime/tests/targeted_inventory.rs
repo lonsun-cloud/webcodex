@@ -205,6 +205,68 @@ fn project_candidate_staging_is_index_only() {
 }
 
 #[tokio::test]
+async fn list_projects_batch_job_counts_join_exact_projects_and_skip_empty_selection() {
+    let runtime = test_runtime();
+    register_target_agent(
+        &runtime,
+        "batch",
+        vec![
+            registered_project("a", "/tmp/batch-a"),
+            registered_project("b", "/tmp/batch-b"),
+        ],
+        None,
+    )
+    .await;
+    for id in ["a", "a", "b"] {
+        runtime
+            .runner_registry
+            .start_job_with_metadata(
+                crate::runner_protocol::ShellJobOpRequest {
+                    login: false,
+                    op: "start".into(),
+                    client_id: Some("batch".into()),
+                    cwd: None,
+                    command: Some("echo fixture".into()),
+                    timeout_secs: Some(60),
+                    job_id: None,
+                    since_stdout_line: None,
+                    since_stderr_line: None,
+                    tail_lines: None,
+                    limit: None,
+                    codex: None,
+                },
+                "fixture".into(),
+                webcodex_runner_registry::ShellJobStartMetadata {
+                    project_id: Some(format!("agent:batch:{id}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let listed = runtime
+        .dispatch_with_auth(
+            list_projects_call(Some("batch"), None, None, None, true),
+            None,
+        )
+        .await;
+    assert!(listed.success, "{:?}", listed.error);
+    assert_eq!(listed.output["projects"][0]["id"], "agent:batch:a");
+    assert_eq!(listed.output["projects"][0]["active_jobs"], 2);
+    assert_eq!(listed.output["projects"][1]["active_jobs"], 1);
+    assert_eq!(runtime.runner_registry.project_job_scan_count_for_test(), 1);
+    let empty = runtime
+        .dispatch_with_auth(
+            list_projects_call(Some("missing"), None, None, None, true),
+            None,
+        )
+        .await;
+    assert!(empty.success);
+    assert_eq!(empty.output["count"], 0);
+    assert_eq!(runtime.runner_registry.project_job_scan_count_for_test(), 1);
+}
+
+#[tokio::test]
 async fn list_projects_large_single_runner_inventory_preserves_linear_staging_contract() {
     for project_count in [256usize, 1024] {
         let runtime = test_runtime();
@@ -232,6 +294,7 @@ async fn list_projects_large_single_runner_inventory_preserves_linear_staging_co
         assert_eq!(exact.output["matched_count"], 1);
         assert_eq!(exact.output["truncated"], false);
         assert_eq!(exact.output["projects"][0]["id"], exact_id);
+        assert_eq!(runtime.runner_registry.project_job_scan_count_for_test(), 1);
 
         let broad = runtime
             .list_projects_with_visible_clients_for_test(
@@ -260,6 +323,7 @@ async fn list_projects_large_single_runner_inventory_preserves_linear_staging_co
             .map(|index| format!("agent:special:project-{index:04}"))
             .collect::<Vec<_>>();
         assert_eq!(broad_ids, expected_ids);
+        assert_eq!(runtime.runner_registry.project_job_scan_count_for_test(), 2);
 
         let full = runtime
             .list_projects_with_visible_clients_for_test(
@@ -272,6 +336,11 @@ async fn list_projects_large_single_runner_inventory_preserves_linear_staging_co
         assert_eq!(full.output["matched_count"], project_count);
         assert_eq!(full.output["count"], project_count);
         assert_eq!(full.output["truncated"], false);
+        assert_eq!(
+            runtime.runner_registry.project_job_scan_count_for_test(),
+            3,
+            "a full inventory must scan Jobs once, not once per Project"
+        );
         assert_eq!(
             full.output["projects"][0]["id"],
             "agent:special:project-0000"
@@ -597,7 +666,14 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
             registered_project("webcodex", "/root/git/webcodex"),
             registered_project("other", "/tmp/other"),
         ],
-        None,
+        Some(RunnerBuildInfo {
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            git_commit: Some("catalog-build".to_string()),
+            git_dirty: Some(false),
+            built_at: Some("300".to_string()),
+            target: Some("x86_64-pc-windows-msvc".to_string()),
+            architecture: Some("x86_64".to_string()),
+        }),
     )
     .await;
     register_target_agent(
@@ -624,6 +700,9 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
     let agent = &focused.output["agents"][0];
     assert_eq!(agent["client_id"], "special");
     assert_eq!(agent["projects_count"], 2);
+    assert_eq!(agent["build"]["built_at"], "300");
+    assert_eq!(agent["build"]["target"], "x86_64-pc-windows-msvc");
+    assert_eq!(agent["build"]["architecture"], "x86_64");
     for omitted in [
         "projects",
         "capabilities",
@@ -698,11 +777,17 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         git_commit: Some("A".to_string()),
         git_dirty: Some(false),
+        built_at: Some("100".to_string()),
+        target: Some("x86_64-unknown-linux-gnu".to_string()),
+        architecture: Some("x86_64".to_string()),
     };
     let mini_build = RunnerBuildInfo {
         version: Some("0.0.1".to_string()),
         git_commit: Some("B".to_string()),
         git_dirty: Some(false),
+        built_at: Some("200".to_string()),
+        target: Some("aarch64-apple-darwin".to_string()),
+        architecture: Some("aarch64".to_string()),
     };
     register_target_agent(
         &runtime,
@@ -737,13 +822,19 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .find(|runner| runner["client_id"] == "mini")
         .unwrap();
     assert_eq!(synthetic_special["source_alignment"]["status"], "aligned");
+    assert_eq!(synthetic_special["build_built_at"], "100");
+    assert_eq!(
+        synthetic_special["build_target"],
+        "x86_64-unknown-linux-gnu"
+    );
+    assert_eq!(synthetic_special["build_architecture"], "x86_64");
     assert_eq!(synthetic_mini["source_alignment"]["status"], "different");
 
     let global = runtime.dispatch(runtime_status_call(None, false)).await;
     assert!(global.success);
     assert_eq!(
         global.output["version_compatibility"]["status"],
-        "version_mismatch"
+        "compatible"
     );
     let global_special = global.output["version_compatibility"]["runners"]
         .as_array()
@@ -751,12 +842,24 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .iter()
         .find(|runner| runner["client_id"] == "special")
         .unwrap();
+    let global_mini = global.output["version_compatibility"]["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runner| runner["client_id"] == "mini")
+        .unwrap();
 
     let special = runtime
         .dispatch(runtime_status_call(Some("special"), true))
         .await;
     assert!(special.success, "{:?}", special.error);
     assert_eq!(special.output["focus"]["client_id"], "special");
+    assert_eq!(special.output["focus"]["build"]["built_at"], "100");
+    assert_eq!(
+        special.output["focus"]["build"]["target"],
+        "x86_64-unknown-linux-gnu"
+    );
+    assert_eq!(special.output["focus"]["build"]["architecture"], "x86_64");
     assert_eq!(
         special.output["version_compatibility"]["status"],
         "compatible"
@@ -767,7 +870,7 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
     );
     assert_eq!(
         special.output["fleet_summary"]["mismatched_agents_count"],
-        1
+        0
     );
     let serialized = special.output.to_string();
     assert!(!serialized.contains("inst-mini"));
@@ -778,10 +881,12 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .await;
     assert!(mini.success);
     assert_eq!(mini.output["focus"]["client_id"], "mini");
+    assert_eq!(mini.output["focus"]["protocol_compatibility"], "compatible");
     assert_eq!(
-        mini.output["version_compatibility"]["status"],
-        "version_mismatch"
+        mini.output["focus"]["build_alignment"],
+        global_mini["build_alignment"]
     );
+    assert_eq!(mini.output["version_compatibility"]["status"], "compatible");
 
     let unknown = runtime
         .dispatch(runtime_status_call(Some("missing"), true))
@@ -823,7 +928,10 @@ fn targeted_inventory_schemas_and_tool_parsing_are_bounded() {
         .unwrap();
     let project_props = project_spec.input_schema["properties"].as_object().unwrap();
     assert_eq!(project_props["query"]["maxLength"], 200);
-    assert_eq!(project_props["limit"]["maximum"], 100);
+    assert!(project_props["limit"].get("maximum").is_none());
+    assert!(project_props["limit"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("clamped to 100")));
     assert!(project_spec.description.contains("exact client_id/project"));
 
     let agent_spec = specs
@@ -849,7 +957,10 @@ fn targeted_inventory_schemas_and_tool_parsing_are_bounded() {
     let job_props = jobs_spec.input_schema["properties"].as_object().unwrap();
     assert!(job_props.contains_key("project"));
     assert!(job_props.contains_key("session_id"));
-    assert_eq!(job_props["limit"]["maximum"], 100);
+    assert!(job_props["limit"].get("maximum").is_none());
+    assert!(job_props["limit"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("clamped to 100")));
     assert!(jobs_spec.description.contains("project/session_id"));
 
     let projects = ToolCall::from_tool_name(

@@ -23,6 +23,13 @@ fn register_project_fields() -> Vec<(&'static str, Value)> {
             ),
         ),
         (
+            "project_ref",
+            schema_type(
+                "string",
+                "Server-issued short model-facing Project selector such as ~p1. It is scoped to the authenticated caller, grants no authority, and is re-authorized against the canonical Runtime Project on every use.",
+            ),
+        ),
+        (
             "agent_project_id",
             schema_type(
                 "string",
@@ -62,13 +69,6 @@ fn register_project_fields() -> Vec<(&'static str, Value)> {
             schema_type(
                 "string",
                 "Project onboarding result metadata path for one Runner project registration record TOML file; not file content and not the registered workspace path.",
-            ),
-        ),
-        (
-            "projects_config_path",
-            schema_type(
-                "string",
-                "Deprecated compatibility alias of project_record_path. Project onboarding result metadata path for one Runner project registration record TOML file; not file content.",
             ),
         ),
         (

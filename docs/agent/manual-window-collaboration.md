@@ -1,6 +1,6 @@
 # Manual Multi-Window Collaboration
 
-This guide defines bounded collaboration between independent WebCodex Workflow Sessions. It reuses the Session handoff and message board; it is not a scheduler, worker pool, task queue, claim service, shared transcript, or filesystem lock. This manual engineering workflow remains valid alongside the separate durable Agent/Conversation domain.
+This guide defines two bounded multi-window collaboration layers: lightweight **Window Peer** awareness/messages and authoritative **Workflow Session** handoff/assignment. Neither layer is a scheduler, worker pool, claim service, shared transcript, or filesystem lock. The peer layer routes conversation; the Session layer keeps task evidence and fenced todo completion. Both remain separate from the durable Agent/Conversation domain.
 
 ## Core model
 
@@ -9,6 +9,25 @@ Assume coordinator Session `C` and worker Session `W`.
 `C` owns the collaboration todo and bounded answers. `W` owns the worker's tool calls, validation, review evidence, and workspace activity. They are always independent Sessions: the worker does not resume `C`, and WebCodex does not copy `W` execution history into `C`.
 
 Knowing a `session_id`, `message_id`, worker Session id, Job id, checkpoint id, artifact ref, commit SHA, or PR number is not authority. Every read or mutation still passes the normal caller/project/owner authorization checks. A `recording_session_id` is authorized before it can affect ledger recording, provenance, or project-mismatch logic; it does not become business execution context. Project-scoped Session targets require both current authorization to the stored project and an immutable creation-time canonical authority-group fingerprint; project-less Sessions use the same internal durable fence. Direct shared-key access and its OAuth shared-key bridge normalize to the same authority group. Workflow Session selection is always explicit: neither window identity, credentials, project identity, nor recorder provenance selects another business Session implicitly. Collaboration never grants filesystem, shell, Computer, artifact, credential, or other project authority.
+
+## Window Peer awareness and cross-Project messaging
+
+A stable host window may be represented by a principal-scoped `wc_peer_*` identity derived from the already-hashed `ClientWindow`. Stateless MCP obtains that `ClientWindow` from host metadata such as `_meta["openai/session"]`; WebCodex never exposes or persists the raw host value. Peer identity is communication identity only: it is not a Workflow Session selector, Project authority, credential, task lease, model-turn id, or proof that the host/model is currently running.
+
+Peer **discovery** is deliberately narrower than peer **contact**. WebCodex may piggyback `peer_awareness` when another window owned by the same authenticated principal has meaningful activity in the exact same visible Project within the last 10 minutes. The hint is deduplicated by retained Server state per observer/peer/Project and reports recent activity, not liveness or presence. A window that has merely opened a connection or issued non-meaningful discovery traffic is not thereby an active collaborator.
+
+Once a peer id is known, `post_peer_message(peer_id=...)` routes to that same principal-owned window independently of Project. This is intentional: a collaborator may discover another window in the main checkout, then move to a managed worktree or another Project without the Project change itself invalidating the communication route; bounded retention still applies. Cross-Project peer contact never reveals or authorizes the recipient's current Project, Workflow Session, branch, files, tool activity, assignment, or handoff. Session collaboration tools keep their existing independent target authorization and exact-project equality rules.
+
+Peer messages reuse the Session message vocabulary (`note`, `proposal`, `question`, `answer`, `decision`, `risk`, `progress`, `guidance`, `todo`), priority, and ACK wrapper, but they do not acquire Session task semantics. In particular, a peer `todo` is a conversational request only; `get_session_assignment`, `assignment_fence`, and `complete_session_message` still belong to an explicit Workflow Session todo.
+
+Delivery is model-facing and intentionally lightweight:
+
+- `requires_ack=false`: WebCodex durably records the message and attempts to piggyback it once in `peer_messages` on the recipient window's next normal model-facing tool result. The persisted first/last projection timestamps and projection count describe a Server projection attempt, not a delivery/read receipt. There is no retry obligation if the model or transport never acts on it.
+- `requires_ack=true`: the message is eligible for the same bounded piggyback on later calls whenever the current request omits its id. Echoing the id in `ack_session_message_ids` suppresses it for that one request/response and records the first observed ACK time. ACK proves neither acceptance nor execution, never resolves the message, and never requires a reply.
+
+Peer transport is deliberately bounded rather than a permanent task queue. Old retained Peer messages and discovery edges may be pruned; `requires_ack` therefore means repeat while retained, not indefinite durable work. ActionAudit activity is discovery input only and never establishes a communication route by itself: a peer route exists only while retained Peer discovery/message state can still resolve it. Use Workflow Session todos and assignment fencing for durable work commitments.
+
+The sender's current Workflow Session and Project may be persisted as analysis context when they are already trusted runtime facts, but they are not part of the recipient projection and never become routing authority. Peer ids are resolved only inside the same authenticated principal; knowing another principal's `wc_peer_*` value does not cross that boundary.
 
 ## Canonical coordinator -> worker flow
 
@@ -49,7 +68,7 @@ A successful completion records:
 - a persisted fingerprint of the exact accepted assignment fence for replay correlation;
 - `author_session_id` only from an already-authorized explicit recording Session when the tool call is recorded under one.
 
-Without an explicit trusted recorder, `author_session_id` is `null`; callers cannot supply a trusted author identity themselves. Stateless MCP 2026 never derives a Workflow Session identity from transport/window continuity, so callers that want worker provenance pass explicit `recording_session_id` wrapper metadata. A ChatGPT `openai/session` window may bind Project Connector task continuity, but WebCodex does not infer Workflow Session provenance from `mcp-session-id`, HTTP connection state, credentials, project identity, a client window, or a recent Workflow Session.
+Without an explicit trusted recorder, `author_session_id` is `null`; callers cannot supply a trusted author identity themselves. Stateless MCP 2026 never derives a Workflow Session identity from transport/window continuity, so callers that want worker provenance pass explicit `recording_session_id` wrapper metadata. WebCodex does not infer Workflow Session provenance from `mcp-session-id`, HTTP connection state, credentials, project identity, a client window, or a recent Workflow Session.
 
 When a collaboration call has both a recording Session and a target Session, WebCodex authorizes both independently and then requires their stored project scopes to match exactly. `project/project` is allowed only for the same project, `project/project` with different projects is denied, both `project/project-less` directions are denied, and `project-less/project-less` is allowed only after both owner authorities have independently matched. The generic cross-project escape flag never widens this collaboration relationship.
 
@@ -76,7 +95,7 @@ All supplied filters use deterministic AND semantics. `message_id` therefore giv
 
 The token is bounded, opaque, bound to the exact Workflow Session, and backed by a durable Session-local monotonic message-observation revision. It is observation state only: it is not authority, an idempotency key, execution identity, an implicit Workflow Session selector, or message-delivery receipt. The same recorder/target authorization fence used by the other collaboration tools applies before any observation result is returned. Token issuance fences the ledger generation containing its revision so a valid token remains usable after Server restart when that Workflow Session can be restored.
 
-Assignment and continuity identities are intentionally separate domains: `assignment_fence` is a semantic todo snapshot, `completion_key` is caller replay identity, `ack_session_context_revision` is model-result continuity evidence, `ack_session_message_ids` is request-scoped retained-guidance proof, an observation token is a generic message-state cursor, business `session_id` names the authorized target, and `recording_session_id` is provenance only. None substitutes for another or grants authority by possession.
+Assignment and continuity identities are intentionally separate domains: `assignment_fence` is a semantic todo snapshot, `completion_key` is caller replay identity, `ack_session_message_ids` is request-scoped retained-message proof, an observation token is a generic Session message-state cursor, business `session_id` names the authorized target, `recording_session_id` is Session provenance only, and `wc_peer_*` names a principal-scoped communication endpoint. None substitutes for another or grants Project/Session authority by possession.
 
 Observation tracks real message-state mutation, not deque length. Posts advance it; a resolve advances it only when status/resolution really changes; a new atomic completion advances for the todo resolution and answer creation; exact completion replay and no-op resolve do not advance it. If one retained message changes multiple times between observations, the observer may receive only its latest current state because this primitive is not an event/audit log.
 
@@ -132,7 +151,7 @@ When multiple workers operate on the same source, use normal Git/WebCodex Projec
 
 The hosted Runtime Console may post `note`, `guidance`, `question`, and `todo` messages into an exact authorized Workflow Session through the same `post_session_message` kernel path. This is a browser affordance, not a Participant entity, membership record, presence signal, or identity-spoofing surface. The browser route keeps the current collaboration metadata authority policy (`runtime:read`) and still applies the stored Session/project authority fence.
 
-High-priority Guidance may opt into `requires_ack`. A Stateless MCP 2026 caller can echo the visible message id in `ack_session_message_ids` on an otherwise ordinary recorded tool call. The original tool executes normally whether the ACK is present, missing, unknown, foreign, or stale. A valid ACK suppresses that Guidance body only for the same request/response. If the model later omits the ACK while the Guidance remains open, the Server may piggyback the bounded body again. The first observed ACK timestamp is observability only; it must never be described as delivered, read, or currently remembered. Durable completion still requires normal message resolution.
+Any Session message may opt into `requires_ack`, independently of kind and priority. A Stateless MCP 2026 caller can echo the visible `wc_msg_*` id in `ack_session_message_ids` on an otherwise ordinary tool call; the same bounded wrapper is also reused for ACK-required Peer messages addressed to the current window. The original tool executes normally whether the ACK is present, missing, unknown, foreign, or stale. A valid ACK suppresses that message body only for the same request/response. If a later request omits the ACK while a Session message remains open, or while a Peer ACK message remains retained, the Server may piggyback it again. The first observed ACK timestamp is observability only; it must never be described as delivered, read, accepted, or currently remembered. Session durable completion still requires normal message resolution.
 
 ## Bounded payload guidance
 
@@ -149,7 +168,7 @@ Do not put bearer tokens, OAuth secrets, private keys, credentials, sensitive co
 
 ## Explicit non-goals
 
-This workflow does not add automatic worker spawning, scheduler/worker pool behavior, generic task queues, automatic claims, work leases, filesystem locks, branch locks, shared transcripts, hidden chain-of-thought transfer, cross-owner delegation, webhook/model callbacks, automatic Job-terminal continuation, or implicit authority inheritance.
+This workflow does not add automatic worker spawning, scheduler/worker pool behavior, generic task queues, automatic claims, work leases, filesystem locks, branch locks, shared transcripts, hidden chain-of-thought transfer, cross-owner peer routing/delegation, webhook/model callbacks, automatic Job-terminal continuation, or implicit authority inheritance.
 
 The human or coordinator still chooses workers and isolated worktrees/Projects. WebCodex supplies bounded durable collaboration state and deterministic completion correlation, not a multi-agent execution scheduler.
 
@@ -190,10 +209,7 @@ independent TaskAttempt/lease/fencing state. Do not silently convert historical 
 current Session todos into Agent Tasks, and do not use `assignment_fence` as an
 Agent Task execution lease.
 
-Likewise, the existing Connector Task used by `task_start` / `task_resume` remains a
-separate project-bound continuity domain. The standing naming and boundary rules for
-future Agent Tasks are in
-[`../architecture/durable-agent-runtime.md`](../architecture/durable-agent-runtime.md).
+The standing naming and boundary rules for Agent Tasks are in [`../architecture/durable-agent-runtime.md`](../architecture/durable-agent-runtime.md). Ordinary coding continuity remains the Workflow Session/Job model and is not an Agent Task lease.
 
 If later product use justifies runnable-frontier scheduling, worker spawning,
 capacity management, dependency graphs, or autonomous routing, those mechanisms may

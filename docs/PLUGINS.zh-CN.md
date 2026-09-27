@@ -13,6 +13,13 @@ Native Plugin 是**受信任的本地 executable**。WebCodex 不会 sandbox、�
 不可信 executable 自动变安全；启动 Plugin 与在 prepared Runner environment 下直接运行
 这个本地程序具有同等级别的本机信任含义。
 
+> **术语区分：** ChatGPT 有时把 developer MCP/custom app 也称为“插件”，但它与
+> WebCodex 的 **Native Tool Plugin** 不是同一层。若 ChatGPT 返回
+> `FORBIDDEN: This conversation does not support developer MCPs`，并且 Host 在
+> `plugin_tool` 到达 WebCodex 之前就拒绝 MCP connection，这不是 Native Tool Plugin
+> health result。此类问题先看[故障排查](TROUBLESHOOTING.zh-CN.md)；只有请求已经到达
+> WebCodex 后，才使用本文的 `plugin_tool` diagnostic 排查本地 provider。
+
 ## 配置 Plugin
 
 Plugin 使用独立的 `runner.toml` 配置，不复用 MCP provider：
@@ -79,18 +86,22 @@ Server-global WebCodex tool namespace，也不会被追加到外层 MCP `tools/l
 其他 WebCodex 工具相同的 canonical metadata/registry 链路，schema 与 Runner 是否在线、
 安装了哪些 Plugin 无关。因此即使当前没有 Plugin-capable Runner，
 `tool_manifest(tool_name="plugin_tool")` 也能返回准确 gateway contract。
+`work_on_project` 还可以在 startup 中提供一个有界、Project-affine 的 Plugin selection catalog。它只包含 configured `cwd` 解析后与 authoritative Project root 一致且当前 ready/committed 的 provider tool；其他目录的 provider 不会自动进入 catalog。该 projection 不会暴露 provider path、command/argv/environment、schema、provider instance identity 或 invocation binding。Runner gateway 和模型 projection 都按序列化后的字节数截断 catalog；`total_count` 与 `catalog_revision` 仍描述完整目录。模型选择后仍必须走 canonical `plugin_tool describe -> call`。在支持 context sidecar 的 surface 上，同时具备 `project:read` 与 `plugin:inspect` 的调用者也可以显式请求 `plugins.catalog` 获取同类 Project-affine metadata。
 
 MCP 与 OpenAPI/GPT Actions 使用的 generic Tool Runtime 都复用同一个 canonical
 `plugin_tool` parser 和 action-aware gateway executor；不存在 MCP Plugin 实现和 GPT
 Plugin 实现两套逻辑。任何声明暴露 `plugin_tool` 的 canonical model surface 都可以实际
-调用它。对 generic `callRuntimeTool`，完整 Plugin contract 使用 canonical nested
-`params`：外层 `tool` 已经用于选择 `plugin_tool`，provider-local `tool` 必须留在 Plugin
-业务参数里：
+调用它。当前 generic GPT Actions surface 上，`plugin_tool` 是 canonical direct
+operation，因此直接传它自己的 business arguments：
 
 ```json
-{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
-{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
+{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
+{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
 ```
+
+独立的 `call_runtime_tool` operation 只用于 manifest route 为 `gateway` 的 Adaptive
+long-tail tools；`plugin_tool` 这类 direct tool 不得再通过 gateway 调用。generic
+gateway envelope 是 canonical `{tool, arguments}`。
 
 静态 ToolDefinition 只表达 worst-case discovery contract。真正执行 policy 会在校验后的
 `action` 上先分类，再进入 Session/permission governance：list/describe 只要求
@@ -310,9 +321,12 @@ invocation path，并继续拥有原有 binding、effect、retry 和 `OutcomeUnk
 Phase 1 曾有意暂缓 `webcodex plugin init`，直到 SDK 建立真实 external dependency contract。
 这个前置条件现在已经满足：`@yyjeqhc/webcodex-plugin-sdk@0.1.0` 已通过 npm 公开分发，Phase 3
 因此加入使用该**精确兼容版本**的本地 scaffold。生成项目不依赖 WebCodex 源码 checkout。
-仓库内 first-party dogfood（例如 `plugins/safe-delete` 和
-[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)）仍有意使用同 checkout 的 local
-SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用 published package。
+仓库内 first-party dogfood（例如 `plugins/safe-delete`、
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)、
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 和
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md)）仍有意使用同 checkout
+的 local SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用
+published package。
 
 ## TypeScript Plugin SDK
 
@@ -408,12 +422,18 @@ keyword 会在 provider admission 时明确拒绝，不会 silently ignore。v1 
 `oneOf`、`allOf`、`not` 或任意 draft-specific keyword。
 
 最小无依赖 Node 示例见
-[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供两个
+[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供多个
 first-party SDK dogfood Plugin：[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)
 把删除权限限制在配置的项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，
 不会把永久删除能力加入 WebCodex 内建工具面；
 [`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 是只读 authoring 示例，它唯一的
-`git_summary` 只观察 provider 配置的 repository `cwd`。
+`git_summary` 只观察 provider 配置的 repository `cwd`；
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 把 bounded
+Browser semantic snapshot 转换成结构化简历填写计划，支持重复 section 和多步骤网申，
+并有意在最终提交之前停止；
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md) 则调用 operator 已安装的
+本机 Agent Browser，继承 native profile/config 或连接用户明确授权的当前 Chrome，同时把
+opaque page/snapshot identity、tab ownership 和不确定 effect 的处理限制在 Plugin 边界内。
 
 ## 调用与失败语义
 

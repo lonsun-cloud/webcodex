@@ -7,6 +7,7 @@ use super::config::{ClaudeCodeMcpConfig, ToolProviderStrategy, ToolProvidersConf
 use super::output::CommandResult;
 use super::shell::cwd_allowed;
 use super::shutdown::{lock_unpoison, SHUTDOWN_POLL_INTERVAL};
+use super::validation::resolve_under_project;
 use super::RunnerPolicy;
 #[cfg(test)]
 use crate::runner_protocol::RunnerRequest;
@@ -234,8 +235,10 @@ impl ExternalToolRouter {
             return ExternalRoute::Native;
         }
         let operation = RunnerShellOperation {
+            login: false,
             cwd: request.cwd.clone(),
             command: request.command.clone(),
+            shell: None,
             stdin: request.stdin.clone(),
             max_bytes: request.max_bytes,
             timeout_secs: request.timeout_secs,
@@ -250,9 +253,6 @@ impl ExternalToolRouter {
         operation: &RunnerShellOperation,
         shutdown: Option<&AtomicBool>,
     ) -> ExternalRoute {
-        if self.strategy == ToolProviderStrategy::Native {
-            return ExternalRoute::Native;
-        }
         let capability = if operation.command.lines().next() == Some(EXTERNAL_SEARCH_REQUEST_PREFIX)
         {
             ProviderCapability::SearchProjectText
@@ -261,12 +261,18 @@ impl ExternalToolRouter {
         };
         let started = Instant::now();
         let raw = operation.stdin.as_deref();
-        let payload = match raw
-            .ok_or_else(request_error)
-            .and_then(|raw| serde_json::from_str(raw).map_err(|_| request_error()))
-        {
-            Ok(payload) => payload,
-            Err(error) => return self.failure_or_native(capability, error, started),
+        let parsed_payload = raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        if parsed_payload.as_ref().is_some_and(|payload| {
+            search_path_is_missing(policy, operation.cwd.as_deref(), payload)
+        }) {
+            return ExternalRoute::Handled(search_path_not_found_result(started));
+        }
+        if self.strategy == ToolProviderStrategy::Native {
+            return ExternalRoute::Native;
+        }
+        let payload = match parsed_payload {
+            Some(payload) => payload,
+            None => return self.failure_or_native(capability, request_error(), started),
         };
         let checked = validate_context(policy, operation.cwd.as_deref(), capability, &payload);
         let (root, target) = match checked {
@@ -440,6 +446,35 @@ fn normalized_search_exit_code(stdout: &str) -> i32 {
     } else {
         1
     }
+}
+
+fn search_path_is_missing(policy: &RunnerPolicy, cwd: Option<&str>, payload: &Value) -> bool {
+    let Some(root) = cwd.and_then(|cwd| Path::new(cwd).canonicalize().ok()) else {
+        return false;
+    };
+    if cwd_allowed(policy, &root).is_err() {
+        return false;
+    }
+    let relative = payload.get("path").and_then(Value::as_str).unwrap_or(".");
+    let Ok(target) = resolve_under_project(&root, relative) else {
+        return false;
+    };
+    matches!(
+        std::fs::symlink_metadata(target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn search_path_not_found_result(started: Instant) -> CommandResult {
+    let stdout = json!({
+        "webcodex_search": {
+            "backend": "native",
+            "feature_unavailable": false,
+            "path_status": "not_found",
+        }
+    })
+    .to_string();
+    command_result_with_exit(stdout, 2, started)
 }
 
 fn validate_context(

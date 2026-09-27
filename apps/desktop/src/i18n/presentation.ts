@@ -100,6 +100,14 @@ export function activitySource(source: string, t: Translate) {
 
 type ErrorPresentation = { title: string; action: string };
 
+export type DesktopCommandDiagnostics = {
+  phase?: string;
+  logicalCommand?: string;
+  executable?: string;
+  exitCode?: number;
+  reasonCode?: string;
+};
+
 const binaryErrors = new Set([
   "binaries_not_checked",
   "binary_directory_invalid",
@@ -120,6 +128,7 @@ const projectErrors = new Set([
   "project_unavailable",
   "project_not_directory",
   "project_not_loaded",
+  "project_not_ready",
 ]);
 const enrollmentErrors = new Set([
   "webcodex_command_failed",
@@ -128,6 +137,16 @@ const enrollmentErrors = new Set([
   "webcodex_command_wait_failed",
   "webcodex_command_timeout",
 ]);
+const commandPhasePresentation: Record<string, { title: MessageKey; action: MessageKey }> = {
+  server_init: { title: "error.serverTitle", action: "error.serverAction" },
+  server_status: { title: "error.serverTitle", action: "error.serverAction" },
+  pairing_create: { title: "error.enrollmentTitle", action: "error.enrollmentAction" },
+  login: { title: "error.enrollmentTitle", action: "error.enrollmentAction" },
+  runner_status: { title: "error.runnerTitle", action: "error.runnerAction" },
+  project_activation: { title: "error.projectTitle", action: "error.projectAction" },
+  project_register: { title: "error.projectTitle", action: "error.projectAction" },
+  project_readiness: { title: "error.projectTitle", action: "error.projectAction" },
+};
 const tunnelErrors = new Set([
   "tunnel_unavailable",
   "tunnel_auth_invalid",
@@ -142,6 +161,7 @@ const processErrors = new Set([
 ]);
 
 export function desktopErrorPresentation(error: DesktopError, t: Translate): ErrorPresentation {
+  if (error.code === "tunnel_config_apply_failed") return { title: t("error.tunnelTitle"), action: t("tunnelConfig.applyFailed") };
   if (error.code === "tunnel_config_invalid") return { title: t("error.tunnelTitle"), action: t("tunnelConfig.invalidInput") };
   if (error.code === "tunnel_config_save_failed") return { title: t("error.fallbackTitle"), action: t("tunnelConfig.saveFailed") };
   if (binaryErrors.has(error.code)) return { title: t("error.binaryTitle"), action: t("error.binaryAction") };
@@ -150,7 +170,14 @@ export function desktopErrorPresentation(error: DesktopError, t: Translate): Err
   if (runnerErrors.has(error.code)) return { title: t("error.runnerTitle"), action: t("error.runnerAction") };
   if (projectErrors.has(error.code)) return { title: t("error.projectTitle"), action: t("error.projectAction") };
   if (error.code === "pairing_code_invalid") return { title: t("error.pairingTitle"), action: t("error.pairingAction") };
-  if (enrollmentErrors.has(error.code)) return { title: t("error.enrollmentTitle"), action: t("error.enrollmentAction") };
+  if (enrollmentErrors.has(error.code)) {
+    const phase = desktopCommandDiagnostics(error)?.phase;
+    const phasePresentation = phase ? commandPhasePresentation[phase] : undefined;
+    if (phasePresentation) {
+      return { title: t(phasePresentation.title), action: t(phasePresentation.action) };
+    }
+    return { title: t("error.enrollmentTitle"), action: t("error.enrollmentAction") };
+  }
   if (tunnelErrors.has(error.code)) return { title: t("error.tunnelTitle"), action: t("error.tunnelAction") };
   if (processErrors.has(error.code)) return { title: t("error.processTitle"), action: t("error.processAction") };
   if (error.code === "webcodex_contract_invalid") return { title: t("error.contractTitle"), action: t("error.contractAction") };
@@ -159,6 +186,29 @@ export function desktopErrorPresentation(error: DesktopError, t: Translate): Err
   if (error.code === "desktop_operation_not_current") return { title: t("error.operationStaleTitle"), action: t("error.operationStaleAction") };
   if (error.code === "desktop_operation_cancelled") return { title: t("error.operationCancelledTitle"), action: t("error.operationCancelledAction") };
   return { title: t("error.fallbackTitle"), action: t("error.fallbackAction") };
+}
+
+export function desktopCommandDiagnostics(error: DesktopError): DesktopCommandDiagnostics | null {
+  if (!error.details || typeof error.details !== "object" || Array.isArray(error.details)) return null;
+  const details = error.details as Record<string, unknown>;
+  const phase = safeDiagnosticString(details.phase, /^[a-z0-9_-]+$/);
+  const logicalCommand = safeDiagnosticString(details.logical_command, /^[a-z0-9 _-]+$/);
+  const executable = safeDiagnosticString(details.executable, /^[A-Za-z0-9._-]+$/);
+  const reasonCode = safeDiagnosticString(details.reason_code, /^[a-z0-9_-]+$/);
+  const exitCode = typeof details.exit_code === "number" && Number.isSafeInteger(details.exit_code)
+    ? details.exit_code
+    : undefined;
+  if (!phase && !logicalCommand && !executable && exitCode === undefined && !reasonCode) return null;
+  return { phase, logicalCommand, executable, exitCode, reasonCode };
+}
+
+function safeDiagnosticString(value: unknown, pattern: RegExp): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 96 || !pattern.test(value)) return undefined;
+  const lowered = value.toLowerCase();
+  if (["token", "secret", "password", "credential", "api_key", "authorization"].some(sensitive => lowered.includes(sensitive))) {
+    return undefined;
+  }
+  return value;
 }
 
 export function normalizeDesktopError(value: unknown): DesktopError {
@@ -201,8 +251,13 @@ export function projectReadinessLabel(value: ProjectReadiness, t: Translate) {
 }
 
 const operationKeys: Record<DesktopOperationKind, MessageKey> = {
+  runtime_probe: "operation.runtimeProbe",
+  runtime_switch: "operation.runtimeSwitch",
+  trace_update: "operation.traceUpdate",
+  configuration_restore: "operation.configurationRestore",
   local_setup: "operation.localSetup",
   local_project_activate: "operation.localProjectActivate",
+  project_unregister: "operation.projectUnregister",
   remote_setup: "operation.remoteSetup",
   quick_share_start: "operation.quickShareStart",
   quick_share_stop: "operation.quickShareStop",
@@ -211,6 +266,8 @@ const operationKeys: Record<DesktopOperationKind, MessageKey> = {
   local_runtime_stop: "operation.localRuntimeStop",
   runtime_refresh: "operation.runtimeRefresh",
   runtime_resume: "operation.runtimeResume",
+  runner_settings_update: "operation.runnerSettingsUpdate",
+  runner_restart: "operation.runnerRestart",
   tunnel_config_update: "operation.tunnelConfigUpdate",
   tunnel_proxy_update: "operation.tunnelProxyUpdate",
 };

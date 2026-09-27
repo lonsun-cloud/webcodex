@@ -1,13 +1,9 @@
-//! Minimal project-readiness console.
+//! Public static shells for the hosted Runtime Console and Admin UI.
 //!
-//! Serves the public static shells for the project Review Console, hosted
-//! Runtime Console, and Admin. The bundles contain no credentials; each browser
-//! authenticates separately for its protected API requests.
-//!
-//! Production uses the committed `frontend/dist/` bundle embedded at compile
-//! time. Development mode validates the core Project Review Console files once
-//! at startup; every requested fixed Review/Admin/Runtime asset is then
-//! path-checked and re-read from that same loopback-only directory.
+//! The bundles contain no credentials; each browser authenticates separately
+//! for protected API requests. Production embeds committed `frontend/dist/`
+//! assets. Development mode validates the Runtime Console core files once at
+//! startup and re-reads fixed Runtime/Admin assets from a loopback-only directory.
 
 use salvo::http::header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA};
 use salvo::http::{HeaderName, HeaderValue};
@@ -27,21 +23,15 @@ const DEVELOPMENT_ERROR_BODY: &str = "Console development asset is unavailable.\
 
 // The committed build stays embedded so production has no runtime filesystem
 // dependency.
-const CONSOLE_HTML: &str = include_str!("../frontend/dist/console.html");
-const CONSOLE_APP_JS: &str = include_str!("../frontend/dist/app.js");
-const CONSOLE_STYLES_CSS: &str = include_str!("../frontend/dist/styles.css");
 const ADMIN_HTML: &str = include_str!("../frontend/dist/admin.html");
 const ADMIN_APP_JS: &str = include_str!("../frontend/dist/admin.js");
 const ADMIN_STYLES_CSS: &str = include_str!("../frontend/dist/admin.css");
 const RUNTIME_HTML: &str = include_str!("../frontend/dist/runtime.html");
-const RUNTIME_APP_JS: &str = include_str!("../frontend/dist/runtime.js");
-const RUNTIME_STYLES_CSS: &str = include_str!("../frontend/dist/runtime.css");
+const RUNTIME_APP_JS: &str = include_str!("../frontend/dist/app.js");
+const RUNTIME_STYLES_CSS: &str = include_str!("../frontend/dist/styles.css");
 
 #[derive(Debug, Clone, Copy)]
 enum ConsoleAsset {
-    Html,
-    JavaScript,
-    Css,
     AdminHtml,
     AdminJavaScript,
     AdminCss,
@@ -53,23 +43,18 @@ enum ConsoleAsset {
 impl ConsoleAsset {
     const fn file_name(self) -> &'static str {
         match self {
-            Self::Html => "console.html",
-            Self::JavaScript => "app.js",
-            Self::Css => "styles.css",
             Self::AdminHtml => "admin.html",
             Self::AdminJavaScript => "admin.js",
             Self::AdminCss => "admin.css",
             Self::RuntimeHtml => "runtime.html",
-            Self::RuntimeJavaScript => "runtime.js",
-            Self::RuntimeCss => "runtime.css",
+            Self::RuntimeJavaScript => "app.js",
+            Self::RuntimeCss => "styles.css",
         }
     }
 
     const fn content_type(self) -> &'static str {
         match self {
-            Self::Html => "text/html; charset=utf-8",
-            Self::JavaScript => "application/javascript; charset=utf-8",
-            Self::Css | Self::AdminCss | Self::RuntimeCss => "text/css; charset=utf-8",
+            Self::AdminCss | Self::RuntimeCss => "text/css; charset=utf-8",
             Self::AdminHtml | Self::RuntimeHtml => "text/html; charset=utf-8",
             Self::AdminJavaScript | Self::RuntimeJavaScript => {
                 "application/javascript; charset=utf-8"
@@ -79,9 +64,6 @@ impl ConsoleAsset {
 
     const fn embedded(self) -> &'static str {
         match self {
-            Self::Html => CONSOLE_HTML,
-            Self::JavaScript => CONSOLE_APP_JS,
-            Self::Css => CONSOLE_STYLES_CSS,
             Self::AdminHtml => ADMIN_HTML,
             Self::AdminJavaScript => ADMIN_APP_JS,
             Self::AdminCss => ADMIN_STYLES_CSS,
@@ -135,7 +117,7 @@ impl ConsoleAssetSource {
         Self::from_directory_for_addr(PathBuf::from(directory), bind_addr)
     }
 
-    /// Validate a development source for a specific HTTP bind address.
+    /// Validate a development asset source for a specific HTTP bind address.
     pub(crate) fn from_directory_for_addr(
         directory: impl AsRef<Path>,
         bind_addr: &str,
@@ -144,9 +126,8 @@ impl ConsoleAssetSource {
         Self::from_directory(directory)
     }
 
-    /// Canonicalize the development root and require the three Project Review
-    /// Console core files. Admin and Runtime assets remain optional in this
-    /// compatibility mode and are validated fail-closed when requested.
+    /// Canonicalize the development root and require the three Runtime Console
+    /// core files. Admin assets remain optional and fail closed when requested.
     pub(crate) fn from_directory(
         directory: impl AsRef<Path>,
     ) -> Result<Self, ConsoleAssetConfigError> {
@@ -172,9 +153,9 @@ impl ConsoleAssetSource {
 
         let source = Self::Directory(ConsoleAssetDirectory { canonical_root });
         for asset in [
-            ConsoleAsset::Html,
-            ConsoleAsset::JavaScript,
-            ConsoleAsset::Css,
+            ConsoleAsset::RuntimeHtml,
+            ConsoleAsset::RuntimeJavaScript,
+            ConsoleAsset::RuntimeCss,
         ] {
             let path = source.validated_path(asset)?;
             fs::File::open(path).map_err(|_| {
@@ -337,24 +318,6 @@ async fn serve_asset(depot: &Depot, res: &mut Response, asset: ConsoleAsset) {
     }
 }
 
-/// `GET /console` — the console HTML shell. Public.
-#[handler]
-pub async fn console_html(depot: &Depot, res: &mut Response) {
-    serve_asset(depot, res, ConsoleAsset::Html).await;
-}
-
-/// `GET /console/app.js` — the console application script. Public.
-#[handler]
-pub async fn console_app_js(depot: &Depot, res: &mut Response) {
-    serve_asset(depot, res, ConsoleAsset::JavaScript).await;
-}
-
-/// `GET /console/styles.css` — the console stylesheet. Public.
-#[handler]
-pub async fn console_styles_css(depot: &Depot, res: &mut Response) {
-    serve_asset(depot, res, ConsoleAsset::Css).await;
-}
-
 /// Public hosted Runtime Console shell; all data stays behind
 /// `/api/runtime-console/*` and ordinary runtime authorization.
 #[handler]
@@ -391,53 +354,22 @@ pub async fn admin_styles_css(depot: &Depot, res: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{test_config, test_db};
     use salvo::test::{ResponseExt, TestClient};
     use salvo::Service;
 
-    fn build_test_router(
-        config: Arc<crate::Config>,
-        db: Arc<crate::Database>,
-        source: Arc<ConsoleAssetSource>,
-    ) -> Router {
-        let runner_registry = Arc::new(crate::RunnerRegistry::default());
-        let runtime_info = Arc::new(crate::tool_runtime::RuntimeInfo::default());
-        let tool_runtime = Arc::new(crate::tool_runtime::ToolRuntime::new(
-            runner_registry,
-            runtime_info,
-        ));
+    fn build_test_router(source: Arc<ConsoleAssetSource>) -> Router {
         Router::new()
-            .hoop(affix_state::inject(config))
-            .hoop(affix_state::inject(db))
-            .hoop(affix_state::inject(tool_runtime))
             .hoop(affix_state::inject(source))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
-            .push(Router::with_path("console").get(console_html))
-            .push(Router::with_path("console/app.js").get(console_app_js))
-            .push(Router::with_path("console/styles.css").get(console_styles_css))
             .push(Router::with_path("runtime").get(runtime_html))
             .push(Router::with_path("runtime/app.js").get(runtime_app_js))
             .push(Router::with_path("runtime/styles.css").get(runtime_styles_css))
             .push(Router::with_path("admin").get(admin_html))
             .push(Router::with_path("admin/app.js").get(admin_app_js))
             .push(Router::with_path("admin/styles.css").get(admin_styles_css))
-            .push(
-                Router::with_path("api")
-                    .hoop(crate::AuthMiddleware)
-                    .push(crate::connector_runtime::http::routes()),
-            )
     }
 
     fn embedded_service() -> Service {
-        let config = test_config(Some("secret"));
-        let (_tmp, db) = test_db();
-        Service::new(build_test_router(
-            config,
-            db,
-            Arc::new(ConsoleAssetSource::Embedded),
-        ))
+        Service::new(build_test_router(Arc::new(ConsoleAssetSource::Embedded)))
     }
 
     fn header(resp: &Response, name: &str) -> String {
@@ -448,89 +380,34 @@ mod tests {
             .to_string()
     }
 
-    fn write_development_assets(directory: &Path) {
+    fn write_runtime_development_assets(directory: &Path) {
         fs::create_dir_all(directory).unwrap();
-        fs::write(
-            directory.join("console.html"),
-            "<html>filesystem html</html>\n",
-        )
-        .unwrap();
-        fs::write(directory.join("app.js"), "globalThis.filesystemJs = 1;\n").unwrap();
-        fs::write(
-            directory.join("styles.css"),
-            ".filesystem { color: red; }\n",
-        )
-        .unwrap();
+        fs::write(directory.join("runtime.html"), "<html>runtime one</html>\n").unwrap();
+        fs::write(directory.join("app.js"), "globalThis.runtime = 1;\n").unwrap();
+        fs::write(directory.join("styles.css"), ".runtime { color: red; }\n").unwrap();
     }
 
     fn development_service(directory: &Path) -> Service {
-        let config = test_config(Some("secret"));
-        let (_tmp, db) = test_db();
         let source =
             ConsoleAssetSource::from_directory_for_addr(directory, "127.0.0.1:8080").unwrap();
-        Service::new(build_test_router(config, db, Arc::new(source)))
+        Service::new(build_test_router(Arc::new(source)))
     }
 
     #[test]
-    fn embedded_bundle_is_non_empty_and_has_expected_markers() {
-        assert!(!CONSOLE_HTML.is_empty());
-        assert!(CONSOLE_HTML.contains("/console/app.js"));
-        assert!(CONSOLE_HTML.contains("/console/styles.css"));
-        assert!(CONSOLE_APP_JS.contains("/api/console/"));
-        assert!(!CONSOLE_APP_JS.contains("/api/runtime/status"));
-        assert!(!CONSOLE_APP_JS.contains("localStorage"));
-        assert!(!CONSOLE_APP_JS.contains("sessionStorage"));
-        assert!(!CONSOLE_APP_JS.contains(".innerHTML"));
-        assert!(CONSOLE_APP_JS.contains("performAction"));
-        assert!(CONSOLE_STYLES_CSS.contains("[hidden]{display:none !important}"));
-        assert!(CONSOLE_HTML.contains("type=\"password\""));
-        assert!(CONSOLE_HTML.contains("WebCodex — Project Review Console"));
-        assert!(!RUNTIME_HTML.is_empty());
-        assert!(RUNTIME_HTML.contains("WebCodex Runtime Console"));
+    fn embedded_bundle_contains_runtime_and_admin_only() {
+        assert!(RUNTIME_HTML.contains("WebCodex — Runtime Workspace"));
         assert!(RUNTIME_HTML.contains("/runtime/app.js"));
         assert!(RUNTIME_HTML.contains("/runtime/styles.css"));
         assert!(RUNTIME_APP_JS.contains("/api/runtime-console/"));
         assert!(!RUNTIME_APP_JS.contains("/api/console/"));
-        // Runtime UI preferences may use localStorage, while tab-scoped drafts and the
-        // optional remembered Bearer credential use sessionStorage. Credentials must
-        // never move into durable localStorage or cookies.
-        assert!(RUNTIME_APP_JS.contains("localStorage"));
-        assert!(RUNTIME_APP_JS.contains("sessionStorage"));
-        assert!(RUNTIME_APP_JS.contains("RUNTIME_CREDENTIAL_SESSION_KEY"));
-        assert!(RUNTIME_APP_JS.contains("sessionStorage.setItem(RUNTIME_CREDENTIAL_SESSION_KEY"));
-        assert!(!RUNTIME_APP_JS.contains("localStorage.setItem(RUNTIME_CREDENTIAL_SESSION_KEY"));
         assert!(!RUNTIME_APP_JS.contains("document.cookie"));
-        assert!(!RUNTIME_APP_JS.contains(".innerHTML"));
-        assert!(!CONSOLE_HTML.contains("Transport"));
+        assert!(!RUNTIME_HTML.contains("prototype-v2"));
+        assert!(!ADMIN_HTML.is_empty());
+        assert!(!ADMIN_APP_JS.contains("/api/console/"));
     }
 
     #[tokio::test]
-    async fn embedded_http_assets_preserve_bodies_mime_and_cache_policy() {
-        let service = embedded_service();
-        for (url, expected, mime) in [
-            ("http://localhost/console", CONSOLE_HTML, "text/html"),
-            (
-                "http://localhost/console/app.js",
-                CONSOLE_APP_JS,
-                "application/javascript",
-            ),
-            (
-                "http://localhost/console/styles.css",
-                CONSOLE_STYLES_CSS,
-                "text/css",
-            ),
-        ] {
-            let mut resp = TestClient::get(url).send(&service).await;
-            assert_eq!(resp.status_code, Some(StatusCode::OK));
-            assert!(header(&resp, "content-type").contains(mime));
-            assert_eq!(header(&resp, "cache-control"), "no-cache, must-revalidate");
-            assert_eq!(header(&resp, "x-webcodex-console-assets"), "embedded");
-            assert_eq!(resp.take_string().await.unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn embedded_runtime_assets_preserve_bodies_mime_and_cache_policy() {
+    async fn embedded_runtime_and_admin_assets_preserve_bodies_and_headers() {
         let service = embedded_service();
         for (url, expected, mime) in [
             ("http://localhost/runtime", RUNTIME_HTML, "text/html"),
@@ -544,79 +421,6 @@ mod tests {
                 RUNTIME_STYLES_CSS,
                 "text/css",
             ),
-        ] {
-            let mut resp = TestClient::get(url).send(&service).await;
-            assert_eq!(resp.status_code, Some(StatusCode::OK));
-            assert!(header(&resp, "content-type").contains(mime));
-            assert_eq!(header(&resp, "cache-control"), "no-cache, must-revalidate");
-            assert_eq!(resp.take_string().await.unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn filesystem_http_assets_preserve_bodies_mime_and_no_store_headers() {
-        let temp = tempfile::tempdir().unwrap();
-        write_development_assets(temp.path());
-        let service = development_service(temp.path());
-        for (url, expected, mime) in [
-            (
-                "http://localhost/console",
-                "<html>filesystem html</html>\n",
-                "text/html",
-            ),
-            (
-                "http://localhost/console/app.js",
-                "globalThis.filesystemJs = 1;\n",
-                "application/javascript",
-            ),
-            (
-                "http://localhost/console/styles.css",
-                ".filesystem { color: red; }\n",
-                "text/css",
-            ),
-        ] {
-            let mut resp = TestClient::get(url).send(&service).await;
-            assert_eq!(resp.status_code, Some(StatusCode::OK));
-            assert!(header(&resp, "content-type").contains(mime));
-            assert_eq!(header(&resp, "cache-control"), "no-store");
-            assert_eq!(header(&resp, "pragma"), "no-cache");
-            assert_eq!(header(&resp, "x-webcodex-console-assets"), "filesystem");
-            assert_eq!(resp.take_string().await.unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn filesystem_js_is_reread_and_missing_file_never_falls_back() {
-        let temp = tempfile::tempdir().unwrap();
-        write_development_assets(temp.path());
-        let service = development_service(temp.path());
-
-        fs::write(temp.path().join("app.js"), "globalThis.filesystemJs = 2;\n").unwrap();
-        let mut updated = TestClient::get("http://localhost/console/app.js")
-            .send(&service)
-            .await;
-        assert_eq!(updated.status_code, Some(StatusCode::OK));
-        assert_eq!(
-            updated.take_string().await.unwrap(),
-            "globalThis.filesystemJs = 2;\n"
-        );
-
-        fs::remove_file(temp.path().join("app.js")).unwrap();
-        let mut missing = TestClient::get("http://localhost/console/app.js")
-            .send(&service)
-            .await;
-        assert_eq!(missing.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
-        assert_eq!(header(&missing, "cache-control"), "no-store");
-        assert_eq!(header(&missing, "x-webcodex-console-assets"), "filesystem");
-        let body = missing.take_string().await.unwrap();
-        assert_eq!(body, DEVELOPMENT_ERROR_BODY);
-        assert!(!body.contains("performAction"));
-    }
-
-    #[tokio::test]
-    async fn admin_assets_cover_embedded_and_filesystem_modes() {
-        let embedded = embedded_service();
-        for (url, expected, mime) in [
             ("http://localhost/admin", ADMIN_HTML, "text/html"),
             (
                 "http://localhost/admin/app.js",
@@ -629,7 +433,7 @@ mod tests {
                 "text/css",
             ),
         ] {
-            let mut response = TestClient::get(url).send(&embedded).await;
+            let mut response = TestClient::get(url).send(&service).await;
             assert_eq!(response.status_code, Some(StatusCode::OK));
             assert!(header(&response, "content-type").contains(mime));
             assert_eq!(
@@ -638,149 +442,54 @@ mod tests {
             );
             assert_eq!(response.take_string().await.unwrap(), expected);
         }
-
-        let temp = tempfile::tempdir().unwrap();
-        write_development_assets(temp.path());
-        fs::write(temp.path().join("admin.html"), "<html>admin one</html>\n").unwrap();
-        fs::write(temp.path().join("admin.js"), "globalThis.admin = 1;\n").unwrap();
-        fs::write(temp.path().join("admin.css"), ".admin { color: blue; }\n").unwrap();
-        let development = development_service(temp.path());
-        for (url, expected, mime) in [
-            (
-                "http://localhost/admin",
-                "<html>admin one</html>\n",
-                "text/html",
-            ),
-            (
-                "http://localhost/admin/app.js",
-                "globalThis.admin = 1;\n",
-                "application/javascript",
-            ),
-            (
-                "http://localhost/admin/styles.css",
-                ".admin { color: blue; }\n",
-                "text/css",
-            ),
-        ] {
-            let mut response = TestClient::get(url).send(&development).await;
-            assert_eq!(response.status_code, Some(StatusCode::OK));
-            assert!(header(&response, "content-type").contains(mime));
-            assert_eq!(header(&response, "cache-control"), "no-store");
-            assert_eq!(header(&response, "pragma"), "no-cache");
-            assert_eq!(response.take_string().await.unwrap(), expected);
-        }
-
-        fs::write(temp.path().join("admin.html"), "<html>admin two</html>\n").unwrap();
-        let mut updated = TestClient::get("http://localhost/admin")
-            .send(&development)
-            .await;
-        assert_eq!(
-            updated.take_string().await.unwrap(),
-            "<html>admin two</html>\n"
-        );
-        fs::remove_file(temp.path().join("admin.html")).unwrap();
-        let mut missing = TestClient::get("http://localhost/admin")
-            .send(&development)
-            .await;
-        assert_eq!(missing.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
-        assert_eq!(header(&missing, "cache-control"), "no-store");
-        assert_eq!(missing.take_string().await.unwrap(), DEVELOPMENT_ERROR_BODY);
-
-        let mut console = TestClient::get("http://localhost/console")
-            .send(&development)
-            .await;
-        assert_eq!(console.status_code, Some(StatusCode::OK));
-        assert_eq!(
-            console.take_string().await.unwrap(),
-            "<html>filesystem html</html>\n"
-        );
     }
 
     #[tokio::test]
-    async fn console_only_development_directory_keeps_console_available() {
+    async fn development_runtime_assets_are_reread_and_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
-        write_development_assets(temp.path());
+        write_runtime_development_assets(temp.path());
         let service = development_service(temp.path());
-        let console = TestClient::get("http://localhost/console")
+        let mut response = TestClient::get("http://localhost/runtime/app.js")
             .send(&service)
             .await;
-        assert_eq!(console.status_code, Some(StatusCode::OK));
-        let mut admin = TestClient::get("http://localhost/admin")
+        assert_eq!(
+            response.take_string().await.unwrap(),
+            "globalThis.runtime = 1;\n"
+        );
+        fs::write(temp.path().join("app.js"), "globalThis.runtime = 2;\n").unwrap();
+        let mut response = TestClient::get("http://localhost/runtime/app.js")
             .send(&service)
             .await;
-        assert_eq!(admin.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
-        assert_eq!(header(&admin, "cache-control"), "no-store");
-        assert_eq!(admin.take_string().await.unwrap(), DEVELOPMENT_ERROR_BODY);
+        assert_eq!(
+            response.take_string().await.unwrap(),
+            "globalThis.runtime = 2;\n"
+        );
+        fs::remove_file(temp.path().join("app.js")).unwrap();
+        let mut response = TestClient::get("http://localhost/runtime/app.js")
+            .send(&service)
+            .await;
+        assert_eq!(
+            response.status_code,
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(header(&response, "cache-control"), "no-store");
+        assert_eq!(
+            response.take_string().await.unwrap(),
+            DEVELOPMENT_ERROR_BODY
+        );
     }
 
     #[test]
-    fn development_directory_rejects_relative_missing_and_incomplete_paths() {
-        let relative = ConsoleAssetSource::from_directory("frontend/.dev-dist").unwrap_err();
-        assert!(relative.to_string().contains("absolute"));
-
+    fn development_directory_requires_runtime_core_and_loopback() {
         let temp = tempfile::tempdir().unwrap();
-        let missing = ConsoleAssetSource::from_directory(temp.path().join("missing")).unwrap_err();
-        assert!(missing.to_string().contains("does not exist"));
-
-        fs::write(temp.path().join("console.html"), "html").unwrap();
-        let incomplete = ConsoleAssetSource::from_directory(temp.path()).unwrap_err();
-        assert!(incomplete.to_string().contains("app.js"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn development_directory_rejects_file_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let assets = temp.path().join("assets");
-        write_development_assets(&assets);
-        let outside = temp.path().join("outside.js");
-        fs::write(&outside, "globalThis.outside = true;\n").unwrap();
-        fs::remove_file(assets.join("app.js")).unwrap();
-        symlink(outside, assets.join("app.js")).unwrap();
-
-        let error = ConsoleAssetSource::from_directory(&assets).unwrap_err();
-        assert!(error.to_string().contains("symbolic link"));
-    }
-
-    #[test]
-    fn development_assets_require_loopback_bind_address() {
-        let temp = tempfile::tempdir().unwrap();
-        write_development_assets(temp.path());
+        let missing = ConsoleAssetSource::from_directory(temp.path()).unwrap_err();
+        assert!(missing.to_string().contains("runtime.html"));
+        write_runtime_development_assets(temp.path());
         for allowed in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
             ConsoleAssetSource::from_directory_for_addr(temp.path(), allowed).unwrap();
         }
-        for denied in ["0.0.0.0:8080", "[::]:8080", "192.0.2.10:8080"] {
-            let error =
-                ConsoleAssetSource::from_directory_for_addr(temp.path(), denied).unwrap_err();
-            assert!(error.to_string().contains("loopback"));
-        }
-    }
-
-    #[tokio::test]
-    async fn http_readiness_requires_bearer_auth() {
-        let _env = crate::auth::AuthEnvGuard::auth_required();
-        let service = embedded_service();
-        let resp = TestClient::post("http://localhost/api/connector/readiness")
-            .json(&serde_json::json!({}))
-            .send(&service)
-            .await;
-        assert_eq!(resp.status_code, Some(StatusCode::UNAUTHORIZED));
-    }
-
-    #[tokio::test]
-    async fn http_readiness_projects_setup_action_with_bearer_auth() {
-        let service = embedded_service();
-        let mut resp = TestClient::post("http://localhost/api/connector/readiness")
-            .bearer_auth("secret")
-            .json(&serde_json::json!({}))
-            .send(&service)
-            .await;
-        assert_eq!(resp.status_code, Some(StatusCode::NOT_FOUND));
-        let body: serde_json::Value = resp.take_json().await.unwrap();
-        assert_eq!(body["ready"], false);
-        assert_eq!(body["findings"][1]["code"], "project_registration_invalid");
-        assert_eq!(body["next_action"], "webcodex doctor");
+        let error =
+            ConsoleAssetSource::from_directory_for_addr(temp.path(), "0.0.0.0:8080").unwrap_err();
+        assert!(error.to_string().contains("loopback"));
     }
 }

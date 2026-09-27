@@ -282,7 +282,16 @@ pub(super) fn read_existing_runner_config(
     validate_existing_regular_file(path)?;
     let content = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read Runner config {}: {error}", path.display()))?;
-    toml::from_str(&content)
+    let document: TomlValue = toml::from_str(&content)
+        .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))?;
+    if document.get("projects_dir").is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
+                .to_string(),
+        );
+    }
+    document
+        .try_into()
         .map(Some)
         .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))
 }
@@ -641,6 +650,12 @@ pub(super) fn render_runner_document(
     canonical_project: &Path,
 ) -> Result<String, String> {
     let mut root = read_runner_document(path)?;
+    if root.contains_key("projects_dir") {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
+                .to_string(),
+        );
+    }
     root.insert(
         "server_url".to_string(),
         TomlValue::String(server_url.to_string()),
@@ -655,10 +670,6 @@ pub(super) fn render_runner_document(
         TomlValue::String(client_id.to_string()),
     );
     root.remove("owner");
-    // A hosted connect update is also a config-spelling migration. Keeping the
-    // legacy key while inserting the canonical one would create a Runner config
-    // that the load-time dual-field fence correctly rejects.
-    root.remove("projects_dir");
     root.insert(
         "project_registry_dir".to_string(),
         TomlValue::String(project_registry_dir.to_string_lossy().to_string()),
@@ -795,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_key_is_generated_once_then_recovered_from_matching_legacy_registry_profile() {
+    fn omitted_key_is_generated_once_then_recovered_from_matching_legacy_registry_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir(&project).unwrap();
@@ -827,12 +838,11 @@ mod tests {
         assert!(first.generated);
         let profile = derived_profile("https://example.test", &first.value);
         let profile_dir = config_base.join("clients").join(&profile);
-        // Deliberately exercise a pre-normalization hosted profile. New
-        // profiles use project-registry/, but a sole projects.d/ remains a
-        // supported compatibility layout.
+        // A sole physical projects.d/ registry remains supported even though
+        // the agent.toml filename and projects_dir config field are retired.
         std::fs::create_dir_all(profile_dir.join("projects.d")).unwrap();
         std::fs::write(
-            profile_dir.join("agent.toml"),
+            profile_dir.join("runner.toml"),
             format!(
                 "server_url = \"https://example.test\"\ntoken = {:?}\nclient_id = \"client\"\n",
                 first.value
@@ -852,18 +862,20 @@ mod tests {
             recovered.recovered_profile.as_deref(),
             Some(profile.as_str())
         );
-        assert!(!profile_dir.join("runner.toml").exists());
+        assert!(profile_dir.join("runner.toml").is_file());
         std::fs::write(profile_dir.join(KEY_DISCLOSED_FILE), "disclosed = true\n").unwrap();
         let disclosed =
             resolve_key(&options, &config_base, "https://example.test", &project).unwrap();
         assert!(!disclosed.generated);
 
-        std::fs::write(profile_dir.join("runner.toml"), "conflicting = true\n").unwrap();
+        std::fs::write(profile_dir.join("agent.toml"), "retired = true\n").unwrap();
         let error =
             resolve_key(&options, &config_base, "https://example.test", &project).unwrap_err();
-        assert!(error.contains("runner.toml"));
-        assert!(error.contains("agent.toml"));
-        assert!(error.contains("refusing to guess"));
+        assert!(
+            error.contains("both runner.toml and legacy agent.toml"),
+            "{error}"
+        );
+        assert!(error.contains("remove or archive agent.toml"), "{error}");
     }
 
     #[cfg(unix)]
@@ -958,9 +970,9 @@ mod tests {
     }
 
     #[test]
-    fn runner_document_migrates_legacy_projects_dir_without_dual_fields() {
+    fn runner_document_rejects_retired_projects_dir_with_migration_guidance() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("agent.toml");
+        let config = tmp.path().join("runner.toml");
         let project = tmp.path().join("project");
         let legacy_registry = tmp.path().join("projects.d");
         std::fs::create_dir(&project).unwrap();
@@ -974,7 +986,7 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = render_runner_document(
+        let error = render_runner_document(
             &config,
             "https://example.test",
             "shared",
@@ -982,14 +994,12 @@ mod tests {
             &legacy_registry,
             &project.canonicalize().unwrap(),
         )
-        .unwrap();
-        let parsed: TomlValue = toml::from_str(&rendered).unwrap();
-        assert!(parsed.get("projects_dir").is_none());
-        assert_eq!(
-            parsed["project_registry_dir"].as_str(),
-            Some(legacy_registry.to_string_lossy().as_ref())
-        );
-        assert_eq!(parsed["custom_field"].as_str(), Some("preserved"));
+        .unwrap_err();
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
+        let unchanged = std::fs::read_to_string(&config).unwrap();
+        assert!(unchanged.contains("projects_dir"));
+        assert!(unchanged.contains("custom_field"));
     }
 
     #[cfg(unix)]

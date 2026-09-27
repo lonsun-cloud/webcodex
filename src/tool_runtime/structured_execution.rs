@@ -2,7 +2,8 @@ use super::helpers::{bounded_tail, COMMAND_STDIO_TAIL_CHARS};
 use crate::auth::AuthContext;
 use crate::runner_http::RunnerRegistry;
 use crate::runner_protocol::{
-    ShellJobInfo, STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    ShellJobInfo, PROCESS_TIMEOUT_MAX_SECS, SCRIPT_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
     STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 use std::sync::Arc;
@@ -10,6 +11,8 @@ use std::time::Duration;
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_runner_registry::RunnerAccess;
 
+/// Canonical model-facing synchronous grace before an already-started
+/// structured execution is handed off as the same durable Job.
 pub(crate) const STRUCTURED_EXECUTION_SYNC_WAIT_SECS: u64 = 10;
 pub(crate) const INITIAL_JOB_HANDOFF_TAIL_LINES: usize = 40;
 pub(crate) use webcodex_core::runtime_contract::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS;
@@ -21,37 +24,53 @@ pub(crate) struct StructuredExecutionBudget {
 }
 
 impl StructuredExecutionBudget {
-    pub(crate) fn resolve(timeout_secs: Option<u64>) -> Result<Self, String> {
-        Self::resolve_with_sync_wait(timeout_secs, None)
+    pub(crate) fn resolve_process(timeout_secs: Option<u64>) -> Result<Self, String> {
+        Self::resolve_with_timeout_max(timeout_secs, None, PROCESS_TIMEOUT_MAX_SECS)
+    }
+
+    pub(crate) fn resolve_process_with_sync_wait(
+        timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::resolve_with_timeout_max(timeout_secs, sync_wait_secs, PROCESS_TIMEOUT_MAX_SECS)
+    }
+
+    pub(crate) fn resolve_script_with_sync_wait(
+        timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::resolve_with_timeout_max(timeout_secs, sync_wait_secs, SCRIPT_TIMEOUT_MAX_SECS)
     }
 
     pub(crate) fn resolve_with_sync_wait(
         timeout_secs: Option<u64>,
         sync_wait_secs: Option<u64>,
     ) -> Result<Self, String> {
-        let effective_timeout_secs =
+        Self::resolve_with_timeout_max(
+            timeout_secs,
+            sync_wait_secs,
+            STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+        )
+    }
+
+    fn resolve_with_timeout_max(
+        timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
+        timeout_max_secs: u64,
+    ) -> Result<Self, String> {
+        let requested_timeout_secs =
             timeout_secs.unwrap_or(STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS);
-        if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
-            .contains(&effective_timeout_secs)
-        {
+        if requested_timeout_secs < STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS {
             return Err(format!(
-                "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS}"
+                "timeout_secs must be at least {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS}"
             ));
         }
+        let effective_timeout_secs = requested_timeout_secs.min(timeout_max_secs);
         let sync_wait_secs = match sync_wait_secs {
-            Some(sync_wait_secs) => {
-                if !(1..=STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS).contains(&sync_wait_secs) {
-                    return Err(format!(
-                        "sync_wait_secs must be between 1 and {STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS}"
-                    ));
-                }
-                if sync_wait_secs > effective_timeout_secs {
-                    return Err(format!(
-                        "sync_wait_secs ({sync_wait_secs}) must not exceed effective timeout_secs ({effective_timeout_secs})"
-                    ));
-                }
-                sync_wait_secs
-            }
+            Some(0) => return Err("sync_wait_secs must be at least 1".to_string()),
+            Some(sync_wait_secs) => sync_wait_secs
+                .min(STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS)
+                .min(effective_timeout_secs),
             None => STRUCTURED_EXECUTION_SYNC_WAIT_SECS.min(effective_timeout_secs),
         };
         Ok(Self {
@@ -118,54 +137,155 @@ pub(crate) async fn structured_job_observation(
     })
 }
 
+/// An execution has already been admitted. Only an independently authorized
+/// Public record may carry identity into a model-facing failure; error prose is
+/// deliberately not retained as recovery authority (or leaked as payload).
+pub(crate) struct StructuredJobHandoffFailure {
+    public_job: Option<ShellJobInfo>,
+}
+
+impl StructuredJobHandoffFailure {
+    pub(crate) async fn unresolved(
+        clients: &RunnerRegistry,
+        access: Option<&RunnerAccess>,
+        job_id: &str,
+    ) -> Self {
+        Self {
+            public_job: clients.get_job_for_auth(access, job_id).await.ok(),
+        }
+    }
+
+    pub(crate) fn has_public_continuation(&self) -> bool {
+        self.public_job.is_some()
+    }
+
+    pub(crate) fn into_tool_result(
+        self,
+        project: &str,
+        budget: StructuredExecutionBudget,
+    ) -> super::ToolResult {
+        use serde_json::json;
+        let mut result = super::process::outcome_unknown_result(
+            "durable execution was admitted but handoff observation failed; recover the original execution before considering any retry",
+        );
+        super::process::add_structured_continuation_facts(
+            &mut result,
+            budget.effective_timeout_secs,
+            budget.sync_wait_secs,
+            true,
+        );
+        if let Some(job) = self.public_job {
+            result.output["promoted_to_job"] = json!(true);
+            result.output["job_id"] = json!(job.job_id);
+            result.output["job_status"] = json!(job.status);
+            result.output["activity"] = serde_json::Value::Null;
+            result.output["continuation"] = super::jobs::observe_job_continuation(
+                &job.job_id,
+                job.observation_token.as_deref(),
+            );
+        } else {
+            result.output["suggested_call"] =
+                super::SuggestedToolCall::new("list_jobs", json!({"project": project})).to_value();
+        }
+        result
+    }
+}
+
+/// Re-observe/promote the same durable record, never a replacement execution.
+/// A terminal race belongs to the initiating call; an unprojectable hidden or
+/// cleanup-pending record stays private and keeps its cleanup guard armed.
+pub(crate) async fn recover_hidden_structured_job(
+    clients: &RunnerRegistry,
+    access: Option<&RunnerAccess>,
+    job_id: &str,
+) -> Result<HiddenStructuredJobWait, StructuredJobHandoffFailure> {
+    if let Ok(job) = clients.promote_hidden_job(access, job_id).await {
+        if !super::jobs::is_terminal_job_status(&job.status) {
+            return Err(StructuredJobHandoffFailure {
+                public_job: Some(job),
+            });
+        }
+        if let Ok(terminal) = hidden_terminal_snapshot(clients, access, job_id).await {
+            return Ok(terminal);
+        }
+    }
+    // Public may already have been established before observation failed. This
+    // lookup rechecks visibility and caller authority; it cannot reveal hidden
+    // terminal or CleanupPending records and does not infer a token from prose.
+    Err(StructuredJobHandoffFailure::unresolved(clients, access, job_id).await)
+}
+
 pub(crate) async fn await_hidden_structured_job(
     clients: Arc<RunnerRegistry>,
     job_id: String,
     sync_wait: Duration,
     auth: Option<AuthContext>,
-) -> Result<HiddenStructuredJobWait, String> {
+) -> Result<HiddenStructuredJobWait, StructuredJobHandoffFailure> {
     let access = crate::runner_http::runner_access_from_auth(auth.as_ref());
     let mut guard = HiddenJobCleanupGuard::new(clients.clone(), job_id.clone(), access.clone());
-    let deadline = std::time::Instant::now() + sync_wait;
-    loop {
-        if let Ok(job) = clients
-            .get_hidden_job_for_auth(access.as_ref(), &job_id)
-            .await
-        {
-            if crate::tool_runtime::jobs::is_terminal_job_status(&job.status) {
-                let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
-                guard.disarm();
-                return Ok(terminal);
+    let attempt: Result<HiddenStructuredJobWait, String> = async {
+        let deadline = std::time::Instant::now() + sync_wait;
+        loop {
+            if let Ok(job) = clients
+                .get_hidden_job_for_auth(access.as_ref(), &job_id)
+                .await
+            {
+                if crate::tool_runtime::jobs::is_terminal_job_status(&job.status) {
+                    let terminal =
+                        hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+                    guard.disarm();
+                    return Ok(terminal);
+                }
             }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 
-    let promoted = clients.promote_hidden_job(&job_id).await?;
-    if crate::tool_runtime::jobs::is_terminal_job_status(&promoted.status) {
-        let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+        let promoted = clients.promote_hidden_job(access.as_ref(), &job_id).await?;
+        if crate::tool_runtime::jobs::is_terminal_job_status(&promoted.status) {
+            let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+            guard.disarm();
+            return Ok(terminal);
+        }
+        let observation = structured_job_observation(&clients, access.as_ref(), &job_id).await?;
+        if crate::tool_runtime::jobs::is_terminal_job_status(&observation.job.status) {
+            let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+            guard.disarm();
+            return Ok(terminal);
+        }
+        let (execution_state, command_started) = continued_execution_state(
+            observation.job.status.as_str(),
+            observation.job.started_at.is_some(),
+        );
         guard.disarm();
-        return Ok(terminal);
+        Ok(HiddenStructuredJobWait::Continued {
+            observation,
+            execution_state,
+            command_started,
+        })
     }
-    let observation = structured_job_observation(&clients, access.as_ref(), &job_id).await?;
-    if crate::tool_runtime::jobs::is_terminal_job_status(&observation.job.status) {
-        let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
+    .await;
+    let result = match attempt {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            Box::pin(recover_hidden_structured_job(
+                &clients,
+                access.as_ref(),
+                &job_id,
+            ))
+            .await
+        }
+    };
+    if result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(|failure| failure.has_public_continuation())
+    {
         guard.disarm();
-        return Ok(terminal);
     }
-    let (execution_state, command_started) = continued_execution_state(
-        observation.job.status.as_str(),
-        observation.job.started_at.is_some(),
-    );
-    guard.disarm();
-    Ok(HiddenStructuredJobWait::Continued {
-        observation,
-        execution_state,
-        command_started,
-    })
+    result
 }
 
 fn continued_execution_state(status: &str, started: bool) -> (&'static str, bool) {
@@ -283,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_execution_budget_preserves_default_and_validates_explicit_sync_wait() {
+    fn structured_execution_budget_clamps_oversized_preferences_and_rejects_zero() {
         let default = StructuredExecutionBudget::resolve_with_sync_wait(None, None).unwrap();
         assert_eq!(default.effective_timeout_secs, 60);
         assert_eq!(default.sync_wait_secs, 10);
@@ -292,17 +412,70 @@ mod tests {
         assert_eq!(short.effective_timeout_secs, 5);
         assert_eq!(short.sync_wait_secs, 5);
 
-        for wait in [1, 45, 60] {
+        for wait in [1, 45, STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS] {
             let budget =
                 StructuredExecutionBudget::resolve_with_sync_wait(Some(600), Some(wait)).unwrap();
             assert_eq!(budget.effective_timeout_secs, 600);
             assert_eq!(budget.sync_wait_secs, wait);
         }
 
+        let host_boundary =
+            StructuredExecutionBudget::resolve_with_sync_wait(Some(600), Some(60)).unwrap();
+        assert_eq!(host_boundary.effective_timeout_secs, 600);
+        assert_eq!(
+            host_boundary.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS
+        );
+
+        let oversized =
+            StructuredExecutionBudget::resolve_with_sync_wait(Some(4_000), Some(600)).unwrap();
+        assert_eq!(
+            oversized.effective_timeout_secs,
+            STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS
+        );
+        assert_eq!(
+            oversized.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS
+        );
+
+        let process_default = StructuredExecutionBudget::resolve_process(None).unwrap();
+        assert_eq!(process_default.effective_timeout_secs, 60);
+        let process_six_hours =
+            StructuredExecutionBudget::resolve_process_with_sync_wait(Some(21_600), None).unwrap();
+        assert_eq!(process_six_hours.effective_timeout_secs, 21_600);
+        assert_eq!(
+            process_six_hours.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+        );
+        let process_oversized =
+            StructuredExecutionBudget::resolve_process(Some(PROCESS_TIMEOUT_MAX_SECS + 1)).unwrap();
+        assert_eq!(
+            process_oversized.effective_timeout_secs,
+            PROCESS_TIMEOUT_MAX_SECS
+        );
+
+        let script_default =
+            StructuredExecutionBudget::resolve_script_with_sync_wait(None, None).unwrap();
+        assert_eq!(script_default.effective_timeout_secs, 60);
+        let script_six_hours =
+            StructuredExecutionBudget::resolve_script_with_sync_wait(Some(21_600), None).unwrap();
+        assert_eq!(script_six_hours.effective_timeout_secs, 21_600);
+        let script_oversized = StructuredExecutionBudget::resolve_script_with_sync_wait(
+            Some(SCRIPT_TIMEOUT_MAX_SECS + 1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            script_oversized.effective_timeout_secs,
+            SCRIPT_TIMEOUT_MAX_SECS
+        );
+
+        let over_total =
+            StructuredExecutionBudget::resolve_with_sync_wait(Some(5), Some(60)).unwrap();
+        assert_eq!(over_total.effective_timeout_secs, 5);
+        assert_eq!(over_total.sync_wait_secs, 5);
+
+        assert!(StructuredExecutionBudget::resolve_with_sync_wait(Some(0), None).is_err());
         assert!(StructuredExecutionBudget::resolve_with_sync_wait(Some(600), Some(0)).is_err());
-        assert!(StructuredExecutionBudget::resolve_with_sync_wait(Some(600), Some(61)).is_err());
-        let conflict = StructuredExecutionBudget::resolve_with_sync_wait(Some(5), Some(6))
-            .expect_err("explicit sync wait above total timeout must be rejected");
-        assert!(conflict.contains("must not exceed effective timeout_secs"));
     }
 }

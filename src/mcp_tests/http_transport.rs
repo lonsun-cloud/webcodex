@@ -69,18 +69,29 @@ async fn stateless_2026_tool_call(
     arguments: Value,
     legacy_session_id: Option<&str>,
 ) -> (StatusCode, Value) {
+    let (call_name, call_params) = if matches!(
+        crate::model_surface::adaptive_runtime_gateway_target_route(name),
+        crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+    ) {
+        (
+            crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            adaptive_runtime_gateway_params(name, arguments),
+        )
+    } else {
+        (name, json!({"name": name, "arguments": arguments}))
+    };
     stateless_2026_jsonrpc(
         service,
         token,
         Some(MCP_STATELESS_PROTOCOL_VERSION),
         Some("tools/call"),
-        Some(name),
+        Some(call_name),
         legacy_session_id,
         json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": mcp_2026_params(json!({"name": name, "arguments": arguments})),
+            "params": mcp_2026_params(call_params),
         }),
     )
     .await
@@ -126,6 +137,8 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
                 hooks: Vec::new(),
                 disabled: false,
                 revision: None,
+                root_fingerprint: None,
+                lineage: None,
                 git_branch: None,
                 git_head: None,
                 git_dirty: None,
@@ -143,6 +156,8 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
                 hooks: Vec::new(),
                 disabled: false,
                 revision: None,
+                root_fingerprint: None,
+                lineage: None,
                 git_branch: None,
                 git_head: None,
                 git_dirty: None,
@@ -181,6 +196,8 @@ fn spawn_stateless_observation_agent_executor(
                         exit_code: Some(exit_code),
                         stdout: Some(String::new()),
                         stderr: Some(stderr.to_string()),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -234,31 +251,28 @@ fn full_trace_dir_with_payload(
     panic!("missing full-trace payload phase {phase} matching this request");
 }
 
-async fn start_stateless_observation_session(
-    service: &Service,
-    id: i64,
-    project: &str,
-    title: &str,
-) -> String {
-    let (status, body) = stateless_2026_tool_call(
-        service,
-        "secret",
-        id,
-        "start_session",
-        json!({"project": project, "title": title}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["result"]["isError"], false, "{body}");
-    stateless_tool_output(&body)["session_id"]
-        .as_str()
-        .expect("stateless project Workflow Session")
-        .to_string()
+fn start_mcp_fixture_session(runtime: &ToolRuntime, project: Option<&str>, title: &str) -> String {
+    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+    auth.is_bootstrap = true;
+    let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+        .expect("bootstrap fixture authority");
+    runtime
+        .sessions
+        .start_session_with_options(
+            crate::tool_runtime::sessions::SessionCreateOptions::new(
+                project.map(str::to_string),
+                Some(title.to_string()),
+                crate::tool_runtime::SessionMode::Normal,
+                crate::tool_runtime::sessions::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(fingerprint)),
+        )
+        .unwrap()
+        .session_id
 }
 
 #[test]
-fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments() {
+fn stateless_full_trace_preserves_raw_context_request_and_records_clean_effective_arguments() {
     // Full tracing retains the request/response trees plus decoded trace payloads.
     // Keep this integration fixture off the default libtest stack for the same
     // reason as the larger stateless MCP continuity/observation fixtures below.
@@ -271,7 +285,7 @@ fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_ar
                 .build()
                 .expect("build stateless full-trace test runtime")
                 .block_on(
-                    stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments_body(),
+                    stateless_full_trace_preserves_raw_context_request_and_records_clean_effective_arguments_body(),
                 );
         })
         .expect("spawn stateless full-trace test thread")
@@ -279,8 +293,8 @@ fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_ar
         .expect("stateless full-trace test thread panicked");
 }
 
-async fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments_body()
-{
+async fn stateless_full_trace_preserves_raw_context_request_and_records_clean_effective_arguments_body(
+) {
     let trace_root = tempfile::tempdir().unwrap();
     let mut env = crate::test_support::TestEnvGuard::new();
     env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
@@ -292,14 +306,14 @@ async fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effect
 
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
-    let arguments = json!({"ack_session_context_revision": 42});
+    let arguments = json!({"context_request": ["webcodex.workflow"]});
     let (status, body) = stateless_2026_tool_call(
         &service,
         "secret",
         41,
-        "list_tools",
+        "runtime_status",
         arguments.clone(),
         None,
     )
@@ -329,14 +343,9 @@ async fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effect
     };
 
     let raw = read_phase("raw_arguments");
-    assert_eq!(
-        raw[crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD],
-        42
-    );
+    assert_eq!(raw["context_request"], json!(["webcodex.workflow"]));
     let effective = read_phase("effective_arguments");
-    assert!(effective
-        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
-        .is_none());
+    assert!(effective.get("context_request").is_none());
     assert_eq!(effective, json!({}));
     assert!(!effective.to_string().contains("__webcodex_"));
     let final_response = read_phase("final_response");
@@ -374,19 +383,19 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
 
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let raw_window = "openai-window-trace-opaque-secret";
 
     for id in [51_i64, 52_i64] {
-        let mut params = mcp_2026_params(json!({"name": "list_tools", "arguments": {}}));
+        let mut params = mcp_2026_params(json!({"name": "runtime_status", "arguments": {}}));
         params["_meta"]["openai/session"] = json!(raw_window);
         let (status, body) = stateless_2026_jsonrpc(
             &service,
             "secret",
             Some(MCP_STATELESS_PROTOCOL_VERSION),
             Some("tools/call"),
-            Some("list_tools"),
+            Some("runtime_status"),
             None,
             json!({
                 "jsonrpc": "2.0",
@@ -443,7 +452,7 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
         if let Some(parsed) = events.iter().find(|event| {
-            event["event"] == "mcp_tool_request_parsed" && event["tool_name"] == "list_tools"
+            event["event"] == "mcp_tool_request_parsed" && event["tool_name"] == "runtime_status"
         }) {
             traced_requests += 1;
             let trace_id = parsed["server_trace_id"]
@@ -537,11 +546,10 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
 
 #[tokio::test]
 async fn mcp_tools_call_writes_a_summary_action_audit_row() {
-    // list_tools is a full-operator-only tool; select that surface so the
-    // call dispatches and lands an action audit row.
+    // Use a canonical Adaptive direct tool so this test isolates ActionAudit behavior.
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let mut resp = TestClient::post("http://localhost/mcp")
         .bearer_auth("secret")
@@ -549,7 +557,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "list_tools", "arguments": {}}
+            "params": {"name": "runtime_status", "arguments": {"summary_only": true}}
         }))
         .send(&service)
         .await;
@@ -638,7 +646,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
     };
     assert_eq!(endpoint, "/mcp");
     assert_eq!(action, "toolsCall");
-    assert_eq!(operation, "list_tools");
+    assert_eq!(operation, "runtime_status");
     assert_eq!(status, "success");
     let request_observed_at_ms = request_observed_at_ms.expect("canonical MCP request start");
     let response_handed_at_ms = response_handed_at_ms.expect("canonical MCP response handoff");
@@ -661,8 +669,8 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
         "summary must not embed tool output: {summary}"
     );
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["schema_version"], 3);
-    assert_eq!(telemetry["tool_name"], "list_tools");
+    assert_eq!(telemetry["schema_version"], 9);
+    assert_eq!(telemetry["tool_name"], "runtime_status");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
     assert_eq!(
@@ -688,7 +696,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
         .json(&json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
-            "params": {"name": "list_tools", "arguments": {}}
+            "params": {"name": "runtime_status", "arguments": {"summary_only": true}}
         }))
         .send(&service)
         .await;
@@ -703,10 +711,47 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
 }
 
 #[tokio::test]
+async fn observe_jobs_action_audit_remains_window_meaningful_transport() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "observe_jobs",
+                "arguments": {"items": [{"job_id": "missing-job-for-activity-test"}]}
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: Value = response.take_json().await.unwrap();
+    assert!(body.get("result").is_some(), "{body}");
+
+    let (operation, window_meaningful, continuity_eligible): (String, i64, Option<i64>) = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT operation, window_meaningful, window_continuity_eligible FROM action_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(operation, "observe_jobs");
+    assert_eq!(window_meaningful, 1);
+    assert_eq!(continuity_eligible, Some(1));
+}
+
+#[tokio::test]
 async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let mut response = TestClient::post("http://localhost/mcp")
         .bearer_auth("secret")
@@ -714,7 +759,7 @@ async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
             "jsonrpc": "2.0",
             "id": 101,
             "method": "tools/call",
-            "params": {"name": "read_file", "arguments": {}}
+            "params": {"name": "read_files", "arguments": {}}
         }))
         .send(&service)
         .await;
@@ -725,14 +770,14 @@ async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
     let summary: String = db
         .conn_for_tests()
         .query_row(
-            "SELECT summary_json FROM action_events WHERE operation = 'read_file'",
+            "SELECT summary_json FROM action_events WHERE operation = 'read_files'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     let summary: Value = serde_json::from_str(&summary).unwrap();
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["tool_name"], "read_file");
+    assert_eq!(telemetry["tool_name"], "read_files");
     assert_eq!(telemetry["success"], false);
     assert_eq!(telemetry["error_kind"], "invalid_arguments");
     assert!(telemetry["serialized_result_bytes"].is_null());
@@ -742,7 +787,7 @@ async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
 async fn mcp_pre_kernel_wrapper_validation_still_records_generic_attempt() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let mut arguments = json!({});
     arguments.as_object_mut().unwrap().insert(
@@ -756,7 +801,7 @@ async fn mcp_pre_kernel_wrapper_validation_still_records_generic_attempt() {
             "jsonrpc": "2.0",
             "id": 102,
             "method": "tools/call",
-            "params": {"name": "list_tools", "arguments": arguments}
+            "params": {"name": "runtime_status", "arguments": arguments}
         }))
         .send(&service)
         .await;
@@ -767,14 +812,14 @@ async fn mcp_pre_kernel_wrapper_validation_still_records_generic_attempt() {
     let summary: String = db
         .conn_for_tests()
         .query_row(
-            "SELECT summary_json FROM action_events WHERE operation = 'list_tools'",
+            "SELECT summary_json FROM action_events WHERE operation = 'runtime_status'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     let summary: Value = serde_json::from_str(&summary).unwrap();
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["tool_name"], "list_tools");
+    assert_eq!(telemetry["tool_name"], "runtime_status");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], false);
     assert_eq!(telemetry["error_kind"], "invalid_arguments");
@@ -807,7 +852,7 @@ async fn mcp_pat_tools_call_persists_user_attribution() {
     let (_tmp, db) = test_db();
     let user = seed_user(&db, "alice");
     let token = seed_action_audit_pat(&db, &user);
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
 
     let resp = TestClient::post("http://localhost/mcp")
@@ -816,7 +861,7 @@ async fn mcp_pat_tools_call_persists_user_attribution() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "list_tools", "arguments": {}}
+            "params": {"name": "runtime_status", "arguments": {"summary_only": true}}
         }))
         .send(&service)
         .await;
@@ -842,7 +887,7 @@ async fn mcp_oauth_tools_call_persists_user_and_client_attribution() {
     let user = seed_user(&db, "alice");
     let client = seed_oauth_client(&db, &user);
     let token = seed_oauth_access_token(&db, &client, &user, "runtime:read");
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
 
     let resp = TestClient::post("http://localhost/mcp")
@@ -851,7 +896,10 @@ async fn mcp_oauth_tools_call_persists_user_and_client_attribution() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "list_tools", "arguments": {}}
+            "params": {
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {"tool": "list_tools", "arguments": {}}
+            }
         }))
         .send(&service)
         .await;
@@ -869,11 +917,146 @@ async fn mcp_oauth_tools_call_persists_user_and_client_attribution() {
     assert_eq!(attrs.1.as_deref(), Some(user.id.as_str()));
     assert_eq!(attrs.2.as_deref(), Some(client.client_id.as_str()));
 }
+async fn authority_probe(
+    service: &Service,
+    host: &str,
+    origin: Option<&str>,
+    forwarded_host: Option<&str>,
+) -> StatusCode {
+    let mut request = TestClient::post("http://localhost/mcp")
+        .add_header("host", host, true)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }));
+    if let Some(origin) = origin {
+        request = request.add_header("origin", origin, true);
+    }
+    if let Some(forwarded_host) = forwarded_host {
+        request = request
+            .add_header("x-forwarded-host", forwarded_host, true)
+            .add_header("x-forwarded-proto", "http", true);
+    }
+    let response = request.send(service).await;
+    effective_status(&response)
+}
+
+#[tokio::test]
+async fn http_mcp_rejects_dns_rebinding_authority_before_jsonrpc_dispatch() {
+    let config = test_config(None);
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    assert_eq!(
+        authority_probe(
+            &service,
+            "evil.example.com",
+            Some("http://evil.example.com"),
+            None,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        authority_probe(
+            &service,
+            "evil.example.com",
+            Some("http://evil.example.com"),
+            Some("localhost"),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "client-supplied forwarded authority must not bypass Host validation"
+    );
+}
+
+#[tokio::test]
+async fn http_mcp_accepts_loopback_authorities_without_requiring_origin() {
+    let config = test_config(None);
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    for host in ["localhost", "127.0.0.1", "[::1]"] {
+        assert_eq!(
+            authority_probe(&service, host, None, None).await,
+            StatusCode::OK,
+            "loopback Host {host} should remain valid without Origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_mcp_accepts_configured_public_authority_and_matching_origin() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_PUBLIC_URL", "https://mcp.example.test");
+    let config = test_config(None);
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    assert_eq!(
+        authority_probe(
+            &service,
+            "mcp.example.test",
+            Some("https://mcp.example.test"),
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        authority_probe(
+            &service,
+            "mcp.example.test:443",
+            Some("https://mcp.example.test"),
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        authority_probe(
+            &service,
+            "mcp.example.test",
+            Some("http://mcp.example.test"),
+            None,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "configured HTTPS public origin must not accept an HTTP Origin"
+    );
+}
+
+#[tokio::test]
+async fn http_mcp_rejects_malformed_host_and_origin() {
+    let config = test_config(None);
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    assert_eq!(
+        authority_probe(&service, "localhost:notaport", None, None).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        authority_probe(&service, "localhost", Some("not-an-origin"), None).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        authority_probe(&service, "localhost", Some("http://localhost/extra"), None,).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 #[tokio::test]
 async fn http_mcp_initialize_success() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let mut resp = TestClient::post("http://localhost/mcp")
         .bearer_auth("secret")
@@ -896,10 +1079,6 @@ async fn http_mcp_initialize_success() {
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 1);
     assert_eq!(body["result"]["serverInfo"]["name"], "webcodex");
-    assert_eq!(
-        body["result"]["serverInfo"]["runtimeExposure"],
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
-    );
     assert!(body["result"]["protocolVersion"].is_string());
     assert_eq!(
         body["result"]["capabilities"]["tools"]["listChanged"],
@@ -911,7 +1090,7 @@ async fn http_mcp_initialize_success() {
 async fn http_mcp_accepts_chatgpt_2025_11_25_protocol_header() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let mut response = TestClient::post("http://localhost/mcp")
         .bearer_auth("secret")
@@ -965,23 +1144,10 @@ fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution() {
 async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_body() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime.clone()));
 
-    let (status, session_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        220,
-        "start_session",
-        json!({"title": "ACK dogfood"}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{session_body}");
-    let session_id = stateless_tool_output(&session_body)["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let session_id = start_mcp_fixture_session(&runtime, None, "ACK dogfood");
 
     let (status, post_body) = stateless_2026_tool_call(
         &service,
@@ -1036,15 +1202,8 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         .as_array()
         .unwrap()
         .is_empty());
-    assert_eq!(
-        acknowledged["session_continuity"]["status"], "unacknowledged",
-        "guidance ACK must remain independent when model-facing context ACK is omitted"
-    );
-    assert!(acknowledged["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(acknowledged["session_recovery"]["current_handoff"].is_object());
+    assert!(acknowledged.get("session_continuity").is_none());
+    assert!(acknowledged.get("session_recovery").is_none());
     let retained = runtime
         .sessions
         .list_messages(
@@ -1308,7 +1467,7 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
 async fn http_mcp_2026_context_request_projects_post_tool_materials_nonfatally() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let arguments = json!({
         crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: [
@@ -1323,11 +1482,6 @@ async fn http_mcp_2026_context_request_projects_post_tool_materials_nonfatally()
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["isError"], false);
     let output = stateless_tool_output(&body);
-    assert_eq!(output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     let materials = output["context_projection"]["materials"]
         .as_array()
         .unwrap();
@@ -1346,7 +1500,7 @@ async fn http_mcp_2026_context_request_projects_post_tool_materials_nonfatally()
 }
 
 #[test]
-fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_invalid_ack() {
+fn http_mcp_2026_explicit_handoff_without_context_ack() {
     // Like the neighboring request-scoped ACK and observation fixtures, this
     // end-to-end continuity test keeps several large MCP response trees alive
     // across awaits. The default libtest stack can overflow only in the full
@@ -1360,235 +1514,112 @@ fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_invalid_ack
                 .enable_all()
                 .build()
                 .expect("build session context continuity test runtime")
-                .block_on(
-                    http_mcp_2026_session_context_revision_recovers_missing_stale_and_invalid_ack_body(),
-                );
+                .block_on(http_mcp_2026_explicit_handoff_without_context_ack_body());
         })
         .expect("spawn session context continuity test thread")
         .join()
         .expect("session context continuity test thread panicked");
 }
 
-async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_invalid_ack_body() {
+async fn http_mcp_2026_explicit_handoff_without_context_ack_body() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
-    let service = Service::new(build_test_router(config, db.clone(), runtime.clone()));
-
-    let (status, session_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        227,
-        "start_session",
-        json!({"title": "context continuity dogfood"}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{session_body}");
-    let session_id = stateless_tool_output(&session_body)["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let mut cached_read_args = with_mcp_recording_session(json!({}), &session_id);
-    cached_read_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(999),
-    );
-    let (status, cached_read_body) = stateless_2026_tool_call(
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime.clone()));
+    let session_id = start_mcp_fixture_session(&runtime, None, "explicit recovery");
+    let (status, posted) = stateless_2026_tool_call(
         &service,
         "secret",
         228,
-        "list_tools",
-        cached_read_args,
+        "post_session_message",
+        with_mcp_recording_session(
+            json!({
+                "session_id": session_id, "kind": "guidance", "message": "Keep the exact target",
+                "requires_ack": true,
+            }),
+            &session_id,
+        ),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{cached_read_body}");
-    let cached_read = stateless_tool_output(&cached_read_body);
-    assert_eq!(cached_read["session_context_revision"], 0);
-    assert_eq!(cached_read["session_continuity"]["status"], "invalid");
-    assert_eq!(cached_read["session_continuity"]["ack_revision"], 999);
-    assert!(cached_read["session_recovery"]["model_facing_events"]
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    let posted = stateless_tool_output(&posted);
+    assert!(posted["session_attention"]["messages"]
         .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(cached_read["session_recovery"]["current_handoff"].is_object());
-    assert_eq!(runtime.sessions.context_revision(&session_id), Some(0));
-
-    let mut exact_args =
-        with_mcp_recording_session(json!({"title": "context checkpoint exact"}), &session_id);
-    exact_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(0),
+        .is_some_and(|v| !v.is_empty()));
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+        "ignored_invocation_metadata",
+    ] {
+        assert!(posted.get(field).is_none(), "{field}: {posted}");
+    }
+    let (status, body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        229,
+        "session_handoff_summary",
+        json!({"session_id": session_id}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let output = stateless_tool_output(&body);
+    assert_eq!(output["session_id"], session_id);
+    assert!(output["handoff_brief"]["basis"].is_object());
+    assert_eq!(output["handoff_brief"]["attention"]["open_guidance"], 1);
+    assert!(serde_json::to_vec(&output["handoff_brief"]).unwrap().len() <= 8192);
+    assert!(output.get("diagnostic").is_none());
+    assert!(output.get("validation").is_none());
+    assert!(output.get("continuation_feedback").is_none());
+    assert!(output.get("verdict").is_none());
+    assert_eq!(output["session_attention"]["requires_ack"], true);
+    assert_eq!(
+        output["session_attention"]["messages"][0]["message"],
+        "Keep the exact target"
     );
-    let (status, exact_body) =
-        stateless_2026_tool_call(&service, "secret", 229, "start_session", exact_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{exact_body}");
-    let exact = stateless_tool_output(&exact_body);
-    assert_eq!(exact["session_context_revision"], 1);
-    assert!(exact.get("session_continuity").is_none());
-    assert!(exact.get("session_recovery").is_none());
-    assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
-
-    let mut second_cached_read_args = with_mcp_recording_session(json!({}), &session_id);
-    second_cached_read_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(1),
-    );
-    let (status, second_cached_read_body) = stateless_2026_tool_call(
+    let (status, body) = stateless_2026_tool_call(
         &service,
         "secret",
         230,
-        "list_tools",
-        second_cached_read_args,
+        "session_handoff_summary",
+        json!({"session_id": session_id, "diagnostic": true}),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{second_cached_read_body}");
-    let second_cached_read = stateless_tool_output(&second_cached_read_body);
-    assert!(second_cached_read.get("session_context_revision").is_none());
-    assert!(second_cached_read.get("session_continuity").is_none());
-    assert!(second_cached_read.get("session_recovery").is_none());
-    assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
-
-    let mut stale_args =
-        with_mcp_recording_session(json!({"title": "context checkpoint stale"}), &session_id);
-    stale_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(0),
-    );
-    let (status, stale_body) =
-        stateless_2026_tool_call(&service, "secret", 231, "start_session", stale_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{stale_body}");
-    let stale = stateless_tool_output(&stale_body);
-    assert_eq!(stale["session_context_revision"], 2);
-    assert_eq!(stale["session_continuity"]["status"], "behind");
-    assert_eq!(stale["session_continuity"]["ack_revision"], 0);
-    assert_eq!(stale["session_continuity"]["pre_call_revision"], 1);
-    assert_eq!(
-        stale["session_recovery"]["model_facing_events"][0]["context_revision"],
-        1
-    );
-    assert_eq!(runtime.sessions.context_revision(&session_id), Some(2));
-
-    let mut future_args =
-        with_mcp_recording_session(json!({"title": "context checkpoint future"}), &session_id);
-    future_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(999),
-    );
-    let (status, future_body) =
-        stateless_2026_tool_call(&service, "secret", 232, "start_session", future_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{future_body}");
-    let future = stateless_tool_output(&future_body);
-    assert_eq!(future["session_context_revision"], 3);
-    assert_eq!(future["session_continuity"]["status"], "invalid");
-    assert_eq!(future["session_continuity"]["ack_revision"], 999);
-    assert!(future["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(future["session_recovery"]["current_handoff"].is_object());
-
-    let missing_args =
-        with_mcp_recording_session(json!({"title": "context checkpoint missing"}), &session_id);
-    let (status, missing_body) =
-        stateless_2026_tool_call(&service, "secret", 233, "start_session", missing_args, None)
-            .await;
-    assert_eq!(status, StatusCode::OK, "{missing_body}");
-    let missing = stateless_tool_output(&missing_body);
-    assert_eq!(missing["session_context_revision"], 4);
-    assert_eq!(missing["session_continuity"]["status"], "unacknowledged");
-    assert!(missing["session_recovery"]["current_handoff"].is_object());
-
-    let mut after_missing_args = with_mcp_recording_session(
-        json!({"title": "context checkpoint after missing"}),
-        &session_id,
-    );
-    after_missing_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(4),
-    );
-    let (status, after_missing_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        234,
-        "start_session",
-        after_missing_args,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{after_missing_body}");
-    let after_missing = stateless_tool_output(&after_missing_body);
-    assert_eq!(after_missing["session_context_revision"], 5);
-    assert!(after_missing.get("session_continuity").is_none());
-    assert!(after_missing.get("session_recovery").is_none());
-
-    let audit = serde_json::to_string(
-        &runtime
-            .sessions
-            .summary(&session_id, Some(100))
-            .unwrap()
-            .events,
-    )
-    .unwrap();
-    assert!(!audit.contains("ack_session_context_revision"));
-    assert!(!audit.contains("__webcodex_stateless_ack_session_context_revision"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let output = stateless_tool_output(&body);
+    assert_eq!(output["diagnostic"], true);
+    assert!(output["validation"].is_object());
+    assert!(output["handoff_brief"].is_object());
+    // The retired field is now an unknown input, including on the gateway.
+    for (tool, arguments) in [
+        ("runtime_status", json!({"ack_session_context_revision": 0})),
+        (
+            "call_runtime_tool",
+            json!({"tool": "list_tools", "arguments": {}, "ack_session_context_revision": 0}),
+        ),
+    ] {
+        let (status, body) =
+            stateless_2026_tool_call(&service, "secret", 231, tool, arguments, None).await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || body.get("error").is_some(),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn http_mcp_2026_collaboration_completion_preserves_explicit_recorder_provenance() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime.clone()));
 
-    let (status, coordinator_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        230,
-        "start_session",
-        json!({"title": "Coordinator C"}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{coordinator_body}");
-    let coordinator_id = coordinator_body["result"]["structuredContent"]["output"]["session_id"]
-        .as_str()
-        .expect("coordinator Workflow Session")
-        .to_string();
-
-    let (status, worker_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        231,
-        "start_session",
-        json!({"title": "Worker W"}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{worker_body}");
-    let worker_id = worker_body["result"]["structuredContent"]["output"]["session_id"]
-        .as_str()
-        .expect("worker Workflow Session")
-        .to_string();
-
-    let (status, replay_worker_body) = stateless_2026_tool_call(
-        &service,
-        "secret",
-        232,
-        "start_session",
-        json!({"title": "Replay worker X"}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{replay_worker_body}");
-    let replay_worker_id = replay_worker_body["result"]["structuredContent"]["output"]
-        ["session_id"]
-        .as_str()
-        .expect("replay worker Workflow Session")
-        .to_string();
+    let coordinator_id = start_mcp_fixture_session(&runtime, None, "Coordinator C");
+    let worker_id = start_mcp_fixture_session(&runtime, None, "Worker W");
+    let replay_worker_id = start_mcp_fixture_session(&runtime, None, "Replay worker X");
 
     let (status, posted_body) = stateless_2026_tool_call(
         &service,
@@ -1615,7 +1646,7 @@ async fn http_mcp_2026_collaboration_completion_preserves_explicit_recorder_prov
         .unwrap()
         .assignment_fence;
 
-    let completion_arguments = with_mcp_recording_session(
+    let forged_completion_arguments = with_mcp_recording_session(
         json!({
             "session_id": coordinator_id,
             "message_id": todo_id,
@@ -1623,6 +1654,31 @@ async fn http_mcp_2026_collaboration_completion_preserves_explicit_recorder_prov
             "completion_key": "stateless-recorder-v1",
             "expected_assignment_fence": assignment_fence.clone(),
             "author_session_id": "wc_sess_forged_should_not_win"
+        }),
+        &worker_id,
+    );
+    let (status, forged_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        2340,
+        "complete_session_message",
+        forged_completion_arguments,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{forged_body}");
+    assert_eq!(forged_body["error"]["code"], -32602);
+    assert!(forged_body["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unknown field `author_session_id`")));
+
+    let completion_arguments = with_mcp_recording_session(
+        json!({
+            "session_id": coordinator_id,
+            "message_id": todo_id,
+            "answer": "Reviewed and completed under the explicit worker recorder.",
+            "completion_key": "stateless-recorder-v1",
+            "expected_assignment_fence": assignment_fence.clone(),
         }),
         &worker_id,
     );
@@ -1864,8 +1920,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
         crate::tool_runtime::runner_project_runtime_id("mcp-observation-agent", "foreign");
     let runtime = Arc::new(
         ToolRuntime::new_for_tests_with_runner_registry(runner_registry.clone())
-            .with_session_ledger(&ledger)
-            .with_model_surface(ModelSurface::FullOperatorRuntime),
+            .with_session_ledger(&ledger),
     );
     let service = Service::new(build_test_router(
         config.clone(),
@@ -1873,33 +1928,23 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
         runtime.clone(),
     ));
 
-    // Create every project-scoped participant through the real stateless MCP
-    // start_session path so target and recorder authorization exercise both
-    // project resolution and the immutable caller authority-group fingerprint.
-    let coordinator_id = start_stateless_observation_session(
-        &service,
-        240,
-        &shared_project,
-        "Observation coordinator C",
-    )
-    .await;
+    // Fixture setup mirrors the bootstrap bearer authority used by this HTTP service.
+    // The assertions below still exercise project resolution and immutable recorder authority
+    // through the real stateless collaboration calls.
+    let coordinator_id =
+        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation coordinator C");
     let worker_id =
-        start_stateless_observation_session(&service, 241, &shared_project, "Observation worker W")
-            .await;
-    let second_coordinator_id = start_stateless_observation_session(
-        &service,
-        242,
-        &shared_project,
+        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation worker W");
+    let second_coordinator_id = start_mcp_fixture_session(
+        &runtime,
+        Some(&shared_project),
         "Observation coordinator C2",
-    )
-    .await;
-    let foreign_worker_id = start_stateless_observation_session(
-        &service,
-        243,
-        &foreign_project,
+    );
+    let foreign_worker_id = start_mcp_fixture_session(
+        &runtime,
+        Some(&foreign_project),
         "Foreign observation worker W2",
-    )
-    .await;
+    );
 
     let pre_baseline_body_marker = "pre-baseline-history-must-not-replay";
     let (status, pre_baseline_body) = stateless_2026_tool_call(
@@ -1943,7 +1988,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
         .as_str()
         .expect("baseline observation token")
         .to_string();
-    assert!(token0.starts_with("wsm1_"));
+    assert!(token0.starts_with("wsm2_"));
     assert!(token0.len() <= 192);
 
     let worker_summary = runtime.sessions.summary(&worker_id, Some(100)).unwrap();
@@ -2193,8 +2238,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
     drop(runtime);
     let restored_runtime = Arc::new(
         ToolRuntime::new_for_tests_with_runner_registry(runner_registry)
-            .with_session_ledger(&ledger)
-            .with_model_surface(ModelSurface::FullOperatorRuntime),
+            .with_session_ledger(&ledger),
     );
     let restored_service = Service::new(build_test_router(config, db, restored_runtime.clone()));
     let (status, restored_unchanged_body) = stateless_2026_tool_call(
@@ -2273,7 +2317,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
 async fn http_mcp_2026_protocol_error_matrix_and_legacy_session_compatibility() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let params = mcp_2026_params(json!({}));
 
@@ -2406,16 +2450,86 @@ async fn http_mcp_2026_protocol_error_matrix_and_legacy_session_compatibility() 
 }
 
 #[tokio::test]
+async fn http_mcp_2026_invalid_request_metadata_maps_to_invalid_params_before_dispatch() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    let service = Service::new(build_test_router(config, db, runtime));
+
+    for (label, params, id) in [
+        ("missing meta", json!({}), 2100),
+        (
+            "missing protocol version",
+            json!({"_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}),
+            2101,
+        ),
+        (
+            "non-string protocol version",
+            json!({"_meta": {
+                "io.modelcontextprotocol/protocolVersion": 7,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}),
+            2102,
+        ),
+    ] {
+        let (status, body) = stateless_2026_jsonrpc(
+            &service,
+            "secret",
+            Some(MCP_STATELESS_PROTOCOL_VERSION),
+            Some("tools/list"),
+            None,
+            None,
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": params}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+        assert_eq!(body["id"], id, "{label}: {body}");
+        assert_eq!(body["error"]["code"], -32602, "{label}: {body}");
+        assert_ne!(
+            body["error"]["code"], MCP_HEADER_MISMATCH,
+            "{label}: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Invalid params:")),
+            "{label}: {body}"
+        );
+        assert!(body.get("result").is_none(), "{label}: {body}");
+    }
+
+    let (status, body) = stateless_2026_jsonrpc(
+        &service,
+        "secret",
+        Some(MCP_STATELESS_PROTOCOL_VERSION),
+        Some("tools/list"),
+        None,
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2103,
+            "method": "tools/list",
+            "params": mcp_2026_params(json!({}))
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], 2103);
+    assert!(body.get("error").is_none(), "{body}");
+    assert!(body.get("result").is_some(), "{body}");
+}
+
+#[tokio::test]
 async fn http_mcp_2026_tools_call_requires_matching_name_and_accepts_base64_sentinel() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
-    let params = mcp_2026_params(json!({"name": "list_projects", "arguments": {}}));
+    let params = mcp_2026_params(json!({"name": "runtime_status", "arguments": {}}));
 
     for (label, name_header, id) in [
         ("missing name", None, 204),
-        ("mismatched name", Some("runtime_status"), 2041),
+        ("mismatched name", Some("read_files"), 2041),
     ] {
         let (status, body) = stateless_2026_jsonrpc(
             &service,
@@ -2432,7 +2546,7 @@ async fn http_mcp_2026_tools_call_requires_matching_name_and_accepts_base64_sent
         assert_eq!(body["error"]["code"], MCP_HEADER_MISMATCH);
     }
 
-    let encoded = general_purpose::STANDARD.encode("list_projects");
+    let encoded = general_purpose::STANDARD.encode("runtime_status");
     let encoded = format!("=?base64?{encoded}?=");
     let (status, body) = stateless_2026_jsonrpc(
         &service,
@@ -2453,7 +2567,7 @@ async fn http_mcp_2026_tools_call_requires_matching_name_and_accepts_base64_sent
 async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let params = mcp_2026_ui_params(json!({"uri": MCP_COMPUTER_UI_RESOURCE_URI}));
 
@@ -2539,7 +2653,7 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
         json!({
             "transport": "mcp",
             "resource_uri": MCP_COMPUTER_UI_RESOURCE_URI,
-            "resource_version": "v11",
+            "resource_version": "v12",
             "protocol_era": "stateless_2026",
             "ui_capability_present": true,
             "mcp_error_code": Value::Null,
@@ -2555,7 +2669,7 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
 async fn http_mcp_computer_app_resource_protocol_failure_is_audited_without_content() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let mut params = mcp_2026_ui_params(json!({"uri": MCP_COMPUTER_UI_RESOURCE_URI}));
     params["_meta"]["io.modelcontextprotocol/protocolVersion"] = Value::from("2099-01-01");
@@ -2593,7 +2707,7 @@ async fn http_mcp_computer_app_resource_protocol_failure_is_audited_without_cont
     assert_eq!(http_status, 400);
     let summary: Value = serde_json::from_str(&summary).unwrap();
     assert_eq!(summary["resource_uri"], MCP_COMPUTER_UI_RESOURCE_URI);
-    assert_eq!(summary["resource_version"], "v11");
+    assert_eq!(summary["resource_version"], "v12");
     assert_eq!(summary["protocol_era"], "validation_failed");
     assert_eq!(summary["ui_capability_present"], true);
     assert_eq!(
@@ -2764,11 +2878,14 @@ async fn http_mcp_tools_call_uses_result_envelope_for_success_and_business_failu
     let service = Service::new(build_test_router(config, db, runtime));
 
     for (id, name, arguments, expected_is_error) in [
-        (3, "list_projects", json!({}), false),
+        (3, "runtime_status", json!({"summary_only": true}), false),
         (
             31,
-            "git_status",
-            json!({"project": "agent:nope:nope"}),
+            "read_files",
+            json!({
+                "project": "agent:nope:nope",
+                "items": [{"path": "README.md"}]
+            }),
             true,
         ),
     ] {
@@ -2936,21 +3053,45 @@ async fn http_mcp_notification_returns_accepted_with_empty_body() {
 }
 
 #[tokio::test]
-async fn http_mcp_get_is_method_not_allowed_for_json_only_transport() {
+async fn http_mcp_get_returns_legacy_info_for_non_stateless_requests() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
-    let resp = TestClient::get("http://localhost/mcp")
+    let mut resp = TestClient::get("http://localhost/mcp")
         .bearer_auth("secret")
         .send(&service)
         .await;
-    assert_eq!(effective_status(&resp), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(effective_status(&resp), StatusCode::OK);
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["name"], "webcodex");
+    assert!(body["version"].is_string());
+    assert_eq!(body["protocol"], "mcp");
+    assert!(body["protocolVersion"].is_string());
+    assert_eq!(body["endpoint"], "/mcp");
+    let methods = body["methods"].as_array().unwrap();
+    let method_names: Vec<String> = methods
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect();
+    assert!(method_names.contains(&"initialize".to_string()));
+    assert!(method_names.contains(&"tools/list".to_string()));
+    assert!(method_names.contains(&"tools/call".to_string()));
+    assert!(method_names.contains(&"notifications/initialized".to_string()));
+    assert_eq!(body["auth"]["type"], "bearer");
+    assert_eq!(body["auth"]["required"], true);
     assert_eq!(
-        resp.headers
-            .get("allow")
-            .and_then(|value| value.to_str().ok()),
-        Some("POST")
+        body["auth"]["header"],
+        "Authorization: Bearer <shared_key_or_wc_pat>"
+    );
+    let auth_json = body["auth"].to_string();
+    assert!(
+        auth_json.contains("shared_key_or_wc_pat"),
+        "MCP auth metadata must advertise shared key or wc_pat bearer use: {auth_json}"
+    );
+    assert!(
+        !auth_json.contains("wc_pat_user_api_token"),
+        "MCP auth metadata must not regress to PAT-only placeholder: {auth_json}"
     );
 }
 
@@ -2969,7 +3110,7 @@ fn contains_empty_enum(value: &Value) -> bool {
 async fn http_mcp_tools_list_has_strict_client_compatible_schemas_and_annotations() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let (status, body) = legacy_mcp_jsonrpc(
         &service,
@@ -3003,3 +3144,6 @@ async fn http_mcp_tools_list_has_strict_client_compatible_schemas_and_annotation
         }
     }
 }
+
+#[path = "external_observations.rs"]
+mod external_observations;

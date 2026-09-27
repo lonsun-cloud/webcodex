@@ -34,22 +34,17 @@ fn apply_text_edits_metadata_mcp_openapi_consistency() {
         .as_array()
         .expect("edit category present");
     assert!(edit.iter().any(|v| v == "apply_text_edits"));
-    // OpenAPI ToolCallRequest description lists the name; operation count
-    // stays within the GPT Actions budget because no dedicated operation is added.
-    let spec = crate::openapi::build_openapi_spec();
-    let tool_desc = &spec["components"]["schemas"]["ToolCallRequest"]["properties"]["tool"]
-        ["description"]
-        .as_str()
+    let openapi = crate::openapi::build_openapi_spec();
+    let action = &openapi["paths"]["/api/actions/apply_text_edits"]["post"];
+    assert_eq!(action["operationId"], "apply_text_edits");
+    let action_schema = &action["requestBody"]["content"]["application/json"]["schema"];
+    let canonical = specs
+        .iter()
+        .find(|spec| spec.name == "apply_text_edits")
         .unwrap();
-    assert!(
-        tool_desc.contains("apply_text_edits"),
-        "OpenAPI ToolCallRequest.tool should list apply_text_edits"
+    assert_eq!(
+        action_schema["required"],
+        canonical.input_schema["required"]
     );
-    let count: usize = spec["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|m| m.as_object().unwrap().len())
-        .sum();
-    assert_eq!(count, 22, "OpenAPI operation count must remain 22");
+    assert_eq!(action_schema["additionalProperties"], false);
 }

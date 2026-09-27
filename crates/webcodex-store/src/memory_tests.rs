@@ -6,8 +6,14 @@ use super::*;
 use rusqlite::{params, Connection};
 use std::sync::{Arc, Barrier};
 
+fn compact_digest_id(prefix: &str, value: u64) -> String {
+    let mut bytes = [0_u8; 32];
+    bytes[24..].copy_from_slice(&value.to_be_bytes());
+    format!("{prefix}{}", webcodex_core::compact::encode(bytes))
+}
+
 fn scope(ch: char) -> String {
-    format!("wc_memscope_{}", ch.to_string().repeat(64))
+    compact_digest_id("wc_memscope_", ch as u64)
 }
 
 fn input(key: &str, summary: &str) -> MemorySetInput {
@@ -26,7 +32,7 @@ fn scope_attribution(project: &str, runner: &str, hex: char) -> MemoryScopeAttri
     MemoryScopeAttribution {
         project_runtime_id: project.to_string(),
         runner_client_id: runner.to_string(),
-        root_fingerprint: format!("wc_memroot_{}", hex.to_string().repeat(64)),
+        root_fingerprint: compact_digest_id("wc_memroot_", hex as u64),
     }
 }
 
@@ -220,8 +226,11 @@ fn memory_global_capacity_is_hard_and_does_not_evict() {
         let mut conn = db.conn_for_tests();
         let tx = conn.transaction().unwrap();
         for index in 0..MAX_MEMORIES_GLOBAL {
-            let memory_id = format!("wc_mem_{index:032x}");
-            let memory_scope_id = format!("wc_memscope_{:064x}", index + 100);
+            let memory_id = format!(
+                "wc_mem_{}",
+                webcodex_core::compact::encode(&(index as u128).to_be_bytes()[4..])
+            );
+            let memory_scope_id = compact_digest_id("wc_memscope_", (index + 100) as u64);
             let memory_key = format!("k{index}");
             let definition_hash =
                 memory_definition_hash(&memory_key, "s", "", MemoryPriority::Normal, false, &[]);
@@ -253,14 +262,14 @@ fn memory_global_capacity_is_hard_and_does_not_evict() {
                 params![
                     memory_scope_id,
                     format!("agent:test:global-{index}"),
-                    format!("wc_memroot_{:064x}", index + 1),
+                    compact_digest_id("wc_memroot_", (index + 1) as u64),
                 ],
             )
             .unwrap();
         }
         tx.commit().unwrap();
     }
-    let new_scope = scope('f');
+    let new_scope = compact_digest_id("wc_memscope_", u64::MAX);
     assert_eq!(
         db.set_project_memory(&new_scope, input("new", "global full"))
             .unwrap_err()
@@ -275,7 +284,7 @@ fn memory_global_capacity_is_hard_and_does_not_evict() {
         .unwrap();
     assert_eq!(total as usize, MAX_MEMORIES_GLOBAL);
 
-    let reclaim_scope = format!("wc_memscope_{:064x}", 100);
+    let reclaim_scope = compact_digest_id("wc_memscope_", 100);
     let reclaim = db
         .get_project_memory_scope(&reclaim_scope)
         .unwrap()
@@ -511,7 +520,7 @@ fn corrupted_persisted_memory_rows_fail_closed_before_projection() {
             Box::new(|conn| {
                 conn.execute(
                     "UPDATE project_memories SET revision = ?1",
-                    params![format!("wc_memrev_{}", "0".repeat(64))],
+                    params![compact_digest_id("wc_memrev_", 0)],
                 )
                 .unwrap();
             }),

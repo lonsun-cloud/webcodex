@@ -154,6 +154,25 @@ fn project_single_search(canonical: &ToolResult) -> ToolResult {
     projected
 }
 
+fn extract_single_search_batch_result(batch: &ToolResult) -> ToolResult {
+    assert!(batch.success, "{:?}", batch.error);
+    let items = batch.output["items"]
+        .as_array()
+        .expect("one-query search batch items");
+    assert_eq!(items.len(), 1, "one-query search batch: {}", batch.output);
+    let item = &items[0];
+    ToolResult {
+        success: item["success"]
+            .as_bool()
+            .expect("one-query search item success"),
+        output: item.get("output").cloned().unwrap_or(Value::Null),
+        error: item
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 fn serialized_output_bytes(result: &ToolResult) -> usize {
     serde_json::to_vec(&result.output).unwrap().len()
 }
@@ -391,14 +410,7 @@ fn search_project_text_model_projection_compacts_files_count_and_guides_truncati
     assert_eq!(truncated_sparse.output["result_mode"], "matches");
     assert_eq!(truncated_sparse.output["truncated"], true);
     assert_eq!(truncated_sparse.output["truncation_reason"], "limit");
-    assert_eq!(
-        truncated_sparse.output["continuation"]["kind"],
-        "refine_query"
-    );
-    assert_eq!(
-        truncated_sparse.output["continuation"]["safe_cursor"],
-        false
-    );
+    assert!(truncated_sparse.output.get("continuation").is_none());
     assert!(truncated_sparse.output.get("next_index").is_none());
     assert!(truncated_sparse.output.get("match_offset").is_none());
     assert!(truncated_sparse.output.get("next_match").is_none());
@@ -527,14 +539,15 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         schema["properties"]["max_result_bytes"]["default"],
         64 * 1024
     );
-    assert_eq!(
-        schema["properties"]["max_result_bytes"]["maximum"],
-        512 * 1024
-    );
+    assert_eq!(schema["properties"]["max_result_bytes"]["minimum"], 0);
+    assert!(schema["properties"]["max_result_bytes"]
+        .get("maximum")
+        .is_none());
     let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
         .unwrap();
-    assert!(budget_description.contains("whole-query"));
+    assert!(budget_description.contains("runtime-clamped"));
+    assert!(budget_description.to_lowercase().contains("whole-query"));
     assert!(budget_description.contains("narrow"));
     let removed_input_cursor = ["match", "offset"].join("_");
     assert!(schema["properties"]["queries"]["items"]["properties"]
@@ -549,10 +562,22 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         .unwrap()
         .insert(removed_input_cursor, json!(1));
     assert!(!validates(&removed_cursor_input));
+    for max_result_bytes in [0, 1, 512 * 1024 + 1, 1024 * 1024] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "queries": [{"pattern": "needle"}],
+            "max_result_bytes": max_result_bytes
+        })));
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "queries": [{"pattern": "needle"}],
-        "max_result_bytes": 512 * 1024 + 1
+        "max_result_bytes": -1
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "queries": [{"pattern": "needle"}],
+        "max_result_bytes": "65536"
     })));
     assert!(
         schema["properties"].get("session_id").is_some(),
@@ -599,13 +624,6 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         assert!(ToolCall::from_tool_name("search_project_texts", invalid).is_err());
     }
 
-    let single = spec_named(&specs, "search_project_text");
-    assert!(single.input_schema["properties"].get("queries").is_none());
-    assert_eq!(
-        single.input_schema["required"],
-        json!(["project", "pattern"]),
-        "single-query schema remains unchanged"
-    );
     let success_full = &batch.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0]
         ["properties"]["items"]["items"]["properties"]["output"]["anyOf"][0]["anyOf"][0];
     let removed_output_cursor = ["next", "match", "offset"].join("_");
@@ -646,7 +664,7 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
 }
 
 #[tokio::test]
-async fn search_project_text_default_success_is_sparse_after_session_recording() {
+async fn search_project_texts_one_query_default_success_is_sparse_after_session_recording() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "search-sparse-single";
@@ -663,19 +681,22 @@ async fn search_project_text_default_success_is_sparse_after_session_recording()
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "needle".to_string(),
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "needle".to_string(),
+                            pattern_mode: None,
+                            path: None,
+                            limit: Some(20),
+                            context_before: None,
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: Some(session_id),
-                        pattern_mode: None,
-                        path: None,
-                        limit: Some(20),
-                        context_before: None,
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -685,7 +706,14 @@ async fn search_project_text_default_success_is_sparse_after_session_recording()
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
     complete_search_success(&runtime, client_id, &request, "src/a.rs").await;
 
-    let result = task.await.unwrap();
+    let batch = task.await.unwrap();
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("search_project_texts");
+    let serialized = serde_json::to_value(&batch).unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
+        .unwrap_or_else(|error| {
+            panic!("sparse one-query batch search success must match schema: {error}")
+        });
+    let result = extract_single_search_batch_result(&batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["matches"][0]["path"], "src/a.rs");
     assert!(result.output.get("session_recorded").is_none());
@@ -720,22 +748,13 @@ async fn search_project_text_default_success_is_sparse_after_session_recording()
     );
     eprintln!("search_project_text_sparse_default_bytes={sparse_bytes}");
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("search_project_text");
-    let instance = json!({
-        "success": true,
-        "output": result.output.clone(),
-        "error": null,
-    });
-    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
-        .unwrap_or_else(|error| panic!("sparse search success must match schema: {error}"));
-
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     let finished = summary
         .events
         .iter()
         .rev()
         .find(|event| {
-            event.kind == "tool_call_finished" && event.tool_name == "search_project_text"
+            event.kind == "tool_call_finished" && event.tool_name == "search_project_texts"
         })
         .expect("recorded search completion");
     assert!(
@@ -748,7 +767,7 @@ async fn search_project_text_default_success_is_sparse_after_session_recording()
 }
 
 #[tokio::test]
-async fn search_project_text_nondefault_success_keeps_effective_selection_metadata() {
+async fn search_project_texts_one_query_nondefault_success_keeps_effective_selection_metadata() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "search-noteworthy-single";
@@ -762,19 +781,22 @@ async fn search_project_text_nondefault_success_keeps_effective_selection_metada
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "needle".to_string(),
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "needle".to_string(),
+                            pattern_mode: None,
+                            path: Some("src".to_string()),
+                            limit: Some(20),
+                            context_before: Some(1),
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: Some(5),
+                        }],
                         session_id: None,
-                        path: Some("src".to_string()),
-                        pattern_mode: None,
-                        limit: Some(20),
-                        context_before: Some(1),
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: Some(5),
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -784,7 +806,8 @@ async fn search_project_text_nondefault_success_keeps_effective_selection_metada
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
     complete_search_success(&runtime, client_id, &request, "src/a.rs").await;
 
-    let result = task.await.unwrap();
+    let batch = task.await.unwrap();
+    let result = extract_single_search_batch_result(&batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["path"], "src");
     assert_eq!(result.output["effective_timeout_secs"], 5);
@@ -808,7 +831,7 @@ async fn search_project_text_nondefault_success_keeps_effective_selection_metada
 }
 
 #[tokio::test]
-async fn search_project_text_literal_mode_keeps_effective_metadata() {
+async fn search_project_texts_one_query_literal_mode_keeps_effective_metadata() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "search-literal-single";
@@ -822,19 +845,22 @@ async fn search_project_text_literal_mode_keeps_effective_metadata() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "RuntimeInfo {".to_string(),
-                        pattern_mode: Some(SearchPatternMode::Literal),
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "RuntimeInfo {".to_string(),
+                            pattern_mode: Some(SearchPatternMode::Literal),
+                            path: None,
+                            limit: Some(20),
+                            context_before: None,
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: None,
-                        path: None,
-                        limit: Some(20),
-                        context_before: None,
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -848,7 +874,8 @@ async fn search_project_text_literal_mode_keeps_effective_metadata() {
     assert_eq!(payload["pattern"], r"RuntimeInfo \{");
     complete_search_success(&runtime, client_id, &request, "src/a.rs").await;
 
-    let result = task.await.unwrap();
+    let batch = task.await.unwrap();
+    let result = extract_single_search_batch_result(&batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["pattern_mode"], "literal");
     assert!(result.output.get("backend").is_none());
@@ -906,7 +933,7 @@ async fn search_project_texts_literal_query_preserves_mode_to_runner_and_output(
 }
 
 #[tokio::test]
-async fn search_project_text_grep_fallback_keeps_backend_metadata() {
+async fn search_project_texts_one_query_grep_fallback_keeps_backend_metadata() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "search-grep-visible";
@@ -920,19 +947,22 @@ async fn search_project_text_grep_fallback_keeps_backend_metadata() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "needle".to_string(),
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "needle".to_string(),
+                            pattern_mode: None,
+                            path: None,
+                            limit: Some(20),
+                            context_before: None,
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: None,
-                        path: None,
-                        limit: Some(20),
-                        pattern_mode: None,
-                        context_before: None,
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -946,11 +976,13 @@ async fn search_project_text_grep_fallback_keeps_backend_metadata() {
     );
     complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, stdout, "").await;
 
-    let result = task.await.unwrap();
+    let batch = task.await.unwrap();
+    let result = extract_single_search_batch_result(&batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["backend"], "grep");
     assert_eq!(result.output["result_mode"], "matches");
-    assert_eq!(result.output["effective_timeout_secs"], 30);
+    let effective_timeout = result.output["effective_timeout_secs"].as_u64().unwrap();
+    assert!((29..=30).contains(&effective_timeout));
     assert_eq!(result.output["count"], 1);
     assert_eq!(result.output["truncated"], false);
     assert!(result.output["truncation_reason"].is_null());
@@ -1428,6 +1460,8 @@ async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
             exit_code: Some(0),
             stdout: Some(search_stdout("matches", "src/late.rs", "late")),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(200),
             error: None,
         })
@@ -1462,6 +1496,32 @@ async fn search_project_texts_does_not_retry_nontransient_agent_failures() {
         "invalid_path"
     );
     assert_no_agent_request(&runtime, client_id).await;
+
+    let mut missing_query = query("missing", None);
+    missing_query.path = Some("src/definitely-missing".to_string());
+    let missing_result = run_single_agent_batch_response(
+        "batch-search-no-retry-missing",
+        missing_query,
+        2,
+        r#"{"webcodex_search":{"backend":"native","feature_unavailable":false,"path_status":"not_found"}}
+"#
+        .to_string(),
+        "",
+    )
+    .await;
+    let missing_output = &missing_result.output["items"][0]["output"];
+    assert_eq!(missing_output["reason_code"], "not_found");
+    assert_eq!(missing_output["failure_stage"], "path_resolution");
+    assert_eq!(missing_output["detail_code"], "not_found");
+    assert_eq!(missing_output["state_changed"], false);
+    assert!(missing_output.get("backend").is_none());
+    assert!(missing_output.get("exit_code").is_none());
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("search_project_texts");
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&missing_result).unwrap(),
+        &schema,
+    )
+    .unwrap();
 
     let mut timeout_query = query("timeout", None);
     timeout_query.timeout_secs = Some(1);
@@ -2016,6 +2076,8 @@ async fn search_project_texts_deadline_preserves_fast_result_and_cancels_unfinis
                 exit_code: Some(0),
                 stdout: Some(search_stdout("matches", "src/late.rs", "late")),
                 stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(200),
                 error: None,
             })
@@ -2129,7 +2191,6 @@ async fn search_project_texts_outer_recording_session_preserves_complete_sparse_
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
         ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -2165,11 +2226,9 @@ async fn search_project_texts_outer_recording_session_preserves_complete_sparse_
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
                     ToolInvocationMetadata {
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -2289,7 +2348,6 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
         ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
     use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
@@ -2300,10 +2358,7 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
         Some(project.clone()),
         Some("search final response cap".to_string()),
     );
-    assert_eq!(
-        seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 20),
-        20
-    );
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
     let arguments = json!({
         "project": project,
@@ -2334,11 +2389,10 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
                     },
                     ToolInvocationMetadata {
                         context_request: vec!["webcodex.workflow".to_string()],
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -2364,19 +2418,14 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
     assert!(outcome.success);
     let result = outcome.result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
     assert_eq!(
         result.output["context_projection"]["materials"][0]["key"],
         "webcodex.workflow"
     );
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
+
     assert!(result.output.get("output_truncated").is_none());
     assert!(result.output.get("next_index").is_none());
     assert!(result.output.get("returned_count").is_none());

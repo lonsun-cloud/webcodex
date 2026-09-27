@@ -91,7 +91,12 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
         json!(["project", "session_id"])
     );
     assert_eq!(spec.input_schema["properties"]["limit"]["minimum"], 1);
-    assert_eq!(spec.input_schema["properties"]["limit"]["maximum"], 100);
+    assert!(spec.input_schema["properties"]["limit"]
+        .get("maximum")
+        .is_none());
+    assert!(spec.input_schema["properties"]["limit"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("clamped to 100")));
     assert!(spec.description.to_lowercase().contains("does not run"));
 
     let output = output_schema_for_tool("validation_summary");
@@ -124,25 +129,16 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
     );
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];
-    let description = tool_call["properties"]["tool"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(description.contains("validation_summary"));
-    for field in ["project", "session_id", "limit"] {
-        assert!(
-            tool_call["properties"].get(field).is_some(),
-            "missing {field}"
-        );
-    }
-    assert_eq!(tool_call["additionalProperties"], false);
-    let operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 22);
+    assert!(openapi["paths"]
+        .get("/api/actions/validation_summary")
+        .is_none());
+    assert!(webcodex_tool_contracts::gpt_action_tool_supported(
+        "validation_summary"
+    ));
+    assert_eq!(
+        crate::model_surface::adaptive_runtime_gateway_target_route("validation_summary"),
+        crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+    );
 }
 
 #[tokio::test]
@@ -585,6 +581,8 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
             "stderr_truncated": false,
             "tests_detected": true,
             "tests_run_count": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
             "zero_tests_run": true
         }),
     );
@@ -611,6 +609,12 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
         result.output["validation"]["historical_failures"]["unresolved"],
         true
     );
+    let schema = output_schema_for_tool("validation_summary");
+    let serialized = serde_json::to_value(&result).unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
+        .unwrap_or_else(|error| {
+            panic!("validation_summary runtime/schema drift: {error}; {serialized}")
+        });
 }
 
 #[tokio::test]

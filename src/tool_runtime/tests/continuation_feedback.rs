@@ -261,7 +261,12 @@ async fn diagnostic_coding_workflow(
                 .await
         }
     });
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "diagnostic coding workflow did not finish within {CODING_WORKFLOW_FIXTURE_TIMEOUT:?}"
+        );
         if let Some(req) = runtime
             .runner_registry
             .poll(crate::runner_protocol::RunnerPollRequest {
@@ -420,7 +425,7 @@ fn handoff_call(session_id: &str) -> ToolCall {
         include_workspace: None,
         include_checkpoints: None,
         include_validation: None,
-        summary_only: false,
+        diagnostic: true,
         limit: None,
     }
 }
@@ -477,7 +482,7 @@ async fn handoff_summary_only_and_include_validation_false_shape() {
             include_workspace: None,
             include_checkpoints: None,
             include_validation: Some(false),
-            summary_only: true,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -676,7 +681,7 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
             Some(false),
             Some(false),
             Some(false),
-            false,
+            true,
             Some(20),
             Some(&auth),
         )
@@ -769,7 +774,12 @@ fn meaningful_tool_classification_excludes_status_and_manifest_queries() {
         );
     }
     // Write / shell / git / validation tools do count.
-    for name in ["apply_text_edits", "run_shell", "git_diff", "cargo_test"] {
+    for name in [
+        "apply_text_edits",
+        "run_shell",
+        "show_changes",
+        "cargo_test",
+    ] {
         assert!(is_meaningful(name), "{name} should count as meaningful");
     }
 }
@@ -808,7 +818,7 @@ fn current_validation_window_excludes_pre_mutation_failure_from_attempt_activity
 
     let feedback = feedback_for(&runtime, &summary, "continued");
     assert_eq!(feedback["attempt"]["activity"]["unresolved_failures"], 0);
-    assert_eq!(feedback["attempt"]["validation"]["status"], "passed");
+    assert_eq!(feedback["attempt"]["validation"]["status"], "unproven");
     assert_eq!(
         feedback["attempt"]["validation"]["unresolved_failure_count"],
         0

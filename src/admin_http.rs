@@ -54,8 +54,10 @@ fn compatibility_by_client(status: &Value) -> HashMap<String, String> {
             Some((
                 runner.get("client_id")?.as_str()?.to_string(),
                 runner
-                    .get("status")
+                    .get("protocol_compatibility")
+                    .or_else(|| runner.get("status"))
                     .and_then(Value::as_str)
+                    .filter(|value| matches!(*value, "compatible" | "incompatible" | "unknown"))
                     .unwrap_or("unknown")
                     .to_string(),
             ))
@@ -96,6 +98,21 @@ fn project_dashboard(
         Value::Null
     };
     let compatibility = compatibility_by_client(&status);
+    let alignment: HashMap<String, Value> = status
+        .pointer("/version_compatibility/runners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|runner| {
+            Some((
+                runner.get("client_id")?.as_str()?.to_string(),
+                runner
+                    .get("build_alignment")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .collect();
     let global_compat = status
         .pointer("/version_compatibility/status")
         .and_then(Value::as_str)
@@ -126,6 +143,8 @@ fn project_dashboard(
                     "active_jobs": agent.get("active_jobs").cloned().unwrap_or_else(|| json!(0)),
                     "runner_protocol_generation": agent.get("agent_protocol_generation").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "protocol_compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "build_alignment": alignment.get(client_id).cloned().unwrap_or(Value::Null),
                 })
             })
             .collect::<Vec<_>>()
@@ -182,7 +201,9 @@ fn project_dashboard(
                     },
                     "shell_profile_status": project.get("shell_profile_status").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
-                    "console_hint": "Use /console with that project's credential; credentials never belong in URLs.",
+                    "protocol_compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "build_alignment": alignment.get(client_id).cloned().unwrap_or(Value::Null),
+                    "console_hint": "Use /runtime with that project's credential; credentials never belong in URLs.",
                 })
             })
             .collect::<Vec<_>>()
@@ -208,6 +229,9 @@ fn project_dashboard(
             "projects_online": status.pointer("/projects/agent_registered/online_count").cloned().unwrap_or_else(|| json!(0)),
             "active_jobs": status.pointer("/jobs/active_count").cloned().unwrap_or_else(|| json!(0)),
             "version_compatibility": global_compat,
+            "protocol_compatibility": status.get("protocol_compatibility").cloned().unwrap_or_else(|| json!("unknown")),
+            "build_alignment": status.get("build_alignment").cloned().unwrap_or(Value::Null),
+            "desktop_runtime_contract": status.get("desktop_runtime_contract").cloned().unwrap_or(Value::Null),
         })
     } else {
         Value::Null
@@ -218,7 +242,6 @@ fn project_dashboard(
             "server_transport": status.pointer("/connection_layers/server_transport").cloned().unwrap_or(Value::Null),
             "server_registration": status.pointer("/connection_layers/server_registration").cloned().unwrap_or(Value::Null),
             "project_registry": status.pointer("/connection_layers/project_registry").cloned().unwrap_or(Value::Null),
-            "connector_endpoint": status.pointer("/connection_layers/connector_endpoint").cloned().unwrap_or(Value::Null),
             "version_compatibility": status.get("version_compatibility").cloned().unwrap_or(Value::Null),
         })
     } else {
@@ -482,10 +505,12 @@ mod tests {
         let status = ToolResult::ok(json!({
             "version": "1.2.3",
             "version_compatibility": {
-                "status": "version_mismatch",
+                "status": "compatible",
+                "protocol_compatibility": "compatible",
+                "build_alignment": "different_version",
                 "runners": [
-                    {"client_id":"runner-b","status":"version_mismatch","agent_protocol_generation":2},
-                    {"client_id":"runner-a","status":"compatible","agent_protocol_generation":2}
+                    {"client_id":"runner-b","status":"compatible","protocol_compatibility":"compatible","build_alignment":"different_version","agent_protocol_generation":2},
+                    {"client_id":"runner-a","status":"compatible","protocol_compatibility":"compatible","build_alignment":"exact","agent_protocol_generation":2}
                 ]
             }
         }));
@@ -550,18 +575,17 @@ mod tests {
         assert_eq!(body["devices"][0]["transport"], "websocket");
         assert_eq!(body["devices"][1]["status"], "stale");
         assert_eq!(body["devices"][1]["capabilities"], json!(["git", "shell"]));
-        assert_eq!(body["devices"][1]["compatibility"], "version_mismatch");
+        assert_eq!(body["devices"][1]["compatibility"], "compatible");
+        assert_eq!(body["devices"][1]["build_alignment"], "different_version");
         assert_eq!(body["devices"][1]["runner_protocol_generation"], 2);
         assert_eq!(body["devices"][1]["transport"], "quic");
         assert_eq!(body["projects"][0]["id"], "agent:runner-a:alpha");
         assert_eq!(body["projects"][0]["compatibility"], "compatible");
-        assert_eq!(body["projects"][1]["compatibility"], "version_mismatch");
+        assert_eq!(body["projects"][1]["compatibility"], "compatible");
+        assert_eq!(body["projects"][1]["build_alignment"], "different_version");
         assert_eq!(body["projects"][2]["compatibility"], "unknown");
         assert_eq!(body["projects"][0]["path"], "/safe/alpha");
-        assert_eq!(
-            body["overview"]["version_compatibility"],
-            "version_mismatch"
-        );
+        assert_eq!(body["overview"]["version_compatibility"], "compatible");
     }
 
     #[test]
@@ -705,14 +729,10 @@ mod tests {
 
     #[test]
     fn admin_routes_are_separate_from_console_routes() {
-        let mut admin = crate::route_metadata::iter_routes()
+        let admin = crate::route_metadata::iter_routes()
             .filter(|spec| spec.surface == crate::route_metadata::RouteSurface::Admin);
         assert!(admin
             .clone()
             .all(|spec| spec.path.starts_with("/api/admin/")));
-        assert!(admin.all(|spec| !crate::route_metadata::path_has_surface(
-            spec.path,
-            crate::route_metadata::RouteSurface::HostConsole,
-        )));
     }
 }

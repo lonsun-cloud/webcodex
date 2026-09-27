@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 const SERVER_MAX_PERSISTENT_SHELLS: usize = 64;
 const SERVER_MAX_TERMINAL_SHELLS: usize = 128;
@@ -116,7 +115,10 @@ impl SessionShellRegistry {
             ));
         }
         let now = chrono::Utc::now().timestamp();
-        let shell_id = format!("wc_shell_{}", Uuid::new_v4().simple());
+        let shell_id = (0..16)
+            .map(|_| format!("wc_shell_{}", webcodex_core::compact::random_suffix::<12>()))
+            .find(|id| !state.records.contains_key(id))
+            .ok_or("persistent_shell_identity_allocation_exhausted")?;
         state.records.insert(
             shell_id.clone(),
             SessionShellRecord {
@@ -586,14 +588,15 @@ impl ToolRuntime {
         let _exec_guard = SessionShellExecGuard {
             busy: Arc::clone(&record.busy),
         };
-        let timeout_secs = timeout_secs.unwrap_or(60);
-        if !(1..=3_600).contains(&timeout_secs) {
+        let requested_timeout_secs = timeout_secs.unwrap_or(60);
+        if requested_timeout_secs == 0 {
             return shell_tool_error(
                 "persistent_shell_invalid_timeout",
-                "timeout_secs must be between 1 and 3600",
+                "timeout_secs must be at least 1",
                 Some(&shell_id),
             );
         }
+        let timeout_secs = requested_timeout_secs.min(3_600);
         let client_id = record.client_id.as_deref().unwrap_or_default();
         let request = PersistentShellRequest {
             action: "exec".to_string(),

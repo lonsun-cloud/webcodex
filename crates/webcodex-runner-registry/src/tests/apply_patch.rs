@@ -31,7 +31,6 @@ async fn register_patch_instance(
     supported: bool,
     metadata_supported: bool,
     matching_mode_supported: bool,
-    strict_supported: bool,
 ) -> Result<RunnerView, String> {
     register_instance_with_capabilities(
         registry,
@@ -42,7 +41,6 @@ async fn register_patch_instance(
             apply_patch: supported,
             apply_patch_match_metadata: metadata_supported,
             apply_patch_matching_mode: matching_mode_supported,
-            apply_patch_strict_matching: strict_supported,
             ..Default::default()
         },
     )
@@ -52,7 +50,7 @@ async fn register_patch_instance(
 #[tokio::test]
 async fn enqueue_apply_patch_requires_explicit_capability_and_queues_atomically() {
     let registry = RunnerRegistry::default();
-    register_patch_instance(&registry, "patch-off", false, false, false, false)
+    register_patch_instance(&registry, "patch-off", false, false, false)
         .await
         .unwrap();
     let error = registry
@@ -70,7 +68,7 @@ async fn enqueue_apply_patch_requires_explicit_capability_and_queues_atomically(
         .unwrap()
         .is_none());
 
-    register_patch_instance(&registry, "legacy-patch", true, false, false, false)
+    register_patch_instance(&registry, "legacy-patch", true, false, false)
         .await
         .unwrap();
     let error = registry
@@ -88,7 +86,7 @@ async fn enqueue_apply_patch_requires_explicit_capability_and_queues_atomically(
         .unwrap()
         .is_none());
 
-    register_patch_instance(&registry, "mode-off", true, true, false, false)
+    register_patch_instance(&registry, "mode-off", true, true, false)
         .await
         .unwrap();
     let error = registry
@@ -106,7 +104,7 @@ async fn enqueue_apply_patch_requires_explicit_capability_and_queues_atomically(
         .unwrap()
         .is_none());
 
-    register_patch_instance(&registry, "patch-on", true, true, true, false)
+    register_patch_instance(&registry, "patch-on", true, true, true)
         .await
         .unwrap();
     let (request_id, _rx) = registry
@@ -144,10 +142,8 @@ fn apply_patch_missing_capability_defaults_false_and_is_omitted() {
     assert!(!legacy.apply_patch);
     assert!(!legacy.apply_patch_match_metadata);
     assert!(!legacy.apply_patch_matching_mode);
-    assert!(!legacy.apply_patch_strict_matching);
     let serialized = serde_json::to_value(RunnerCapabilities::default()).unwrap();
     assert!(serialized.get("apply_patch").is_none());
     assert!(serialized.get("apply_patch_match_metadata").is_none());
     assert!(serialized.get("apply_patch_matching_mode").is_none());
-    assert!(serialized.get("apply_patch_strict_matching").is_none());
 }

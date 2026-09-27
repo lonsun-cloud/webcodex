@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebCodex Job Continuation</title>
+<style>
+  :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+  body { margin: 0; padding: 14px; background: transparent; color: CanvasText; }
+  .card { display: grid; gap: 9px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .label { opacity: .62; font-size: 12px; }
+  .value { font-size: 13px; text-align: right; overflow-wrap: anywhere; }
+  .status { font-size: 13px; font-weight: 600; }
+  .hint { opacity: .7; font-size: 12px; line-height: 1.4; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="status" id="status">Connecting…</div>
+  <div class="row"><span class="label">Job</span><span class="value" id="job">—</span></div>
+  <div class="row"><span class="label">Wait</span><span class="value" id="wait">—</span></div>
+  <div class="row"><span class="label">Delivery</span><span class="value" id="delivery">—</span></div>
+  <div class="hint" id="hint">This card observes one exact durable Job terminal wait. Detailed logs remain available through ordinary Job observation.</div>
+</div>
+<script>
+(() => {
+  "use strict";
+  const APP_PROTOCOL = "2026-01-26";
+  const WAIT_ID = /^wc_job_wait_[A-Za-z0-9_-]{16}$/;
+  const ATTEMPT_ID = /^wc_job_delivery_[A-Za-z0-9_-]{16}$/;
+  const CALL_TIMEOUT_MS = 10000;
+  const VISIBLE_POLL_MS = 3000;
+  const HIDDEN_EARLY_POLL_MS = 15000;
+  const HIDDEN_MEDIUM_POLL_MS = 60000;
+  const HIDDEN_LATE_POLL_MS = 300000;
+  const HIDDEN_EARLY_POLLS = 20;
+  const HIDDEN_MEDIUM_POLLS = 25;
+  // MCP Apps exposes the presentation tool result lifecycle but not an authoritative
+  // "current model turn is terminal" signal. Give the invoking turn a bounded yield
+  // window after its tool result before any follow-up ui/message dispatch.
+  const AUTO_RESUME_TURN_YIELD_GRACE_MS = 10000;
+  const MAX_AUTOMATIC_MESSAGE_CHARS = 1024;
+  const TERMINAL_DELIVERY = new Set(["delivered", "delivery_unknown"]);
+
+  let nextRpcId = 1;
+  const pending = new Map();
+  let hostInitialized = false;
+  let tornDown = false;
+  let waitId = null;
+  let bindingId = null;
+  let bindAttempted = false;
+  let timer = null;
+  let coordinationInFlight = false;
+  let projection = null;
+  let prepareUncertain = false;
+  let dispatchStartedAttempt = null;
+  let pendingFinish = null;
+  let rebindAttemptedAfterLoss = false;
+  let carrierLost = false;
+  let hiddenPollCount = 0;
+  let initialToolResultSeen = false;
+  let autoResumeNotBeforeMs = null;
+  let autoResumeSuppressed = false;
+
+  const el = id => document.getElementById(id);
+
+  function allocateBindingId() {
+    try {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      const encoded = btoa(String.fromCharCode(...bytes))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      return "wc_host_binding_" + encoded;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  const viewBindingId = allocateBindingId();
+
+  function request(method, params, timeoutMs = CALL_TIMEOUT_MS) {
+    if (tornDown) return Promise.reject(new Error("App torn down"));
+    const id = nextRpcId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("Host bridge timeout"));
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timeout });
+      parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+    });
+  }
+
+  function notify(method, params) {
+    if (!tornDown) parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+  }
+
+  function callToolResultOf(result) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const nested = result.result;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)
+      && (nested.structuredContent || nested.structured_content || Array.isArray(nested.content)
+        || typeof nested.success === "boolean" || Object.prototype.hasOwnProperty.call(nested, "isError"))) {
+      return nested;
+    }
+    return result;
+  }
+
+  function canonicalEnvelope(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.success === "boolean"
+      && (Object.prototype.hasOwnProperty.call(value, "output")
+        || Object.prototype.hasOwnProperty.call(value, "error")));
+  }
+
+  function structuredOf(result) {
+    const callResult = callToolResultOf(result);
+    if (!callResult || typeof callResult !== "object" || Array.isArray(callResult)) return null;
+    if (canonicalEnvelope(callResult)) return callResult;
+    const blocks = Array.isArray(callResult.content) ? callResult.content : [];
+    for (const block of blocks) {
+      if (!block || block.type !== "text" || typeof block.text !== "string") continue;
+      try {
+        const parsed = JSON.parse(block.text);
+        if (canonicalEnvelope(parsed)) return parsed;
+      } catch (_) {}
+    }
+    const direct = callResult.structuredContent || callResult.structured_content;
+    return canonicalEnvelope(direct) ? direct : null;
+  }
+
+  function outputOf(result) {
+    const structured = structuredOf(result);
+    return structured && structured.output && typeof structured.output === "object"
+      ? structured.output : null;
+  }
+
+  function toolCallSucceeded(result) {
+    const callResult = callToolResultOf(result);
+    const structured = structuredOf(callResult);
+    return !!(callResult && callResult.isError !== true && structured && structured.success === true);
+  }
+
+  async function callTool(name, args) {
+    return request("tools/call", { name, arguments: args });
+  }
+
+  function validProjection(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && value.version === 1
+      && WAIT_ID.test(value.wait_id || "")
+      && typeof value.job_id === "string" && value.job_id.length > 0 && value.job_id.length <= 128
+      && ["waiting", "triggered"].includes(value.state)
+      && ["not_ready", "pending", "prepared", "delivered", "delivery_unknown"].includes(value.delivery_state)
+      && typeof value.automatic_resume_available === "boolean"
+      && Number.isSafeInteger(value.expires_at));
+  }
+
+  function projectionOf(result) {
+    const output = outputOf(result);
+    const value = output && output.job_terminal_continuation;
+    return validProjection(value) ? value : null;
+  }
+
+  function sameWait(value) {
+    return validProjection(value) && waitId && value.wait_id === waitId;
+  }
+
+  function expired(value) {
+    return value && Number.isSafeInteger(value.expires_at)
+      && Math.floor(Date.now() / 1000) >= value.expires_at;
+  }
+
+  function armAutomaticResumeFromInitialToolResult(value) {
+    if (initialToolResultSeen) return;
+    initialToolResultSeen = true;
+    if (value.state === "waiting" && value.delivery_state === "not_ready") {
+      autoResumeNotBeforeMs = Date.now() + AUTO_RESUME_TURN_YIELD_GRACE_MS;
+    } else {
+      // If the presentation tool result already carries terminal truth, the
+      // invoking model turn can handle it directly; do not enqueue a redundant turn.
+      autoResumeSuppressed = true;
+    }
+  }
+
+  function automaticResumeDelayMs() {
+    if (autoResumeSuppressed || autoResumeNotBeforeMs === null) return null;
+    return Math.max(0, autoResumeNotBeforeMs - Date.now());
+  }
+
+  function render(value) {
+    if (!validProjection(value)) return;
+    projection = value;
+    el("job").textContent = value.job_id;
+    el("wait").textContent = value.wait_id;
+    el("delivery").textContent = value.delivery_state;
+    if (expired(value)) {
+      el("status").textContent = "Terminal attention expired";
+      return;
+    }
+    if (value.delivery_state === "delivered") {
+      el("status").textContent = "Continuation accepted by Host";
+    } else if (value.delivery_state === "delivery_unknown") {
+      el("status").textContent = "Continuation delivery is unknown";
+    } else if (value.delivery_state === "prepared") {
+      el("status").textContent = "Continuation prepared";
+    } else if (value.state === "triggered") {
+      if (autoResumeSuppressed) {
+        el("status").textContent = "Job finished · terminal result already available";
+      } else if (automaticResumeDelayMs() > 0) {
+        el("status").textContent = "Job finished · waiting for current turn to yield…";
+      } else {
+        el("status").textContent = "Job finished · continuing…";
+      }
+    } else if (bindingId) {
+      el("status").textContent = "Waiting for Job completion";
+    } else {
+      el("status").textContent = "Connecting…";
+    }
+  }
+
+  function shouldStop(value = projection) {
+    return carrierLost
+      || !!(value && (TERMINAL_DELIVERY.has(value.delivery_state) || expired(value)))
+      || !!(value && autoResumeSuppressed && value.state === "triggered");
+  }
+
+  function nextPollDelay() {
+    if (!document.hidden) {
+      hiddenPollCount = 0;
+      return VISIBLE_POLL_MS;
+    }
+    const delay = hiddenPollCount < HIDDEN_EARLY_POLLS
+      ? HIDDEN_EARLY_POLL_MS
+      : hiddenPollCount < HIDDEN_EARLY_POLLS + HIDDEN_MEDIUM_POLLS
+        ? HIDDEN_MEDIUM_POLL_MS
+        : HIDDEN_LATE_POLL_MS;
+    hiddenPollCount += 1;
+    return delay;
+  }
+
+  function scheduleNext() {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (tornDown || shouldStop()) return;
+    let delay = nextPollDelay();
+    if (projection && projection.state === "triggered" && projection.delivery_state === "pending") {
+      const remaining = automaticResumeDelayMs();
+      if (remaining !== null && remaining > 0) delay = remaining;
+    }
+    timer = setTimeout(() => {
+      timer = null;
+      void reconcile();
+    }, delay);
+  }
+
+  async function bind() {
+    if (!hostInitialized || !waitId || !viewBindingId || tornDown) return false;
+    bindAttempted = true;
+    const response = await callTool("job_terminal_continuation_bind", {
+      wait_id: waitId,
+      binding_id: viewBindingId,
+    });
+    const output = outputOf(response);
+    const value = projectionOf(response);
+    if (!toolCallSucceeded(response) || !output || !value
+      || !output.host_binding || output.host_binding.bound !== true || !sameWait(value)) {
+      throw new Error("Job continuation bind was not accepted");
+    }
+    bindingId = viewBindingId;
+    rebindAttemptedAfterLoss = false;
+    render(value);
+    return true;
+  }
+
+  async function state() {
+    if (!waitId || !bindingId || tornDown) return null;
+    const response = await callTool("job_terminal_continuation_state", {
+      wait_id: waitId,
+      binding_id: bindingId,
+    });
+    const output = outputOf(response);
+    const value = projectionOf(response);
+    if (!toolCallSucceeded(response) || !output || !value || !sameWait(value)
+      || !output.host_binding || output.host_binding.bound !== true) {
+      throw new Error("Job continuation state was not accepted");
+    }
+    render(value);
+    const preparedAttemptId = output.app_protocol && output.app_protocol.prepared_attempt_id;
+    return {
+      projection: value,
+      preparedAttemptId: ATTEMPT_ID.test(preparedAttemptId || "") ? preparedAttemptId : null,
+    };
+  }
+
+  async function finish(attemptId, outcome) {
+    try {
+      const response = await callTool("job_terminal_continuation_finish", {
+        wait_id: waitId,
+        binding_id: bindingId,
+        attempt_id: attemptId,
+        outcome,
+      });
+      const output = outputOf(response);
+      if (!toolCallSucceeded(response) || !output || output.wait_id !== waitId
+        || output.attempt_id !== attemptId
+        || !["delivered", "delivery_unknown"].includes(output.delivery_state)) {
+        throw new Error("Job continuation finish was not accepted");
+      }
+      pendingFinish = null;
+      if (projection) render(Object.assign({}, projection, { delivery_state: output.delivery_state }));
+      return true;
+    } catch (_) {
+      if (!tornDown) pendingFinish = { attemptId, outcome };
+      return false;
+    }
+  }
+
+  async function reconcilePrepareUncertainty(current) {
+    if (!prepareUncertain) return false;
+    if (current.projection.delivery_state === "prepared" && current.preparedAttemptId) {
+      await finish(current.preparedAttemptId, "delivery_unknown");
+      return true;
+    }
+    if (current.projection.delivery_state === "pending") {
+      // Authoritative state proves the durable prepare fence was not crossed.
+      prepareUncertain = false;
+      return false;
+    }
+    prepareUncertain = false;
+    return true;
+  }
+
+  async function prepareAndDispatch() {
+    if (prepareUncertain || dispatchStartedAttempt || pendingFinish || tornDown
+      || autoResumeSuppressed || autoResumeNotBeforeMs === null || Date.now() < autoResumeNotBeforeMs) return;
+    let response;
+    try {
+      response = await callTool("job_terminal_continuation_prepare", {
+        wait_id: waitId,
+        binding_id: bindingId,
+      });
+    } catch (_) {
+      prepareUncertain = true;
+      return;
+    }
+    const output = outputOf(response);
+    const message = output && output.app_protocol && output.app_protocol.automatic_message;
+    const attemptId = output && output.attempt_id;
+    if (!toolCallSucceeded(response) || !output || output.wait_id !== waitId
+      || output.delivery_state !== "prepared" || output.dispatch_observation !== "dispatch_prepared"
+      || !ATTEMPT_ID.test(attemptId || "")
+      || typeof message !== "string" || message.trim().length === 0
+      || message.length > MAX_AUTOMATIC_MESSAGE_CHARS) {
+      // The response may have been malformed after the durable fence. Never guess
+      // an automatic message and never dispatch until authoritative state reconciles it.
+      prepareUncertain = true;
+      return;
+    }
+
+    // Set the local dispatch fence before Host dispatch. Replacement Views observe
+    // the durable prepared state and the Server reconciles it conservatively.
+    dispatchStartedAttempt = attemptId;
+    let outcome = "delivery_unknown";
+    try {
+      await request("ui/message", {
+        role: "user",
+        content: [{ type: "text", text: message }],
+      });
+      outcome = "dispatch_accepted";
+    } catch (_) {
+      // Host rejection, timeout, or response loss after prepare is unknown.
+    }
+    await finish(attemptId, outcome);
+  }
+
+  async function rebindAfterBindingLoss() {
+    if (rebindAttemptedAfterLoss || tornDown) {
+      carrierLost = true;
+      return false;
+    }
+    rebindAttemptedAfterLoss = true;
+    bindingId = null;
+    try {
+      await bind();
+      return !!bindingId;
+    } catch (_) {
+      carrierLost = true;
+      return false;
+    }
+  }
+
+  async function reconcile() {
+    if (tornDown || coordinationInFlight || !hostInitialized || !waitId) return scheduleNext();
+    coordinationInFlight = true;
+    try {
+      if (!bindingId) {
+        await bind();
+        if (!bindingId || shouldStop()) return;
+      }
+      if (pendingFinish) {
+        const retry = { ...pendingFinish };
+        if (await finish(retry.attemptId, retry.outcome)) {
+          if (shouldStop()) return;
+        } else {
+          try {
+            const current = await state();
+            if (current && shouldStop(current.projection)) {
+              pendingFinish = null;
+              return;
+            }
+          } catch (_) {
+            if (!await rebindAfterBindingLoss()) {
+              throw new Error("Job continuation binding unavailable");
+            }
+            if (shouldStop()) {
+              pendingFinish = null;
+              return;
+            }
+          }
+          return;
+        }
+      }
+      let current;
+      try {
+        current = await state();
+      } catch (_) {
+        // Process bindings disappear on Server restart. One bounded rebind attempt
+        // lets a surviving View recover a pending wait; a stale same-process View
+        // is rejected by the Server's retired binding fence and stops polling.
+        if (!await rebindAfterBindingLoss()) {
+          throw new Error("Job continuation binding unavailable");
+        }
+        if (shouldStop()) return;
+        current = await state();
+      }
+      if (!current || shouldStop(current.projection)) return;
+      if (await reconcilePrepareUncertainty(current)) return;
+      if (current.projection.delivery_state === "prepared") {
+        // A prepared attempt that this View did not dispatch is never resent.
+        if (current.preparedAttemptId) await finish(current.preparedAttemptId, "delivery_unknown");
+        return;
+      }
+      if (current.projection.state === "triggered" && current.projection.delivery_state === "pending") {
+        await prepareAndDispatch();
+      }
+    } catch (_) {
+      if (!tornDown) el("status").textContent = "Continuation carrier unavailable";
+    } finally {
+      coordinationInFlight = false;
+      scheduleNext();
+    }
+  }
+
+  function acceptToolInput(params) {
+    const args = params && params.arguments;
+    const candidate = args && !Array.isArray(args) ? args.wait_id : null;
+    if (!WAIT_ID.test(candidate || "")) return;
+    if (waitId && waitId !== candidate) return;
+    waitId = candidate;
+    el("wait").textContent = waitId;
+    void reconcile();
+  }
+
+  function acceptToolResult(result) {
+    const value = projectionOf(result);
+    if (!value) return;
+    if (waitId && value.wait_id !== waitId) return;
+    waitId = value.wait_id;
+    armAutomaticResumeFromInitialToolResult(value);
+    render(value);
+    void reconcile();
+  }
+
+  function bestEffortUnbind() {
+    if (!waitId || !viewBindingId || !bindAttempted || tornDown) return;
+    const id = nextRpcId++;
+    parent.postMessage({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "job_terminal_continuation_unbind",
+        arguments: { wait_id: waitId, binding_id: viewBindingId },
+      },
+    }, "*");
+  }
+
+  function teardown() {
+    if (tornDown) return;
+    bestEffortUnbind();
+    tornDown = true;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timeout);
+      entry.reject(new Error("App torn down"));
+    }
+    pending.clear();
+  }
+
+  addEventListener("message", event => {
+    if (event.source !== parent) return;
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0") return;
+    if (Object.prototype.hasOwnProperty.call(msg, "id") && pending.has(msg.id)) {
+      const entry = pending.get(msg.id);
+      pending.delete(msg.id);
+      clearTimeout(entry.timeout);
+      if (msg.error) entry.reject(new Error("Host request failed"));
+      else entry.resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-input") {
+      acceptToolInput(msg.params);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result") {
+      acceptToolResult(msg.params);
+      return;
+    }
+    if (msg.method === "ui/resource-teardown") {
+      teardown();
+      if (Object.prototype.hasOwnProperty.call(msg, "id")) {
+        parent.postMessage({ jsonrpc: "2.0", id: msg.id, result: {} }, "*");
+      }
+    }
+  });
+
+  addEventListener("visibilitychange", () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (!document.hidden) hiddenPollCount = 0;
+    void reconcile();
+  });
+  addEventListener("pagehide", teardown, { once: true });
+  addEventListener("beforeunload", teardown, { once: true });
+
+  request("ui/initialize", {
+    protocolVersion: APP_PROTOCOL,
+    appInfo: {
+      name: "webcodex-job-terminal-continuation-app",
+      title: "WebCodex Job Continuation",
+      version: "1.0.0",
+    },
+    appCapabilities: {},
+  }).then(() => {
+    if (tornDown) return;
+    hostInitialized = true;
+    notify("ui/notifications/initialized", {});
+    void reconcile();
+  }).catch(() => {
+    if (!tornDown) el("status").textContent = "Host connection unavailable";
+  });
+})();
+</script>
+</body>
+</html>

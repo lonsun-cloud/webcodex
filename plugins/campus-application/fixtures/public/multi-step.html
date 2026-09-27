@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>多步骤秋招网申 Fixture</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="shell">
+  <h1>2027 届校园招聘 — 多步骤 Fixture</h1>
+  <div class="note">用于验证 fill → next → fresh snapshot → re-plan。最终提交按钮只用于验证 review boundary，不会由 Plugin 自动点击。</div>
+  <div id="wizard-progress" class="status" aria-live="polite"></div>
+  <form>
+    <section class="wizard-step" data-step="1">
+      <h2>基本信息</h2>
+      <div class="grid">
+        <div><label for="ms-name">姓名</label><input id="ms-name"></div>
+        <div><label for="ms-email">邮箱</label><input id="ms-email" type="email"></div>
+        <div><label for="ms-phone">手机号</label><input id="ms-phone"></div>
+        <div><label for="ms-city">所在城市</label><input id="ms-city"></div>
+      </div>
+      <div class="actions"><button type="button" data-next>下一步</button></div>
+    </section>
+
+    <section class="wizard-step" data-step="2" hidden>
+      <h2>教育经历</h2>
+      <div id="ms-education"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="ms-add-education">新增教育经历</button>
+        <button type="button" data-next>保存并进入下一步</button>
+      </div>
+    </section>
+
+    <section class="wizard-step" data-step="3" hidden>
+      <h2>实习与项目经历</h2>
+      <div id="ms-experience"></div>
+      <div class="actions"><button type="button" class="secondary" id="ms-add-experience">新增实习经历</button></div>
+      <div id="ms-projects"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="ms-add-project">新增项目经历</button>
+        <button type="button" data-next>继续</button>
+      </div>
+    </section>
+
+    <section class="wizard-step" data-step="4" hidden>
+      <h2>确认信息</h2>
+      <p>请检查以上信息。这个本地 fixture 不会向任何招聘系统发送数据。</p>
+      <button type="submit" id="ms-submit">提交申请</button>
+    </section>
+    <div id="status" class="status">尚未提交。</div>
+  </form>
+</main>
+<script src="/multi-step.js"></script>
+<script src="/fixture.js"></script>
+</body>
+</html>

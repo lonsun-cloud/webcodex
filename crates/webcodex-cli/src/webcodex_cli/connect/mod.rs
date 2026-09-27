@@ -323,6 +323,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn connect_rejects_retired_projects_dir_before_network_or_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        // macOS /var is a symlink. Exercise the retired-field validation rather
+        // than the independent credential-directory symlink defense.
+        let root = tmp.path().canonicalize().unwrap();
+        let config_base = root.join("config");
+        let state_base = root.join("state");
+        let project = root.join("repo");
+        let profile_dir = config_base.join("clients/legacy");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("runner.toml"),
+            format!(
+                "server_url = \"http://127.0.0.1:9\"\ntoken = \"shared-key\"\nclient_id = \"client\"\nprojects_dir = {:?}\n",
+                profile_dir.join("projects.d").to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let error = run_connect(ConnectOptions {
+            server_url: "http://127.0.0.1:9".to_string(),
+            server_http: webcodex_admin::ServerHttpOptions::default(),
+            key: Some("shared-key".to_string()),
+            key_file: None,
+            auth: ConnectAuth::SharedKey,
+            oauth_redirect_uri: None,
+            oauth_computer_permissions: false,
+            oauth_local_mcp: false,
+            oauth_local_plugins: false,
+            oauth_local_ssh: false,
+            oauth_coding_agent: false,
+            username: None,
+            project,
+            profile: Some("legacy".to_string()),
+            client_id: None,
+            project_id: None,
+            config_base: Some(config_base),
+            state_base: Some(state_base),
+            runner_bin: None,
+            wait_timeout_ms: 100,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
+        let registry = profile_dir.join("project-registry");
+        assert!(
+            !registry.exists()
+                || std::fs::read_dir(&registry).unwrap().all(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    != Some("toml")),
+            "migration failure must not persist a project registration"
+        );
+    }
+
     #[test]
     fn generated_key_marker_is_committed_only_after_write_and_flush() {
         let tmp = tempfile::tempdir().unwrap();

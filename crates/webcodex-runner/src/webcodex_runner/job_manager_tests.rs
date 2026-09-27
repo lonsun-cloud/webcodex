@@ -1,3 +1,6 @@
+use super::super::config::DEFAULT_MAX_CONCURRENT_JOBS;
+use super::super::output_text::OutputTextDecoder;
+use super::super::transport::WS_OUTGOING_CAPACITY;
 use super::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::webcodex_runner::detached_job::{
@@ -6,11 +9,15 @@ use crate::webcodex_runner::detached_job::{
 };
 use serde_json::json;
 use std::ffi::OsString;
+#[cfg(feature = "runner-real-process-tests")]
 use std::io::BufReader;
+#[cfg(feature = "runner-real-process-tests")]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use tempfile::TempDir;
+use webcodex_core::runner_protocol::{RunnerEnvelope, VALIDATION_STEP_WAIT_FAILED_CODE};
 
 fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     let mut snapshot = test_job_snapshot(job_id);
@@ -87,6 +94,66 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
         .iter()
         .skip(1)
         .all(|snapshot| runner_job_is_terminal(&snapshot.status)));
+}
+
+#[test]
+fn runner_structured_timeout_admission_matches_execution_form_ceilings() {
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        21_600,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS,
+    )
+    .is_ok());
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS + 1,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS,
+    )
+    .is_err());
+
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    )
+    .is_ok());
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS + 1,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    )
+    .is_err());
+}
+
+#[test]
+fn terminal_inventory_retains_past_old_fifteen_minutes_and_prunes_at_24h_boundary() {
+    let manager = JobManager::new(1);
+    let now = chrono::Utc::now().timestamp();
+    let old_fifteen_minute_id = "terminal-past-old-fifteen-minute-window";
+    let expired_id = "terminal-at-24h-boundary";
+    lock_unpoison(&manager.jobs).insert(
+        old_fifteen_minute_id.to_string(),
+        retained_terminal_job(old_fifteen_minute_id, now - 15 * 60 - 1),
+    );
+    lock_unpoison(&manager.jobs).insert(
+        expired_id.to_string(),
+        retained_terminal_job(expired_id, now - JOB_TERMINAL_RETENTION_SECS),
+    );
+
+    assert_eq!(JOB_TERMINAL_RETENTION_SECS, 86_400);
+    let inventory = manager.inventory();
+    assert!(inventory
+        .jobs
+        .iter()
+        .any(|snapshot| snapshot.job_id == old_fifteen_minute_id));
+    assert!(!inventory
+        .jobs
+        .iter()
+        .any(|snapshot| snapshot.job_id == expired_id));
 }
 
 #[test]
@@ -170,7 +237,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             ..Default::default()
         },
     );
-    let first = recv_job_update(&mut rx, Duration::from_secs(2), "incremental update");
+    let first = recv_job_update(&mut rx, Duration::from_secs(5), "incremental update");
     assert_eq!(first.update_seq, Some(2));
     assert!(first.stdout_chunk.is_none());
     let first_logs = first
@@ -249,7 +316,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         runner_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
-    assert!(wait_until(Duration::from_secs(2), || {
+    assert!(wait_until(Duration::from_secs(5), || {
         !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
     }));
     while reconnected_rx.try_recv().is_ok() {}
@@ -274,7 +341,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     manager.replay_snapshots_since(&registered_inventory);
     let replay = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "post-register replay",
     );
     assert_eq!(replay.job_id, "offline-terminal-job");
@@ -284,10 +351,23 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     assert_eq!(logs.stdout.tail, "one\ntwo\n");
     assert_eq!(logs.stdout.next_line, 3);
 
+    // Receiving the replay proves it entered the transport queue, but the
+    // delivery worker may not yet have acknowledged the same update_seq in its
+    // local pending queue. Wait for that first delivery to retire before
+    // simulating a later server stop; otherwise the resend can legitimately
+    // coalesce with the still-pending identical sequence and the test races its
+    // own delivery bookkeeping.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
+        }),
+        "first terminal replay must retire before simulating the later stop"
+    );
+
     manager.stop("offline-terminal-job").unwrap();
     let stopped_race = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "stop racing a lost terminal update replays the terminal snapshot",
     );
     assert_eq!(stopped_race.status, "completed");
@@ -398,7 +478,7 @@ fn detached_job_request(
                     .into_owned(),
                 args: vec![
                     "--exact".to_string(),
-                    "job_manager_tests::detached_job_payload_subprocess_entrypoint".to_string(),
+                    "webcodex_runner::job_manager::job_manager_tests::detached_job_payload_subprocess_entrypoint".to_string(),
                     "--nocapture".to_string(),
                 ],
             },
@@ -3234,6 +3314,110 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
 
 #[cfg(unix)]
 #[test]
+fn cargo_test_terminal_count_evidence_survives_runner_stream_retention() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 7000 ]; do printf 'noise-%04d\\n' \"$i\"; i=$((i + 1)); done\nprintf 'running 120 tests\\n'\nprintf 'test result: ok. 100 passed; 0 failed; 0 ignored\\n'\nprintf 'test result: ok. 20 passed; 0 failed; 0 ignored\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let step = ShellJobValidationStep {
+        name: "test".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        env: Vec::new(),
+    };
+    let mut context = test_job_context(temp.path(), vec!["test".to_string()]);
+    context.purpose = Some("test".to_string());
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        source_fence: None,
+        tool: "cargo_test".to_string(),
+        kind: "test".to_string(),
+        steps: vec![step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 10,
+        adapter: "cargo_test".to_string(),
+        validation_target_id: None,
+        minimum_tests: Some(100),
+        require_tests: Some(true),
+        no_run: None,
+    });
+
+    let (sink, mut rx) = structured_test_sink("validation-agent", "validation-instance");
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            shell,
+            SshConfig::default(),
+            temp.path().join("project-registry"),
+            serde_json::from_value(json!({
+                "request_id": "cargo-count-retention-request",
+                "client_id": "validation-agent",
+                "kind": "start_validation_job",
+                "job_id": "cargo-count-retention-job",
+                "cwd": temp.path(),
+                "command": serde_json::to_string(&[step]).unwrap(),
+                "timeout_secs": 60,
+                "requested_by": "test",
+                "created_at": 1,
+                "job_context": context,
+            }))
+            .unwrap(),
+        ),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(30));
+    let terminal = updates
+        .iter()
+        .rev()
+        .find(|update| update.finished)
+        .expect("cargo test terminal update");
+    assert_eq!(terminal.status, "completed", "{terminal:?}");
+    assert_eq!(terminal.exit_code, Some(0));
+    let logs = terminal
+        .log_snapshot
+        .as_ref()
+        .expect("terminal bounded logs");
+    assert!(logs.stdout.truncated);
+    assert!(logs.stdout.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    let evidence = terminal
+        .test_count_evidence
+        .as_ref()
+        .expect("authoritative terminal test-count evidence");
+    assert!(evidence.tests_detected);
+    assert_eq!(evidence.tests_run_count, Some(120));
+    assert_eq!(
+        evidence.status,
+        webcodex_core::validation_evidence::CargoTestCountEvidenceStatus::CompleteSummary
+    );
+
+    let snapshot = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "cargo-count-retention-job")
+        .expect("terminal snapshot in Runner inventory");
+    assert!(snapshot.stdout.truncated);
+    assert_eq!(snapshot.test_count_evidence, terminal.test_count_evidence);
+}
+
+#[cfg(unix)]
+#[test]
 fn validation_job_exposes_activity_during_silent_step_and_clears_terminal() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -4028,7 +4212,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
 /// Platform-native liveness probe for job descendants, so the tree tests never
 /// shell out to `tasklist`/`ps`/PowerShell.
 #[cfg(windows)]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -4048,7 +4232,7 @@ pub(super) fn process_running(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     let bytes = unsafe {
@@ -4068,14 +4252,14 @@ pub(super) fn process_running(pid: u32) -> bool {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     // SAFETY: signal 0 is an existence probe; the pid comes from our own
     // helper subprocess.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -4130,6 +4314,7 @@ fn wait_for_pid_marker(path: &Path, deadline: Instant, tag: &str) -> u32 {
 }
 
 /// Poll `process_running(pid)` until the process is gone or `timeout` elapses.
+#[cfg(feature = "runner-real-process-tests")]
 fn wait_for_process_exit(pid: u32, timeout: Duration, tag: &str) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -4157,13 +4342,16 @@ fn wait_for_process_exit(pid: u32, timeout: Duration, tag: &str) -> bool {
 
 /// Compiled copy of the `process_tree_helper` fixture, kept alive for the whole
 /// test process so its binary path never disappears under a running grandchild.
+#[cfg(feature = "runner-real-process-tests")]
 struct JobTreeHelper {
     _temp: TempDir,
     path: PathBuf,
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 static JOB_TREE_HELPER: OnceLock<Arc<JobTreeHelper>> = OnceLock::new();
 
+#[cfg(feature = "runner-real-process-tests")]
 fn job_tree_helper() -> Arc<JobTreeHelper> {
     JOB_TREE_HELPER
         .get_or_init(|| {
@@ -4199,6 +4387,7 @@ fn job_tree_helper() -> Arc<JobTreeHelper> {
 /// A background line reader over a job's captured stdout. Each complete line is
 /// delivered as `Line`, and a final `Eof` marks the pipe closing (which a
 /// descendant holding the write end would otherwise delay indefinitely).
+#[cfg(feature = "runner-real-process-tests")]
 enum JobTreeOut {
     Line(Vec<u8>),
     Eof,
@@ -4207,6 +4396,7 @@ enum JobTreeOut {
 /// Spawn the helper in `mode`, capturing its stdout and piping it through a
 /// background line reader. The helper's descendants inherit the stdout write
 /// end, so `Eof` only arrives once the whole tree is gone.
+#[cfg(feature = "runner-real-process-tests")]
 fn spawn_helper_raw(mode: &str, args: &[&str]) -> (ManagedChild, mpsc::Receiver<JobTreeOut>) {
     let helper = job_tree_helper();
     let mut cmd = Command::new(&helper.path);
@@ -4249,6 +4439,7 @@ fn spawn_helper_raw(mode: &str, args: &[&str]) -> (ManagedChild, mpsc::Receiver<
     (managed, rx)
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn read_grandchild_pid(rx: &mpsc::Receiver<JobTreeOut>) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -4272,6 +4463,7 @@ fn read_grandchild_pid(rx: &mpsc::Receiver<JobTreeOut>) -> u32 {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn wait_for_stdout_eof(rx: &mpsc::Receiver<JobTreeOut>, timeout: Duration, tag: &str) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -4289,6 +4481,7 @@ fn wait_for_stdout_eof(rx: &mpsc::Receiver<JobTreeOut>, timeout: Duration, tag: 
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn extract_grandchild_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         line.trim()
@@ -4299,6 +4492,7 @@ fn extract_grandchild_pid(text: &str) -> Option<u32> {
     })
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn insert_running_job(
     manager: &JobManager,
     job_id: &str,
@@ -4319,12 +4513,14 @@ fn insert_running_job(
     stop_requested
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 struct RunningJobTreeFixture {
     parent_pid: u32,
     grandchild_pid: u32,
     output: mpsc::Receiver<JobTreeOut>,
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 impl RunningJobTreeFixture {
     fn assert_terminated(&self, timeout: Duration, tag: &str) {
         assert!(
@@ -4342,6 +4538,7 @@ impl RunningJobTreeFixture {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn seed_running_job_tree(
     manager: &JobManager,
     job_id: &str,
@@ -4368,6 +4565,7 @@ fn seed_running_job_tree(
 /// An explicit stop terminates the whole job process tree, including a
 /// descendant that inherited the stdout pipe, and the stdout reader reaches
 /// EOF instead of blocking forever.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_terminates_whole_tree_including_descendant() {
@@ -4396,6 +4594,7 @@ fn runner_real_process_job_stop_terminates_whole_tree_including_descendant() {
 /// The job worker's cleanup sequence (bounded tree wait, force terminate, then
 /// reader join) must kill an orphaned descendant that keeps the stdout pipe
 /// open, and the output reader must reach EOF instead of being detached.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_reaches_eof() {
@@ -4461,7 +4660,14 @@ fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_r
     // This is exactly what the job worker runs after the direct child's status
     // is decided.
     cleanup_managed_tree(&child);
-    let detached = join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
+    let mut stderr = String::new();
+    let detached = drain_and_join_reader_threads_until(
+        readers,
+        &rx,
+        &mut accumulated,
+        &mut stderr,
+        Instant::now() + Duration::from_secs(1),
+    );
     assert_eq!(
         detached, 0,
         "stdout reader must finish on EOF instead of being detached"
@@ -4478,6 +4684,7 @@ fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_r
 
 /// A shutdown drain terminates every running job's whole tree, leaves a
 /// completed job untouched, and is bounded.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed_jobs() {
@@ -4522,6 +4729,7 @@ fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed
 
 /// Repeated stops are idempotent: the second stop must not panic and must not
 /// leave the tree running.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_twice_is_idempotent() {
@@ -4540,6 +4748,7 @@ fn runner_real_process_job_stop_twice_is_idempotent() {
 
 /// Stopping a job whose tree already exited naturally must not panic and must
 /// report success.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_after_natural_exit_does_not_panic() {
@@ -4565,6 +4774,7 @@ fn runner_real_process_job_stop_after_natural_exit_does_not_panic() {
 
 /// Dropping the last real JobManager owner must terminate an active tree even
 /// while a worker clone still holds the jobs map and ManagedChild Arc.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_last_job_manager_owner_drop_terminates_running_tree_with_worker_clone_alive()
@@ -4588,6 +4798,7 @@ fn runner_real_process_last_job_manager_owner_drop_terminates_running_tree_with_
 }
 
 /// Cleanup on an already-exited tree must be a no-op that never panics.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_cleanup_managed_tree_on_exited_tree_does_not_panic() {
@@ -4608,6 +4819,7 @@ fn runner_real_process_cleanup_managed_tree_on_exited_tree_does_not_panic() {
 
 /// A user stop racing Runner shutdown must not deadlock or panic, and both
 /// paths must converge on a fully-terminated tree.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_racing_shutdown_does_not_panic() {
@@ -4632,7 +4844,7 @@ fn runner_real_process_job_stop_racing_shutdown_does_not_panic() {
 /// A job timeout must terminate the whole tree (parent shell, helper, and the
 /// helper's descendant) and publish exactly one `timeout` completion. Requires
 /// a real `sh` for the full worker path, so it runs on Linux.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_timeout_terminates_the_whole_tree() {
@@ -4715,4 +4927,685 @@ fn runner_real_process_job_timeout_terminates_the_whole_tree() {
         !marker.exists(),
         "delayed grandchild marker must never appear after timeout"
     );
+}
+
+pub(crate) fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
+    RunnerRequest {
+        login: false,
+        shell: None,
+        request_id: "req-job".to_string(),
+        client_id: "ws-client".to_string(),
+        kind: "start_job".to_string(),
+        job_id: Some("job-profile".to_string()),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+        path: None,
+        content: None,
+        max_bytes: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        create_dirs: false,
+        command: command.to_string(),
+        process: None,
+        script: None,
+        stdin: None,
+        timeout_secs: 10,
+        requested_by: "tester".to_string(),
+        created_at: 0,
+        validation: None,
+        lsp: None,
+        job_context: Some(test_job_context(cwd, Vec::new())),
+        mcp_gateway: None,
+        plugin_gateway: None,
+        coding_agent: None,
+        persistent_shell: None,
+    }
+}
+
+#[test]
+fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_validation_job".to_string();
+    let cargo_step = ShellJobValidationStep {
+        name: "test".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["test".to_string(), "tool_runtime".to_string()],
+        env: Vec::new(),
+    };
+    request.command = serde_json::to_string(&vec![cargo_step.clone()]).unwrap();
+    let context = request.job_context.as_mut().unwrap();
+    context.purpose = Some("validation".to_string());
+    context.validation_steps = vec!["test".to_string()];
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        source_fence: None,
+        tool: "go_test".to_string(),
+        kind: "test".to_string(),
+        steps: vec![cargo_step],
+        effective_timeout_secs: 1800,
+        sync_wait_secs: 10,
+        adapter: "go_test".to_string(),
+        validation_target_id: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    });
+    let context = context.clone();
+
+    let error = validate_runner_job_context(&context, &request, "ws-client").unwrap_err();
+    assert!(error.contains("validation metadata is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_server_validation_identity_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_process_job".to_string();
+    request.process = Some(runner_protocol::ShellProcessArgv {
+        executable: "cargo".to_string(),
+        args: vec!["test".to_string(), "focused".to_string()],
+    });
+    let context = request.job_context.as_mut().unwrap();
+    context.purpose = Some("test".to_string());
+    context.shell = Some("direct_argv".to_string());
+    context.command_preview = "cargo test focused".to_string();
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_process".to_string(),
+        language: None,
+        script_bytes: None,
+        arg_count: 2,
+        stdin_present: false,
+        validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
+        validation_tool: Some("cargo_test".to_string()),
+        assertion_name: Some("runner restart assertion".to_string()),
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context.clone();
+    invalid
+        .structured_execution
+        .as_mut()
+        .unwrap()
+        .validation_identity = Some("target:not-valid".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(
+        error.contains("structured execution metadata is invalid"),
+        "{error}"
+    );
+
+    let mut detached_assertion = context.clone();
+    let structured = detached_assertion.structured_execution.as_mut().unwrap();
+    structured.execution_source = "run_detached_process".to_string();
+    structured.validation_tool = None;
+    structured.assertion_name = None;
+    assert!(
+        !structured.is_valid(),
+        "assertion identities must remain closed to model-facing process/script Jobs"
+    );
+}
+
+#[test]
+fn runner_recovery_context_accepts_compact_session_base64url_alphabet() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "printf ok");
+    let context = request.job_context.as_mut().unwrap();
+    context.runtime_project_id = Some("agent:ws-client:demo".to_string());
+    context.workflow_session_id = Some("wc_sess_AAAAAAAA-AAAAAA_".to_string());
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+}
+
+#[test]
+fn runner_recovery_context_accepts_javascript_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Javascript,
+        script: "console.log('recovered');\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("javascript".to_string());
+    context.command_preview = format!(
+        "javascript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Javascript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context;
+    invalid.shell = Some("node".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(error.contains("shell is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_python_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Python,
+        script: "print('recovered')\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("python".to_string());
+    context.command_preview = format!(
+        "python script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Python),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    assert_eq!(context.shell.as_deref(), Some("python"));
+    assert_eq!(
+        context.structured_execution.as_ref().unwrap().language,
+        Some(runner_protocol::ShellScriptLanguage::Python)
+    );
+    assert_eq!(
+        context
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
+        "run_script"
+    );
+
+    for concrete_runtime in ["python3", "python.exe"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
+}
+
+#[test]
+fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Typescript,
+        script: "const recovered: string = 'ok';\nvoid recovered;\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("typescript".to_string());
+    context.command_preview = format!(
+        "typescript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Typescript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    for concrete_runtime in ["node", "tsx"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
+}
+
+pub(crate) fn wait_for_job_envelope(
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
+    message: &str,
+) -> RunnerEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match rx.try_recv() {
+            Ok(envelope) => return envelope,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => panic!("{message}"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("{message}: channel disconnected")
+            }
+        }
+    }
+}
+
+pub(crate) fn ws_sink(
+    client_id: &str,
+) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    (
+        RunnerSink::WebSocket {
+            tx,
+            client_id: client_id.to_string(),
+            runner_instance_id: "ws-inst".to_string(),
+        },
+        rx,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_registry_dir = tmp.path().join("config/project-registry");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        ..RunnerPolicy::default()
+    };
+    let shell = ShellConfig::default();
+    let ssh = SshConfig::default();
+    let jobs = JobManager::new(1);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let mut running_command =
+        configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
+    running_command
+        .current_dir(tmp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let running_child = Arc::new(Mutex::new(
+        ManagedChild::spawn(&mut running_command).unwrap(),
+    ));
+    let running_pid = lock_unpoison(&running_child).id();
+    jobs.jobs.lock().unwrap().insert(
+        "running-job".to_string(),
+        RunningJob {
+            client_id: "ws-client".to_string(),
+            runner_instance_id: "ws-instance".to_string(),
+            snapshot: test_job_snapshot("running-job"),
+            child: Some(Arc::clone(&running_child)),
+            stop_requested: stop_requested.clone(),
+            slot_reserved: true,
+        },
+    );
+    let (sink, mut rx) = ws_sink("ws-client");
+    let request = RunnerRequest {
+        login: false,
+        shell: None,
+        request_id: "req-queued".to_string(),
+        client_id: "ws-client".to_string(),
+        kind: "start_job".to_string(),
+        job_id: Some("queued-job".to_string()),
+        cwd: Some(tmp.path().to_string_lossy().to_string()),
+        path: None,
+        content: None,
+        max_bytes: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        create_dirs: false,
+        command: ": > queued-started".to_string(),
+        process: None,
+        script: None,
+        stdin: None,
+        timeout_secs: 60,
+        requested_by: "tester".to_string(),
+        created_at: 0,
+        validation: None,
+        lsp: None,
+        job_context: Some(test_job_context(tmp.path(), Vec::new())),
+        mcp_gateway: None,
+        plugin_gateway: None,
+        coding_agent: None,
+        persistent_shell: None,
+    };
+    let mut rejected_request = request.clone();
+    rejected_request.request_id = "req-after-shutdown".to_string();
+    rejected_request.job_id = Some("job-after-shutdown".to_string());
+
+    jobs.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            policy.clone(),
+            shell.clone(),
+            ssh.clone(),
+            project_registry_dir.clone(),
+            request,
+        ),
+    );
+    match wait_for_job_envelope(&mut rx, "queued status was sent") {
+        RunnerEnvelope::JobUpdate { payload } => {
+            assert_eq!(payload.job_id, "queued-job");
+            assert_eq!(payload.status, "agent_queued");
+        }
+        other => panic!("expected job_update, got {:?}", other.kind()),
+    }
+    assert_eq!(jobs.queued.lock().unwrap().len(), 1);
+
+    jobs.stop_all();
+
+    assert!(stop_requested.load(Ordering::SeqCst));
+    assert!(jobs.queued.lock().unwrap().is_empty());
+    assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
+    assert!(!process_running(running_pid));
+    assert!(
+        !tmp.path().join("queued-started").exists(),
+        "queued job started during shutdown"
+    );
+
+    let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
+    jobs.enqueue(
+        rejected_sink,
+        PendingJobStart::from_wire(
+            1,
+            policy.clone(),
+            shell.clone(),
+            ssh.clone(),
+            project_registry_dir.clone(),
+            rejected_request,
+        ),
+    );
+    assert!(jobs.queued.lock().unwrap().is_empty());
+    let rejected = (0..2)
+        .find_map(
+            |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
+                RunnerEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
+                RunnerEnvelope::JobUpdate { .. } => None,
+                other => panic!("expected job_update, got {:?}", other.kind()),
+            },
+        )
+        .expect("shutdown rejection terminal update was sent");
+    assert_eq!(rejected.job_id, "job-after-shutdown");
+    assert_eq!(rejected.status, "failed");
+    assert!(rejected.finished);
+    assert_eq!(rejected.error.as_deref(), Some("runner is shutting down"));
+}
+
+fn decoded_job_operation(request: RunnerRequest) -> RunnerJobOperation {
+    match request.decode_operation().expect("valid typed Job fixture") {
+        RunnerOperation::Job(operation) => operation,
+        _ => panic!("expected Job operation"),
+    }
+}
+
+#[test]
+fn raw_shell_job_lifecycle_distinguishes_terminal_truth_without_error_text_matching() {
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("completed", Some(0)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("failed", Some(7)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("stopped", Some(-1)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("timeout", Some(-1)),
+        ShellCommandExecutionState::TimedOut
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("failed", None),
+        ShellCommandExecutionState::OutcomeUnknown
+    );
+}
+
+#[test]
+fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let operation = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
+    assert_eq!(
+        job_prestart_lifecycle(&operation),
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+}
+
+#[test]
+fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
+    assert_eq!(
+        post_spawn_interruption_lifecycle(&shell),
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string(), "--all-targets".to_string()],
+        env: Vec::new(),
+    };
+    let mut validation = shell_job_request(temp.path(), "");
+    validation.kind = "start_validation_job".to_string();
+    validation.command = serde_json::to_string(&[step]).unwrap();
+    validation.job_context.as_mut().unwrap().validation_steps = vec!["check".to_string()];
+    let validation = decoded_job_operation(validation);
+    assert_eq!(post_spawn_interruption_lifecycle(&validation), None);
+}
+
+// Native SSH fixtures stay with SSH; private Job delta assertions stay here.
+#[cfg(windows)]
+pub(in crate::webcodex_runner) fn post_spawn_interruption_reason_for_test(
+    shutting_down: bool,
+    stop_requested: bool,
+    job_record_present: bool,
+) -> Option<&'static str> {
+    post_spawn_interruption_reason(shutting_down, stop_requested, job_record_present)
+}
+
+#[cfg(windows)]
+pub(in crate::webcodex_runner) fn assert_post_spawn_interruption_delta(
+    operation: &RunnerJobOperation,
+    duration_ms: u64,
+    error: &str,
+) {
+    let delta = post_spawn_interruption_delta(operation, duration_ms, error);
+    assert_eq!(delta.status, "failed");
+    assert_eq!(delta.exit_code, None);
+    assert_eq!(delta.duration_ms, Some(duration_ms));
+    assert_eq!(
+        delta.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+    assert!(delta.finished);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: runs an isolated JobManager with parent-only input"]
+fn runner_real_process_shell_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_shell_job_stdin_isolated", false);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: covers every step of a validation Job"]
+fn runner_real_process_validation_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_validation_job_stdin_isolated", true);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+fn assert_local_job_stdin_isolated(test_name: &str, validation: bool) {
+    const FIXTURE_ENV: &str = "WEBCODEX_TEST_JOB_STDIN_FIXTURE";
+    const PARENT_INPUT: &str = "parent-liveness-input-must-not-reach-jobs\n";
+    if std::env::var(FIXTURE_ENV).as_deref() == Ok(test_name) {
+        let root = tempfile::tempdir().unwrap();
+        let mut shell = ShellConfig::default();
+        #[cfg(windows)]
+        let probe =
+            "if ([Console]::In.ReadToEnd().Length -ne 0) { exit 9 }; Write-Output 'JOB_STDIN_EOF'";
+        #[cfg(unix)]
+        let probe = "if IFS= read -r line; then exit 9; fi; printf 'JOB_STDIN_EOF\\n'";
+        let mut request = shell_job_request(root.path(), probe);
+        request.timeout_secs = 5;
+        if validation {
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::copy(
+                &structured_process_helper().path,
+                bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+            )
+            .unwrap();
+            shell.path_prepend.push(bin);
+            let steps = vec![
+                ShellJobValidationStep {
+                    name: "format".into(),
+                    program: "cargo".into(),
+                    args: vec!["fmt".into(), "--".into(), "--check".into()],
+                    env: Vec::new(),
+                },
+                ShellJobValidationStep {
+                    name: "check".into(),
+                    program: "cargo".into(),
+                    args: vec!["check".into(), "--all-targets".into()],
+                    env: Vec::new(),
+                },
+            ];
+            request.kind = "start_validation_job".to_string();
+            request.command = serde_json::to_string(&steps).unwrap();
+            request.job_context = Some(test_job_context(
+                root.path(),
+                vec!["format".into(), "check".into()],
+            ));
+        }
+        let (sink, mut rx) = ws_sink("ws-client");
+        let manager = JobManager::new(1);
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(
+                1,
+                RunnerPolicy {
+                    allow_raw_shell: true,
+                    allow_cwd_anywhere: true,
+                    ..RunnerPolicy::default()
+                },
+                shell,
+                SshConfig::default(),
+                root.path().join("project-registry"),
+                request,
+            ),
+        );
+        let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+        let terminal = updates.last().expect("Job must emit an update");
+        assert!(
+            terminal.finished,
+            "Job did not reach terminal: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.status, "completed",
+            "Job inherited parent stdin: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.exit_code,
+            Some(0),
+            "Job must receive EOF: {terminal:?}"
+        );
+        if validation {
+            assert_eq!(terminal.validation_progress.as_ref().unwrap().completed, 2);
+        }
+        let stdout = terminal.log_snapshot.as_ref().unwrap().stdout.tail.as_str();
+        assert_eq!(
+            stdout.matches("JOB_STDIN_EOF").count(),
+            if validation { 2 } else { 1 }
+        );
+        let mut remaining = String::new();
+        std::io::stdin().read_to_string(&mut remaining).unwrap();
+        assert_eq!(
+            remaining, PARENT_INPUT,
+            "Jobs must not consume Runner input"
+        );
+        return;
+    }
+
+    // Isolate the inherited input in a subprocess; never replace process-global
+    // stdin in the test runner or depend on an interactive terminal / installed Git.
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("parent-input");
+    std::fs::write(&input, PARENT_INPUT).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            &format!(
+                "{}::{test_name}",
+                module_path!().split_once("::").unwrap().1
+            ),
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FIXTURE_ENV, test_name)
+        .stdin(std::fs::File::open(input).unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let mut stdout = child.child_mut().stdout.take().unwrap();
+    let mut stderr = child.child_mut().stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.terminate_tree().unwrap();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Reclaim descendants even after a failed fixture before joining pipe readers.
+    child.terminate_tree().unwrap();
+    let stdout = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert!(
+        status.success(),
+        "isolated {test_name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("1 passed"));
 }

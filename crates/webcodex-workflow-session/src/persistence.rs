@@ -20,7 +20,7 @@ use super::model::{
     SessionMessage, SessionRecord, StoredSession, DEFAULT_MAX_MESSAGES_PER_SESSION,
     EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
     MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS,
-    MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
+    SESSION_LEDGER_VERSION,
 };
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
@@ -98,8 +98,11 @@ impl PersistedSessionRecord {
             updated_at: record.updated_at,
             events,
             messages,
+            message_delivery_replays: record.message_delivery_replays.clone(),
             events_observed: record.events_observed,
-            context_revision: record.context_revision,
+            legacy_context_revision: None,
+            git_baseline_tree: record.git_baseline_tree.clone(),
+            repository_edit_observed: record.repository_edit_observed,
             materialized_validation_job_ids: record
                 .materialized_validation_job_ids
                 .iter()
@@ -136,12 +139,14 @@ impl PersistedSessionRecord {
             && self.created_at == record.created_at
             && self.updated_at == record.updated_at
             && self.events_observed == record.events_observed
-            && self.context_revision == record.context_revision
+            && self.git_baseline_tree == record.git_baseline_tree
+            && self.repository_edit_observed == record.repository_edit_observed
             && self
                 .materialized_validation_job_ids
                 .iter()
                 .eq(record.materialized_validation_job_ids.iter())
             && self.message_observation_revision == record.message_observation_revision
+            && self.message_delivery_replays == record.message_delivery_replays
             && self.message_observation_floor == record.message_observation_floor
             && self.message_observation_revisions == record.message_observation_revisions
             && self.assignment_history_floors == record.assignment_history_floors
@@ -231,6 +236,16 @@ impl PersistedSessionRecord {
             .iter()
             .map(|message| message.message_id.clone())
             .collect::<HashSet<_>>();
+        let message_delivery_replays = self
+            .message_delivery_replays
+            .into_iter()
+            .filter(|(scope_key, replay)| {
+                is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(scope, _)| scope))
+                    && is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(_, key)| key))
+                    && is_lower_hex_sha256(&replay.payload_fingerprint)
+                    && retained_message_ids.contains(&replay.message_id)
+            })
+            .collect();
         let current_observation_revision = self.message_observation_revision;
         let mut observation_floor = self
             .message_observation_floor
@@ -365,11 +380,6 @@ impl PersistedSessionRecord {
         // retained. A live ledger that exceeded the cap has the true cumulative
         // count persisted.
         let retained_events = events.len() as u64;
-        let retained_context_revision = events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .max()
-            .unwrap_or(0);
         let project = self.project.map(|value| bound_summary_string(value.trim()));
         let execution_context = if project.is_some() {
             self.execution_context.sanitized_for_restore()
@@ -389,9 +399,13 @@ impl PersistedSessionRecord {
             updated_at: self.updated_at.max(self.created_at),
             events,
             events_observed: self.events_observed.max(retained_events),
-            context_revision: self.context_revision.max(retained_context_revision),
+            git_baseline_tree: self.git_baseline_tree.filter(|tree| {
+                matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            repository_edit_observed: self.repository_edit_observed,
             materialized_validation_job_ids,
             messages,
+            message_delivery_replays,
             project_instructions: None,
             message_observation_revision: current_observation_revision,
             message_observation_floor: observation_floor,
@@ -465,7 +479,6 @@ pub fn cold_session_from_persisted(
         guards: persisted.guards,
         lifecycle,
         updated_at: persisted.updated_at,
-        context_revision: persisted.context_revision,
         project_instructions,
         raw,
     })
@@ -758,38 +771,24 @@ pub fn sanitize_persisted_event(mut event: SessionEvent, session_id: &str) -> Op
 }
 
 fn is_valid_persisted_message_id(message_id: &str) -> bool {
-    message_id
-        .strip_prefix(MESSAGE_ID_PREFIX)
-        .is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        })
+    webcodex_core::workflow_session_contract::is_valid_session_message_id(message_id)
 }
 
 pub fn sanitize_persisted_message(
     mut message: SessionMessage,
     session_id: &str,
 ) -> Option<SessionMessage> {
-    if message.session_id != session_id || !message.message_id.starts_with(MESSAGE_ID_PREFIX) {
+    if message.session_id != session_id || !is_valid_persisted_message_id(&message.message_id) {
         return None;
     }
     message.message = bound_chars(message.message.trim(), MAX_MESSAGE_CHARS);
     message.tags = validate_message_tags(message.tags).unwrap_or_default();
-    if message.requires_ack
-        && (message.kind != super::model::SessionMessageKind::Guidance
-            || message.priority != super::model::SessionMessagePriority::High)
-    {
-        message.requires_ack = false;
-    }
     message.first_ack_observed_at = message
         .first_ack_observed_at
         .filter(|value| *value > 0 && message.requires_ack);
     message.reply_to = message.reply_to.and_then(|reply_to| {
         let reply_to = reply_to.trim().to_string();
-        reply_to.starts_with(MESSAGE_ID_PREFIX).then_some(reply_to)
+        is_valid_persisted_message_id(&reply_to).then_some(reply_to)
     });
     message.author_session_id = message.author_session_id.and_then(|author_session_id| {
         let author_session_id = author_session_id.trim().to_string();
@@ -797,9 +796,7 @@ pub fn sanitize_persisted_message(
     });
     message.resolved_by_message_id = message.resolved_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();
-        message_id
-            .starts_with(MESSAGE_ID_PREFIX)
-            .then_some(message_id)
+        is_valid_persisted_message_id(&message_id).then_some(message_id)
     });
     message.superseded_by_message_id = message.superseded_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();

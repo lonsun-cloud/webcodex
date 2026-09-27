@@ -21,15 +21,17 @@ mod audit_http;
 mod auth;
 mod client_window;
 mod config;
-mod connector_runtime;
 mod console_web;
 mod db;
-mod host_console_http;
-mod job_observation;
+pub(crate) use webcodex_core::job_observation;
+mod job_receipts;
+mod job_terminal_attention;
+mod json_digest;
+mod json_measurement;
 mod mcp;
 mod mcp_gateway;
 mod model_surface;
-mod models;
+pub(crate) use webcodex_store::models;
 mod oauth_http;
 mod openapi;
 mod pairing_http;
@@ -44,12 +46,11 @@ mod runner_tokens_http;
 mod runner_ws;
 mod runtime_console_http;
 mod runtime_http;
-mod server_instance;
+pub(crate) use webcodex_store::ServerInstanceGuard;
 mod server_listener;
 mod server_shutdown;
 mod ssh_resource_gateway;
 mod startup;
-mod task_cli;
 #[cfg(test)]
 mod test_support;
 mod tool_request_trace;
@@ -65,7 +66,7 @@ pub(crate) use webcodex_core::{
 };
 pub(crate) use webcodex_runner_config as runner_config;
 pub(crate) use webcodex_workspace::project_overview;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-checkpoints"))]
 pub(crate) use webcodex_workspace::workspace_checkpoint;
 
 pub(crate) use auth::{get_db, json_error, AuthMiddleware};
@@ -75,7 +76,6 @@ pub(crate) use config::parse_env_file_line;
 pub use config::Config;
 pub use config::OAuth2Config;
 pub use db::{Database, OAuthRefreshTokenMode, ReusableRefreshResult, RotateResult};
-pub use models::{ActionEventRecord, ActionSessionRecord};
 pub(crate) use openapi::openapi_json;
 pub(crate) use runner_http::{
     runner_job_update, runner_offline, runner_persistent_shell_result, runner_poll,
@@ -86,6 +86,7 @@ pub use startup::{
     is_project_command, run_project_command, run_regular_server_tunnel, CliCommandOutput,
     RegularServerTunnelOptions,
 };
+pub use webcodex_store::models::{ActionEventRecord, ActionSessionRecord};
 
 // ============================================================================
 // Main
@@ -123,6 +124,9 @@ where
             code: 0,
             stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
             stderr: String::new(),
+        },
+        [arg] if arg == "--build-info-json" => ServerBinaryAction::Exit {
+            code: 0, stdout: build_info::build_info_json("webcodex-server"), stderr: String::new(),
         },
         [arg] if matches!(arg.as_str(), "--version" | "-V") => ServerBinaryAction::Exit {
             code: 0,
@@ -240,12 +244,16 @@ only for local/trusted-network demos."
     }
     std::fs::create_dir_all(&config.data_dir)?;
     let db = Database::open(&config.db_path())?;
-    let server_instance_guard = server_instance::ServerInstanceGuard::acquire(&db)?;
+    let server_instance_guard = ServerInstanceGuard::acquire(&db)?;
     db.recover_agent_wakes_for_server_takeover(
         &server_instance_guard,
         chrono::Utc::now().timestamp_millis(),
     )
     .map_err(anyhow::Error::from)?;
+    // Any E3 delivery that crossed its durable dispatch fence in the old
+    // process has an unknowable Host outcome; never retry it silently.
+    db.recover_job_terminal_deliveries_after_restart(chrono::Utc::now().timestamp())
+        .map_err(anyhow::Error::from)?;
     tracing::info!("Database initialized at {:?}", config.db_path());
 
     // Set max payload size to 2MB for text messages
@@ -259,59 +267,49 @@ only for local/trusted-network demos."
     // login form to the consent decision. PAT/bootstrap plaintext is never
     // stored here — only the resolved user identity.
     let authorize_session_store = Arc::new(oauth_http::AuthorizeSessionStore::new());
-    let runner_registry = Arc::new(runner_http::registry_with_tool_request_trace());
+    let job_terminal_continuations =
+        job_terminal_attention::JobTerminalContinuationController::new(db.clone());
+    let runner_registry = Arc::new(
+        job_receipts::production_registry_with_terminal_attention(
+            db.clone(),
+            job_terminal_continuations.clone(),
+        )
+        .await,
+    );
     // Root HTTP admission consults this process-local state before any
     // side-effecting handler can run. It closes the small race between the
     // authoritative drain transition and Salvo consuming its stop command.
     let shutdown_coordinator = Arc::new(server_shutdown::ShutdownCoordinator::default());
     let quic_cfg = config::QuicServerConfig::from_env();
-    let connector_context =
-        connector_runtime::ConnectorContext::from_env().map_err(std::io::Error::other)?;
-    // Resolve the top-level runtime exposure exactly once at startup, after
-    // Connector configuration has been parsed and validated. Every request-time
-    // projection reads this immutable enum from ToolRuntime.
-    let runtime_exposure = model_surface::resolve_runtime_exposure(connector_context.as_ref())
-        .map_err(std::io::Error::other)?;
+    let project_auth = Arc::new(auth::ProjectAuthState::from_env().map_err(std::io::Error::other)?);
     let runtime_info = Arc::new(tool_runtime::RuntimeInfo::from_config_with_quic_config(
         &config, &quic_cfg,
     ));
     let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
-            .with_runtime_exposure(runtime_exposure)
             .with_window_activity_database(db.clone())
             .with_memory_database(db.clone())
+            .with_project_reference_database(db.clone())
             .with_communication_database(db.clone())
-            .with_checkpoint_state_dir(runtime_state_dir.clone())
+            .with_job_terminal_attention(db.clone(), job_terminal_continuations)
             .with_session_ledger(config.session_ledger_path())
             .with_persistent_coding_agent_observation_state(&runtime_state_dir)
             .map_err(std::io::Error::other)?;
+    #[cfg(feature = "workspace-checkpoints")]
+    {
+        tool_runtime_builder =
+            tool_runtime_builder.with_checkpoint_state_dir(runtime_state_dir.clone());
+    }
     if let Some(activity_store) = db::WorkspaceActivityStore::from_env(db.clone()) {
         tool_runtime_builder =
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
-    let connector_runtime = connector_runtime::ConnectorRuntime::from_context(
-        tool_runtime.clone(),
-        db.clone(),
-        connector_context,
-    )
-    .map_err(std::io::Error::other)?;
-    if let Some(runtime) = connector_runtime.0.as_ref() {
-        tracing::info!(
-            project_id = %runtime.context().project_id,
-            profile = %runtime.context().profile,
-            capabilities = connector_runtime::surface::CAPABILITY_NAMES.len(),
-            runtime_exposure = runtime_exposure.name(),
-            "Project-bound Connector exposure enabled"
-        );
-    } else {
-        tracing::info!(
-            runtime_exposure = runtime_exposure.name(),
-            config = "WEBCODEX_MCP_MODEL_SURFACE",
-            "MCP runtime exposure enabled"
-        );
-    }
+    tracing::info!(
+        project_scoped = project_auth.is_configured(),
+        "Adaptive Runtime enabled"
+    );
 
     // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
@@ -362,8 +360,6 @@ only for local/trusted-network demos."
 
     let authed_api_router = Router::new()
         .hoop(AuthMiddleware)
-        .push(connector_runtime::http::routes())
-        .push(host_console_http::routes())
         .push(runtime_console_http::routes())
         .push(admin_http::routes())
         .push(
@@ -375,100 +371,16 @@ only for local/trusted-network demos."
                 .post(runtime_http::tools_call),
         )
         .push(
+            Router::with_path(route_metadata::api_path(RouteId::GptActionsInvoke))
+                .post(runtime_http::gpt_action_invoke),
+        )
+        .push(
             Router::with_path(route_metadata::api_path(RouteId::ArtifactsImport))
                 .post(runtime_http::import_conversation_files_to_project),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsStatus))
-                .post(runtime_http::job_status),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsLog))
-                .post(runtime_http::job_log),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsStop))
-                .post(runtime_http::job_stop),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsList))
-                .post(runtime_http::jobs_list),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsTail))
-                .post(runtime_http::job_tail),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigCheck))
-                .post(runtime_http::runner_config_check),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigReload))
-                .post(runtime_http::runner_config_reload),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsList))
-                .post(runtime_http::projects_list),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRegister))
-                .post(runtime_http::projects_register),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsCreate))
-                .post(runtime_http::projects_create),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsUnregister))
-                .post(runtime_http::projects_unregister),
-        )
-        .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsResolveOrRegister))
                 .post(runtime_http::projects_resolve_or_register),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsReadFile))
-                .post(runtime_http::projects_read_file),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitStatus))
-                .post(runtime_http::projects_git_status),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitDiff))
-                .post(runtime_http::projects_git_diff),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitDiffSummary))
-                .post(runtime_http::projects_git_diff_summary),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsListFiles))
-                .post(runtime_http::projects_list_files),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsSearchText))
-                .post(runtime_http::projects_search_text),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsApplyUnifiedDiff))
-                .post(runtime_http::projects_apply_unified_diff),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRunShell))
-                .post(runtime_http::projects_run_shell),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitRestorePaths))
-                .post(runtime_http::projects_git_restore_paths),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsDiscardUntracked))
-                .post(runtime_http::projects_discard_untracked),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRunJob))
-                .post(runtime_http::projects_run_job),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::RuntimeStatus))
@@ -488,6 +400,18 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::api_path(RouteId::OAuthClientsUpdateScopes))
                 .post(oauth_http::oauth_clients_update_scopes),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(
+                RouteId::OAuthClientsAddRedirectUri,
+            ))
+            .post(oauth_http::oauth_clients_add_redirect_uri),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(
+                RouteId::OAuthClientsRemoveRedirectUri,
+            ))
+            .post(oauth_http::oauth_clients_remove_redirect_uri),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::OAuthClientsRevoke))
@@ -607,36 +531,25 @@ only for local/trusted-network demos."
                 .post(pairing_http::pairing_enroll),
         )
         .push(
-            authed_api_router.push(
-                Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
-                    .post(pairing_http::pairing_create),
-            ),
+            authed_api_router
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
+                        .post(pairing_http::pairing_create),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(
+                        RouteId::RunnerCapabilityAuthorization,
+                    ))
+                    .post(pairing_http::runner_capability_authorization),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingRunnerCapabilities))
+                        .post(pairing_http::grant_runner_capabilities),
+                ),
         );
 
     let openapi_router =
         Router::with_path(route_metadata::root_path(RouteId::OpenApiDocument)).get(openapi_json);
-
-    // Read-only readiness console. Public static entry — the HTML/JS/CSS
-    // bundle carries no secrets; project facts come from the protected shared
-    // `POST /api/connector/readiness` application projection. Mirrors
-    // `/openapi.json` being public. NOT part of the GPT Actions schema.
-    let console_root = RouteId::ConsoleWebRoot;
-    let console_router = Router::with_path(route_metadata::root_path(console_root))
-        .get(console_web::console_html)
-        .push(
-            Router::with_path(route_metadata::direct_child_path(
-                console_root,
-                RouteId::ConsoleWebAppJs,
-            ))
-            .get(console_web::console_app_js),
-        )
-        .push(
-            Router::with_path(route_metadata::direct_child_path(
-                console_root,
-                RouteId::ConsoleWebStylesCss,
-            ))
-            .get(console_web::console_styles_css),
-        );
 
     let runtime_root = RouteId::RuntimeWebRoot;
     let runtime_console_router = Router::with_path(route_metadata::root_path(runtime_root))
@@ -693,12 +606,11 @@ only for local/trusted-network demos."
         .hoop(affix_state::inject(authorize_session_store.clone()))
         .hoop(affix_state::inject(runner_registry.clone()))
         .hoop(affix_state::inject(tool_runtime.clone()))
-        .hoop(affix_state::inject(connector_runtime.clone()))
+        .hoop(affix_state::inject(project_auth.clone()))
         .hoop(affix_state::inject(console_asset_source))
         .hoop(cors.into_handler())
         .push(api_router)
         .push(openapi_router)
-        .push(console_router)
         .push(runtime_console_router)
         .push(admin_router)
         // OAuth2 token, revocation, registration, and discovery endpoints —
@@ -803,11 +715,13 @@ only for local/trusted-network demos."
         "tool_request_trace"
     );
     tracing::info!(
-        mcp_compact_schemas = crate::config::mcp_compact_schemas_enabled(),
+        mcp_compact_schemas = crate::model_surface::effective_mcp_compact_schemas(
+            crate::config::mcp_compact_schemas_override(),
+        ),
         "mcp_compact_schemas"
     );
     tracing::info!("OpenAPI (GPT Actions): {}/openapi.json", base);
-    tracing::info!("MCP App console: {}/console", base);
+    tracing::info!("Runtime console: {}/runtime", base);
     tracing::info!("Runtime status: {}/api/runtime/status", base);
     tracing::info!("Runner WebSocket: {}/api/agents/ws", base);
     tracing::info!("Runner polling (fallback): {}/api/shell/agent/poll", base);

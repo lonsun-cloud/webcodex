@@ -21,58 +21,141 @@ fn run_command_sync_with_shell(
     timeout_secs: u64,
     shell: &Path,
 ) -> (i32, String, String, u64) {
-    let start = Instant::now();
     let mut command = std::process::Command::new(shell);
     #[cfg(windows)]
-    command.arg("-s").stdin(std::process::Stdio::piped());
+    command.arg("-s");
     #[cfg(not(windows))]
     command.arg("-c").arg(cmd);
+    command.current_dir(cwd);
+    #[cfg(windows)]
+    let stdin_payload = Some(cmd.as_bytes());
+    #[cfg(not(windows))]
+    let stdin_payload: Option<&[u8]> = None;
+    let (exit_code, stdout, stderr, elapsed_ms, _timed_out) =
+        run_test_command_with_timeout(command, stdin_payload, timeout_secs);
+    (exit_code, stdout, stderr, elapsed_ms)
+}
+
+#[cfg(test)]
+pub(crate) fn run_test_command_with_timeout(
+    mut command: std::process::Command,
+    stdin_payload: Option<&[u8]>,
+    timeout_secs: u64,
+) -> (i32, String, String, u64, bool) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let start = Instant::now();
+    if let Some(stdin_payload) = stdin_payload {
+        let mut stdin_source = match tempfile::tempfile() {
+            Ok(file) => file,
+            Err(error) => {
+                return (
+                    -1,
+                    String::new(),
+                    format!("Failed to create stdin source: {error}"),
+                    start.elapsed().as_millis() as u64,
+                    false,
+                );
+            }
+        };
+        if let Err(error) = stdin_source.write_all(stdin_payload) {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to write stdin source: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+        if let Err(error) = stdin_source.seek(SeekFrom::Start(0)) {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to rewind stdin source: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+        command.stdin(std::process::Stdio::from(stdin_source));
+    } else {
+        // Match the non-interactive Runner: no payload means EOF, not the
+        // invoking console's stdin. Commands such as `git mktree` otherwise
+        // wait for user input even though headless CI happens to pass.
+        command.stdin(std::process::Stdio::null());
+    }
+    let mut stdout_capture = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to create stdout capture: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+    };
+    let mut stderr_capture = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to create stderr capture: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+    };
+    let stdout_sink = match stdout_capture.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to clone stdout capture: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+    };
+    let stderr_sink = match stderr_capture.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("Failed to clone stderr capture: {error}"),
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+        }
+    };
     command
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::from(stdout_sink))
+        .stderr(std::process::Stdio::from(stderr_sink));
     // Put the command in its own process group so its whole subtree can be
-    // reaped as a group. Argument 0 makes the child a group leader whose pgid
-    // equals its pid. Without this, a backgrounded grandchild that inherits the
-    // stdout/stderr pipes (e.g. `some-daemon &`) keeps the pipe write-end open,
-    // and `wait_with_output()` below blocks on pipe EOF *forever* — the exact
-    // intermittent "no reply" hang this guards against.
+    // reaped as a group. Regular-file capture prevents pipe-capacity deadlocks,
+    // while process-group ownership prevents background descendants from
+    // leaking beyond the fixture.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(child) => child,
+        Err(error) => {
             return (
                 -1,
                 String::new(),
-                format!("Failed to execute command: {}", e),
+                format!("Failed to execute command: {error}"),
                 start.elapsed().as_millis() as u64,
+                false,
             );
         }
     };
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        let write_result = child
-            .stdin
-            .take()
-            .expect("test shell stdin")
-            .write_all(cmd.as_bytes());
-        if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return (
-                -1,
-                String::new(),
-                format!("Failed to write command to test shell: {error}"),
-                start.elapsed().as_millis() as u64,
-            );
-        }
-    }
-    // Under `process_group(0)` the child's pid is also its process-group id.
+    // Under process_group(0) the child's pid is also its process-group id.
     let pgid = child.id();
     let timeout = Duration::from_secs(timeout_secs);
     let mut timed_out = false;
@@ -86,55 +169,73 @@ fn run_command_sync_with_shell(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                // Still reap the group so a spawned subtree is not leaked.
+            Err(error) => {
+                let _ = child.kill();
                 reap_process_group(pgid);
+                let _ = child.wait();
                 return (
                     -1,
                     String::new(),
-                    format!("Failed to wait for command: {}", e),
+                    format!("Failed to wait for command: {error}"),
                     start.elapsed().as_millis() as u64,
+                    false,
                 );
             }
         }
     }
+    if timed_out {
+        let _ = child.kill();
+    }
     // Whether the command timed out or exited on its own, reap the entire
-    // process group before draining output. This kills any backgrounded
-    // grandchildren still holding the stdout/stderr pipes so `wait_with_output`
-    // observes EOF promptly instead of blocking indefinitely. On a clean exit
-    // with no stragglers the signal simply finds nothing to kill.
+    // process group so backgrounded descendants do not leak past the fixture.
     reap_process_group(pgid);
-    let output = child.wait_with_output();
+    let status = child.wait();
     let elapsed = start.elapsed().as_millis() as u64;
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let mut stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    let read_capture = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let stdout = read_capture(&mut stdout_capture);
+    let stderr = read_capture(&mut stderr_capture);
+    match (status, stdout, stderr) {
+        (Ok(status), Ok(stdout), Ok(stderr)) => {
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
+            let mut stderr = String::from_utf8_lossy(&stderr).to_string();
             if timed_out {
                 if !stderr.is_empty() && !stderr.ends_with('\n') {
                     stderr.push('\n');
                 }
-                stderr.push_str(&format!("Command timed out after {} seconds", timeout_secs));
-                (-1, stdout, stderr, elapsed)
+                stderr.push_str(&format!("Command timed out after {timeout_secs} seconds"));
+                (-1, stdout, stderr, elapsed, true)
             } else {
-                let code = out.status.code().unwrap_or(-1);
-                (code, stdout, stderr, elapsed)
+                (status.code().unwrap_or(-1), stdout, stderr, elapsed, false)
             }
         }
-        Err(e) if timed_out => (
+        (Err(error), _, _) if timed_out => (
             -1,
             String::new(),
             format!(
-                "Command timed out after {} seconds; failed to collect output: {}",
-                timeout_secs, e
+                "Command timed out after {timeout_secs} seconds; failed to reap command: {error}"
             ),
             elapsed,
+            true,
         ),
-        Err(e) => (
+        (Err(error), _, _) => (
             -1,
             String::new(),
-            format!("Failed to collect command output: {}", e),
+            format!("Failed to wait for command: {error}"),
             elapsed,
+            false,
+        ),
+        (_, Err(error), _) | (_, _, Err(error)) => (
+            -1,
+            String::new(),
+            format!("Failed to collect command output: {error}"),
+            elapsed,
+            timed_out,
         ),
     }
 }
@@ -578,7 +679,6 @@ pub(crate) const COMMAND_STDIO_TAIL_CHARS: usize = 12_000;
 /// `runner_http` validation (`wait_timeout_secs` must be <= 120).
 pub(crate) const MIN_SYNC_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_SYNC_TIMEOUT_SECS: u64 = 120;
-pub(crate) const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;
 
 /// Read-only structured validation tools (`cargo_check`, `cargo_test`,
 /// `cargo_fmt(check=true)`) define `timeout_secs` as the total runtime budget
@@ -593,28 +693,22 @@ pub(crate) const DEFAULT_CARGO_CHECK_TIMEOUT_SECS: u64 = 600;
 pub(crate) const DEFAULT_CARGO_TEST_TIMEOUT_SECS: u64 = 1800;
 pub(crate) const DEFAULT_CARGO_FMT_TIMEOUT_SECS: u64 = 120;
 
-/// Internal synchronous wait window for a structured validation. The tool call
-/// blocks up to this long for the command to finish in-process; after that the
-/// same execution is promoted to a queryable Job. Kept well below the 120s MCP
-/// hard ceiling so transport/result serialization retains substantial headroom.
-pub(crate) const SYNC_VALIDATION_WAIT_SECS: u64 = 60;
-
-/// Resolve a synchronous command timeout. Out-of-range values are rejected
-/// (not clamped) so callers cannot request longer waits than the sync path
-/// can honor.
+/// Resolve a synchronous command timeout. Zero remains invalid, while an
+/// oversized caller preference is clamped to the largest wait this path can
+/// actually honor so the model does not need a second decision just to retry
+/// with the documented ceiling.
 pub(crate) fn resolve_sync_timeout_secs(
     timeout_secs: Option<u64>,
     default: u64,
 ) -> Result<u64, String> {
     debug_assert!((MIN_SYNC_TIMEOUT_SECS..=MAX_SYNC_TIMEOUT_SECS).contains(&default));
     let value = timeout_secs.unwrap_or(default);
-    if !(MIN_SYNC_TIMEOUT_SECS..=MAX_SYNC_TIMEOUT_SECS).contains(&value) {
+    if value < MIN_SYNC_TIMEOUT_SECS {
         return Err(format!(
-            "timeout_secs must be between {} and {}",
-            MIN_SYNC_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS
+            "timeout_secs must be at least {MIN_SYNC_TIMEOUT_SECS}"
         ));
     }
-    Ok(value)
+    Ok(value.min(MAX_SYNC_TIMEOUT_SECS))
 }
 
 /// Structured pre-execution rejection for an out-of-range synchronous timeout.
@@ -630,7 +724,7 @@ pub(crate) fn sync_timeout_out_of_range_result(
                 "{tool_name} timeout_secs must be between {MIN_SYNC_TIMEOUT_SECS} and {MAX_SYNC_TIMEOUT_SECS}"
             ),
             format!(
-                "pass timeout_secs between {MIN_SYNC_TIMEOUT_SECS} and {MAX_SYNC_TIMEOUT_SECS}, or omit it for the default of {default} seconds. For longer work use run_job."
+                "pass timeout_secs between {MIN_SYNC_TIMEOUT_SECS} and {MAX_SYNC_TIMEOUT_SECS}, or omit it for the default of {default} seconds. Duration alone does not select run_job or run_detached_process: ordinary long work should keep the canonical tool/Job handoff; use run_job only for intentional asynchronous shell start, and run_detached_process only for a native child that must survive Runner restart/replacement."
             ),
         ),
         json!({
@@ -683,7 +777,7 @@ pub(crate) fn command_timeout_message(
     stderr_tail: &str,
 ) -> String {
     format!(
-        "Command timed out after {}s.\nCommand definitely started, but WebCodex cannot prove its side effects ended with the timeout.\nOutput tails before timeout:\nstdout_tail:\n{}\nstderr_tail:\n{}\nRetry guidance: do not blindly retry. First inspect the actual process, service, and target state. If validation is safe and idempotent, use run_job for longer observation or a narrower invocation.",
+        "Command timed out after {}s.\nCommand definitely started, but WebCodex cannot prove its side effects ended with the timeout.\nOutput tails before timeout:\nstdout_tail:\n{}\nstderr_tail:\n{}\nRetry guidance: do not blindly retry. First inspect the actual Job, process, service, and target state. On a fresh safe attempt, keep ordinary long work on its canonical execution tool and Job handoff; use run_job only for intentional asynchronous shell start. If a new native child must survive Runner restart/replacement, use run_detached_process from the start instead of changing tools merely for duration.",
         timeout_secs, stdout_tail, stderr_tail
     )
 }
@@ -808,6 +902,24 @@ mod tests {
 
         let (code, _stdout, _stderr, _ms) = run_command_sync("exit 3", &dir, 10);
         assert_eq!(code, 3, "non-zero exit codes must survive the reap");
+    }
+
+    /// Large test-process output must not turn into a fake timeout because the
+    /// parent waited for exit before draining a bounded OS pipe.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_sync_captures_output_larger_than_pipe_capacity() {
+        let dir = std::env::temp_dir();
+        let (code, stdout, stderr, _ms) =
+            run_command_sync("printf '%98304s' x; printf '%98304s' y >&2", &dir, 5);
+        assert_eq!(
+            code,
+            0,
+            "stderr tail: {}",
+            &stderr[stderr.len().saturating_sub(200)..]
+        );
+        assert_eq!(stdout.len(), 98_304);
+        assert_eq!(stderr.len(), 98_304);
     }
 
     /// A genuinely slow foreground command still hits the timeout path.

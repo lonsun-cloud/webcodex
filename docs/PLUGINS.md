@@ -15,6 +15,14 @@ contain, sign, or otherwise make an untrusted executable safe. A Plugin has the
 same practical local-process trust implications as launching that executable
 directly with the prepared Runner environment.
 
+> **Terminology:** ChatGPT may call a developer MCP/custom app a “plugin”. That
+> Host-side MCP connection is different from a WebCodex **Native Tool Plugin**.
+> A ChatGPT error such as `FORBIDDEN: This conversation does not support
+> developer MCPs` happens before `plugin_tool` when the Host refuses the MCP
+> connection; it is not a Native Tool Plugin health result. Use
+> [Troubleshooting](TROUBLESHOOTING.md) for that case. Use the `plugin_tool`
+> diagnostics in this document only after the request reaches WebCodex.
+
 ## Configure a Plugin
 
 Plugins have their own `runner.toml` section; they are not MCP providers:
@@ -88,19 +96,22 @@ Its ToolSpec is static and registered in the same canonical tool metadata path
 as other WebCodex tools; its schema does not depend on Runner availability or
 Plugin inventory. `tool_manifest(tool_name="plugin_tool")` therefore describes
 the exact gateway contract even when no Plugin-capable Runner is online.
+`work_on_project` may additionally surface a bounded project-affine Plugin selection catalog at startup. That catalog is metadata only: it includes tools from ready committed providers whose configured `cwd` resolves to the authoritative Project root, omits providers for other directories, and never exposes provider paths, command/argv/environment, schemas, provider-instance identity, or an invocation binding. Catalogs are truncated by serialized byte size both at the Runner gateway and in the model projection; `total_count` and `catalog_revision` still describe the complete catalog. Selecting an entry still requires the canonical `plugin_tool describe -> call` path. The same project-affine metadata can be requested explicitly as `plugins.catalog` through the supported context sidecar when the caller has both `project:read` and `plugin:inspect`.
 
 The same canonical `plugin_tool` request parser and action-aware gateway executor
 serve MCP and the generic Tool Runtime used by OpenAPI/GPT Actions. A surface
 that advertises `plugin_tool` can therefore call it; MCP does not have a separate
-Plugin implementation. For generic `callRuntimeTool`, use the canonical nested
-`params` envelope for the complete Plugin contract because the outer `tool`
-field already selects `plugin_tool` and the provider-local `tool` name belongs
-inside Plugin arguments:
+Plugin implementation. On the current generic GPT Actions surface, `plugin_tool`
+is a direct canonical operation, so pass its normal business arguments directly:
 
 ```json
-{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
-{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
+{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
+{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
 ```
+
+The separate `call_runtime_tool` operation is only for Adaptive long-tail tools
+whose manifest route is `gateway`; direct tools such as `plugin_tool` must not be
+re-routed through it. Its generic envelope is canonical `{tool, arguments}`.
 
 The static ToolDefinition is intentionally a worst-case discovery contract.
 Execution policy is classified from the validated action before Session or
@@ -356,9 +367,11 @@ external dependency contract. That prerequisite is now satisfied:
 `@yyjeqhc/webcodex-plugin-sdk@0.1.0` is publicly distributed through npm, and Phase 3
 adds the local scaffold using that exact compatibility pin. A generated project
 therefore works independently of a WebCodex source checkout. Repository first-party
-dogfood such as `plugins/safe-delete` and [`plugins/repo-info`](../plugins/repo-info/README.md)
-intentionally continues to use the local SDK source so it tests the checkout under
-development; external projects created by `plugin init` use the published package.
+dogfood such as `plugins/safe-delete`, [`plugins/repo-info`](../plugins/repo-info/README.md),
+[`plugins/campus-application`](../plugins/campus-application/README.md), and
+[`plugins/agent-browser`](../plugins/agent-browser/README.md) intentionally continues
+to use the local SDK source so it tests the checkout under development;
+external projects created by `plugin init` use the published package.
 
 ## TypeScript Plugin SDK
 
@@ -466,13 +479,19 @@ forms of `additionalProperties`, union `type`, `anyOf`, `oneOf`, `allOf`, `not`,
 or arbitrary draft-specific keywords.
 
 See [`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs) for
-a minimal no-dependency Node example. The repository also ships two first-party
-SDK dogfood Plugins: [`plugins/safe-delete`](../plugins/safe-delete/README.md) is an
-optional project-root-fenced Plugin that moves one file or directory to the operating
-system Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in
-tool surface; [`plugins/repo-info`](../plugins/repo-info/README.md) is a read-only
-authoring example whose single `git_summary` tool observes only the provider's
-configured repository `cwd`.
+a minimal no-dependency Node example. The repository also ships first-party SDK
+dogfood Plugins: [`plugins/safe-delete`](../plugins/safe-delete/README.md) is an optional
+project-root-fenced Plugin that moves one file or directory to the operating system
+Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in tool
+surface; [`plugins/repo-info`](../plugins/repo-info/README.md) is a read-only authoring
+example whose single `git_summary` tool observes only the provider's configured
+repository `cwd`; [`plugins/campus-application`](../plugins/campus-application/README.md)
+turns bounded Browser semantic snapshots into structured resume-form plans, supports
+repeated and multi-step application flows, and deliberately stops before final
+submission; and [`plugins/agent-browser`](../plugins/agent-browser/README.md) uses an
+operator-installed local Agent Browser to inherit native profiles/configuration or
+attach to an explicitly authorized running Chrome while keeping opaque page/snapshot
+identities, tab ownership, and uncertain-effect handling inside the Plugin boundary.
 
 ## Calling and failure semantics
 

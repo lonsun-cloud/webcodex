@@ -11,6 +11,8 @@ mod path;
 mod pyright;
 mod registry;
 
+pub(crate) use path::resolve_under_project;
+
 #[cfg(test)]
 pub(crate) use registry::{adapter_metadata, registered_adapter_ids};
 

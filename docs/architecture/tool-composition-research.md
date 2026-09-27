@@ -1,9 +1,10 @@
 # Tool composition research and development plan
 
-Status: exploratory design note. This document records current research findings
-and a staged direction for reducing model/tool round trips. It is not a current
-runtime contract and does not authorize implementation shortcuts around existing
-tool, Session, Job, permission, audit, or Project boundaries.
+Status: active experimental design record. E1 read-only orchestration, the E2a
+structured-validation/Job foundation, and the narrow E2b guarded structured-mutation
+slice are implemented behind the experimental Code Mode feature. The governing rule
+is still that composition may reduce model-facing round trips but may not shortcut
+existing tool, Session, Job, permission, audit, Project, recovery, or Runner boundaries.
 
 ## Motivation
 
@@ -102,6 +103,20 @@ That shape is more attractive for WebCodex than a large user-facing JSON DAG:
 code can express dependencies and parallel branches compactly, while the Server
 can keep a small outer MCP schema and a closed nested-tool boundary.
 
+## Prerequisite: remove primitive contract friction first
+
+Composition must not be used to hide avoidable friction in the underlying tools.
+Before implementing this plan, ordinary primitives should follow the standing
+contract style: harmless bounded parameters normalize instead of wasting a turn,
+failures expose actionable typed reasons, successful results stay sparse, and
+follow-up calls have one parser-ready representation.
+
+Only after that baseline is stable should telemetry decide whether a repeated
+sequence represents real independent work, a pruning candidate, or a composition
+opportunity. A sequence caused mainly by schema correction, duplicate recovery,
+or discovery noise is a primitive-contract bug, not evidence for a composition
+runtime.
+
 ## Combined design principles
 
 A WebCodex composition layer should follow these rules:
@@ -136,6 +151,40 @@ A WebCodex composition layer should follow these rules:
 10. **Direct tools remain first-class.** Composition is an optimization for a
     known plan, not a requirement for ordinary single-tool work.
 
+## Current execution selection contract (T1)
+
+Ordinary model-facing execution primitives now declare a small canonical selection contract on `ToolDefinition`. It has four independent dimensions: `form` (`native_argv`, `typed_script`, `shell_command`, `structured_validation`, `persistent_shell_command`), `lifetime` (`runner`, `supervisor`, `session_shell`), `start` (`sync_first`, `async_immediate`, `existing_session`), and `continuation` (`observe_jobs`, `session_shell`, or `none`). `tool_manifest` projects these facts directly instead of asking the model to reconstruct them from descriptions or route names.
+
+This vocabulary is selection metadata, not a new execution layer. `lifetime=supervisor` does not grant authority; none of the four fields changes Project resolution, scope checks, permission/approval, Runner capability admission, timeout behavior, Job transitions, retry safety, OutcomeUnknown semantics, detached-process fencing, or Session-shell lifecycle. `run_shell` and `run_job`, for example, remain distinct canonical tools: both are shell commands owned by the Runner, but the former is `sync_first` while the latter is `async_immediate`. `run_process` and `run_detached_process` are both native argv forms, but their lifetime carriers are `runner` and `supervisor` respectively. Persistent `session_shell_exec` reuses an existing Session shell rather than becoming a Job.
+
+Structured validation keeps its tool-specific effects and evidence. `cargo_fmt`, `cargo_check`, `cargo_test`, and `go_test` share the selection shape `structured_validation / runner / sync_first / observe_jobs`; this does not imply identical mutation semantics. In particular, `cargo_fmt check=false` remains synchronous ensure-format mutation while `check=true` may use the existing same-execution Job handoff.
+
+T1 also makes filtered recommended-flow projections explicit when only part of a canonical flow is visible: partial projections identify themselves and list omitted canonical members instead of silently pairing complete-flow prose with a truncated tool list. Composition work must build on these canonical primitive semantics; T1 does not add JavaScript Code Mode, a generic composition runtime, or a universal execution abstraction.
+
+## Current result follow-up contract (T2)
+
+T2 adds a second, orthogonal vocabulary for **result follow-up**, not tool selection. `ContinuationSemantics` classifies follow-up by `kind` (`page`, `batch`, `observe`, `checkpoint`, `refine`) and `carrier` (`position`, `index`, `opaque_token`, `observation_token`, `revision`, `none`). It is published only when the result itself needs to disambiguate a dynamic follow-up shape; tools whose input/output contract already names one unambiguous token mapping do not repeat a static descriptor on every result. Concrete domains still own encoding, validation, fences, lifecycle, and failure behavior.
+
+The underlying mappings remain intentionally heterogeneous. Ordinary positional pagination such as `next_offset` or the next file range is `page / position`; aggregate packers may use `batch / index` boundaries internally, but when Runtime can reconstruct the complete follow-up and fit it inside the model-result budget it publishes only the parser-ready call; `git_diff_hunks` uses scope/fence-bound opaque page or hunk-fragment tokens; Job, CodingAgentRun, and Session-message stream cursors are `observe / observation_token`; and parameter changes such as increasing `max_result_bytes` or `max_hunk_lines` are `refine / none`. The wire fields remain domain-specific because they carry different invariants. CodingAgentRun and Session-message observation, for example, expose `observation_token` and the matching `after_observation_token` input directly without repeating `continuation_semantics` in every result.
+
+Those similarities do **not** create a shared token runtime. Git continuation keeps its scope/fence/MAC and committed-range identity. Job observation tokens remain exact-Job delta cursors. CodingAgentRun tokens retain their own Run binding, epoch, MAC, stale-epoch and history-loss rules. Session-message observation retains its Session-bound durable cursor. Task-context recovery instead uses an explicit `session_handoff_summary(session_id=...)` observation with an internal event/message snapshot fence; it publishes no model-context token. No token implementation parses another domain's token merely because both project the same semantic vocabulary.
+
+T2 also introduces one small shared `SuggestedToolCall { tool, arguments }` result-expression primitive and a matching schema helper. It only represents a bounded parser-ready advisory call already chosen by a domain producer. It does not dispatch, grant authority, carry retry permission, or replace the actual continuation identity. Existing domain envelopes remain intact: for example, `read_files` still reports `safe_cursor`, source SHA and snapshot stability; Git still distinguishes later-record continuation from omitted-current-hunk refinement; Session task-context recovery remains an explicit handoff observation rather than a generic continuation token.
+
+Failure recovery remains a separate lane. When a domain can prove one complete parser-ready `{tool, arguments}` action, that `suggested_call` is the sole actionable machine expression and does not repeat `recovery_kind`. When only a non-actionable recovery family can be proven, the result retains `recovery_kind` together with the family hint. The retired `RecoveryTool` enum and `recovery_tool` output field are no longer published. `retry_same` continues to mean exact safe replay only, and `outcome_unknown` never becomes retry authority. Successful or partial business continuation does not acquire failure-recovery metadata merely because more work remains. Task-context recovery is explicit through `session_handoff_summary(session_id=...)`; it neither ACKs nor resolves collaboration messages and grants no authority.
+
+After T1 and T2 the primitive foundation therefore has four distinct views:
+
+```text
+tool selection          execution form / lifetime / start / continuation primitive
+result follow-up        continuation kind / carrier
+failed invocation       recovery kind / domain-proven advisory action
+task-context recovery   explicit Session handoff
+collaboration retention request-scoped message ACK
+```
+
+These contracts reduce model inference cost without introducing a `NextAction` state machine, universal cursor, generic execution manager, workflow graph, or Code Mode. Any future composition layer must consume these canonical primitive facts while preserving the underlying child tool identities and domain state machines.
+
 ## Proposed shape
 
 Conceptually:
@@ -148,7 +197,10 @@ ChatGPT / model host
 compose_tools / code-mode entry
         |
         v
-bounded orchestration runtime
+orchestration frontend/runtime
+        |
+        v
+CanonicalOrchestrationHost
         |
         +--> canonical child invocation A --+
         +--> canonical child invocation B --+--> existing ToolRuntime
@@ -182,6 +234,13 @@ sandbox guarantees are measured. An internal test representation may use a
 structured plan; that does not imply shipping a generic JSON DAG as the ordinary
 model-facing contract.
 
+The E1.x implementation now exercises this split concretely: V8 remains the
+current frontend, while root-side canonical authority/admission/dispatch and
+composition accounting live in `CanonicalOrchestrationHost`. This does not decide
+that V8 is permanent. It establishes a seam where a later structured-plan or
+reusable TypeScript frontend can be compared without creating a second execution
+authority.
+
 ## Canonical nested invocation boundary
 
 The composition runtime should call one internal canonical dispatch entry rather
@@ -204,7 +263,9 @@ nested tool name + typed arguments
 Each child needs an independent logical invocation identity. A parent composition
 correlation id may connect those children for diagnostics, but it is not an
 idempotency key, Job id, Session id, permission token, or replacement for the
-child invocation identity.
+child invocation identity. Canonical target, recorder, context sidecars/message ACK, expectation,
+and private wrapper fields must remain host-owned invariants; frontend admission
+policy may only narrow this boundary further, never re-enable those fields.
 
 Specialized gateways should be excluded from the first version. If they are ever
 admitted, they must continue through their existing action-specific governance
@@ -212,30 +273,19 @@ boundary rather than becoming generic nested callbacks.
 
 ## Concurrency contract
 
-The first useful runtime contract can remain small:
+The implemented E2a runtime contract is deliberately smaller than the earlier two-axis sketch:
 
 ```text
-ToolConcurrencyPolicy::Parallel
-ToolConcurrencyPolicy::Sequential
-CompositionPolicy::Allowed | Denied
+ToolCompositionPolicy::Denied
+ToolCompositionPolicy::Sequential
+ToolCompositionPolicy::Parallel
 ```
 
-The default should be denied or sequential until a tool is reviewed. Read-only,
-independent inspection tools are the first candidates for `Parallel`. Mutation,
-Session-management, publication, release, Git-index/worktree mutation, and other
-shared-state tools stay sequential initially.
+This policy is canonical `ToolDefinition` metadata. The default, including unknown/future tools, is `Denied`. The exact E1 read allowlist is `Parallel`; `cargo_check`, `cargo_test`, and `apply_text_edits` are `Sequential`; everything else remains denied unless deliberately reviewed later. Frontend admission is separate and explicit: composition policy never makes a tool reachable and grants no scope, permission, Project, Runner, retry, or idempotency authority. E1 still admits only reads, E2a admits reads plus the two validators, and E2b admits reads plus only `apply_text_edits`.
 
-A later, evidence-driven extension may add a resource key such as:
+`CanonicalOrchestrationHost` enforces the policy with one composition-local shared/exclusive scheduling fence. `Parallel` canonical child invocation intervals can overlap; `Sequential` is exclusive against every child interval. The fence ends when canonical ToolRuntime invocation returns, including an existing same-execution Job handoff. Durable Jobs then own their ordinary lifetime independently, so two predetermined E2a validators can enter sequentially yet later run concurrently as Jobs.
 
-```text
-file:<canonical project + path>
-git:<canonical project/worktree>
-job:<job id>
-```
-
-That would allow, for example, two proven-independent file mutations while still
-serializing two mutations of the same file. This should not become a generic lock
-framework before concrete mutation dogfood requires it.
+E2b adds one deliberately coarse cross-host fence only for orchestration-originated canonical mutation. A process-local registry is shared by cloned `ToolRuntime` state and keyed by canonical resolved Project id. An E2b mutation acquires that Project's exclusive fence before canonical dispatch and holds it until the child `ToolResult` is known; different Projects remain independent. Read-only orchestration and E2a validation never acquire this registry, and ordinary direct mutations deliberately bypass it. The experiment does not define file locks, Git locks, lock hierarchies, a generic resource graph, distributed locking, or Runner-protocol locking. Finer locking is deferred until telemetry demonstrates that Project-level serialization is a real bottleneck.
 
 Even parallel-eligible tools need a composition-wide concurrency cap. Parallelism
 must improve latency without turning one model call into unbounded Runner/process
@@ -252,12 +302,7 @@ tool, resource-budget exhaustion, runtime exception, cancellation, or a hard
 orchestration timeout. Such a parent failure must not claim that already-entered
 child effects did not occur.
 
-Long-running child execution needs special care. Existing WebCodex Jobs already
-provide the durable same-execution handoff path, so composition should not invent
-a second background-process or cell lifecycle. A nested tool may eventually
-return its normal `job_id`; the parent can emit that result and the model can use
-ordinary Job observation. The first implementation can avoid long-running
-children until this projection is proven.
+Long-running child execution now uses the existing WebCodex Job path directly. E2a admits only structured `cargo_check` / `cargo_test` as consequential children and caps their nested synchronous handoff preference at five seconds without changing total `timeout_secs`. An unfinished validator returns the same canonical `job_id` and parser-ready ordinary Job continuation; E2a creates no second background-process or cell lifecycle and does not restart the child. `observe_jobs` intentionally remains outside nested Code Mode in E2a.
 
 A Server restart should not attempt to resume arbitrary process-local
 orchestration code. Canonical child effects keep their existing recovery truth.
@@ -273,15 +318,9 @@ recorder context to admitted child calls, but each child must record through the
 same existing Session path it would use directly. The composition wrapper must
 not become a second authoritative business event that double-counts the children.
 
-Read-only/re-observable children are a suitable first slice because they do not
-usually advance the Session context checkpoint. Consequential child tools are
-harder: several children may independently advance `context_revision`, produce
-permission evidence, or create Jobs while the host receives only one parent
-response. Before mutation or consequential execution is admitted, WebCodex needs
-a deterministic rule for the final parent Session continuity projection and for
-intermediate child revisions. It must preserve the existing monotonic revision,
-ACK, recovery, and message semantics rather than compressing them into a fake
-single child result.
+E1 read-only/re-observable children established the first slice. E2a proves the consequential validation rule: every child records through its ordinary canonical Session path; the parent does not become a fake validation identity or transaction. E2b applies the same rule to mutation: the nested canonical `apply_text_edits` event owns first-class Edit provenance and state-change evidence, while the outer `code_mode_exec_mutating` wrapper emits no generic top-level `state_changed` and does not independently set `repository_edit_observed`. No-op, dry-run, and provably pre-start edits remain non-provenance; a successful nested edit with canonical `state_changed=true` qualifies exactly as a direct edit would. Final Changes continues to compare the Session Git baseline with the complete final workspace, not with a Code Mode-local diff.
+
+Once all already-started children have drained to a known result, same-execution Job handoff, or truthful uncertainty, a consequential parent is decorated from the latest monotonic Session state. It accepts only trusted outer ACK metadata, never lets JavaScript ACK guidance, and never compresses child revisions or evidence into a synthetic event.
 
 Composition must never use Window affinity or recorder-gap hints to fill in a
 missing recorder. The Window work remains diagnostic only.
@@ -343,90 +382,89 @@ must remain separate because only the former are wholly service-owned.
 
 ## Staged implementation plan
 
-### Phase 0 — Measurement and contract inventory
+The concrete Direct-vs-Code-Mode capture/report protocol is documented in
+[`../experiments/agent-loop-baseline.md`](../experiments/agent-loop-baseline.md).
 
-- Use Window/server-trace correlation to measure model-facing outer-call counts,
-  tool durations, Runner timing available today, and gaps outside WebCodex.
-- Classify existing direct tools by composition eligibility and concurrency safety.
-- Identify which current ToolDefinition fields can own the policy without a
-  parallel registry.
-- Define parent/child diagnostic identity and bounded audit projection before
-  changing execution behavior.
-- Establish representative review/implementation traces to compare outer MCP
-  calls, canonical child calls, Runner calls, and wall time separately.
-
-Success means we can explain where elapsed time is spent without claiming access
-to model-private state.
-
-### Phase 1 — Read-only bounded composition prototype
-
-Expose one experimental operator tool with a simple outer schema and a restricted
-orchestration program. Start with a closed allowlist of independent inspection
-operations such as multi-file reads, source search, Git review/diff inspection,
-and other already-direct read-only coding tools.
-
-Initial hard rules:
-
-- no recursive composition;
-- no file/Git/Session mutation;
-- no generic shell/process execution;
-- no plugin/MCP/SSH gateway calls;
-- no adaptive long-tail bypass;
-- small program-size and child-call limits;
-- small parallelism cap;
-- shared wall-clock and serialized-output ceilings;
-- every child uses canonical ToolRuntime dispatch.
-
-Synthetic delayed-tool tests should prove that independent children actually run
-concurrently while a sequential child fences execution as designed. Authority
-negative tests should prove that composition cannot call a child the caller could
-not invoke directly.
-
-### Phase 2 — Review dogfood and latency comparison
-
-Dogfood the read-only slice on real branch review. Compare:
+The experiment now uses these concrete stage names:
 
 ```text
-outer model/tool round trips
-canonical tool invocations
-Runner requests
-WebCodex-owned wall time
-end-to-end task wall time
-findings / validation quality
+E1   read-only orchestration
+E2a  structured validation + Job/effect foundation
+E2b  guarded structured mutation: E1 reads + one apply_text_edits attempt
+E2c  decide whether validation and mutation should coexist in one cell;
+     consider selective generic process/shell only if telemetry justifies it
+E3   implemented generic asynchronous Job terminal attention v1
+E4   product/stability decision
 ```
 
-The target is not fewer canonical facts. The target is fewer *outer model-facing
-round trips* for evidence that was already known to be independent.
+### E1 — implemented read-only control
 
-Keep direct-tool traces as the control. If composition does not materially reduce
-latency or makes model behavior less reliable, stop before adding mutation.
+`code_mode_exec` remains a separate `Observe / Read / PureRead / project:read` control surface. Its closed read allowlist, V8 limits, canonical host boundary, composition telemetry, and direct-tools-vs-Code-Mode dogfood establish whether moving inspection decisions below the outer model round trip is actually useful.
 
-### Phase 3 — Structured execution and Job-aware composition
+### E2a — implemented consequential foundation
 
-After read-only dogfood is stable, consider bounded structured process/validation
-children. Preserve existing same-execution Job handoff and observation rather than
-creating a new composition-specific background lifecycle. Define cancellation and
-parent timeout behavior before allowing parallel long-running executions.
+`code_mode_exec_effectful` is feature-gated and conservatively declares `Execute / JobRun / Standard / NonIdempotent / job:run`. It admits all E1 reads plus only `cargo_check` and `cargo_test`. It adds no source mutation.
 
-This phase should also prove that a child Job remains observable and recoverable
-after the parent composition request has returned.
+E2a closes the correctness prerequisites that were previously future work:
 
-### Phase 4 — Guarded mutation, only if justified
+- `ToolDefinition` owns default-denied Parallel/Sequential composition policy;
+- the canonical host, not JavaScript, owns scheduling and a monotonic close gate;
+- a Sequential waiter cannot begin canonical dispatch after frontend termination;
+- timeout/JS failure drains children that already crossed canonical dispatch;
+- a separate sparse effect receipt distinguishes known results, same-execution Job handoffs, and outcome uncertainty;
+- failed validation is a known business result, not uncertainty;
+- outer failure never claims no effect or whole-program retry safety after consequential dispatch;
+- Job handoff preserves ordinary `job_id`/continuation and ordinary later observation;
+- final parent Session continuity is projected from the latest canonical Session state after child evidence;
+- outer durable audit stores only bounded effect counters, not Job tokens or child payloads.
 
-Mutation should be last. Before enabling it, close:
+`observe_jobs` is deliberately not nested: Code Mode has a 30-second frontend maximum while ordinary Job observation may wait up to 100 seconds. The parent returns the canonical handoff and the model later observes it normally.
 
-- Workflow Session context-revision projection for multiple consequential child
-  calls;
-- resource-level serialization for file and Git/worktree mutation;
-- partial-success/failure presentation with no rollback fiction;
-- stale SHA/context recovery per child;
-- permission evidence and audit ordering;
-- parent retry behavior after an uncertain response.
+### E2b — implemented guarded structured mutation
 
-Start with independent guarded file edits only if dogfood shows a substantial
-round-trip benefit beyond existing `apply_text_edits` batching. Git publication,
-Session messaging, release/deploy actions, and heterogeneous gateways should stay
-outside until they have their own demonstrated composition need.
+`code_mode_exec_mutating` is feature-gated and conservatively declares `Mutate / ProjectWrite / Standard / NonIdempotent / project:write`. It admits the E1 read set plus only canonical `apply_text_edits`; validators, `apply_patch`, whole-file write, generic process/shell, Job observation, gateways, Computer control, Git/Session mutation, and recursive Code Mode remain excluded.
+
+The first-version mutation contract is intentionally narrow:
+
+- one E2b cell may cross the canonical mutation boundary at most once, counted by canonical `ToolEffect::Mutate` rather than a tool-name registry;
+- the one mutation may still use `apply_text_edits`' existing transactional multi-file batch and `read_revision` guards;
+- a guarded `replace_exact` may state `expected_match_count` for repetitive exact text, with optional `line_scope`; dry-run match evidence is bounded and does not authorize the later actual request;
+- a second mutation attempt is rejected before canonical business dispatch and cannot reach the Runner;
+- same-Project E2b mutations are serialized by the process-local Project fence described above; different Projects may proceed independently;
+- direct writes are unchanged and are not silently serialized against the experimental fence;
+- mutation receipts preserve optional authoritative `state_changed`: missing mutation truth fails closed to `outcome_unknown`, never false;
+- JavaScript failure or timeout after dispatch preserves completed mutation truth, while unresolved work after the existing bounded five-second reconciliation remains `outcome_unknown`;
+- E2b adds no retry engine, mutation transaction coordinator, JS patch parser, filesystem API, or second write protocol.
+
+The primary adaptive workflow is therefore `canonical read -> JavaScript decision -> one canonical apply_text_edits -> canonical post-edit inspection`. Validation is intentionally outside the mutation-capable cell. Combining validation Jobs and later mutation would otherwise make validation freshness ambiguous without a workspace-snapshot fence; that question is deferred rather than hidden.
+
+### E3 — implemented generic Job terminal attention v1
+
+E3 is a generic Job lifecycle capability, not a Code Mode child tool. The model-visible operation is `wait_for_job_terminal(job_id, idempotency_key)`: it arms one caller-owned, bounded, one-shot terminal wait for one exact already-dispatched public Job. `job_id` remains execution identity; the wait never starts, retries, stops, replaces, or redispatches work. Observation tokens remain opaque log/lifecycle cursors and are not E3 identity or authority. The sparse terminal event contains only exact Job identity, canonical terminal status, and a bounded outcome classification; detailed logs and validation evidence remain available only through ordinary `observe_jobs`.
+
+Authoritative triggering comes only from the existing RunnerRegistry Job lifecycle. Accepted sequenced Runner terminal updates, protocol-violation terminalization, stop/lost/timeout paths, and authoritative receipt/reconciliation hydration all converge on the existing first-terminal-observation hook. That hook marks an in-memory candidate while the registry mutex is held; an immutable sparse terminal fact is captured and sent to the E3 sink only after the mutex is released. E3 therefore creates neither a second Job tracker nor SQLite I/O under the RunnerRegistry async mutex. Stale, duplicate, out-of-order, wrong-instance, or otherwise rejected Runner updates cannot create a second logical terminal event.
+
+The durable `wc_job_terminal_waits` store is separate from Durable Agent waits because its authority model is different. Registration first re-authorizes the exact visible Job and persists only a digest of caller ownership plus the minimum Job authority partition. Workflow Session, ClientWindow, MCP request id, recording provenance, and observation cursor are absent from execution authority. Exact keyed replay returns the same wait; changed reuse conflicts. Registration uses a two-snapshot handshake around the durable insert: a terminal Job is matched immediately, while a transition racing the insert is caught either by the post-lock terminal sink or the second canonical snapshot. Active-wait retention is derived from the structured execution ceiling, recovery grace, and existing Job terminal-retention window rather than a short arbitrary TTL.
+
+Restart preserves durable event truth but not a process-local Host callback. Waiting rows survive Store reopen; Runner reconciliation or retained terminal-receipt hydration can match them to the same Job without redispatch. A triggered event remains `pending` when no eligible carrier exists. A failed preflight remains pending because the durable dispatch fence was not crossed. `delivered` means the configured carrier accepted dispatch after that fence. `delivery_unknown` means dispatch crossed the durable fence but acknowledgement is not authoritative; it is never silently retried. A Server takeover conservatively converts any old process-local `prepared` delivery to `delivery_unknown`.
+
+E3-H1 adds the Job-native MCP App Host carrier without wrapping Jobs in Durable Agents or Agent Endpoints. The one model-visible presentation operation is `present_job_terminal_continuation(wait_id)`: presentation always names one exact caller-owned wait, independently re-authorizes that wait and its underlying Job visibility, and creates only a bounded App card. It cannot infer a wait from Project, Workflow Session, ClientWindow, Window Peer, credential, or recent activity, and it cannot start, retry, stop, replace, or otherwise mutate the Job lifecycle. The App-only bind/state/prepare/finish/unbind coordination operations remain ModelHidden.
+
+The H1 carrier keeps Host routing separate from Job authority. A View generates a cryptographically random process-local `binding_id`; canonical `ClientWindow` arrives only from MCP Host sideband and is already domain-separated/hashed. The process binding is therefore `(wait_id, authorized wait principal, ClientWindow, binding_id)`. ClientWindow is a routing-continuity fence only: it is not Job, Project, Workflow Session, execution, or bearer authority. The raw Host session value is neither accepted as tool input nor persisted. Window Peer is deliberately not a continuation transport: H1 does not read or write peer-message rows, and a peer id never substitutes for either wait authority or ClientWindow continuity.
+
+Only one process-local App carrier is active per exact wait. Exact binding replay is idempotent; a refreshed View from the same ClientWindow may replace its stale binding and immediately fences the old View; a different ClientWindow cannot steal a live carrier. The carrier registry is process-local, so Server restart clears it. `automatic_resume_available` is consequently calculated for the exact wait at call time: an eligible exact binding makes only that wait true, an unrelated or stale/unbound wait remains false, and restart makes surviving waits false until an eligible App rebinds. Exact `wait_for_job_terminal` keyed replay reports this current per-wait truth rather than a global MCP-App capability.
+
+The MCP App is a bounded pull bridge rather than a Server-push channel. While a card is live it reads only its App-hidden exact state at a bounded foreground/background cadence; no model-facing `observe_jobs` polling is needed merely to discover terminal completion. When canonical E3 terminalization moves the durable wait to triggered/pending, the View calls prepare, which re-authorizes the exact wait and live binding before crossing the existing durable `pending -> prepared` fence. The returned private message contains only sparse Job id/status/outcome continuation instructions. The View then has one `ui/message` dispatch site and records only Host `dispatch_accepted` or conservative `delivery_unknown` through finish. Host acceptance means the Host accepted the dispatch request, not that a fresh model turn has already completed.
+
+No second delivery ledger exists. Before prepare, binding/state/preflight failure leaves durable pending truth recoverable by a later valid binding. After prepare, missing/malformed responses, Host rejection/timeout/response loss, View replacement, or teardown must never reopen pending merely to retry; authoritative prepared state is reconciled to `delivery_unknown` when safe evidence cannot prove that dispatch never occurred. A pending wait may rebind after Server restart, while the existing restart recovery converts any pre-restart prepared attempt to `delivery_unknown` and never redispatches it. `delivered` and `delivery_unknown` stop App polling. `observe_jobs` remains the canonical optional detail/recovery primitive for logs and validation evidence.
+
+Deterministic controller and Host-harness tests can prove the local topology `running Job -> wait -> explicit App bind -> canonical terminal -> pending -> prepare -> exactly one ui/message -> finish`, including zero model-facing `observe_jobs` calls for terminal discovery, no second execution, no second logical event, and no second Host dispatch. They do not prove live ChatGPT auto-resume. That production claim remains behind a separately authorized candidate deployment built from the then-current `main` plus H1 and a real long-Job test whose first post-terminal model activity is the Host-generated continuation turn.
+
+E3 and E3-H1 deliberately do not enter the E1/E2a/E2b allowlists. `wait_for_job_terminal`, `present_job_terminal_continuation`, all App-hidden Job continuation operations, and `observe_jobs` remain outside Code Mode. E2a and direct validators still return the same canonical Job handoff, E2b remains mutation-only, and no Code Mode cell waits on Jobs. The intended relationship is `E2a or Direct validator -> canonical Job handoff -> E3 terminal attention -> explicit H1 Host carrier`, with an optional later `observe_jobs` call only when the model needs detailed evidence.
+
+### E2c / E4
+
+E2c still decides whether validation and mutation should coexist in one cell and whether any selective process/shell composition is justified by telemetry. Finer mutation locking is also evidence-driven, not assumed. E3 remains independent of that decision and is not evidence for nested Job waiting. Product/stability commitment comes only after the experimental execution, E3 Host-integration dogfood, and broader evidence are mature.
 
 ## What not to build
 
@@ -465,8 +503,7 @@ A production-ready first slice should satisfy all of the following:
   exposing raw host identity or payload bodies;
 - direct tools continue to work unchanged;
 - no Workflow Session is selected from Window identity;
-- no mutation support ships until multi-child Session/Job/recovery semantics are
-  explicitly proven.
+- guarded mutation reuses canonical `apply_text_edits`, allows at most one mutation attempt per cell, preserves exact state-change/uncertainty truth, and leaves direct mutation semantics unchanged.
 
 ## Open design questions
 
@@ -481,12 +518,10 @@ A production-ready first slice should satisfy all of the following:
    without prematurely designing resource locks for mutation?
 5. How should parent/child invocation identities appear in ActionAudit and the
    Windows view while preserving current privacy policy?
-6. What final Session continuity projection is correct once one parent response
-   contains several consequential child revisions?
-7. How should a parent request report a mixture of synchronous results and child
-   Jobs without creating a second Job lifecycle?
-8. Which timing boundaries can the current Runner protocol prove directly, and
-   which require additive privacy-safe telemetry?
+6. Does E2b dogfood show enough same-Project mutation contention to justify anything finer than the current coarse Project fence?
+7. Can validation and mutation safely coexist in one E2c cell without a canonical workspace-snapshot/freshness fence, or should ordinary post-cell validation remain the boundary?
+8. Does nested short Job observation remove enough outer turns to justify widening E2a, or is ordinary `observe_jobs` the better boundary?
+9. Which timing boundaries can the current Runner protocol prove directly, and which require additive privacy-safe telemetry?
 
 These questions should be answered with focused prototypes and dogfood traces,
 not by widening the first implementation preemptively.

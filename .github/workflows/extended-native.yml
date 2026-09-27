@@ -88,7 +88,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - name: Verify native macOS Intel host
         shell: bash
         env:
@@ -103,6 +105,8 @@ jobs:
         run: |
           cargo check --locked --workspace
           cargo test --locked -p webcodex-runner -p webcodex-computer
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend and Rust
@@ -204,7 +208,9 @@ jobs:
           node-version: 22
           architecture: arm64
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: extended-windows-arm64-ci
@@ -218,6 +224,8 @@ jobs:
           if ($hostLine.Line -ne 'host: aarch64-pc-windows-msvc') { throw "Unexpected Rust host: $($hostLine.Line)" }
           cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner
           if ($LASTEXITCODE -ne 0) { throw "Windows ARM64 cargo check failed" }
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend and Rust

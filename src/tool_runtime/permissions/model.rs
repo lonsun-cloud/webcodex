@@ -93,7 +93,7 @@ pub(crate) fn new_permission_decision(
     PermissionDecision {
         required: true,
         policy: policy.into(),
-        request_id: format!("wc_perm_{}", uuid::Uuid::new_v4().simple()),
+        request_id: format!("wc_perm_{}", webcodex_core::compact::random_suffix::<12>()),
         status: outcome.as_str().to_string(),
         reason: reason.into(),
         risk: risk.into(),

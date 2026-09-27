@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use super::super::input_schemas::{checkpoint_labels_schema, checkpoint_validation_schema};
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
+    array_schema, checkpoint_labels_schema, checkpoint_validation_schema, nullable_schema,
+    open_object_schema, schema_type, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {

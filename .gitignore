@@ -51,3 +51,8 @@ data*
 # Watched frontend development output.
 /frontend/.dev-dist/
 logs/
+
+# Regenerable isolated UI verification output; curated screenshots live in docs/ux/.
+/artifacts/issue470-ui/
+/artifacts/liquid-glass-ui/
+/scripts/ui-smoke/node_modules/

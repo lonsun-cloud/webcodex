@@ -1,13 +1,13 @@
 use super::protocol::request_client_capabilities;
 use super::response::{
-    mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error, rpc_result,
+    mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error, rpc_error_with_data,
+    rpc_result, McpToolResultPresentation, MCP_STATELESS_CACHE_SCOPE, MCP_STATELESS_CACHE_TTL_MS,
 };
 use super::{require_mcp_scope, scope_forbidden, McpOutcome};
 use crate::auth::AuthContext;
-use crate::model_surface::ModelSurface;
 use crate::tool_runtime::{
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot, ToolResult,
-    ToolRuntime, MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH,
+    ToolRuntime, INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES, MAX_PROJECT_ARTIFACT_EXPORT_BYTES,
 };
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::future::join_all;
@@ -36,7 +36,7 @@ pub(super) const MAX_MCP_ARTIFACT_EXPORTS: usize = 128;
 pub(super) const MAX_MCP_ARTIFACT_EXPORTS_PER_CALLER: usize = 16;
 pub(super) const MCP_ARTIFACT_EXPORT_BUSY_CODE: i64 = -32029;
 pub(super) const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-pub(super) const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v11";
+pub(super) const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v12";
 pub(super) const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
@@ -48,15 +48,49 @@ pub(super) const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v8",
     "ui://webcodex/computer/v9",
     "ui://webcodex/computer/v10",
+    "ui://webcodex/computer/v11",
 ];
 // Temporary gray-card diagnostic: force the host to re-read the canonical App
 // resource for every card so resource reuse/cache is not an unobserved variable.
 pub(super) const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 0;
-pub(super) const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
-pub(super) const MCP_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/result/v1";
+pub(super) const MCP_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/changes/v2";
+pub(super) const MCP_RESULT_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
+    "ui://webcodex/changes/v1",
+    "ui://webcodex/result/v1",
+    "ui://webcodex/result/v2",
+    "ui://webcodex/result/v3",
+];
+pub(super) const MCP_WORK_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/work-result/v6";
+// Hosts can retain previously shipped Work Result / Changes resources across
+// deploys. Keep those URIs readable with the current safe template, but only the
+// canonical v6 descriptor admits a new card. Legacy payloads are never promoted
+// into authoritative Work Result state.
+pub(super) const MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
+    "ui://webcodex/work-result/v1",
+    "ui://webcodex/work-result/v2",
+    "ui://webcodex/work-result/v3",
+    "ui://webcodex/work-result/v4",
+    "ui://webcodex/work-result/v5",
+    "ui://webcodex/changes/v3",
+];
+// Goal Plan intentionally serves only one current resource identity. Hosts may
+// retain a live/cached View by URI across Server deploys, so any shipped App
+// template or incompatible App-tool wire change must advance this URI rather
+// than relying on a same-URI resource refresh.
+pub(super) const MCP_GOAL_PLAN_UI_RESOURCE_URI: &str = "ui://webcodex/goal-plan/v6";
+pub(super) const MCP_AGENT_CONTINUATION_UI_RESOURCE_URI: &str =
+    "ui://webcodex/agent-continuation/v17";
+pub(super) const MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI: &str =
+    "ui://webcodex/job-terminal-continuation/v1";
 pub(super) const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(super) const MCP_COMPUTER_APP_HTML: &str = include_str!("../mcp_computer_app.html");
 pub(super) const MCP_RESULT_APP_HTML: &str = include_str!("../mcp_result_app.html");
+pub(super) const MCP_WORK_RESULT_APP_HTML: &str = include_str!("../mcp_work_result_app.html");
+pub(super) const MCP_GOAL_PLAN_APP_HTML: &str = include_str!("../mcp_goal_plan_app.html");
+pub(super) const MCP_AGENT_CONTINUATION_APP_HTML: &str =
+    include_str!("../mcp_agent_continuation_app.html");
+pub(super) const MCP_JOB_TERMINAL_CONTINUATION_APP_HTML: &str =
+    include_str!("../mcp_job_terminal_continuation_app.html");
 
 pub(super) fn request_supports_mcp_apps(params: &Value) -> bool {
     let Some(extension) = request_client_capabilities(params)
@@ -74,62 +108,81 @@ pub(super) fn request_supports_mcp_apps(params: &Value) -> bool {
     }
 }
 
-pub(super) fn model_surface_supports_mcp_apps(model_surface: ModelSurface) -> bool {
-    model_surface.supports_operator_extensions()
-}
-
-pub(super) fn model_surface_supports_computer_app(model_surface: ModelSurface) -> bool {
-    model_surface_supports_mcp_apps(model_surface)
-}
-
-pub(super) fn mcp_computer_app_resource_meta() -> Value {
-    json!({
-        "ui": {
-            "prefersBorder": true,
-            "domain": MCP_COMPUTER_UI_DOMAIN,
-            "csp": {
-                "connectDomains": [],
-                "resourceDomains": []
-            }
+fn mcp_app_resource_meta(domain: Option<&str>) -> Value {
+    let mut ui = json!({
+        "prefersBorder": true,
+        "csp": {
+            "connectDomains": [],
+            "resourceDomains": []
         }
-    })
+    });
+    if let Some(domain) = domain {
+        ui["domain"] = Value::String(domain.to_string());
+    }
+    json!({ "ui": ui })
 }
 
-pub(super) fn mcp_computer_app_resources_list() -> Value {
+pub(super) fn mcp_computer_app_resource_meta(domain: Option<&str>) -> Value {
+    mcp_app_resource_meta(domain)
+}
+
+pub(super) fn mcp_computer_app_resources_list(domain: Option<&str>) -> Value {
     json!({
         "resources": [{
             "uri": MCP_COMPUTER_UI_RESOURCE_URI,
             "name": "WebCodex Computer",
-            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
+            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders native images returned by computer_observe snapshot actions.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-            "_meta": mcp_computer_app_resource_meta()
+            "_meta": mcp_computer_app_resource_meta(domain)
         }]
     })
 }
 
-pub(super) fn mcp_result_app_resource_meta() -> Value {
-    json!({
-        "ui": {
-            "prefersBorder": true,
-            "csp": {
-                "connectDomains": [],
-                "resourceDomains": []
-            }
-        }
-    })
+pub(super) fn mcp_result_app_resource_meta(domain: Option<&str>) -> Value {
+    mcp_app_resource_meta(domain)
 }
 
-pub(super) fn mcp_app_resources_list() -> Value {
-    let mut result = mcp_computer_app_resources_list();
+pub(super) fn mcp_app_resources_list(domain: Option<&str>) -> Value {
+    let mut result = mcp_computer_app_resources_list(domain);
     result["resources"]
         .as_array_mut()
         .expect("computer App resource list must be an array")
         .push(json!({
-            "uri": MCP_RESULT_UI_RESOURCE_URI,
-            "name": "WebCodex Result",
-            "description": "Read-only WebCodex structured result presentation for list_jobs, observe_jobs, cargo_check, cargo_test, go_test, and validation_summary. The App renders bounded presentation metadata and never performs tool calls or owns runtime state.",
+            "uri": MCP_WORK_RESULT_UI_RESOURCE_URI,
+            "name": "WebCodex",
+            "description": "Persistent user-facing task card for one explicitly presented project-scoped Workflow Session. The mounted App performs bounded app-only refreshes for current activity, last-active timing, shared Session collaboration Acknowledged/Handled state, and closeout result. It reuses the same Session message store as WebUI. Live workspace details stay hidden; a non-blocking current-attempt finish_coding_task closeout may seal one immutable final-changes snapshot that the card discovers and lazily expands per file.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-            "_meta": mcp_result_app_resource_meta()
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result["resources"]
+        .as_array_mut()
+        .expect("App resource list must be an array")
+        .push(json!({
+            "uri": MCP_GOAL_PLAN_UI_RESOURCE_URI,
+            "name": "WebCodex Goal Plan",
+            "description": "Sparse read-only durable Goal presentation. One explicit present_goal_plan call creates the card; the View converges by app-only exact polling of authoritative Goal state and never owns execution or lifecycle state.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result["resources"]
+        .as_array_mut()
+        .expect("App resource list must be an array")
+        .push(json!({
+            "uri": MCP_AGENT_CONTINUATION_UI_RESOURCE_URI,
+            "name": "WebCodex Agent Continuation",
+            "description": "Sparse Host controller for one explicit Durable Agent Endpoint generation. The View is a process-local carrier only: SQLite Wake/Wake Delivery Attempt remains authoritative, and Host dispatch is considered actually resumed only after exact consume_agent_wake.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result["resources"]
+        .as_array_mut()
+        .expect("App resource list must be an array")
+        .push(json!({
+            "uri": MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI,
+            "name": "WebCodex Job Continuation",
+            "description": "Job-native Host continuation carrier for one explicit caller-owned Job terminal wait. The View is routing-only: canonical Job terminal truth and the durable delivery fence remain in the existing Job terminal wait ledger, while the App performs bounded state polling and at most one prepared ui/message dispatch.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
         }));
     result
 }
@@ -138,7 +191,7 @@ pub(super) fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
     uri == MCP_COMPUTER_UI_RESOURCE_URI || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
-pub(super) fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
+pub(super) fn mcp_computer_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
     // ChatGPT can retain an older tool descriptor across connector refreshes.
     // Keep prior computer App URIs as hidden read aliases so an already-bound
     // card can fetch the current safe template. resources/list and tools/list
@@ -150,27 +203,131 @@ pub(super) fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
                 "uri": uri,
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "text": MCP_COMPUTER_APP_HTML,
-                "_meta": mcp_computer_app_resource_meta()
+                "_meta": mcp_computer_app_resource_meta(domain)
             }]
         })
     })
 }
 
-pub(super) fn mcp_result_app_resource_read(uri: &str) -> Option<Value> {
-    (uri == MCP_RESULT_UI_RESOURCE_URI).then(|| {
+pub(super) fn is_mcp_result_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_RESULT_UI_RESOURCE_URI || MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+}
+
+pub(super) fn mcp_result_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_result_app_resource_uri(uri).then(|| {
         json!({
             "contents": [{
                 "uri": uri,
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "text": MCP_RESULT_APP_HTML,
-                "_meta": mcp_result_app_resource_meta()
+                "_meta": mcp_result_app_resource_meta(domain)
             }]
         })
     })
 }
 
-fn mcp_static_app_resource_read(uri: &str) -> Option<Value> {
-    mcp_computer_app_resource_read(uri).or_else(|| mcp_result_app_resource_read(uri))
+pub(super) fn is_mcp_work_result_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_WORK_RESULT_UI_RESOURCE_URI || MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+}
+
+pub(super) fn mcp_work_result_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_work_result_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_WORK_RESULT_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_goal_plan_app_resource_uri(uri: &str) -> bool {
+    // Goal workflow is pre-production: one current resource and wire contract.
+    uri == MCP_GOAL_PLAN_UI_RESOURCE_URI
+}
+
+pub(super) fn mcp_goal_plan_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_goal_plan_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_GOAL_PLAN_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_agent_continuation_app_resource_uri(uri: &str) -> bool {
+    // Thin hidden read aliases for existing cards; discovery advertises only v17.
+    uri == MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+        || matches!(
+            uri,
+            "ui://webcodex/agent-continuation/v1"
+                | "ui://webcodex/agent-continuation/v2"
+                | "ui://webcodex/agent-continuation/v3"
+                | "ui://webcodex/agent-continuation/v4"
+                | "ui://webcodex/agent-continuation/v5"
+                | "ui://webcodex/agent-continuation/v6"
+                | "ui://webcodex/agent-continuation/v7"
+                | "ui://webcodex/agent-continuation/v8"
+                | "ui://webcodex/agent-continuation/v9"
+                | "ui://webcodex/agent-continuation/v10"
+                | "ui://webcodex/agent-continuation/v11"
+                | "ui://webcodex/agent-continuation/v12"
+                | "ui://webcodex/agent-continuation/v13"
+                | "ui://webcodex/agent-continuation/v14"
+                | "ui://webcodex/agent-continuation/v15"
+                | "ui://webcodex/agent-continuation/v16"
+        )
+}
+
+pub(super) fn mcp_agent_continuation_app_resource_read(
+    uri: &str,
+    domain: Option<&str>,
+) -> Option<Value> {
+    is_mcp_agent_continuation_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_AGENT_CONTINUATION_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_job_terminal_continuation_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI
+}
+
+pub(super) fn mcp_job_terminal_continuation_app_resource_read(
+    uri: &str,
+    domain: Option<&str>,
+) -> Option<Value> {
+    is_mcp_job_terminal_continuation_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_JOB_TERMINAL_CONTINUATION_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+fn mcp_static_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    mcp_computer_app_resource_read(uri, domain)
+        .or_else(|| mcp_work_result_app_resource_read(uri, domain))
+        .or_else(|| mcp_result_app_resource_read(uri, domain))
+        .or_else(|| mcp_goal_plan_app_resource_read(uri, domain))
+        .or_else(|| mcp_agent_continuation_app_resource_read(uri, domain))
+        .or_else(|| mcp_job_terminal_continuation_app_resource_read(uri, domain))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,13 +542,22 @@ pub(super) fn mcp_artifact_export_id_from_uri(uri: &str) -> Option<&str> {
 pub(super) enum McpSnapshotResourceKind {
     Window,
     Display,
+    Browser,
 }
 
 impl McpSnapshotResourceKind {
-    pub(super) fn from_tool_name(tool_name: &str) -> Option<Self> {
+    pub(super) fn from_result(tool_name: &str, output: &Value) -> Option<Self> {
+        if output.get("content_base64").is_none() {
+            return None;
+        }
         match tool_name {
-            "computer_snapshot" => Some(Self::Window),
-            "computer_snapshot_display" => Some(Self::Display),
+            "browser_observe"
+                if output.get("browser_id").is_some() && output.get("page_id").is_some() =>
+            {
+                Some(Self::Browser)
+            }
+            "computer_observe" if output.get("display_id").is_some() => Some(Self::Display),
+            "computer_observe" => Some(Self::Window),
             _ => None,
         }
     }
@@ -405,6 +571,7 @@ impl McpSnapshotResourceKind {
         let kind = match self {
             Self::Window => "window",
             Self::Display => "display",
+            Self::Browser => "browser",
         };
         let normalized_client_id: String = client_id
             .chars()
@@ -417,7 +584,10 @@ impl McpSnapshotResourceKind {
             })
             .collect();
         let client_id = if normalized_client_id.is_empty() {
-            "computer"
+            match self {
+                Self::Browser => "browser",
+                Self::Window | Self::Display => "computer",
+            }
         } else {
             normalized_client_id.as_str()
         };
@@ -558,16 +728,18 @@ pub(super) fn mcp_issue_artifact_export(
 pub(super) fn mcp_artifact_export_tool_result(
     result: ToolResult,
     caller: McpArtifactExportCallerBinding,
+    result_presentation: McpToolResultPresentation,
 ) -> Value {
     if !result.success {
-        return mcp_runtime_tool_result_fallback(result);
+        return mcp_runtime_tool_result_fallback(result, result_presentation);
     }
     let (uri, snapshot) = match mcp_issue_artifact_export(caller, &result) {
         Ok(value) => value,
         Err(error) => {
-            return mcp_runtime_tool_result_fallback(ToolResult::err(format!(
-                "cannot frame artifact export resource: {error}"
-            )))
+            return mcp_runtime_tool_result_fallback(
+                ToolResult::err(format!("cannot frame artifact export resource: {error}")),
+                result_presentation,
+            )
         }
     };
     json!({
@@ -604,9 +776,11 @@ pub(super) fn mcp_runtime_tool_result_with_snapshot_resource(
     as_image_requested: bool,
     mut result: ToolResult,
     snapshot_caller: Option<McpArtifactExportCallerBinding>,
+    result_presentation: McpToolResultPresentation,
 ) -> Value {
-    let native_image_requested = (tool_name == "read_project_artifact" && as_image_requested)
-        || matches!(tool_name, "computer_snapshot" | "computer_snapshot_display");
+    let native_image_requested = as_image_requested
+        || (matches!(tool_name, "computer_observe" | "browser_observe")
+            && result.output.get("content_base64").is_some());
     if native_image_requested && result.success {
         match mcp_native_image_tool_result(tool_name, &mut result, snapshot_caller) {
             Ok(value) => return value,
@@ -618,7 +792,7 @@ pub(super) fn mcp_runtime_tool_result_with_snapshot_resource(
         }
     }
 
-    mcp_runtime_tool_result_fallback(result)
+    mcp_runtime_tool_result_fallback(result, result_presentation)
 }
 
 pub(super) fn mcp_native_image_tool_result(
@@ -665,24 +839,28 @@ pub(super) fn mcp_native_image_tool_result(
     if detected != Some(mime_type.as_str()) {
         return Err("image MIME does not match decoded content".to_string());
     }
-    let image_label = if tool_name == "computer_snapshot" {
-        result
+    let snapshot_kind = McpSnapshotResourceKind::from_result(tool_name, &result.output);
+    let image_label = match snapshot_kind {
+        Some(McpSnapshotResourceKind::Window) => result
             .output
             .pointer("/surface/surface_id")
             .and_then(Value::as_str)
-            .unwrap_or("desktop surface")
-    } else if tool_name == "computer_snapshot_display" {
-        result
+            .unwrap_or("desktop surface"),
+        Some(McpSnapshotResourceKind::Display) => result
             .output
             .get("display_id")
             .and_then(Value::as_str)
-            .unwrap_or("full display")
-    } else {
-        result
+            .unwrap_or("full display"),
+        Some(McpSnapshotResourceKind::Browser) => result
+            .output
+            .get("page_id")
+            .and_then(Value::as_str)
+            .unwrap_or("browser page"),
+        None => result
             .output
             .get("path")
             .and_then(Value::as_str)
-            .unwrap_or("project image")
+            .unwrap_or("project image"),
     };
     let file_bytes = result
         .output
@@ -697,7 +875,7 @@ pub(super) fn mcp_native_image_tool_result(
         .get("sha256")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let metadata_text = if matches!(tool_name, "computer_snapshot" | "computer_snapshot_display") {
+    let metadata_text = if snapshot_kind.is_some() {
         let width = result
             .output
             .get("width")
@@ -709,7 +887,7 @@ pub(super) fn mcp_native_image_tool_result(
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if width == 0 || height == 0 || width > 4096 || height > 4096 {
-            return Err("computer snapshot dimensions are invalid".to_string());
+            return Err("native image dimensions are invalid".to_string());
         }
         format!("Image {image_label}: {mime_type}, {width}x{height}, {file_bytes} bytes.")
     } else {
@@ -725,7 +903,7 @@ pub(super) fn mcp_native_image_tool_result(
     let structured_output = result.output.clone();
 
     let snapshot_link = snapshot_caller
-        .zip(McpSnapshotResourceKind::from_tool_name(tool_name))
+        .zip(snapshot_kind)
         .map(|(caller, kind)| {
             let client_id = result
                 .output
@@ -756,7 +934,7 @@ pub(super) fn mcp_native_image_tool_result(
                 "name": name,
                 "mimeType": mime_type,
                 "size": file_bytes,
-                "description": "Short-lived authenticated WebCodex computer screenshot. No project artifact was created."
+                "description": "Short-lived authenticated WebCodex screenshot resource. No project artifact was created."
             })
         });
     let mut content = Vec::with_capacity(if snapshot_link.is_some() { 3 } else { 2 });
@@ -899,6 +1077,7 @@ pub(super) async fn mcp_artifact_export_read_chunk(
             &record.project,
             &record.snapshot.path,
             record.snapshot.bytes,
+            &record.snapshot.sha256,
             offset,
             length,
             auth,
@@ -976,13 +1155,13 @@ pub(super) async fn mcp_artifact_export_stream_plan_with_gate_timeout(
     )
     .await?;
     let max_chunks = MAX_PROJECT_ARTIFACT_EXPORT_BYTES
-        .div_ceil(MAX_READ_PROJECT_ARTIFACT_LENGTH)
+        .div_ceil(INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES)
         .saturating_add(1);
     let mut first_chunk = Vec::new();
     let mut offset = 0usize;
     let mut chunks = 0usize;
     if snapshot.bytes > 0 {
-        let length = snapshot.bytes.min(MAX_READ_PROJECT_ARTIFACT_LENGTH);
+        let length = snapshot.bytes.min(INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES);
         let chunk = mcp_artifact_export_with_read_budget(
             runtime,
             &mut read_budget,
@@ -1093,7 +1272,19 @@ pub(super) fn mcp_artifact_export_stream_prefix(
 }
 
 pub(super) fn mcp_artifact_export_stream_suffix() -> Result<Vec<u8>, McpArtifactExportReadError> {
-    let mut output = b"\"}],\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"webcodex\",\"version\":".to_vec();
+    let mut output = b"\"}],\"resultType\":\"complete\",\"ttlMs\":".to_vec();
+    output.extend_from_slice(
+        &serde_json::to_vec(&MCP_STATELESS_CACHE_TTL_MS)
+            .map_err(|_| McpArtifactExportReadError::Unsafe)?,
+    );
+    output.extend_from_slice(b",\"cacheScope\":");
+    output.extend_from_slice(
+        &serde_json::to_vec(MCP_STATELESS_CACHE_SCOPE)
+            .map_err(|_| McpArtifactExportReadError::Unsafe)?,
+    );
+    output.extend_from_slice(
+        b",\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"webcodex\",\"version\":",
+    );
     output.extend_from_slice(
         &serde_json::to_vec(env!("CARGO_PKG_VERSION"))
             .map_err(|_| McpArtifactExportReadError::Unsafe)?,
@@ -1175,7 +1366,8 @@ pub(super) async fn mcp_artifact_export_stream_transfer(
                 return Err(McpArtifactExportReadError::Unsafe);
             }
             plan.chunks = plan.chunks.saturating_add(1);
-            let length = (snapshot.bytes - batch_offset).min(MAX_READ_PROJECT_ARTIFACT_LENGTH);
+            let length =
+                (snapshot.bytes - batch_offset).min(INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES);
             batch.push((batch_offset, length));
             batch_offset = batch_offset
                 .checked_add(length)
@@ -1371,13 +1563,9 @@ pub(super) fn server_capabilities(apps_enabled: bool) -> Value {
 pub(super) fn mcp_app_enabled(
     server_apps_enabled: bool,
     stateless_2026: bool,
-    model_surface: ModelSurface,
     params: &Value,
 ) -> bool {
-    server_apps_enabled
-        && stateless_2026
-        && model_surface_supports_mcp_apps(model_surface)
-        && request_supports_mcp_apps(params)
+    server_apps_enabled && stateless_2026 && request_supports_mcp_apps(params)
 }
 
 pub(super) fn is_artifact_export_resource_uri(uri: &str) -> bool {
@@ -1395,13 +1583,26 @@ pub(super) fn resource_read_bypasses_runtime_read(params: &Value) -> bool {
         .is_some_and(|uri| is_artifact_export_resource_uri(uri) || is_snapshot_resource_uri(uri))
 }
 
-pub(super) fn handle_list(id: Option<Value>, app_enabled: bool) -> McpOutcome {
+pub(super) fn handle_list(
+    runtime: &ToolRuntime,
+    id: Option<Value>,
+    app_enabled: bool,
+) -> McpOutcome {
     let result = if app_enabled {
-        mcp_app_resources_list()
+        mcp_app_resources_list(runtime.runtime_info.configured_public_url.as_deref())
     } else {
         json!({ "resources": [] })
     };
     McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, true)))
+}
+
+fn resource_not_found(id: Option<Value>, uri: &str) -> McpOutcome {
+    McpOutcome::BadRequest(rpc_error_with_data(
+        id,
+        -32602,
+        format!("Resource not found: {uri}"),
+        json!({ "uri": uri }),
+    ))
 }
 
 pub(super) async fn handle_read(
@@ -1409,7 +1610,6 @@ pub(super) async fn handle_read(
     params: Value,
     id: Option<Value>,
     auth: Option<&AuthContext>,
-    model_surface: ModelSurface,
     apps_enabled: bool,
 ) -> McpOutcome {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
@@ -1429,24 +1629,14 @@ pub(super) async fn handle_read(
     if is_snapshot_resource_uri(uri) {
         let caller = match mcp_artifact_export_caller_binding(auth) {
             Ok(caller) => caller,
-            Err(_) => {
-                return McpOutcome::BadRequest(rpc_error(
-                    id,
-                    -32602,
-                    format!("Resource not found: {uri}"),
-                ));
-            }
+            Err(_) => return resource_not_found(id, uri),
         };
         let record = mcp_snapshot_resource_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_for_caller(uri, &caller);
         let Some(record) = record else {
-            return McpOutcome::BadRequest(rpc_error(
-                id,
-                -32602,
-                format!("Resource not found: {uri}"),
-            ));
+            return resource_not_found(id, uri);
         };
         for scope in match record.kind {
             McpSnapshotResourceKind::Window => &[crate::auth::SCOPE_COMPUTER_READ][..],
@@ -1454,6 +1644,7 @@ pub(super) async fn handle_read(
                 crate::auth::SCOPE_COMPUTER_READ,
                 crate::auth::SCOPE_COMPUTER_DISPLAY_READ,
             ][..],
+            McpSnapshotResourceKind::Browser => &[crate::auth::SCOPE_BROWSER_READ][..],
         } {
             if let Some(outcome) = require_mcp_scope(auth, scope) {
                 return outcome;
@@ -1487,21 +1678,47 @@ pub(super) async fn handle_read(
 
     // Tool descriptors advertise the App resource independently of whether a
     // later resource fetch repeats UI client-capability metadata.
-    if !model_surface_supports_mcp_apps(model_surface) {
-        return McpOutcome::BadRequest(rpc_error(
-            id,
-            -32602,
-            "MCP App resource is unavailable on this model surface",
-        ));
-    }
-    let Some(result) = mcp_static_app_resource_read(uri) else {
-        return McpOutcome::BadRequest(rpc_error(id, -32602, format!("Resource not found: {uri}")));
+    let Some(result) =
+        mcp_static_app_resource_read(uri, runtime.runtime_info.configured_public_url.as_deref())
+    else {
+        return resource_not_found(id, uri);
     };
     let mut result = mcp_stateless_result(result, true);
     if uri == MCP_COMPUTER_UI_RESOURCE_URI {
         result["ttlMs"] = Value::from(MCP_COMPUTER_UI_RESOURCE_TTL_MS);
     }
     McpOutcome::Ok(rpc_result(id, result))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ProjectArtifactPresentationMode {
+    #[default]
+    None,
+    Image,
+    Export,
+}
+
+pub(super) fn project_artifact_presentation_mode(
+    tool_name: &str,
+    arguments: &Value,
+) -> ProjectArtifactPresentationMode {
+    match tool_name {
+        "read_project_artifact"
+            if arguments.get("as_image").and_then(Value::as_bool) == Some(true) =>
+        {
+            ProjectArtifactPresentationMode::Image
+        }
+        "project_artifact" => match arguments.get("action").and_then(Value::as_str) {
+            Some("image") => ProjectArtifactPresentationMode::Image,
+            Some("export") => ProjectArtifactPresentationMode::Export,
+            _ => ProjectArtifactPresentationMode::None,
+        },
+        _ => ProjectArtifactPresentationMode::None,
+    }
+}
+
+fn artifact_export_operation_label(_tool_name: &str) -> &'static str {
+    "project_artifact(action=export)"
 }
 
 #[derive(Debug, Default)]
@@ -1512,53 +1729,53 @@ pub(super) struct McpResourceToolCallContext {
 
 #[derive(Debug)]
 pub(super) enum McpResourceToolCallPrepareError {
-    UnsupportedExportSurface,
-    ArtifactCallerBinding(&'static str),
+    UnsupportedExportSurface(&'static str),
+    ArtifactCallerBinding(&'static str, &'static str),
 }
 
 impl McpResourceToolCallPrepareError {
     pub(super) fn message(&self) -> String {
         match self {
-            Self::UnsupportedExportSurface => {
-                "export_project_artifact requires a stateless-2026 operator-capable MCP surface"
-                    .to_string()
+            Self::UnsupportedExportSurface(operation) => {
+                format!("{operation} requires stateless-2026 MCP")
             }
-            Self::ArtifactCallerBinding(error) => {
-                format!("export_project_artifact cannot bind this caller: {error}")
+            Self::ArtifactCallerBinding(operation, error) => {
+                format!("{operation} cannot bind this caller: {error}")
             }
         }
     }
 
     pub(super) fn records_model_ergonomics_failure(&self) -> bool {
-        matches!(self, Self::ArtifactCallerBinding(_))
+        matches!(self, Self::ArtifactCallerBinding(_, _))
     }
 }
 
 pub(super) fn prepare_tool_call(
     tool_name: &str,
+    artifact_presentation: ProjectArtifactPresentationMode,
     stateless_2026: bool,
-    model_surface: ModelSurface,
     auth: Option<&AuthContext>,
 ) -> Result<McpResourceToolCallContext, McpResourceToolCallPrepareError> {
-    let artifact_export_caller = if tool_name == "export_project_artifact" {
-        if !stateless_2026 || !model_surface.supports_operator_extensions() {
-            return Err(McpResourceToolCallPrepareError::UnsupportedExportSurface);
-        }
-        Some(
-            mcp_artifact_export_caller_binding(auth)
-                .map_err(McpResourceToolCallPrepareError::ArtifactCallerBinding)?,
-        )
-    } else {
-        None
-    };
-    let snapshot_resource_caller = if stateless_2026
-        && model_surface.supports_operator_extensions()
-        && matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
+    let artifact_export_caller = if artifact_presentation == ProjectArtifactPresentationMode::Export
     {
-        mcp_artifact_export_caller_binding(auth).ok()
+        let operation = artifact_export_operation_label(tool_name);
+        if !stateless_2026 {
+            return Err(McpResourceToolCallPrepareError::UnsupportedExportSurface(
+                operation,
+            ));
+        }
+        Some(mcp_artifact_export_caller_binding(auth).map_err(|error| {
+            McpResourceToolCallPrepareError::ArtifactCallerBinding(operation, error)
+        })?)
     } else {
         None
     };
+    let snapshot_resource_caller =
+        if stateless_2026 && matches!(tool_name, "computer_observe" | "browser_observe") {
+            mcp_artifact_export_caller_binding(auth).ok()
+        } else {
+            None
+        };
     Ok(McpResourceToolCallContext {
         artifact_export_caller,
         snapshot_resource_caller,
@@ -1572,27 +1789,30 @@ pub(super) enum McpResourceToolResultAdaptation {
 
 pub(super) fn adapt_tool_result(
     tool_name: &str,
-    as_image_requested: bool,
+    artifact_presentation: ProjectArtifactPresentationMode,
     result: ToolResult,
     context: McpResourceToolCallContext,
+    result_presentation: McpToolResultPresentation,
 ) -> McpResourceToolResultAdaptation {
-    if tool_name == "export_project_artifact" {
+    if artifact_presentation == ProjectArtifactPresentationMode::Export {
         return McpResourceToolResultAdaptation::Framed(mcp_artifact_export_tool_result(
             result,
             context
                 .artifact_export_caller
                 .expect("validated artifact export caller binding"),
+            result_presentation,
         ));
     }
-    if matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
-        || (tool_name == "read_project_artifact" && as_image_requested)
+    if artifact_presentation == ProjectArtifactPresentationMode::Image
+        || matches!(tool_name, "computer_observe" | "browser_observe")
     {
         return McpResourceToolResultAdaptation::Framed(
             mcp_runtime_tool_result_with_snapshot_resource(
                 tool_name,
-                as_image_requested,
+                artifact_presentation == ProjectArtifactPresentationMode::Image,
                 result,
                 context.snapshot_resource_caller,
+                result_presentation,
             ),
         );
     }

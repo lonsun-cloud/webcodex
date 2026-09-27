@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use webcodex_admin::ServerHttpOptions;
 
-use super::super::http::{fetch_runtime_status, post_json_authed, ApiCall};
+use super::super::http::{call_runtime_tool_status, fetch_runtime_status};
 use super::process::local_runner_state_summary;
 
 pub(super) async fn preflight_shared_key(
@@ -11,15 +11,31 @@ pub(super) async fn preflight_shared_key(
     server_http: &ServerHttpOptions,
     key: &str,
 ) -> Result<(), String> {
-    post_json_authed(ApiCall {
-        server_url,
-        server_http,
-        token: key,
-        path: "/api/projects/list",
-        body: json!({}),
-    })
+    async {
+        let (status, content_type, body) = call_runtime_tool_status(
+            server_url,
+            server_http,
+            Some(key),
+            "list_projects",
+            json!({}),
+        )
+        .await?;
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "Server returned HTTP {status} ({content_type}) for canonical list_projects"
+            ));
+        }
+        if body
+            .as_ref()
+            .and_then(|value| value.get("success"))
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err("Server rejected canonical list_projects".to_string());
+        }
+        Ok::<(), String>(())
+    }
     .await
-    .map(|_| ())
     .map_err(|error| {
         format!(
             "Server did not accept hosted shared-key access: {error}. Confirm shared-key mode is enabled and use a non-wc_ key"
@@ -78,13 +94,22 @@ pub(super) async fn wait_for_connection(
             return Err("Runner exited before it registered with the Server".to_string());
         }
         let runtime = fetch_runtime_status(server_url, server_http, Some(key)).await;
-        let projects = post_json_authed(ApiCall {
-            server_url,
-            server_http,
-            token: key,
-            path: "/api/projects/list",
-            body: json!({}),
-        })
+        let projects = async {
+            let (status, content_type, value) = call_runtime_tool_status(
+                server_url,
+                server_http,
+                Some(key),
+                "list_projects",
+                json!({}),
+            )
+            .await?;
+            if !(200..300).contains(&status) {
+                return Err(format!(
+                    "canonical list_projects returned HTTP {status} ({content_type})"
+                ));
+            }
+            value.ok_or_else(|| "canonical list_projects returned no JSON body".to_string())
+        }
         .await;
         match (runtime, projects) {
             (Ok(runtime), Ok(projects))

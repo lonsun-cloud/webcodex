@@ -107,12 +107,12 @@ impl ActionAudit {
         transition: Option<crate::tool_runtime::WindowLoopTransition>,
         streaming: bool,
         continuity_eligible: bool,
-    ) {
+    ) -> bool {
         self.record_inner(
             event,
             audit_timing,
             Some((timing, transition, streaming, continuity_eligible)),
-        );
+        )
     }
 
     fn record_inner(
@@ -125,9 +125,9 @@ impl ActionAudit {
             bool,
             bool,
         )>,
-    ) {
+    ) -> bool {
         let Some(db) = self.db.as_ref() else {
-            return;
+            return false;
         };
         record_action_event(
             db,
@@ -180,7 +180,7 @@ impl ActionAudit {
                 recorder_gap_session_id: event.recorder_gap_session_id,
                 workflow_links: event.workflow_links,
             },
-        );
+        )
     }
 }
 

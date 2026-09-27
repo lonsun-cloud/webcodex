@@ -43,7 +43,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             "binding",
             json!({
                 "type": "string",
-                "pattern": "^wc_sbind_[0-9a-f]{32}$",
+                "pattern": "^wc_sbind_[A-Za-z0-9_-]{21}[AQgw]$",
                 "description": "Opaque caller + exact Runner instance + registry revision observation used to fence register/remove."
             }),
         ),

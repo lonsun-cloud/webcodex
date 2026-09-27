@@ -8,9 +8,6 @@ use crate::metadata::{
     ToolRisk::{Read, RunControl},
     RUNNER_MANAGE, RUNTIME_READ, TOOL_PROVIDER_RUNNER,
 };
-use crate::registry::input_schemas::{
-    runner_config_check_input_schema, runner_config_reload_input_schema,
-};
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     model_spec(
@@ -35,7 +32,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolSessionEvidencePolicy::NONE,
             ),
             "Read, parse, validate, and classify the candidate at one exact caller-visible Runner's startup-bound runner.toml path. This never mutates active config, accepts no filesystem path, and returns only bounded sanitized validation metadata.",
-            runner_config_check_input_schema,
     ),
     permission_risk(
             model_spec(
@@ -60,7 +56,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     super::ToolSessionEvidencePolicy::NONE,
                 ),
                 "Activate the candidate already present at one exact caller-visible Runner's startup-bound runner.toml path. Requires expected_generation, never writes the file, and reports partial activation/restart-required fields without pretending restart-only fields are live.",
-                runner_config_reload_input_schema,
             ),
             PERMISSION_RISK_WRITE,
     ),

@@ -1,17 +1,22 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::runtime_contract::{
+    MAX_JOB_OBSERVATION_WAIT_SECS, MODEL_JOB_CONTINUATION_WAIT_SECS,
+};
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
     command_rejected_message, explicit_shell_dispatch_command, is_safe_job_id,
     project_relative_runner_cwd, resolve_runner_cwd, validate_raw_shell_command_length,
 };
-use super::tool_result::{RecoveryKind, RecoveryTool, ToolResult};
+use super::tool_result::{RecoveryKind, SuggestedToolCall, ToolResult};
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
 use crate::runner_protocol::{
     ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
-    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata, ShellJobValidationStep,
+    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
+    ShellJobTestCountEvidence, ShellJobValidationStep,
 };
 
 pub(crate) fn is_blocking_active_job_status(status: &str) -> bool {
@@ -41,6 +46,7 @@ pub(crate) fn detected_job_summary(
         exit_code,
         stdout,
         stderr,
+        false,
         None,
     )
 }
@@ -94,6 +100,7 @@ pub(crate) fn detected_job_summary_with_activity(
     exit_code: Option<i64>,
     stdout: &str,
     stderr: &str,
+    analysis_truncated: bool,
     activity: Option<&ShellJobActivity>,
 ) -> Value {
     let normalized = command_summary
@@ -101,7 +108,8 @@ pub(crate) fn detected_job_summary_with_activity(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let kind = if normalized.starts_with("cargo test") {
+    let cargo_test = normalized == "cargo test" || normalized.starts_with("cargo test ");
+    let kind = if cargo_test {
         "test"
     } else if normalized.starts_with("cargo check") {
         "check"
@@ -182,6 +190,31 @@ pub(crate) fn detected_job_summary_with_activity(
         detected["zero_tests_run"] = json!(metadata.zero_tests_run);
         detected["tests_passed"] = json!(metadata.tests_passed);
         detected["tests_failed"] = json!(metadata.tests_failed);
+        if cargo_test
+            && outcome == "passed"
+            && metadata.tests_detected
+            && metadata.tests_run_count == Some(0)
+            && metadata.zero_tests_run == Some(true)
+        {
+            detected["outcome"] = json!("inconclusive");
+        }
+        if cargo_test {
+            let diagnostics = webcodex_core::validation_evidence::parse_cargo_test_diagnostics(
+                stdout,
+                stderr,
+                analysis_truncated,
+            );
+            if !diagnostics.failed_test_details.is_empty() || metadata.tests_failed.unwrap_or(0) > 0
+            {
+                detected["failed_test_details"] = json!(diagnostics
+                    .failed_test_details
+                    .iter()
+                    .map(|detail| json!({"name": detail.name}))
+                    .collect::<Vec<_>>());
+                detected["failed_test_details_truncated"] =
+                    json!(diagnostics.failed_test_details_truncated);
+            }
+        }
     }
     detected
 }
@@ -192,6 +225,124 @@ mod detected_summary_tests {
     use crate::runner_protocol::{
         ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
     };
+
+    #[test]
+    fn generic_cargo_failed_identities_are_bounded_advisory_and_truthful_when_incomplete() {
+        let stdout = (0..25).map(|index| format!("test cases::failure_{index} ... FAILED\n")).collect::<String>()
+            + "test result: FAILED. 0 passed; 25 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+        let detected = detected_job_summary_with_activity(
+            Some("cargo test --lib"),
+            None,
+            "failed",
+            Some(101),
+            &stdout,
+            "",
+            false,
+            None,
+        );
+        assert_eq!(detected["tests_failed"], 25);
+        assert_eq!(
+            detected["failed_test_details"].as_array().unwrap().len(),
+            webcodex_core::validation_evidence::MAX_FAILED_TESTS
+        );
+        assert_eq!(
+            detected["failed_test_details"][0]["name"],
+            "cases::failure_0"
+        );
+        assert_eq!(detected["failed_test_details_truncated"], true);
+        assert!(detected.get("validation_target_id").is_none());
+        assert!(detected.get("test_count_evidence").is_none());
+        for captured in [false, true] {
+            let stdout = if captured { "test cases::captured ... FAILED\n" } else { "" }.to_string()
+                + "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+            let detected = detected_job_summary_with_activity(
+                Some("cargo test"),
+                None,
+                "failed",
+                Some(101),
+                &stdout,
+                "",
+                true,
+                None,
+            );
+            assert_eq!(
+                detected["failed_test_details"].as_array().unwrap().len(),
+                usize::from(captured)
+            );
+            assert_eq!(detected["failed_test_details_truncated"], true);
+        }
+        for command in ["cargo testing", "echo cargo test", "custom"] {
+            let detected = detected_job_summary_with_activity(
+                Some(command),
+                Some("test"),
+                "failed",
+                Some(1),
+                &stdout,
+                "",
+                false,
+                None,
+            );
+            assert!(detected.get("failed_test_details").is_none());
+        }
+    }
+
+    #[test]
+    fn generic_cargo_test_zero_tests_are_inconclusive_without_changing_process_success() {
+        let zero = detected_job_summary(
+            Some("cargo test --lib __webcodex_no_such_test_filter__"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(zero["tests_detected"], true);
+        assert_eq!(zero["tests_run_count"], 0);
+        assert_eq!(zero["zero_tests_run"], true);
+        assert_eq!(zero["outcome"], "inconclusive");
+
+        let passed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 1 test\ntest focused ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(passed["tests_run_count"], 1);
+        assert_eq!(passed["zero_tests_run"], false);
+        assert_eq!(passed["outcome"], "passed");
+
+        let failed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "running 1 test\ntest focused ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(failed["outcome"], "failed");
+
+        let timed_out = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "timed_out",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(timed_out["outcome"], "timed_out");
+
+        let cancelled = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "cancelled",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(cancelled["outcome"], "cancelled");
+    }
 
     #[test]
     fn cargo_progress_is_advisory_and_command_scoped() {
@@ -241,6 +392,7 @@ mod detected_summary_tests {
             None,
             "",
             "Checking webcodex v0.3.9\n",
+            false,
             Some(&activity),
         );
         assert_eq!(detected["progress"]["state"], "waiting");
@@ -314,7 +466,7 @@ pub(crate) fn structured_validation_evidence(
             evidence.test_count_evidence_reason = Some(if truncated {
                 "output_truncated"
             } else {
-                metadata.count_evidence_reason
+                metadata.count_evidence_reason()
             });
             if !truncated {
                 evidence.tests_run_count = metadata.tests_run_count;
@@ -353,6 +505,7 @@ pub(crate) fn validation_job_projection(
         stdout,
         stderr,
         truncated,
+        None,
         minimum_tests,
         None,
         None,
@@ -367,6 +520,7 @@ pub(crate) fn validation_job_projection_with_policy(
     stdout: &str,
     stderr: &str,
     truncated: bool,
+    authoritative_test_count: Option<&ShellJobTestCountEvidence>,
     minimum_tests: Option<u64>,
     require_tests: Option<bool>,
     no_run: Option<bool>,
@@ -433,7 +587,16 @@ pub(crate) fn validation_job_projection_with_policy(
         return Some(value);
     }
     let process_passed = lifecycle == Some(RunnerJobLifecycle::Completed) && exit_code == Some(0);
-    let evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+    let mut evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+    if tool == "cargo_test" {
+        if let Some(authoritative) = authoritative_test_count.filter(|evidence| evidence.is_valid())
+        {
+            evidence.tests_detected = Some(authoritative.tests_detected);
+            evidence.tests_run_count = authoritative.tests_run_count;
+            evidence.zero_tests_run = authoritative.tests_run_count.map(|count| count == 0);
+            evidence.test_count_evidence_reason = Some(authoritative.status.reason_code());
+        }
+    }
     let mut passed = process_passed;
     let mut value = json!({
         "tool": tool,
@@ -646,6 +809,120 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     })
 }
 
+impl ToolRuntime {
+    /// Runtime-only model projection for Job inventory. The base summary remains
+    /// the canonical compact execution metadata used by internal reconciliation.
+    fn model_job_summary_value(&self, job: &ShellJobInfo) -> Value {
+        let mut summary = agent_job_summary_value(job);
+        let generic_validation = job
+            .structured_execution
+            .as_ref()
+            .and_then(|metadata| metadata.validation_identity.as_deref())
+            .is_some()
+            && job
+                .purpose
+                .as_deref()
+                .is_some_and(is_validation_like_execution_purpose);
+        if job.validation.is_none() && !generic_validation {
+            return summary;
+        }
+        let source_state = match job.project_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(project) => self.validation_sources.observe(
+                project,
+                job.validation
+                    .as_ref()
+                    .and_then(|metadata| metadata.source_fence.as_ref()),
+            ),
+            None => webcodex_core::validation_source::ValidationSourceState::default(),
+        };
+        summary["validation"] = json!({
+            "source_state": {
+                "freshness": source_state.freshness,
+                "observed_mutation_fence": source_state.observed_mutation_fence,
+            }
+        });
+        summary
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_job_summary_value_for_test(&self, job: &ShellJobInfo) -> Value {
+        self.model_job_summary_value(job)
+    }
+}
+
+pub(crate) fn job_observation_continuation_semantics() -> Value {
+    super::ContinuationSemantics::new(
+        super::ContinuationKind::Observe,
+        super::ContinuationCarrier::ObservationToken,
+    )
+    .to_value()
+}
+
+pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&str>) -> Value {
+    let mut item = json!({"job_id": job_id});
+    if let Some(token) = observation_token.filter(|token| !token.is_empty()) {
+        item["after_observation_token"] = json!(token);
+    }
+    super::SuggestedToolCall::new(
+        "observe_jobs",
+        json!({
+            "items": [item],
+            "wait_secs": MODEL_JOB_CONTINUATION_WAIT_SECS,
+            "wake_on": "terminal",
+        }),
+    )
+    .to_value()
+}
+
+/// Keep the internal handoff receipt intact for recording, then project the
+/// exact observe call as the sole observation-token carrier on normal handoff.
+pub(super) fn sparsify_job_handoff_model_result(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    if !matches!(
+        output.get("execution_state").and_then(Value::as_str),
+        Some("queued" | "running" | "started" | "pending")
+    ) {
+        return;
+    }
+    let Some(job_id) = output
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let call = &output["continuation"];
+    if call["tool"] != "observe_jobs" || call["arguments"]["items"][0]["job_id"] != job_id {
+        return;
+    }
+    let token = output.get("observation_token").and_then(Value::as_str);
+    if call["arguments"]["items"][0]["after_observation_token"].as_str() != token {
+        return;
+    }
+    output.remove("observation_token");
+    output.remove("continuation_semantics");
+    if output.get("promoted_to_job").and_then(Value::as_bool) == Some(true) {
+        output.remove("promoted_to_job");
+    }
+    if output
+        .get("async_handoff_available")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        output.remove("async_handoff_available");
+    }
+}
+
+fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
+    let arguments = project.map_or_else(|| json!({}), |project| json!({"project": project}));
+    SuggestedToolCall::new("list_jobs", arguments).to_value()
+}
+
 fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
     ToolResult::err_with_output(
         message,
@@ -655,7 +932,7 @@ fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResu
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn unknown_job_observation_result(job_id: &str) -> ToolResult {
@@ -666,9 +943,9 @@ fn unknown_job_observation_result(job_id: &str) -> ToolResult {
             "failure_kind": "job_not_found",
             "job_id": job_id,
             "state_changed": false,
+            "suggested_call": list_jobs_recovery_suggested_call(None),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
 }
 
 fn agent_job_log_error_result(job_id: &str, error: String) -> ToolResult {
@@ -698,7 +975,7 @@ fn confirmation_required_result(project: &str, job_id: &str) -> ToolResult {
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
@@ -718,9 +995,9 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "final_status": Value::Null,
             "stop_effect": "not_found",
             "command_started": false,
+            "suggested_call": list_jobs_recovery_suggested_call(Some(project)),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
 }
 
 fn job_project_mismatch_result(
@@ -750,7 +1027,7 @@ fn job_project_mismatch_result(
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn job_stop_forbidden_result(
@@ -782,7 +1059,7 @@ fn job_stop_forbidden_result(
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn job_session_unknown_warning() -> Value {
@@ -821,7 +1098,7 @@ fn job_recovering_stop_result(project: &str, job: &ShellJobInfo) -> ToolResult {
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::Wait, None)
+    .with_recovery(RecoveryKind::Wait)
 }
 
 fn ownership_basis_for_stop(
@@ -898,7 +1175,7 @@ fn stop_job_output(
 }
 
 fn active_job_brief(summary: &Value) -> Value {
-    json!({
+    let mut brief = json!({
         "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
         "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
         "status": summary.get("status").cloned().unwrap_or(Value::Null),
@@ -906,10 +1183,27 @@ fn active_job_brief(summary: &Value) -> Value {
         "started_at": summary.get("started_at").cloned().unwrap_or(Value::Null),
         "created_at": summary.get("created_at").cloned().unwrap_or(Value::Null),
         "executor": summary.get("executor").cloned().unwrap_or(Value::Null),
-    })
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
+}
+
+fn active_job_continuation_brief(summary: &Value) -> Value {
+    let mut brief = json!({
+        "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
+        "status": summary.get("status").cloned().unwrap_or(Value::Null),
+        "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
 }
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn run_job_for_auth(
         &self,
         project: String,
@@ -934,6 +1228,7 @@ impl ToolRuntime {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_job_for_auth_with_contract(
         &self,
@@ -1044,22 +1339,25 @@ impl ToolRuntime {
         } else {
             "configured"
         });
-        let dispatched_command = match shell {
-            Some(shell) => match explicit_shell_dispatch_command(&command, shell.as_str()) {
-                Ok(command) => command,
-                Err(error) => {
-                    return ToolResult::err(command_rejected_message(
-                        error,
-                        "use run_script for large or quote-dense explicit-shell program text.",
-                    ))
+        let dispatched_command = match (remote, shell) {
+            (true, Some(shell)) => {
+                match explicit_shell_dispatch_command(&command, shell.as_str()) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        return ToolResult::err(command_rejected_message(
+                            error,
+                            "use run_script for substantially larger typed program text.",
+                        ))
+                    }
                 }
-            },
-            None => command.clone(),
+            }
+            _ => command.clone(),
         };
         match self
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: effective_cwd,
@@ -1080,6 +1378,11 @@ impl ToolRuntime {
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
+                        explicit_shell: if !remote && validation_steps.is_empty() {
+                            shell
+                        } else {
+                            None
+                        },
                         validation_steps,
                         validation: None,
                         visibility: crate::runner_http::ShellJobVisibility::Public,
@@ -1095,7 +1398,12 @@ impl ToolRuntime {
                 )
                 .await
             {
-                Ok(job) => ToolResult::ok(json!({
+                Ok(job) => {
+                    let continuation = observe_job_continuation(
+                        &job.job_id,
+                        job.observation_token.as_deref(),
+                    );
+                    ToolResult::ok(json!({
                     "job_id": job.job_id,
                     "kind": job.kind,
                     "status": job.status,
@@ -1110,6 +1418,7 @@ impl ToolRuntime {
                     "execution_state": "started",
                     "created_at": job.created_at,
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "last_update_seq": job.last_update_seq,
                     "stdout_tail": "",
                     "stderr_tail": "",
@@ -1117,7 +1426,9 @@ impl ToolRuntime {
                     "stderr_lines": 0,
                     "stdout_truncated": false,
                     "stderr_truncated": false,
-                })),
+                    "continuation": continuation,
+                }))
+                }
                 Err(e) => ToolResult::err(command_rejected_message(
                     e,
                     "confirm the agent is connected and async jobs are allowed, then retry or use run_shell for short commands.",
@@ -1226,6 +1537,7 @@ impl ToolRuntime {
                         &stdout,
                         &stderr,
                         truncated,
+                        job.test_count_evidence.as_ref(),
                         validation_metadata.and_then(|metadata| metadata.minimum_tests),
                         validation_metadata.and_then(|metadata| metadata.require_tests),
                         validation_metadata.and_then(|metadata| metadata.no_run),
@@ -1235,6 +1547,10 @@ impl ToolRuntime {
                         {
                             validation["validation_target_id"] = json!(target_id);
                         }
+                        validation["source_state"] = json!(self.validation_sources.observe(
+                            job.project_id.as_deref().unwrap_or_default(),
+                            validation_metadata.and_then(|metadata| metadata.source_fence.as_ref()),
+                        ));
                         output["validation"] = validation;
                     }
                 }
@@ -1260,10 +1576,10 @@ impl ToolRuntime {
     /// binding are validated before execution or waiting by the selected executor.
     fn validate_job_log_wait(wait_secs: Option<u64>) -> Result<(), String> {
         if let Some(secs) = wait_secs {
-            if secs == 0 || secs > 60 {
+            if secs == 0 || secs > MAX_JOB_OBSERVATION_WAIT_SECS {
                 return Err(format!(
-                    "invalid wait_secs: must be between 1 and 60, got {}",
-                    secs
+                    "invalid wait_secs: must be between 1 and {}, got {}",
+                    MAX_JOB_OBSERVATION_WAIT_SECS, secs
                 ));
             }
         }
@@ -1312,6 +1628,7 @@ impl ToolRuntime {
                     job.exit_code.map(i64::from),
                     &wait.analysis_stdout,
                     &wait.analysis_stderr,
+                    wait.analysis_truncated,
                     job.activity.as_ref(),
                 );
                 let validation_tool = job
@@ -1330,6 +1647,7 @@ impl ToolRuntime {
                     &wait.analysis_stdout,
                     &wait.analysis_stderr,
                     wait.analysis_truncated,
+                    job.test_count_evidence.as_ref(),
                     job.validation
                         .as_ref()
                         .and_then(|metadata| metadata.minimum_tests),
@@ -1338,6 +1656,14 @@ impl ToolRuntime {
                         .and_then(|metadata| metadata.require_tests),
                     job.validation.as_ref().and_then(|metadata| metadata.no_run),
                 );
+                if let Some(validation) = validation.as_mut() {
+                    validation["source_state"] = json!(self.validation_sources.observe(
+                        job.project_id.as_deref().unwrap_or_default(),
+                        job.validation
+                            .as_ref()
+                            .and_then(|metadata| metadata.source_fence.as_ref()),
+                    ));
+                }
                 if let (Some(validation), Some(target_id)) = (
                     validation.as_mut(),
                     job.validation
@@ -1378,6 +1704,7 @@ impl ToolRuntime {
                         job.recovery_reason_code.as_deref(),
                     ),
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "log_delta_status": wait.log_delta_status.as_str(),
                     "stdout_delta_reset": wait.stdout_delta_reset,
                     "stderr_delta_reset": wait.stderr_delta_reset,
@@ -1463,7 +1790,11 @@ impl ToolRuntime {
         // behind unrelated recent Jobs.
         let agent_jobs = self
             .runner_registry
-            .list_all_jobs_for_auth(crate::runner_http::runner_access_from_auth(auth).as_ref())
+            .list_jobs_for_auth_filtered(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                project_filter.as_deref(),
+                session_filter.as_deref(),
+            )
             .await;
         let mut summaries: Vec<Value> = agent_jobs
             .iter()
@@ -1472,16 +1803,8 @@ impl ToolRuntime {
                     .as_ref()
                     .map(|status| status == &job.status)
                     .unwrap_or(true)
-                    && project_filter
-                        .as_deref()
-                        .map(|project| job.project_id.as_deref() == Some(project))
-                        .unwrap_or(true)
-                    && session_filter
-                        .as_deref()
-                        .map(|session_id| job.session_id.as_deref() == Some(session_id))
-                        .unwrap_or(true)
             })
-            .map(agent_job_summary_value)
+            .map(|job| self.model_job_summary_value(job))
             .collect();
 
         summaries.sort_by(|a, b| {
@@ -1535,12 +1858,10 @@ impl ToolRuntime {
                 .as_ref()
                 .and_then(|metadata| metadata.validation_identity.as_deref())
                 .is_some()
-                && job.purpose.as_deref().is_some_and(|purpose| {
-                    matches!(
-                        purpose,
-                        "validation" | "test" | "build" | "format" | "release"
-                    )
-                });
+                && job
+                    .purpose
+                    .as_deref()
+                    .is_some_and(is_validation_like_execution_purpose);
             if job.project_id.as_deref() == Some(project)
                 && requested.contains(session_id)
                 && (job.validation.is_some() || generic_validation)
@@ -1723,28 +2044,32 @@ impl ToolRuntime {
     pub(crate) async fn active_jobs_summary(
         &self,
         project: Option<&str>,
+        continuation_session_id: Option<&str>,
         auth: Option<&AuthContext>,
         limit: usize,
     ) -> Value {
         let max = limit.clamp(1, 20);
         let mut active = Vec::new();
+        let mut continuation_candidates = Vec::new();
         for job in self
             .runner_registry
-            .list_jobs_for_auth(
+            .list_jobs_for_auth_filtered(
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                Some(100),
+                project,
+                None,
             )
             .await
         {
             if !webcodex_runner_registry::job_status_is_active(&job.status) {
                 continue;
             }
-            if let Some(project) = project {
-                if job.project_id.as_deref() != Some(project) {
-                    continue;
-                }
+            let summary = self.model_job_summary_value(&job);
+            if continuation_session_id.is_some()
+                && job.session_id.as_deref() == continuation_session_id
+            {
+                continuation_candidates.push(active_job_continuation_brief(&summary));
             }
-            active.push(agent_job_summary_value(&job));
+            active.push(summary);
         }
 
         active.sort_by(|a, b| {
@@ -1811,7 +2136,7 @@ impl ToolRuntime {
                 ),
             }));
         }
-        json!({
+        let mut output = json!({
             "active_count": active_count,
             "running_count": running_count,
             "recovering_count": recovering_count,
@@ -1823,35 +2148,11 @@ impl ToolRuntime {
             "recent_limit": max,
             "truncated": active_count > max,
             "warnings": warnings,
-        })
-    }
-
-    /// Hidden REST compatibility wrapper for stopping a runtime Job by id.
-    /// Registered Project Jobs are Runner-owned, so this delegates directly to
-    /// the Runner Job registry and never attempts Server-local process control.
-    pub async fn stop_job(&self, job_id: String, auth: Option<&AuthContext>) -> ToolResult {
-        if !is_safe_job_id(&job_id) {
-            return ToolResult::err("invalid job id");
+        });
+        if continuation_candidates.len() == 1 {
+            output["active_job"] = continuation_candidates.pop().unwrap_or(Value::Null);
         }
-        match self
-            .runner_registry
-            .stop_job_for_auth(
-                crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                &job_id,
-                crate::runner_http::requested_by_from_auth(auth),
-            )
-            .await
-        {
-            Ok(job) => ToolResult::ok(json!({
-                "job_id": job.job_id,
-                "project": job.project_id,
-                "status": job.status,
-            })),
-            Err(error) if error.contains("unknown shell job") => {
-                ToolResult::err(format!("unknown job: {job_id}"))
-            }
-            Err(error) => ToolResult::err(error),
-        }
+        output
     }
 }
 
@@ -1860,10 +2161,11 @@ mod recovery_projection_tests {
     use super::{
         confirmation_required_result, job_not_found_result, job_project_mismatch_result,
         job_recovering_stop_result, job_stop_forbidden_result, recovery_reason_text,
-        validation_job_projection,
+        validation_job_projection, validation_job_projection_with_policy,
     };
-    use crate::runner_protocol::ShellJobInfo;
+    use crate::runner_protocol::{ShellJobInfo, ShellJobTestCountEvidence};
     use serde_json::json;
+    use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
     #[test]
     fn recovery_reason_text_recovering_explains_wait() {
@@ -1954,8 +2256,29 @@ mod recovery_projection_tests {
 
         let missing = job_not_found_result("agent:special:demo", "job-missing");
         assert_eq!(missing.output["failure_kind"], "job_not_found");
-        assert_eq!(missing.output["recovery_kind"], "reobserve");
-        assert_eq!(missing.output["recovery_tool"], "list_jobs");
+        assert!(missing.output.get("recovery_kind").is_none());
+        assert!(missing.output.get("recovery_tool").is_none());
+        assert_eq!(
+            missing.output["suggested_call"],
+            json!({"tool": "list_jobs", "arguments": {"project": "agent:special:demo"}})
+        );
+        let suggested = &missing.output["suggested_call"];
+        let parsed = crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("stop_job missing-identity recovery must parse");
+        match parsed {
+            crate::tool_runtime::ToolCall::ListJobs {
+                project,
+                session_id,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("agent:special:demo"));
+                assert!(session_id.is_none());
+            }
+            other => panic!("unexpected recovery call: {}", other.tool_name()),
+        }
 
         let mismatch =
             job_project_mismatch_result("agent:special:demo", "agent:special:other", "job-2");
@@ -2206,6 +2529,107 @@ mod recovery_projection_tests {
     }
 
     #[test]
+    fn authoritative_cargo_test_count_survives_truncated_logs_and_still_fails_closed() {
+        let complete = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(120),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        let passed = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "retained tail without the harness summary",
+            "",
+            true,
+            Some(&complete),
+            Some(100),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(passed["truncated"], true);
+        assert_eq!(passed["tests_run_count"], 120);
+        assert_eq!(passed["test_count_assertion"]["status"], "passed");
+        assert_eq!(
+            passed["test_count_assertion"]["reason_code"],
+            "minimum_satisfied"
+        );
+
+        let below_minimum = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(5),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        let failed = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "",
+            "",
+            true,
+            Some(&below_minimum),
+            Some(6),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(failed["passed"], false);
+        assert_eq!(
+            failed["test_count_assertion"]["reason_code"],
+            "minimum_not_met"
+        );
+
+        let incomplete = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: None,
+            status: CargoTestCountEvidenceStatus::IncompleteStream,
+        };
+        let unproven = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "",
+            "",
+            true,
+            Some(&incomplete),
+            Some(1),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unproven["passed"], false);
+        assert!(unproven["tests_run_count"].is_null());
+        assert_eq!(
+            unproven["test_count_assertion"]["reason_code"],
+            "test_count_unproven"
+        );
+        assert_eq!(
+            unproven["test_count_assertion"]["evidence_reason_code"],
+            "incomplete_stream"
+        );
+
+        let command_failure = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "",
+            "",
+            true,
+            Some(&complete),
+            Some(100),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(command_failure["passed"], false);
+    }
+
+    #[test]
     fn validation_projection_reports_check_counts_and_never_fakes_truncated_counts() {
         let complete = validation_job_projection(
             Some("cargo_check"),
@@ -2315,6 +2739,7 @@ mod recovery_projection_tests {
             codex: None,
             result: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             validation: None,
             recovery_state: None,
@@ -2366,13 +2791,14 @@ mod recovery_projection_tests {
             codex: None,
             result: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             validation: None,
             recovery_state: Some("lost_after_reconcile".to_string()),
             recovered_after_server_restart: true,
             reconciled_at: Some(3),
             recovery_reason_code: Some("runner_recovery_deadline_exceeded".to_string()),
-            observation_token: Some("wjob1:a:job-1:0123456789abcdef:4".to_string()),
+            observation_token: Some("wj3_abcdefghijklmnop.4.0.0".to_string()),
             last_update_seq: Some(4),
             stdout_retained_from_line: Some(1),
             stderr_retained_from_line: Some(1),

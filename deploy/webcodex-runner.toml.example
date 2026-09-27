@@ -72,14 +72,28 @@ conda activate ml
 # host = "tmp"
 # default_cwd = "/opt/webcodex-edge"
 
-# Optional read-only live Skill roots on this Runner host. These paths do not
-# expand [policy].allowed_roots and are not copied into the managed Skill Store.
-# Editing files under a root is visible on the next Skill discovery/read; editing
-# this roots list is applied with runner config check/reload, without a restart.
+# Optional live Skill roots on this Runner host. WebCodex does not modify files
+# under these roots, but supported scripts/*.py and scripts/*.sh may execute via
+# run_skill_resource because the configured root is an operator-trusted Skill source.
+# These paths do not expand [policy].allowed_roots and are not copied into the
+# managed Skill Store. File edits are visible to the next discovery/read/execution;
+# editing this roots list is applied with runner config check/reload, without restart.
 [skills]
 roots = []
 # roots = ["/home/webcodex/.codex/skills", "/opt/company/agent-skills"]
 # Windows TOML literal-string example: roots = ['C:\Users\alice\.codex\skills']
+
+# Optional Runner-level coding instructions. There is no implicit default path:
+# list every trusted Runner-local file explicitly. These files are observed through
+# the narrow instruction runtime and do not expand [policy].allowed_roots or grant
+# ordinary project file/shell/process access. The path list is hot-reloadable with
+# runner_config_check + runner_config_reload; file content itself is live and is
+# re-read by each new project bootstrap without config reload or Runner restart.
+[instructions]
+files = []
+# files = ["/home/webcodex/.codex/AGENTS.md"]
+# macOS example: files = ["/Users/alice/.codex/AGENTS.md"]
+# Windows TOML literal-string example: files = ['C:\Users\alice\.codex\AGENTS.md']
 
 [capabilities]
 file_read = true
@@ -102,3 +116,11 @@ allow_cwd_anywhere = false
 # allowed_roots = ["/root/git"]
 max_timeout_secs = 3600
 max_output_bytes = 262144
+
+
+# Optional Runner-global ACP admission policy. Empty/omitted is the default.
+# Values must be advertised by every provider session that is expected to run
+# under this Runner. Unsupported providers fail closed before session/prompt.
+# [acp.forced_config]
+# model = "provider-model"
+# feature_flag = true

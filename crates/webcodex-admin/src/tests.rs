@@ -70,6 +70,19 @@ fn admin_usage_keeps_rest_registration_commands_but_not_create_local() {
 }
 
 #[test]
+fn admin_parser_rejects_retired_agent_tokens_group_with_migration_guidance() {
+    assert!(!is_admin_group("agent-tokens"));
+    for args in [
+        vec!["agent-tokens".to_string()],
+        vec!["agent-tokens".to_string(), "list".to_string()],
+    ] {
+        let error = parse_admin_cli(&args).unwrap_err();
+        assert!(error.contains("agent-tokens was removed"), "{error}");
+        assert!(error.contains("runner-tokens"), "{error}");
+    }
+}
+
+#[test]
 fn users_create_builds_request_path_and_body() {
     let req = request(&[
         "users",

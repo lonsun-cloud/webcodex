@@ -2,7 +2,7 @@
 
 [English](QUICK_START.md) | [简体中文](QUICK_START.zh-CN.md)
 
-这个页面只做一件事：用 `webcodex share` 临时分享一个本地仓库，让你几分钟内判断 WebCodex 是否适合自己。这个模式是一条命令的**临时、单项目、受限体验**；关闭命令后连接会结束。
+这个页面只做一件事：用 `webcodex share` 临时分享一个本地仓库，让你几分钟内判断 WebCodex 是否适合自己。这个模式是一条命令的**临时、单项目、Project-scoped 普通 WebCodex runtime**；关闭命令后连接会结束。
 
 如果你准备日常使用 WebCodex，并希望获得普通 Server + Runner 的完整 coding 能力，请直接使用[完整使用指南](PERSONAL_SETUP.zh-CN.md)，不要把 `share` 当作长期默认部署。
 

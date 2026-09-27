@@ -43,7 +43,11 @@ fn validate_coding_agent_registration(
     inventory: Option<&CodingAgentRunInventory>,
 ) -> Result<(), String> {
     match (capability, providers, inventory) {
-        (false, None, None) => return Ok(()),
+        // Older/no-ACP Runners may serialize the optional provider list as []
+        // instead of null/absent. Empty discovery grants no execution capability.
+        (false, providers, None) if providers.is_none_or(|providers| providers.is_empty()) => {
+            return Ok(())
+        }
         (false, _, _) => {
             return Err(
                 "coding-agent provider/inventory metadata requires coding_agent_runs capability"
@@ -254,14 +258,6 @@ impl RunnerRegistry {
                 "apply_patch_match_metadata capability requires apply_patch capability".to_string(),
             );
         }
-        if runner_features.supports(RunnerFeature::ApplyPatchStrictMatching)
-            && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
-        {
-            return Err(
-                "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
-                    .to_string(),
-            );
-        }
         if runner_features.supports(RunnerFeature::ApplyPatchMatchingMode)
             && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
         {
@@ -432,6 +428,12 @@ impl RunnerRegistry {
             inner.runners.get(&client_id),
             &runner_instance_id,
             &runner_features,
+            RunnerFeature::StructuredCargoTestLib,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
             RunnerFeature::StructuredScriptJavascript,
         )?;
         reject_same_instance_feature_downgrade(
@@ -453,21 +455,6 @@ impl RunnerRegistry {
             return Err(
                 "same runner instance cannot change ACP coding-agent provider inventory"
                     .to_string(),
-            );
-        }
-        if inner.runners.get(&client_id).is_some_and(|existing| {
-            existing.runner_instance_id == runner_instance_id
-                && existing
-                    .policy
-                    .as_ref()
-                    .and_then(|policy| policy.mcp_gateway_providers.as_ref())
-                    != record
-                        .policy
-                        .as_ref()
-                        .and_then(|policy| policy.mcp_gateway_providers.as_ref())
-        }) {
-            return Err(
-                "same runner instance cannot change MCP gateway provider inventory".to_string(),
             );
         }
         // A successful different-instance registration is an explicit lease
@@ -590,6 +577,8 @@ impl RunnerRegistry {
                 &runner_instance_id,
                 auth_group,
                 self.observation_epoch.clone(),
+                self.inner.capture_candidates(),
+                self.inner.capture_terminal_event_candidates(),
                 inventory,
                 now,
             );
@@ -718,50 +707,64 @@ impl RunnerRegistry {
         Ok(())
     }
 
-    /// Apply sanitized provider metadata to the active Runner record. Optional
-    /// metadata is best-effort: malformed/unknown state is ignored by the
-    /// normalizer and never changes transport or tool completion semantics.
-    /// Polling-transport `RuntimeMetadata` uses this path.
-    pub async fn update_tool_providers(
+    /// Atomically apply changed-only runtime metadata to the exact active Runner.
+    /// MCP inventory is routing authority, so an invalid inventory rejects the
+    /// entire metadata update before the registry record is touched. `None`
+    /// preserves that metadata family while `Some([])` explicitly clears it.
+    pub async fn update_runtime_metadata(
         &self,
         client_id: &str,
         runner_instance_id: &str,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
     ) -> Result<(), String> {
-        self.update_tool_providers_checked(client_id, runner_instance_id, None, status)
-            .await
-    }
-
-    /// Connection-scoped `RuntimeMetadata` for long-lived transports. A stale
-    /// same-instance connection must not overwrite the current connection's
-    /// provider metadata or refresh its liveness: when the connection no
-    /// longer holds the lease the update is rejected with a stable error.
-    pub async fn update_tool_providers_for_connection(
-        &self,
-        client_id: &str,
-        runner_instance_id: &str,
-        connection_id: &str,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
-    ) -> Result<(), String> {
-        self.update_tool_providers_checked(
+        self.update_runtime_metadata_checked(
             client_id,
             runner_instance_id,
-            Some(connection_id),
-            status,
+            None,
+            tool_providers,
+            mcp_gateway_providers,
         )
         .await
     }
 
-    async fn update_tool_providers_checked(
+    /// Connection-scoped runtime metadata for long-lived transports. The exact
+    /// connection lease prevents a superseded same-instance stream from
+    /// overwriting current routing authority.
+    pub async fn update_runtime_metadata_for_connection(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: &str,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata_checked(
+            client_id,
+            runner_instance_id,
+            Some(connection_id),
+            tool_providers,
+            mcp_gateway_providers,
+        )
+        .await
+    }
+
+    async fn update_runtime_metadata_checked(
         &self,
         client_id: &str,
         runner_instance_id: &str,
         expected_connection_id: Option<&str>,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
     ) -> Result<(), String> {
-        let Some(status) = normalize_tool_providers(status) else {
+        let tool_providers = normalize_tool_providers(tool_providers);
+        if let Some(providers) = mcp_gateway_providers.as_ref() {
+            validate_providers(providers)
+                .map_err(|error| format!("invalid MCP gateway provider inventory: {error}"))?;
+        }
+        if tool_providers.is_none() && mcp_gateway_providers.is_none() {
             return Ok(());
-        };
+        }
         validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get_mut(client_id) else {
@@ -782,10 +785,50 @@ impl RunnerRegistry {
             }
         }
         if let Some(policy) = runner.policy.as_mut() {
-            policy.tool_providers = Some(status);
+            if let Some(status) = tool_providers {
+                policy.tool_providers = Some(status);
+            }
+            if let Some(providers) = mcp_gateway_providers {
+                policy.mcp_gateway_providers = Some(providers);
+            }
         }
         runner.last_seen = now_ts();
         Ok(())
+    }
+
+    /// Apply sanitized provider metadata to the active Runner record. Optional
+    /// metadata is best-effort: malformed/unknown state is ignored by the
+    /// normalizer and never changes transport or tool completion semantics.
+    /// Polling-transport `RuntimeMetadata` uses this path.
+    pub async fn update_tool_providers(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata(client_id, runner_instance_id, status, None)
+            .await
+    }
+
+    /// Connection-scoped `RuntimeMetadata` for long-lived transports. A stale
+    /// same-instance connection must not overwrite the current connection's
+    /// provider metadata or refresh its liveness: when the connection no
+    /// longer holds the lease the update is rejected with a stable error.
+    pub async fn update_tool_providers_for_connection(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: &str,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata_for_connection(
+            client_id,
+            runner_instance_id,
+            connection_id,
+            status,
+            None,
+        )
+        .await
     }
 
     /// Test-only hook to force a runner's `last_seen` so liveness/stale
@@ -1202,6 +1245,39 @@ impl RunnerRegistry {
             .collect()
     }
 
+    /// Exact Project visibility from the registered Runner snapshot. This is
+    /// deliberately read-only: diagnostic observations must not reconcile Jobs
+    /// or prune Runner records as a side effect of checking visibility.
+    pub async fn exact_project_visible_for_auth_snapshot(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project: &str,
+    ) -> bool {
+        let now = now_ts();
+        let inner = self.inner.lock().await;
+        inner.runners.values().any(|runner| {
+            if !runner_visible_to_access(auth, runner) {
+                return false;
+            }
+            if matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
+                let connected = inner.notifiers.contains_key(&runner.client_id);
+                let recently_seen =
+                    now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
+                let offline_since = runner.disconnected_at.unwrap_or(runner.last_seen);
+                if !connected
+                    && !recently_seen
+                    && now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs
+                {
+                    return false;
+                }
+            }
+            runner
+                .projects
+                .iter()
+                .any(|entry| project == format!("agent:{}:{}", runner.client_id, entry.id))
+        })
+    }
+
     /// Return a complete canonical Runner/Project observation only when both
     /// caller-supplied cardinality bounds hold. `None` means the observation is
     /// incomplete and must never support a negative authority conclusion.
@@ -1443,6 +1519,7 @@ impl RunnerRegistry {
         let view = Self::runner_view_locked(inner, client_id)?;
         Some(RunnerSemanticView {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         })
     }

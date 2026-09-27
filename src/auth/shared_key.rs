@@ -95,9 +95,9 @@ fn open_anonymous_scopes() -> Vec<String> {
     ]
 }
 
-/// Minimum scopes needed by the canonical project Connector, MCP projection,
-/// and host-local review console.
-fn project_connector_scopes() -> Vec<String> {
+/// Scopes granted to a project-scoped model credential. Project/Runner visibility
+/// is separately constrained by its ProjectGrant.
+fn project_credential_scopes() -> Vec<String> {
     vec![
         SCOPE_RUNTIME_READ.to_string(),
         SCOPE_SESSION_COLLABORATE.to_string(),
@@ -122,7 +122,7 @@ pub(crate) fn shared_key_context(token: &str) -> AuthContext {
 pub(crate) fn project_credential_context(grant_id: &str) -> AuthContext {
     AuthContext {
         role: Some("project".to_string()),
-        scopes: project_connector_scopes(),
+        scopes: project_credential_scopes(),
         token_kind: Some("project".to_string()),
         project_grant_id: Some(grant_id.to_string()),
         ..AuthContext::new(AuthKind::ProjectCredential)

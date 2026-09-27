@@ -79,3 +79,35 @@ pub(in crate::tool_runtime::tests) fn assert_safe_patch_command(command: &str, m
         command
     );
 }
+
+pub(in crate::tool_runtime::tests) fn assert_observe_job_continuation(output: &Value) {
+    use crate::tool_runtime::{ObserveJobsWakeOn, ToolCall};
+    let hint = &output["continuation"];
+    assert_eq!(hint["tool"], "observe_jobs");
+    assert_eq!(hint["arguments"]["items"][0]["job_id"], output["job_id"]);
+    if let Some(token) = output.get("observation_token") {
+        assert_eq!(
+            hint["arguments"]["items"][0]["after_observation_token"],
+            *token
+        );
+    } else {
+        assert!(hint["arguments"]["items"][0]["after_observation_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+        assert!(output.get("continuation_semantics").is_none());
+    }
+    let call = ToolCall::from_tool_name(hint["tool"].as_str().unwrap(), hint["arguments"].clone())
+        .expect("Job continuation must be parser-ready");
+    assert!(matches!(
+        call,
+        ToolCall::ObserveJobs {
+            wait_secs: Some(webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS),
+            wake_on: ObserveJobsWakeOn::Terminal,
+            ..
+        }
+    ));
+    assert!(
+        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+            <= webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
+    );
+}

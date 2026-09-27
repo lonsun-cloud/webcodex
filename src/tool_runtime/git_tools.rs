@@ -29,11 +29,6 @@ impl ToolRuntime {
                 project,
                 session_id: _,
             } => self.git_status(project).await,
-            ToolCall::GitDiff {
-                project,
-                session_id: _,
-                args,
-            } => self.git_diff(project, args).await,
             ToolCall::GitDiffHunks {
                 project,
                 session_id: _,
@@ -61,10 +56,14 @@ impl ToolRuntime {
             }
             ToolCall::GitLog {
                 project,
+                head_commit,
                 limit,
                 skip,
-                session_id: _,
-            } => self.git_log(project, limit, skip).await,
+                session_id,
+            } => {
+                self.git_log(project, head_commit, limit, skip, session_id)
+                    .await
+            }
             ToolCall::GitReviewSummary {
                 project,
                 base_commit,
@@ -74,10 +73,6 @@ impl ToolRuntime {
                 self.git_review_summary(project, base_commit, head_commit)
                     .await
             }
-            ToolCall::GitDiffSummary {
-                project,
-                session_id: _,
-            } => self.git_diff_summary(project).await,
             ToolCall::ShowChanges {
                 project,
                 session_id,

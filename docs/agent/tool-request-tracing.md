@@ -49,7 +49,7 @@ For a model tool call, the useful payload layers are:
 
 These layers let a maintainer determine where a field disappeared or changed.
 For example, a caller-visible wrapper field such as
-`ack_session_context_revision` can be compared between the raw and effective
+`context_request` can be compared between the raw and effective
 argument layers without making that field part of ordinary user troubleshooting.
 
 ## Runner correlation

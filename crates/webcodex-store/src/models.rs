@@ -130,6 +130,10 @@ pub struct WindowActivityEventRecord {
     pub meaningful: bool,
     pub recorder_gap_session_id: Option<String>,
     pub workflow_links: Vec<WindowWorkflowLinkRecord>,
+    /// Bounded Code Mode composition object extracted from sanitized ActionAudit
+    /// summary JSON. Internal only; Runtime Console applies its own typed projection.
+    #[serde(skip)]
+    pub code_mode_composition: Option<serde_json::Value>,
     /// Internal principal correlation is intentionally not serialized by the
     /// Runtime Console projection. It is used only to avoid cross-principal
     /// adjacency when an administrator reads a Window.
@@ -142,6 +146,8 @@ pub struct WindowActivityEventRecord {
     pub window_transition_kind: Option<String>,
     pub response_streaming: Option<bool>,
     pub window_continuity_eligible: Option<bool>,
+    /// HTTP response status from the WebCodex handler, if recorded.
+    pub http_status: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,6 +290,9 @@ pub struct PairingCodeRecord {
     pub used_at: Option<i64>,
     pub user_token_name: Option<String>,
     pub agent_token_name: Option<String>,
+    /// Explicit admin-issued enrollment grant. Old codes retain their old scopes.
+    #[serde(default)]
+    pub runner_capabilities: bool,
 }
 
 impl ApiKeyRecord {

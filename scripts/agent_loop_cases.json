@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "fixture_reference": {
+    "name": "coding-loop-eval-v1",
+    "source": "scripts/eval_coding_loop.sh",
+    "description": "Reuse the disposable Rust project recipe already owned by eval_coding_loop.sh; do not create a second runtime eval harness."
+  },
+  "protocol": {
+    "same_case_requires_same_base_revision": true,
+    "fresh_clean_workspace_per_run": true,
+    "variants": [
+      "direct",
+      "code_mode"
+    ]
+  },
+  "cases": [
+    {
+      "id": "readonly_review",
+      "title": "Read-only review",
+      "target": "webcodex_repository",
+      "prompt": "Perform a read-only review. Inspect git status, read src/tool_runtime/window_activity.rs and docs/architecture/tool-composition-research.md, search for project_window_loop_timings references, inspect the current git diff, and report concrete findings. Do not modify files and do not run mutation tools.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "git status",
+          "window_activity implementation",
+          "tool-composition research timing contract",
+          "git diff"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      },
+      "code_mode_surface": "read_only"
+    },
+    {
+      "id": "focused_edit_validation",
+      "title": "Focused structured edit plus validation",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "In the disposable coding-loop eval Rust project, change greeting() from \"hello\" to \"hello baseline\" without changing topic(). Inspect the resulting diff, run cargo check successfully, and report the final changed file and validation result.",
+      "correctness": {
+        "changed_files": [
+          "src/lib.rs"
+        ],
+        "required_final_text": "\"hello baseline\"",
+        "forbidden_final_text": "\"hello\" as the greeting return value",
+        "topic_must_remain_unchanged": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo check",
+        "expected_exit_code": 0
+      },
+      "code_mode_surface": "guarded_edit"
+    },
+    {
+      "id": "failed_validation_recovery",
+      "title": "Failed validation recovery",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "Use test-first recovery in the disposable coding-loop eval Rust project. First add a unit test named greeting_matches_recovery_target asserting greeting() == \"hello recovered\" and run cargo test while greeting() still returns \"hello\"; inspect the expected failing diagnostic. Then change greeting() to \"hello recovered\", rerun cargo test successfully, inspect the final diff, and report both the observed failing validation and the successful rerun.",
+      "correctness": {
+        "changed_files": [
+          "src/lib.rs"
+        ],
+        "required_final_text": "\"hello recovered\"",
+        "required_test_name": "greeting_matches_recovery_target",
+        "must_observe_failed_validation_before_fix": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo test",
+        "expected_sequence": [
+          "failed",
+          "success"
+        ]
+      },
+      "code_mode_surface": "guarded_edit"
+    },
+    {
+      "id": "long_validation_handoff",
+      "title": "Long validation and same-execution Job handoff",
+      "target": "webcodex_repository",
+      "prompt": "Do not modify files. Start cargo test --lib with sync_wait_secs=1 and a sufficient total timeout. If it hands off, preserve that exact Job identity; while it runs, independently inspect the timing terminology in docs/architecture/tool-composition-research.md, then observe the same Job to terminal completion. Do not redispatch cargo test. If the validation finishes synchronously before handoff, report that this run does not satisfy the handoff case instead of fabricating one.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "same_execution_must_be_preserved": true,
+        "redispatch_forbidden": true,
+        "requires_real_handoff_for_valid_case": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo test --lib",
+        "sync_wait_secs": 1,
+        "expected_terminal_result": "success"
+      },
+      "code_mode_surface": "validation"
+    },
+    {
+      "id": "independent_observations",
+      "title": "Independent read-only observations",
+      "target": "webcodex_repository",
+      "prompt": "Perform a read-only readiness check for the Agent Loop baseline. Report whether the workspace is clean, whether the current worktree diff contains changes, where CODE_MODE_TOOLS is defined, and the documented meaning of observed_span_ms. Inspect the relevant repository sources and report only those facts. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "independent_observations",
+        "model_round_trips",
+        "max_in_flight",
+        "argument_accuracy"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "git status",
+          "worktree diff",
+          "CODE_MODE_TOOLS definition",
+          "observed_span_ms semantics"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "adaptive_search_read",
+      "title": "Adaptive search then targeted read",
+      "target": "webcodex_repository",
+      "prompt": "Locate the repository references that define outside_webcodex_gap_ms, then inspect the most relevant matched ranges and explain when a serial gap is measured versus unavailable. Keep the workspace unchanged.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "adaptive_search_read",
+        "result_field_usage",
+        "model_round_trips",
+        "repair_turns"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "search results for outside_webcodex_gap_ms",
+          "targeted read of defining code or protocol text",
+          "measured versus unavailable semantics"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "native_batching_observations",
+      "title": "Related multi-file and multi-query observations",
+      "target": "webcodex_repository",
+      "prompt": "Cross-check the Agent Loop protocol across AGENTS.md, docs/experiments/agent-loop-baseline.md, and scripts/agent_loop_cases.json. Also locate references to model_round_trips and nested_raw_result_bytes_total. Report the protocol rule for clean paired runs, the wall-time caveat, and where the two metrics are represented. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "native_batching",
+        "related_reads",
+        "related_searches",
+        "child_call_count",
+        "result_bytes"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "AGENTS.md",
+          "agent-loop baseline protocol",
+          "case manifest",
+          "model_round_trips references",
+          "nested_raw_result_bytes_total references"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "result_shape_pressure",
+      "title": "Layered search-result follow-up",
+      "target": "webcodex_repository",
+      "prompt": "Find same_case_requires_same_base_revision in the repository, report the first matching file and line, then read the surrounding manifest protocol and the corresponding Agent Loop documentation. State whether the two sources agree about paired-run base revisions. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "result_shape",
+        "search_match_projection",
+        "optional_fields",
+        "repair_turns"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "first structured search match path and line",
+          "manifest protocol value",
+          "documentation agreement"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "known_business_failure",
+      "title": "Expected missing-file business failure with fallback",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "Inspect docs/task-notes.md in the disposable coding-loop eval project. That optional note may be absent; if the read reports it missing, treat that as the expected business result and continue by reading README.md. Report the README title and the stable phrase describing why the project exists. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "known_business_failure",
+        "failed_child_calls",
+        "normal_recovery",
+        "failure_kind_distinction"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "expected_missing_path": "docs/task-notes.md",
+        "required_fallback": "README.md",
+        "required_final_fact": "coding-loop eval"
+      },
+      "validation": {
+        "required": false,
+        "expectation": "The missing optional file is an expected business failure; no code validation is required."
+      }
+    },
+    {
+      "id": "compact_projection",
+      "title": "Large read evidence with compact final projection",
+      "target": "webcodex_repository",
+      "prompt": "Read the relevant guidance in AGENTS.md, docs/agent/tool-contract-guidelines.md, and docs/experiments/agent-loop-baseline.md. Return exactly three concise facts: the rule for independent versus adaptive observations, what observed_span_ms does not mean, and the authorization rule for deploy/restart. Do not quote long passages and do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "compact_projection",
+        "nested_raw_result_bytes",
+        "returned_bytes",
+        "context_pressure"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_final_facts": [
+          "independent versus adaptive observation rule",
+          "observed_span_ms is not task wall time",
+          "deploy/restart requires explicit authorization"
+        ],
+        "final_fact_count": 3
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    }
+  ]
+}

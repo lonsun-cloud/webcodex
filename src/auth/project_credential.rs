@@ -13,7 +13,7 @@ pub(crate) struct ProjectCredentialVerifier {
 }
 
 /// Exact verifier for the private Agent Token generated for one project entry.
-/// Unlike the Connector credential, this context is an Agent Token bound to
+/// Unlike the project credential, this context is an Agent Token bound to
 /// one client id and is therefore valid only on Runner transport routes.
 #[derive(Clone)]
 pub(crate) struct ProjectAgentTokenVerifier {
@@ -21,6 +21,85 @@ pub(crate) struct ProjectAgentTokenVerifier {
     allowed_client_id: String,
     owner: String,
     token_hash: [u8; 32],
+}
+
+/// Process-local authentication material for a project-scoped Server launched by
+/// `webcodex run` / `webcodex share`. This state authenticates credentials only;
+/// it does not define a coding surface, Project model, Task model, or execution
+/// lifecycle. Canonical ToolRuntime and Runner authorization remain authoritative.
+#[derive(Clone, Default)]
+pub(crate) struct ProjectAuthState {
+    credential: Option<ProjectCredentialVerifier>,
+    agent_token: Option<ProjectAgentTokenVerifier>,
+}
+
+pub(crate) const PROJECT_GRANT_ID_ENV: &str = "WEBCODEX_PROJECT_GRANT_ID";
+pub(crate) const PROJECT_CREDENTIAL_FILE_ENV: &str = "WEBCODEX_PROJECT_CREDENTIAL_FILE";
+pub(crate) const PROJECT_AGENT_TOKEN_FILE_ENV: &str = "WEBCODEX_PROJECT_AGENT_TOKEN_FILE";
+pub(crate) const PROJECT_RUNNER_CLIENT_ID_ENV: &str = "WEBCODEX_PROJECT_RUNNER_CLIENT_ID";
+
+impl ProjectAuthState {
+    pub(crate) fn from_env() -> Result<Self, String> {
+        let grant_id = nonempty_env(PROJECT_GRANT_ID_ENV);
+        let credential_file = nonempty_env(PROJECT_CREDENTIAL_FILE_ENV);
+        let agent_token_file = nonempty_env(PROJECT_AGENT_TOKEN_FILE_ENV);
+        let runner_client_id = nonempty_env(PROJECT_RUNNER_CLIENT_ID_ENV);
+        let present = [
+            grant_id.is_some(),
+            credential_file.is_some(),
+            agent_token_file.is_some(),
+            runner_client_id.is_some(),
+        ];
+        if !present.iter().any(|present| *present) {
+            return Ok(Self::default());
+        }
+        if !present.iter().all(|present| *present) {
+            return Err(format!(
+                "project-scoped authentication requires {PROJECT_GRANT_ID_ENV}, {PROJECT_CREDENTIAL_FILE_ENV}, {PROJECT_AGENT_TOKEN_FILE_ENV}, and {PROJECT_RUNNER_CLIENT_ID_ENV}"
+            ));
+        }
+        let grant_id = grant_id.expect("checked above");
+        validate_grant_id(&grant_id)?;
+        let runner_client_id = runner_client_id.expect("checked above");
+        super::validate_allowed_client_id(&runner_client_id)?;
+        let credential = ProjectCredentialVerifier::from_file(
+            grant_id.clone(),
+            Path::new(&credential_file.expect("checked above")),
+        )?;
+        let agent_token = ProjectAgentTokenVerifier::from_file(
+            grant_id,
+            runner_client_id,
+            "local-owner".to_string(),
+            Path::new(&agent_token_file.expect("checked above")),
+        )?;
+        Ok(Self {
+            credential: Some(credential),
+            agent_token: Some(agent_token),
+        })
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.credential.is_some()
+    }
+
+    pub(crate) fn authenticate_project_credential(&self, token: &str) -> Option<AuthContext> {
+        self.credential
+            .as_ref()
+            .and_then(|verifier| verifier.authenticate(token))
+    }
+
+    pub(crate) fn authenticate_project_agent_token(&self, token: &str) -> Option<AuthContext> {
+        self.agent_token
+            .as_ref()
+            .and_then(|verifier| verifier.authenticate(token))
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 impl ProjectCredentialVerifier {
@@ -41,10 +120,6 @@ impl ProjectCredentialVerifier {
         let candidate: [u8; 32] = Sha256::digest(credential.trim().as_bytes()).into();
         crate::config::constant_time_eq(&self.credential_hash, &candidate)
             .then(|| project_credential_context(&self.grant_id))
-    }
-
-    pub(crate) fn grant_id(&self) -> &str {
-        &self.grant_id
     }
 }
 

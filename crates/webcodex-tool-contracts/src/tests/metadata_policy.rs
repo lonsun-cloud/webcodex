@@ -50,7 +50,7 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
     }
 
     let cases = [
-        ("read_file", ToolEffect::Observe, ToolIdempotency::PureRead),
+        ("read_files", ToolEffect::Observe, ToolIdempotency::PureRead),
         (
             "close_session",
             ToolEffect::Mutate,
@@ -94,9 +94,11 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
         "apply_text_edits",
         "apply_unified_diff",
         "write_project_file",
+        #[cfg(feature = "workspace-checkpoints")]
         "workspace_checkpoint_restore",
         "save_project_artifact",
         "import_conversation_files_to_project",
+        "transfer_project_artifact",
         "artifact_upload_finish",
         "artifact_upload_abort",
         "assign_agent_task",
@@ -104,15 +106,13 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
         "heartbeat_agent_task_attempt",
         "complete_agent_task_attempt",
         "update_agent_identity",
+        "rotate_agent_continuation_endpoint",
         "attach_agent_endpoint",
         "detach_agent_endpoint",
         "consume_agent_deliveries",
         "consume_agent_wake",
         "coding_agent_cancel",
-        "computer_write_clipboard",
-        "computer_pointer_click",
         "computer_control",
-        "computer_key_input",
         "update_session_context",
         "close_session",
         "resolve_session_message",
@@ -129,6 +129,7 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
     }
 
     for name in [
+        #[cfg(feature = "workspace-checkpoints")]
         "workspace_checkpoint_create",
         "git_commit_paths",
         "artifact_upload_begin",

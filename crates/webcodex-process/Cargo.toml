@@ -18,7 +18,7 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [[bin]]
-name = "process_tree_helper"
+name = "process-tree-helper"
 path = "src/bin/process_tree_helper.rs"
 
 [dev-dependencies]

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const WRITE_TOOL: &str = "write_project_file";
-const READ_TOOL: &str = "read_file";
+const READ_TOOL: &str = "read_files";
 
 #[test]
 fn trusted_agent_auto_authorizes_permission_bearing_tools() {
@@ -22,7 +22,11 @@ fn trusted_agent_auto_authorizes_permission_bearing_tools() {
     assert_eq!(decision.risk, "write");
     assert_eq!(decision.tool_name, WRITE_TOOL);
     assert_eq!(decision.project.as_deref(), Some("agent:oe:private-drop"));
-    assert!(decision.request_id.starts_with("wc_perm_"));
+    let request_suffix = decision
+        .request_id
+        .strip_prefix("wc_perm_")
+        .expect("permission request namespace");
+    assert!(webcodex_core::compact::decode::<12>(request_suffix).is_some());
     assert_eq!(decision.outcome(), Some(PermissionOutcome::AutoApproved));
 }
 

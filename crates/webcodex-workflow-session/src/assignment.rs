@@ -13,9 +13,9 @@ use super::model::{
 use base64::{engine::general_purpose, Engine as _};
 use sha2::{Digest, Sha256};
 
-const ASSIGNMENT_FENCE_PREFIX: &str = "wsa1_";
+const ASSIGNMENT_FENCE_PREFIX: &str = "wsa2_";
 const ASSIGNMENT_DIGEST_BYTES: usize = 32;
-const ASSIGNMENT_FENCE_PAYLOAD_BYTES: usize = 32;
+const ASSIGNMENT_FENCE_PAYLOAD_BYTES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(super) struct AssignmentState {
@@ -215,14 +215,14 @@ fn encode_assignment_fence(
     semantic_digest: &[u8; ASSIGNMENT_DIGEST_BYTES],
 ) -> String {
     let payload = scoped_digest(
-        b"webcodex/session-assignment/fence/v1\0",
+        b"webcodex/session-assignment/fence/v2\0",
         session_id,
         todo_id,
         semantic_digest,
     );
     let token = format!(
         "{ASSIGNMENT_FENCE_PREFIX}{}",
-        general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        general_purpose::URL_SAFE_NO_PAD.encode(&payload[..ASSIGNMENT_FENCE_PAYLOAD_BYTES])
     );
     debug_assert_eq!(token.len(), MAX_SESSION_ASSIGNMENT_FENCE_LEN);
     token

@@ -9,9 +9,6 @@ use crate::metadata::{
     ToolRisk::ProjectWrite,
     PROJECT_WRITE, TOOL_PROVIDER_RUNNER,
 };
-use crate::registry::input_schemas::{
-    apply_text_edits_input_schema, write_project_file_input_schema,
-};
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     permission_risk(
@@ -36,8 +33,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create new files or intentional whole-file rewrites. Existing-file overwrite requires the exact current expected_sha256. For ordinary model-generated changes after read_file/read_files, prefer apply_text_edits with the returned current SHA. Use apply_patch only when contextual or multi-hunk patch form is materially clearer, not merely because many lines change. Inspect current content and worktree changes before replacing a file.",
-            write_project_file_input_schema,
+            "Create a new file or perform an intentional whole-file replacement. Existing-file replacement requires expected_read_revision from read_files; ToolRuntime resolves that model-facing snapshot handle to the Runner guard, so the model does not copy a digest. Failures expose minimal error facts and at most one parser-ready read_files recovery call when a fresh read is required. Choose this path when whole-file replacement is genuinely the clearest reliable mutation, then inspect the resulting diff and validate the final source.",
         ),
         PERMISSION_RISK_WRITE,
     ),
@@ -63,10 +59,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+                )
+                .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+                .with_host_orchestration_hint(
+                    super::ToolHostOrchestrationHint::sequential()
+                        .with_native_batch_field("changes"),
                 ),
-                "Canonical default guarded edit path after read_file/read_files for ordinary model-generated changes on the current worktree. Transactional and SHA-guarded: pass each existing file's current read SHA as expected_sha256; exact matches are unique by default, occurrence remains global source order, and optional line_scope fences matches. Supports transactional multi-file edits. Many changed lines alone are not a reason to choose apply_patch; use apply_patch only when contextual or large multi-hunk patch form is materially clearer. Use apply_unified_diff only for an external raw diff.",
-                apply_text_edits_input_schema,
-            ),
+                "Small/local exact edits use a transactional structured option: use ONE change per file with edits. Globally unique edits may omit expected_read_revision; occurrence or line_scope requires expected_read_revision; occurrence selects one match in global source order; revisions fence whole-file snapshots; model input never needs a digest. For same old_text in an explicit bounded file when exact cardinality is known, use replace_exact expected_match_count=N (1..=1024), scoped if needed; never occurrence. If uncertain, optional dry_run; if obvious, apply directly—dry_run is not ritual. Batches are preflighted transactionally; conflicts fail closed; Runner rechecks source before mutation. change_summary/changed_files/resolved_matches confirm mechanical scope; do not diff only to recount. Summary is not semantic review: use show_changes, git_diff_hunks, or git_review_summary. On stale state use one parser-ready read_files recovery call; inspect the resulting diff if review is needed; validate the final source.",
+            ).with_gpt_action_description("Transactional exact edits. Known same old_text + bounded exact cardinality: expected_match_count=N; uncertain count/range: optional dry_run; obvious count: apply directly. change_summary is mechanical scope only; use Git review tools for semantic review. Canonical guards and rollback remain."),
             PERMISSION_RISK_WRITE,
         ),
         60,

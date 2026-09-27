@@ -24,6 +24,33 @@ pub const VALIDATION_OUTPUT_METADATA_ABSENT_REASON: &str =
 pub const MAX_DIAGNOSTICS: usize = 20;
 pub const MAX_FAILED_TESTS: usize = 20;
 pub const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
+
+/// Completeness of authoritative Cargo test-count extraction. This is shared
+/// by bounded Server parsing and Runner full-stream accumulation so there is
+/// one vocabulary for why an executed-test count is or is not proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoTestCountEvidenceStatus {
+    CompleteSummary,
+    PartialHarnessSummary,
+    NoCompleteSummary,
+    IncompleteStream,
+}
+
+impl CargoTestCountEvidenceStatus {
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::CompleteSummary => "complete_summary",
+            Self::PartialHarnessSummary => "partial_harness_summary",
+            Self::NoCompleteSummary => "no_complete_summary",
+            Self::IncompleteStream => "incomplete_stream",
+        }
+    }
+
+    pub const fn count_is_proven(self) -> bool {
+        matches!(self, Self::CompleteSummary)
+    }
+}
 const MAX_CODE_CHARS: usize = 64;
 const MAX_FILE_CHARS: usize = 512;
 const MAX_TEST_NAME_CHARS: usize = 240;

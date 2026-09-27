@@ -4,7 +4,7 @@
 
 Use this path for CLI setup, an existing Server, or a setup that needs more control than Desktop provides. For a normal Windows or macOS personal installation, the recommended first path is [WebCodex Desktop + the official OpenAI Secure Tunnel](desktop-install.md). In either case, the full WebCodex model is the same: ChatGPT connects to a regular Server, and a persistent Runner uses the real projects, Git checkout, compiler, and test tools on your machine.
 
-If you only want to try WebCodex for a few minutes, use the [Quick Trial](QUICK_START.md) and `webcodex share` instead. `share` is a temporary, single-project, more restricted experience that ends when the command exits.
+If you only want to try WebCodex for a few minutes, use the [Quick Trial](QUICK_START.md) and `webcodex share` instead. `share` is a temporary, single-project launch of the ordinary Adaptive Runtime with project-scoped authentication; it ends when the command exits.
 
 ## What you will have
 
@@ -182,7 +182,7 @@ With the full setup, the AI should be able to explore and edit projects, use Git
 
 | Goal | Recommended entry | What it is |
 | --- | --- | --- |
-| Try one repository for a few minutes | `webcodex share` | One command, temporary, single-project, ends on exit, more restricted |
+| Try one repository for a few minutes | `webcodex share` | One command, temporary, single-project, ordinary Adaptive Runtime, ends on exit |
 | Everyday use on Windows/macOS | [Desktop + official OpenAI Secure Tunnel](desktop-install.md) | Local Server + Runner, multiple projects, simplest recommended personal path |
 | CLI, Linux, or an existing Server | regular Server + Runner (this guide) | Durable identity, multiple projects, full development tools, independent network choice |
 | Operate a team/production deployment | [Deployment](DEPLOYMENT.md) | systemd, Docker, OAuth, multi-user and operator reference |

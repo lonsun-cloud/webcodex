@@ -51,6 +51,18 @@ impl Drop for RegularTunnelSession {
 pub(crate) async fn run_regular_server_tunnel(
     options: &RegularServerTunnelOptions,
 ) -> Result<(), ProductError> {
+    match run_regular_server_tunnel_inner(options).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            println!("{}", machine_regular_tunnel_failure_event(&error));
+            Err(error)
+        }
+    }
+}
+
+async fn run_regular_server_tunnel_inner(
+    options: &RegularServerTunnelOptions,
+) -> Result<(), ProductError> {
     let local_server_url = validate_local_server_url(&options.local_server_url)?;
     let session = RegularTunnelSession::create(&options.runtime_parent)?;
     let authorization_file = session.write_authorization_file(&options.bootstrap_token)?;
@@ -65,8 +77,18 @@ pub(crate) async fn run_regular_server_tunnel(
     )
     .await?;
 
-    let clipboard = copy_text_to_clipboard(&prerequisites.tunnel_id, true).await;
-    let ready = machine_regular_tunnel_ready_event(clipboard);
+    // Managed profiles use explicit Copy ID controls; concurrent starts must not
+    // race over the user's clipboard. Keep CLI handoff for an unmanaged invocation.
+    let managed = std::env::var("WEBCODEX_TUNNEL_PROFILE_ID").is_ok();
+    let clipboard = copy_text_to_clipboard(&prerequisites.tunnel_id, !managed).await;
+    let mut ready = machine_regular_tunnel_ready_event(clipboard);
+    ready["runtime"] = json!({
+        "directory": session.directory,
+        "health_url": tunnel.health_url,
+        "log_file": tunnel.log_file,
+        "tunnel_client_pid": tunnel.pid(),
+        "local_mcp_url": mcp_url(&local_server_url),
+    });
     let encoded = serde_json::to_string(&ready).map_err(|_| {
         ProductError::new(
             "machine_output_failed",
@@ -76,12 +98,76 @@ pub(crate) async fn run_regular_server_tunnel(
     })?;
     println!("{encoded}");
 
+    let health_url = tunnel.health_url.clone();
+    let local_mcp_url = mcp_url(&local_server_url);
     let outcome = tokio::select! {
         _ = wait_for_regular_tunnel_stop_signal() => Ok(()),
         result = tunnel.wait_for_exit() => result,
+        result = report_regular_tunnel_health(&health_url, &local_mcp_url, &options.bootstrap_token) => result,
     };
     tunnel.stop().await;
     outcome
+}
+
+/// A running daemon is not sufficient proof of a usable local MCP endpoint.
+/// No response body, credential, or network error text crosses the machine channel.
+async fn report_regular_tunnel_health(
+    health_url: &str,
+    local_mcp_url: &str,
+    bootstrap: &str,
+) -> Result<(), ProductError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|_| tunnel_auth_error("Local connection health monitoring is unavailable"))?;
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let (tunnel_ready, local_mcp_ready) = tokio::join!(
+            async {
+                client
+                    .get(format!("{health_url}/readyz"))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            },
+            probe_local_mcp(&client, local_mcp_url, bootstrap),
+        );
+        println!(
+            "{}",
+            json!({"event":"health", "schema_version":1, "tunnel_ready":tunnel_ready, "local_mcp_ready":local_mcp_ready})
+        );
+    }
+}
+
+async fn probe_local_mcp(client: &reqwest::Client, local_mcp_url: &str, bootstrap: &str) -> bool {
+    let Ok(mut response) = client
+        .get(local_mcp_url)
+        .bearer_auth(bootstrap.trim())
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() || response.content_length().is_some_and(|size| size > 8192)
+    {
+        return false;
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= 8192 => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    serde_json::from_slice::<Value>(&body).is_ok_and(|value| {
+        value["name"] == "webcodex" && value["protocol"] == "mcp" && value["endpoint"] == "/mcp"
+    })
 }
 
 fn machine_regular_tunnel_ready_event(clipboard: ClipboardCopyOutcome) -> Value {
@@ -101,6 +187,37 @@ fn machine_regular_tunnel_ready_event(clipboard: ClipboardCopyOutcome) -> Value 
             "clipboard_contains": "tunnel_id",
         }
     })
+}
+
+fn machine_regular_tunnel_failure_event(error: &ProductError) -> Value {
+    let (failure_stage, reason_code) = tunnel_failure_evidence(&error.code);
+    json!({
+        "event": "failure",
+        "schema_version": 1,
+        "provider": "openai",
+        "failure_stage": failure_stage,
+        "reason_code": reason_code,
+    })
+}
+
+fn tunnel_failure_evidence(code: &str) -> (&'static str, &'static str) {
+    match code {
+        "tunnel_client_verification_failed" => (
+            "tunnel_client_verification",
+            "tunnel_client_verification_failed",
+        ),
+        "tunnel_doctor_failed" => ("tunnel_doctor", "tunnel_doctor_failed"),
+        "tunnel_control_plane_unreachable" => {
+            ("tunnel_control_plane", "tunnel_control_plane_unreachable")
+        }
+        "tunnel_control_plane_probe_failed" => {
+            ("tunnel_control_plane", "tunnel_control_plane_probe_failed")
+        }
+        "tunnel_daemon_start_failed" => ("tunnel_daemon_start", "tunnel_daemon_start_failed"),
+        "tunnel_daemon_not_ready" => ("tunnel_daemon_readiness", "tunnel_daemon_not_ready"),
+        "local_mcp_unavailable" | "tunnel_auth_invalid" => ("local_mcp", "local_mcp_unavailable"),
+        _ => ("tunnel_startup", "tunnel_startup_failed"),
+    }
 }
 
 fn validate_local_server_url(value: &str) -> Result<String, ProductError> {
@@ -198,6 +315,24 @@ mod tests {
         assert!(!encoded.contains("Bearer"));
         assert!(!encoded.contains("wc_pat_"));
         assert!(!encoded.contains("wc_boot_"));
+    }
+
+    #[test]
+    fn machine_failure_event_is_typed_bounded_and_secret_free() {
+        let error = ProductError::new(
+            "tunnel_control_plane_probe_failed",
+            "private runtime key and tunnel id must never cross the machine channel",
+            Some("private recovery text"),
+        );
+        let event = machine_regular_tunnel_failure_event(&error);
+        assert_eq!(event["event"], "failure");
+        assert_eq!(event["failure_stage"], "tunnel_control_plane");
+        assert_eq!(event["reason_code"], "tunnel_control_plane_probe_failed");
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("private runtime key"));
+        assert!(!encoded.contains("private recovery"));
+        assert!(!encoded.contains("Authorization"));
+        assert!(!encoded.contains("Bearer"));
     }
 
     #[test]

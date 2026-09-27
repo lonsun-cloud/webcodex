@@ -6,8 +6,10 @@ use crate::Database;
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
 
-pub const MAX_WINDOW_ACTIVITY_LIMIT: usize = 500;
-pub const MAX_WINDOW_LINK_LIMIT: usize = 100;
+// Window history is already bounded by ActionAudit retention. Keep the human
+// console able to inspect the retained set instead of imposing tiny UI-only caps.
+pub const MAX_WINDOW_ACTIVITY_LIMIT: usize = 2_000;
+pub const MAX_WINDOW_LINK_LIMIT: usize = 2_000;
 
 fn bounded_limit(limit: usize, max: usize) -> i64 {
     limit.clamp(1, max) as i64
@@ -35,7 +37,7 @@ impl Database {
         principal: Option<(&str, &str)>,
         limit: usize,
     ) -> anyhow::Result<Vec<WindowActivitySummaryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let (principal_sql, kind, id) = principal_predicate(principal);
         let sql = format!(
             "SELECT e.client_window_key,
@@ -79,7 +81,7 @@ impl Database {
         &self,
         principal: Option<(&str, &str)>,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let count = match principal {
             Some((kind, id)) => conn.query_row(
                 "SELECT COUNT(DISTINCT client_window_key)
@@ -108,7 +110,7 @@ impl Database {
         window_key: &str,
         principal: Option<(&str, &str)>,
     ) -> anyhow::Result<Option<WindowActivitySummaryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let row = match principal {
             Some((kind, id)) => conn
                 .query_row(
@@ -156,7 +158,7 @@ impl Database {
         principal: Option<(&str, &str)>,
         limit: usize,
     ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let (principal_sql, kind, id) = principal_predicate(principal);
         let sql = format!(
             "SELECT e.event_id, e.client_window_key, e.client_window_source,
@@ -166,7 +168,7 @@ impl Database {
                     e.principal_correlation_kind, e.principal_correlation_id,
                     e.request_observed_at_ms, e.response_handed_at_ms,
                     e.window_transition_kind, e.response_streaming,
-                    e.window_continuity_eligible
+                    e.window_continuity_eligible, e.http_status
              FROM action_events e
              WHERE e.client_window_key = ?1
                AND e.window_started_at_ms IS NOT NULL
@@ -183,11 +185,110 @@ impl Database {
                 let sql = sql.replace("LIMIT ?4", "LIMIT ?2");
                 drop(stmt);
                 let mut stmt = conn.prepare(&sql)?;
-                let records = collect_window_events(&conn, &mut stmt, params![window_key, limit])?;
+                let records =
+                    collect_window_events(&conn, &mut stmt, params![window_key, limit], None)?;
                 return Ok(records);
             }
         };
-        collect_window_event_rows(&conn, &mut rows)
+        collect_window_event_rows(&conn, &mut rows, None)
+    }
+
+    /// Goal liveness needs the latest meaningful work even after thousands of
+    /// transport-only App polls. Reuse the action ledger, with a bounded page of
+    /// meaningful events plus the newest observation; never maintain another clock.
+    pub fn list_goal_window_activity_events(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let (kind, id) = principal
+            .map(|(kind, id)| (Some(kind), Some(id)))
+            .unwrap_or((None, None));
+        let mut statement = conn.prepare(
+            "WITH selected AS (
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1 AND window_meaningful = 1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT ?4
+                )
+                UNION
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT 1
+                )
+             )
+             SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming, e.window_continuity_eligible, e.http_status
+             FROM action_events e JOIN selected s ON s.event_id = e.event_id
+             ORDER BY e.window_ended_at_ms DESC, e.event_id DESC",
+        )?;
+        collect_window_events(
+            &conn,
+            &mut statement,
+            params![
+                window_key,
+                kind,
+                id,
+                bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT)
+            ],
+            None,
+        )
+    }
+
+    /// Variant used only by feature-gated Code Mode Runtime Console dogfood.
+    /// The ordinary Window query above intentionally keeps its historical SQL
+    /// and does not read ActionAudit summary JSON.
+    pub fn list_window_activity_events_with_code_mode_composition(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let (principal_sql, kind, id) = principal_predicate(principal);
+        let sql = format!(
+            "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.summary_json
+             FROM action_events e
+             WHERE e.client_window_key = ?1
+               AND e.window_started_at_ms IS NOT NULL
+               AND e.window_ended_at_ms IS NOT NULL
+               {principal_sql}
+             ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms) DESC, e.event_id DESC
+             LIMIT ?4"
+        );
+        let limit = bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = match (kind, id) {
+            (Some(kind), Some(id)) => stmt.query(params![window_key, kind, id, limit])?,
+            _ => {
+                let sql = sql.replace("LIMIT ?4", "LIMIT ?2");
+                drop(stmt);
+                let mut stmt = conn.prepare(&sql)?;
+                let records =
+                    collect_window_events(&conn, &mut stmt, params![window_key, limit], Some(21))?;
+                return Ok(records);
+            }
+        };
+        collect_window_event_rows(&conn, &mut rows, Some(21))
     }
 
     /// Latest authoritative Window/Session relation for diagnostic continuity.
@@ -200,7 +301,7 @@ impl Database {
         principal_id: &str,
         project: &str,
     ) -> anyhow::Result<Option<WindowWorkflowAffinityRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         conn.query_row(
             "SELECT l.workflow_session_id, l.project, l.workflow_session_relation, l.linked_at_ms
              FROM action_event_workflow_links l
@@ -233,7 +334,7 @@ impl Database {
         principal: Option<(&str, &str)>,
         limit: usize,
     ) -> anyhow::Result<Vec<WindowWorkflowSessionSummaryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let (principal_sql, kind, id) = principal_predicate(principal);
         let sql = format!(
             "SELECT l.workflow_session_id, MAX(l.project), MIN(l.linked_at_ms),
@@ -267,7 +368,7 @@ impl Database {
         principal: Option<(&str, &str)>,
         limit: usize,
     ) -> anyhow::Result<Vec<WindowSessionLinkSummaryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
         let limit = bounded_limit(limit, MAX_WINDOW_LINK_LIMIT);
         match principal {
             Some((kind, id)) => {
@@ -370,14 +471,16 @@ fn collect_window_events<P: rusqlite::Params>(
     conn: &Connection,
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
+    code_mode_summary_column: Option<usize>,
 ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
     let mut rows = stmt.query(params)?;
-    collect_window_event_rows(conn, &mut rows)
+    collect_window_event_rows(conn, &mut rows, code_mode_summary_column)
 }
 
 fn collect_window_event_rows(
     conn: &Connection,
     rows: &mut rusqlite::Rows<'_>,
+    code_mode_summary_column: Option<usize>,
 ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -404,6 +507,16 @@ fn collect_window_event_rows(
             window_transition_kind: row.get(17)?,
             response_streaming: row.get(18)?,
             window_continuity_eligible: row.get(19)?,
+            http_status: row.get(20)?,
+            code_mode_composition: match code_mode_summary_column {
+                Some(column) => row
+                    .get::<_, Option<String>>(column)?
+                    .and_then(|summary_json| {
+                        serde_json::from_str::<serde_json::Value>(&summary_json).ok()
+                    })
+                    .and_then(|summary| summary.get("code_mode_composition").cloned()),
+                None => None,
+            },
         });
     }
     Ok(out)

@@ -25,6 +25,106 @@ Client：
   `webcodex ops status --strict --server-url https://your-domain.example`。
 - `list_runners` / `runtime_status` 显示 Runner online。
 
+## 先判断故障发生在哪一层
+
+当 ChatGPT 提示 app、插件或工具被 block 时，不要第一步就重启 Runner。先判断这次
+请求是否真正到达 WebCodex。
+
+| 现象 | 更可能的层 | 下一步 |
+| --- | --- | --- |
+| ChatGPT 返回 `FORBIDDEN: This conversation does not support developer MCPs`，或提示当前会话已禁用 developer MCP server；同时 WebCodex 没有观察到对应请求 | ChatGPT Host / conversation 的 MCP admission | 从 operator/Runner 主机独立验证 WebCodex，再单独排查 Host 连接 |
+| WebCodex 返回 HTTP 401/403、MCP authentication error，或正常 structured ToolResult failure | Server auth / authorization / ToolRuntime | 检查 user/API credential、OAuth scope、Server 日志与精确 WebCodex error |
+| `runtime_status` 能成功执行，但显示 Runner offline 或 project missing | Runner / project registration | 在 Runner 主机执行 `webcodex runner status` 并查看有界日志 |
+| `plugin_tool` 已到达 WebCodex，并返回 `ready=false`、`plugin_check_busy`、`plugin_reload_busy` 等 Plugin diagnostic | WebCodex Native Tool Plugin runtime | 使用 `webcodex plugin check/list/describe/reload`，并查看 [Native Tool Plugin 文档](PLUGINS.zh-CN.md) |
+
+第一行尤其重要：如果 ChatGPT Host 根本没有 dispatch `runtime_status`，界面显示的
+`FORBIDDEN` **不是** WebCodex 的 `runtime_status` 返回值。一个没有到达 Server 的
+请求，无法通过重启或重配 Runner 来修复。
+
+### ChatGPT 提示 developer MCP 被禁用或当前会话不支持
+
+[Issue #500](https://github.com/yyjeqhc/webcodex/issues/500) 已出现一组很有代表性的
+对照：同一个会话此前已经正常使用 WebCodex，随后连续得到：
+
+```text
+FORBIDDEN: This conversation does not support developer MCPs
+```
+
+当时同一 Server、Runner、project 与本地 workspace 通过独立路径仍然可用；之后没有
+修改 WebCodex 配置，同一个 ChatGPT 会话又自行恢复。这更符合 Host/conversation 级
+developer-MCP routing / permission state 的间歇性异常，而不是持久的 Runner 故障。
+
+推荐按下面顺序排查：
+
+1. 记录完整错误文本、发生时间、时区，以及使用的 ChatGPT surface
+   （例如 web/desktop/mobile）。
+2. 脱离这个会话，独立验证 WebCodex。Hosted profile 可执行：
+
+   ```bash
+   webcodex --version
+   webcodex-runner --version
+   webcodex runner status --profile <connect 输出的 profile>
+   webcodex runner logs --profile <connect 输出的 profile> --lines 100
+   ```
+
+   Managed deployment 还可以使用只读 operator 检查：
+
+   ```bash
+   webcodex ops status --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE" --strict
+   webcodex ops runners --server-url "$SERVER_URL" --token-file "$USER_TOKEN_FILE"
+   ```
+
+   systemd Runner 要使用安装时相同的 `--scope user|system`。
+3. 判断失败的 ChatGPT 调用有没有到达 Server。普通日志不够时，使用下面
+   [捕获一次失败的 tool call](#捕获一次失败的-tool-call) 的单次有界 trace 流程。
+   如果 Server/Runner 独立检查正常，而且精确复现时间没有对应 inbound request，这是
+   “故障发生在 WebCodex 之前”的强证据。若 trace 文件缺失，仍应先检查 trace-capture
+   warning，不能单凭“没有文件”下结论。
+4. 在 ChatGPT 中确认 Developer Mode / developer MCP app 对当前 conversation/workspace
+   仍然可用；Host UI 提供时可以重新连接或重新启用同一个 MCP。使用相同 endpoint 在
+   新会话中测试也是很有价值的隔离手段：如果新会话正常、旧会话异常，不要为了旧会话
+   去改 Runner/project 配置。
+5. 只有独立检查确实发现 WebCodex 问题时，才修改 WebCodex：例如 Server 不可达/auth
+   失败、Runner offline、project missing，或真正的 `plugin_tool` diagnostic。
+
+复制一个新 MCP、只改 display name 有时可能让 Host 建立新的 mount，但它不是可靠的
+WebCodex 修复，也不能解释原来的 Host state。对于上面的精确 Host-level error，也不要
+仅因为它就旋转 token、改写 `runner.toml`、重新注册 project，或反复重启本来健康的
+Runner。
+
+反馈此类问题时，建议只提供安全 evidence：
+
+- 精确 Host error、复现/恢复时间与时区；
+- ChatGPT surface，以及相同 MCP 在新会话中是否可用；
+- `webcodex --version` 与 `webcodex-runner --version`；
+- 已脱敏的 `webcodex runner status` / `webcodex ops status`；
+- 如果另一个会话/client 仍能调用 `runtime_status`，提供其已脱敏的 build / connection-layer summary；
+- 故障时间点 Server 是否观察到对应 request/trace。
+
+不要公开 access token、OAuth secret、`Authorization` header、完整 env file、完整
+`runner.toml`，也不要未经检查/脱敏直接贴 full raw trace。
+
+### 长任务期间 ChatGPT 显示 `Thinking stopped` / `Thinking failed`
+
+WebCodex 的长任务 Job 不依赖单个 ChatGPT/model turn 一直保持打开。命令或验证超过
+同步等待窗口后，会继续作为同一个 Job 运行，并保留稳定的 `job_id`。因此，ChatGPT
+界面在长任务期间出现 `Thinking stopped` 或 `Thinking failed`，**本身不能说明**
+本地进程或 WebCodex Job 已经失败，也不能据此判断存在某个固定的 Host/server 超时。
+
+遇到这种情况时：
+
+1. **不要立即重新执行同一个任务。** 如果手头还有 `job_id`，先观察这个 Job；
+   如果 Job 身份确实丢失，再用 Job 列表恢复身份。
+2. 如果原 Job 仍处于 running、queued 或 recovering 状态，继续观察它，或先处理
+   不依赖终态结果的其他工作。不要仅因为 ChatGPT turn 结束就启动第二个副本。
+3. 如果当前 ChatGPT 会话还能继续，在原会话发送“继续”，并让它重新检查已有 Job
+   后从先前进度继续。开始一个新的 model turn 不要求重新启动底层 Job。
+4. 只有确认原 Job 已经终止、丢失，且重试本身安全时，才考虑重新执行。状态不确定时，
+   应先重新观察/核对现有 Job，避免产生重复进程、重复副作用或资源冲突。
+
+更多 Job 行为见 [Coding workflow：Long-running work](CODING_WORKFLOW.md#long-running-work)
+和 [Runner：Jobs and concurrency](RUNNER.md#jobs-and-concurrency)。
+
 ## 常见问题
 
 ### `webcodex connect` 无法完成
@@ -160,20 +260,19 @@ sudo webcodex runner logs --scope system --lines 100
 
 同时确认 server URL、本地 token files 和 Runner `allowed_roots`。缺失或为空的 `allowed_roots` 默认使用 `$HOME`；显式 `allowed_roots` 会覆盖该默认值。
 
-### `listRuntimeTools` full response 过大
+### `tool_manifest` discovery 范围过大
 
-完整 `listRuntimeTools` 会包含展开后的 schemas 和 metadata。GPT Actions 的日常
-discovery 应优先使用 `callRuntimeTool` 且 `tool="tool_manifest"`。需要聚焦
-schema/debug 时，再调用 `listRuntimeTools`，并传
-`summary_only=true` 加 `category`、`features` 或 `limit`。
+GPT Actions 应直接调用 canonical `tool_manifest` operation，并优先传 exact
+`tool_name`，或使用 `category` / `intent` filter 来保持 discovery 紧凑。generic
+Actions surface 已不再暴露退休的 `listRuntimeTools` facade。
 
 ### GPT Action 仍在使用旧 schema
 
 从已部署的 `/openapi.json` 重新导入 OpenAPI schema，然后检查 operation count。
-当前推荐值是 25，GPT Actions 上限是 30。如果 count 超过 30，不要直接部署该
-schema；artifact upload tools 应继续作为 runtime-only tools 通过
-`callRuntimeTool` 使用，不要新增 dedicated Actions。兼容编辑工具也应继续通过
-`callRuntimeTool` 使用。
+该数量由当前 Adaptive Direct projection 加 `call_runtime_tool` 动态派生，不应再和
+固定“推荐数量”比较。生成 surface 必须保持在 GPT Actions 的 30-operation ceiling
+以下；如果达到 ceiling，应调整 canonical Adaptive projection 或真实的 protocol
+exception，而不是静默截断 schema。
 
 ### MCP tool list 看起来是旧的
 
@@ -226,9 +325,9 @@ Runner-backed git project。
 
 ### `operation_count` 超过 30
 
-GPT Actions surface 必须保持在 30 operations 以内。runtime-only tools，包括
-chunked artifact upload tools，应继续放在 `callRuntimeTool` 后面，除非有明确的
-产品决策和 operation budget 来新增 dedicated Action。
+生成的 GPT Actions surface 必须保持在 30 operations 以下。long-tail runtime
+tools（包括 chunked artifact upload tools）继续通过 `call_runtime_tool` 调用；direct
+operations 从 canonical Adaptive Direct surface 派生，不维护单独的 Actions allowlist。
 
 ### `artifact_upload_chunk` 报 `path` 缺失
 

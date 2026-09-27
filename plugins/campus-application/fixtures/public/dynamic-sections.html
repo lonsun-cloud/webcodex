@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>动态多段经历秋招网申 Fixture</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="shell">
+  <h1>2027 届校园招聘 — 动态经历 Fixture</h1>
+  <div class="note">初始仅渲染一段教育、一段实习和一个项目。新增按钮用于验证 click → re-snapshot → re-plan 生命周期；所有内容均为本地虚构数据。</div>
+  <form>
+    <div class="grid">
+      <div><label for="candidate-name">姓名</label><input id="candidate-name"></div>
+      <div><label for="candidate-email">邮箱</label><input id="candidate-email" type="email"></div>
+    </div>
+
+    <section class="section">
+      <h2>教育经历</h2>
+      <div id="education-sections"></div>
+      <div class="actions"><button type="button" class="secondary" id="add-education">新增教育经历</button></div>
+    </section>
+
+    <section class="section">
+      <h2>实习经历</h2>
+      <div id="experience-sections"></div>
+      <div class="actions"><button type="button" class="secondary" id="add-experience">新增实习经历</button></div>
+    </section>
+
+    <section class="section">
+      <h2>项目经历</h2>
+      <div id="project-sections"></div>
+      <div class="actions"><button type="button" class="secondary" id="add-project">新增项目经历</button></div>
+    </section>
+
+    <div class="actions"><button type="submit">保存并进入下一步</button><button type="button" class="secondary">暂存</button></div>
+    <div id="status" class="status">尚未保存。</div>
+  </form>
+</main>
+<script src="/dynamic-sections.js"></script>
+<script src="/fixture.js"></script>
+</body>
+</html>

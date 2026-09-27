@@ -4,11 +4,13 @@ use crate::lsp_bridge::{
     CallHierarchyEdgeDirection, CallHierarchyResult, DocumentDiagnosticsResult,
     DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult, LocationsResult,
     LspAvailabilityStatus, LspStatusResult, PublicCallHierarchyEdge, PublicCallHierarchySymbol,
-    PublicDiagnostic, PublicHover, PublicLocation, PublicPosition, PublicRange, PublicSymbol,
-    PublicWorkspaceSymbol, RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope,
-    WorkspaceSymbolsResult, AGENT_LSP_REQUEST_KIND,
+    PublicDiagnostic, PublicDiagnosticSeverity, PublicDiagnosticTag, PublicHover, PublicHoverKind,
+    PublicLocation, PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol,
+    RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope, WorkspaceSymbolsResult,
+    AGENT_LSP_REQUEST_KIND,
 };
 use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use crate::tool_runtime::tool_definition::{
     lookup_tool_definition, model_visible_tool_definitions, RunnerCapabilityRequirement,
     TOOL_CATEGORY_LSP,
@@ -122,13 +124,13 @@ fn lsp_input_schemas_have_required_bounds() {
 
     let symbols = &by_name["document_symbols"].input_schema;
     assert_eq!(symbols["required"], json!(["project", "path"]));
-    assert_eq!(symbols["properties"]["limit"]["maximum"], 500);
+    assert!(symbols["properties"]["limit"].get("maximum").is_none());
     assert_eq!(symbols["additionalProperties"], false);
 
     let diagnostics = &by_name["document_diagnostics"].input_schema;
     assert_eq!(diagnostics["required"], json!(["project", "path"]));
     assert_eq!(diagnostics["properties"]["limit"]["minimum"], 1);
-    assert_eq!(diagnostics["properties"]["limit"]["maximum"], 200);
+    assert!(diagnostics["properties"]["limit"].get("maximum").is_none());
     assert_eq!(diagnostics["properties"]["limit"]["default"], 100);
     assert_eq!(diagnostics["additionalProperties"], false);
     let hierarchy = &by_name["call_hierarchy"].input_schema;
@@ -141,7 +143,8 @@ fn lsp_input_schemas_have_required_bounds() {
         json!(["incoming", "outgoing", "both"])
     );
     assert_eq!(hierarchy["properties"]["depth"]["maximum"], 2);
-    assert_eq!(hierarchy["properties"]["limit"]["maximum"], 100);
+    assert_eq!(hierarchy["properties"]["limit"]["minimum"], 1);
+    assert!(hierarchy["properties"]["limit"].get("maximum").is_none());
     assert_eq!(hierarchy["additionalProperties"], false);
     let diagnostics_output = &by_name["document_diagnostics"].output_schema;
     let output_properties = &diagnostics_output["properties"]["output"]["properties"];
@@ -193,7 +196,7 @@ fn lsp_input_schemas_have_required_bounds() {
     assert_eq!(workspace["properties"]["query"]["minLength"], 1);
     assert_eq!(workspace["properties"]["query"]["maxLength"], 200);
     assert_eq!(workspace["properties"]["limit"]["default"], 50);
-    assert_eq!(workspace["properties"]["limit"]["maximum"], 200);
+    assert!(workspace["properties"]["limit"].get("maximum").is_none());
     assert_eq!(workspace["additionalProperties"], false);
     let workspace_item = &by_name["workspace_symbols"].output_schema["properties"]["output"]
         ["properties"]["symbols"]["items"];
@@ -208,7 +211,7 @@ fn lsp_input_schemas_have_required_bounds() {
     );
     assert_eq!(goto["properties"]["line"]["minimum"], 1);
     assert_eq!(goto["properties"]["column"]["minimum"], 1);
-    assert_eq!(goto["properties"]["limit"]["maximum"], 100);
+    assert!(goto["properties"]["limit"].get("maximum").is_none());
 
     let refs = &by_name["find_references"].input_schema;
     assert_eq!(
@@ -216,48 +219,8 @@ fn lsp_input_schemas_have_required_bounds() {
         json!(["project", "path", "line", "column"])
     );
     assert_eq!(refs["properties"]["include_declaration"]["default"], true);
-    assert_eq!(refs["properties"]["limit"]["maximum"], 200);
+    assert!(refs["properties"]["limit"].get("maximum").is_none());
     assert_eq!(refs["additionalProperties"], false);
-
-    // Flattened Action fields must list path/line/column/include_declaration/limit.
-    use crate::tool_runtime::accepted_flattened_args_for_spec;
-    let flat_goto = accepted_flattened_args_for_spec(&by_name["goto_definition"]);
-    for field in ["project", "path", "line", "column", "limit", "session_id"] {
-        assert!(
-            flat_goto.iter().any(|f| f == field),
-            "goto missing flattened {field}: {flat_goto:?}"
-        );
-    }
-    let flat_refs = accepted_flattened_args_for_spec(&by_name["find_references"]);
-    for field in [
-        "project",
-        "path",
-        "line",
-        "column",
-        "include_declaration",
-        "limit",
-        "session_id",
-    ] {
-        assert!(
-            flat_refs.iter().any(|f| f == field),
-            "refs missing flattened {field}: {flat_refs:?}"
-        );
-    }
-    let flat_diagnostics = accepted_flattened_args_for_spec(&by_name["document_diagnostics"]);
-    for field in ["project", "path", "limit", "session_id"] {
-        assert!(
-            flat_diagnostics.iter().any(|item| item == field),
-            "diagnostics missing flattened {field}: {flat_diagnostics:?}"
-        );
-    }
-    let flat_hover = accepted_flattened_args_for_spec(&by_name["hover"]);
-    for field in ["project", "path", "line", "column", "session_id"] {
-        assert!(flat_hover.iter().any(|item| item == field));
-    }
-    let flat_workspace = accepted_flattened_args_for_spec(&by_name["workspace_symbols"]);
-    for field in ["project", "query", "limit", "session_id"] {
-        assert!(flat_workspace.iter().any(|item| item == field));
-    }
 }
 
 #[test]
@@ -301,19 +264,12 @@ fn document_diagnostics_tool_call_parser_produces_only_typed_fields() {
             && path == "src/main.rs"
             && session_id == "wc_sess_demo"
     ));
-    let call_with_ignored_internal_extra = ToolCall::from_tool_name(
+    let error = ToolCall::from_tool_name(
         "document_diagnostics",
         json!({"project": "agent:oe:demo", "path": "src/main.rs", "timeout": 30}),
     )
-    .unwrap();
-    assert!(matches!(
-        call_with_ignored_internal_extra,
-        ToolCall::DocumentDiagnostics {
-            limit: None,
-            session_id: None,
-            ..
-        }
-    ));
+    .unwrap_err();
+    assert!(error.contains("unknown field `timeout`"), "{error}");
 }
 
 async fn register_lsp_agent(
@@ -428,12 +384,12 @@ fn document_diagnostics_result(path: &str) -> DocumentDiagnosticsResult {
                 start: PublicPosition { line: 1, column: 1 },
                 end: PublicPosition { line: 1, column: 2 },
             },
-            severity: "warning".into(),
+            severity: PublicDiagnosticSeverity::Warning,
             severity_code: Some(2),
             code: Some("unused".into()),
             source: Some("rust-analyzer".into()),
             message: "unused item".into(),
-            tags: vec!["unnecessary".into()],
+            tags: vec![PublicDiagnosticTag::Unnecessary],
         }],
         total_count: 1,
         returned_count: 1,
@@ -452,7 +408,7 @@ fn hover_result(path: &str) -> HoverResult {
         path: path.into(),
         position: PublicPosition { line: 1, column: 1 },
         hover: Some(PublicHover {
-            kind: "markdown".into(),
+            kind: PublicHoverKind::Markdown,
             value: "`main`".into(),
             range: None,
         }),
@@ -529,6 +485,21 @@ fn call_hierarchy_result_with_edge(path: &str) -> CallHierarchyResult {
     result
 }
 
+fn call_hierarchy_result_with_edge_count(path: &str, count: usize) -> CallHierarchyResult {
+    let mut result = call_hierarchy_result_with_edge(path);
+    let template = result.edges[0].clone();
+    result.edges = (0..count)
+        .map(|index| {
+            let mut edge = template.clone();
+            edge.from.name = format!("caller{index}");
+            edge.from.path = format!("src/caller{index}.rs");
+            edge
+        })
+        .collect();
+    result.returned_count = count;
+    result
+}
+
 async fn dispatch_call_hierarchy_result(
     client_id: &str,
     result: CallHierarchyResult,
@@ -558,6 +529,54 @@ async fn dispatch_call_hierarchy_result(
     });
     complete_lsp_agent_request(&runtime, client_id, result).await;
     task.await.unwrap()
+}
+
+async fn dispatch_call_hierarchy_with_limit(
+    client_id: &str,
+    requested_limit: Option<usize>,
+    result: CallHierarchyResult,
+) -> (RunnerLspRequest, ToolResult) {
+    let runtime = test_runtime();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = register_lsp_agent(&runtime, client_id, "demo", tmp.path(), true).await;
+    let mut arguments = json!({
+        "project": project,
+        "path": "src/main.rs",
+        "line": 1,
+        "column": 4,
+        "direction": "both",
+        "depth": 1
+    });
+    if let Some(limit) = requested_limit {
+        arguments["limit"] = json!(limit);
+    }
+    let call = ToolCall::from_tool_name("call_hierarchy", arguments).unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(call, Some(&auth_context(None, true)))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    let sent = request
+        .lsp
+        .as_ref()
+        .expect("call_hierarchy Runner request")
+        .request
+        .clone();
+    let envelope = RunnerLspResultEnvelope::ok(result);
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &request.request_id,
+        0,
+        &envelope.to_stdout_json(),
+        "",
+    )
+    .await;
+    (sent, task.await.unwrap())
 }
 
 fn assert_malformed_call_hierarchy(case: &str, result: &ToolResult) {
@@ -694,7 +713,7 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
     assert!(result.success, "{result:?}");
     assert_eq!(result.output["project"], project);
 
-    for (depth, limit) in [(0, 50), (1, 101)] {
+    for (depth, limit) in [(0, 50), (3, 50), (1, 0)] {
         let invalid = runtime
             .dispatch_with_auth(
                 ToolCall::CallHierarchy {
@@ -712,6 +731,60 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
             .await;
         assert!(!invalid.success, "{depth}/{limit}: {invalid:?}");
     }
+}
+
+#[tokio::test]
+async fn call_hierarchy_result_limit_is_normalized_before_runner_and_result_validation() {
+    for (index, (requested_limit, effective_limit)) in [
+        (None, 50),
+        (Some(25), 25),
+        (Some(500), 100),
+        (Some(1_000_000_000), 100),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let client_id = format!("hierarchy-budget-{index}");
+        let (request, result) = dispatch_call_hierarchy_with_limit(
+            &client_id,
+            requested_limit,
+            call_hierarchy_result("src/main.rs"),
+        )
+        .await;
+        assert!(result.success, "requested={requested_limit:?}: {result:?}");
+        assert!(matches!(
+            request,
+            RunnerLspRequest::CallHierarchy {
+                depth: 1,
+                limit,
+                ..
+            } if limit == effective_limit
+        ));
+    }
+
+    let (request, accepted) = dispatch_call_hierarchy_with_limit(
+        "hierarchy-budget-result-ok",
+        Some(500),
+        call_hierarchy_result_with_edge_count("src/main.rs", 100),
+    )
+    .await;
+    assert!(matches!(
+        request,
+        RunnerLspRequest::CallHierarchy { limit: 100, .. }
+    ));
+    assert!(accepted.success, "{accepted:?}");
+
+    let (request, rejected) = dispatch_call_hierarchy_with_limit(
+        "hierarchy-budget-result-overflow",
+        Some(500),
+        call_hierarchy_result_with_edge_count("src/main.rs", 101),
+    )
+    .await;
+    assert!(matches!(
+        request,
+        RunnerLspRequest::CallHierarchy { limit: 100, .. }
+    ));
+    assert_malformed_call_hierarchy("effective-limit-overflow", &rejected);
 }
 
 #[tokio::test]

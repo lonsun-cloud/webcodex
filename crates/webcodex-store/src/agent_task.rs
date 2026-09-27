@@ -1,8 +1,15 @@
+use super::agent_attention::create_agent_task_terminal_attention_in_transaction;
+use super::agent_wait::record_agent_task_terminal_wait_matches_in_transaction;
+use super::agent_wake::{
+    AgentWakeState, AGENT_WAKE_CONSUME_TOKEN_PREFIX, AGENT_WAKE_ID_PREFIX,
+    WAKE_TRIGGER_AGENT_TASK_ATTEMPT,
+};
 use super::communication::{
-    authorize_conversation_access, digest_text, lookup_idempotent_resource, new_id, now_unix_ms,
-    record_idempotent_resource, store_error, validate_communication_principal, validate_id,
-    validate_idempotency_key, CommunicationPrincipal, CommunicationStoreError, ConversationAccess,
-    CONVERSATION_ID_PREFIX, CONVERSATION_MESSAGE_ID_PREFIX, DURABLE_AGENT_ID_PREFIX,
+    allocate_identity, authorize_conversation_access, digest_json, digest_text,
+    lookup_idempotent_resource, new_proof, now_unix_ms, record_idempotent_resource, store_error,
+    validate_communication_principal, validate_id, validate_idempotency_key, validate_proof,
+    CommunicationPrincipal, CommunicationStoreError, ConversationAccess, CONVERSATION_ID_PREFIX,
+    CONVERSATION_MESSAGE_ID_PREFIX, DURABLE_AGENT_ID_PREFIX,
 };
 use super::Database;
 use rusqlite::{
@@ -25,6 +32,8 @@ pub const MAX_AGENT_TASK_TERMINAL_TEXT_BYTES: usize = 4_096;
 pub(crate) const MAX_AGENT_TASK_PROJECT_REF_CHARS: usize = 256;
 pub const MAX_AGENT_TASK_LIST_LIMIT: usize = 100;
 pub(crate) const DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS: i64 = 60_000;
+pub(crate) const AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS: i64 = 5 * 60_000;
+pub(crate) const AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS: i64 = 30 * 60_000;
 
 const OP_CREATE_AGENT_TASK: &str = "create_agent_task";
 const OP_START_AGENT_TASK_ATTEMPT: &str = "start_agent_task_attempt";
@@ -60,7 +69,7 @@ impl AgentTaskState {
         }
     }
 
-    fn from_db(value: &str, index: usize) -> rusqlite::Result<Self> {
+    pub(crate) fn from_db(value: &str, index: usize) -> rusqlite::Result<Self> {
         match value {
             "ready" => Ok(Self::Ready),
             "active" => Ok(Self::Active),
@@ -74,7 +83,7 @@ impl AgentTaskState {
         }
     }
 
-    const fn terminal(self) -> bool {
+    pub(crate) const fn terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
     }
 }
@@ -152,6 +161,13 @@ impl AgentTaskCodingRunDispatchState {
     const fn blocks_replacement(self) -> bool {
         matches!(self, Self::OutcomeUnknown | Self::Bound)
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskExecutionKind {
+    CodingAgentRun,
+    AgentEndpoint,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -287,12 +303,49 @@ pub struct AgentTaskCodingRunDispatchClaim {
     pub may_dispatch: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentTaskEndpointExecutionRecord {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub wake_id: String,
+    pub wake_state: AgentWakeState,
+    pub endpoint_id: Option<String>,
+    pub endpoint_controller_generation: Option<i64>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentTaskEndpointExecutionMutation {
+    pub execution: AgentTaskEndpointExecutionRecord,
+    pub replayed: bool,
+    pub state_changed: bool,
+}
+
+impl AgentTaskEndpointExecutionRecord {
+    fn execution_status(&self) -> AgentTaskExecutionStatus {
+        match self.wake_state {
+            AgentWakeState::Pending | AgentWakeState::Claimed => {
+                AgentTaskExecutionStatus::NotStarted
+            }
+            AgentWakeState::Prepared | AgentWakeState::Delivered | AgentWakeState::Consumed => {
+                AgentTaskExecutionStatus::Active
+            }
+            AgentWakeState::DeliveryUnknown => AgentTaskExecutionStatus::OutcomeUnknown,
+            AgentWakeState::Retired => AgentTaskExecutionStatus::Terminal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTaskCodingRunReconcileMutation {
     pub task: AgentTaskSummary,
     pub attempt: AgentTaskAttemptRecord,
     pub binding: AgentTaskCodingRunBindingRecord,
     pub state_changed: bool,
+    pub attention_event_count: usize,
+    pub attention_target_agent_ids: Vec<String>,
+    pub wait_target_agent_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -326,6 +379,7 @@ pub struct AgentTaskSummary {
     pub terminal_at_unix_ms: Option<i64>,
     pub latest_attempt: Option<AgentTaskAttemptRecord>,
     pub execution_bound: bool,
+    pub execution_kind: Option<AgentTaskExecutionKind>,
     pub execution_status: Option<AgentTaskExecutionStatus>,
     pub recovery_kind: AgentTaskExecutionRecoveryKind,
 }
@@ -375,6 +429,12 @@ pub struct AgentTaskAttemptCompletionMutation {
     pub attempt: AgentTaskAttemptRecord,
     pub replayed: bool,
     pub state_changed: bool,
+    #[serde(skip_serializing)]
+    pub attention_event_count: usize,
+    #[serde(skip_serializing)]
+    pub attention_target_agent_ids: Vec<String>,
+    #[serde(skip_serializing)]
+    pub wait_target_agent_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +500,7 @@ struct StoredTask {
     terminal_at_unix_ms: Option<i64>,
     latest_attempt: Option<StoredAttempt>,
     latest_coding_run: Option<AgentTaskCodingRunBindingRecord>,
+    latest_endpoint_execution: Option<AgentTaskEndpointExecutionRecord>,
 }
 
 impl StoredTask {
@@ -460,6 +521,21 @@ impl StoredTask {
     }
 
     fn summary(&self, now: i64) -> AgentTaskSummary {
+        let endpoint_execution_status = self.latest_endpoint_execution.as_ref().map(|execution| {
+            let attempt_terminal = self.latest_attempt.as_ref().is_some_and(|attempt| {
+                matches!(
+                    attempt.effective_state(now),
+                    AgentTaskAttemptState::Succeeded
+                        | AgentTaskAttemptState::Failed
+                        | AgentTaskAttemptState::Expired
+                )
+            });
+            if attempt_terminal {
+                AgentTaskExecutionStatus::Terminal
+            } else {
+                execution.execution_status()
+            }
+        });
         AgentTaskSummary {
             task_id: self.task_id.clone(),
             assignee_agent_id: self.assignee_agent_id.clone(),
@@ -475,11 +551,20 @@ impl StoredTask {
                 .latest_attempt
                 .as_ref()
                 .map(|attempt| attempt.record(now)),
-            execution_bound: self.latest_coding_run.is_some(),
+            execution_bound: self.latest_coding_run.is_some()
+                || self.latest_endpoint_execution.is_some(),
+            execution_kind: if self.latest_coding_run.is_some() {
+                Some(AgentTaskExecutionKind::CodingAgentRun)
+            } else if self.latest_endpoint_execution.is_some() {
+                Some(AgentTaskExecutionKind::AgentEndpoint)
+            } else {
+                None
+            },
             execution_status: self
                 .latest_coding_run
                 .as_ref()
-                .map(AgentTaskCodingRunBindingRecord::execution_status),
+                .map(AgentTaskCodingRunBindingRecord::execution_status)
+                .or(endpoint_execution_status),
             recovery_kind: self
                 .latest_coding_run
                 .as_ref()
@@ -578,6 +663,28 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_wc_agent_task_coding_runs_task
                 ON wc_agent_task_coding_runs(task_id, updated_at_unix_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS wc_agent_task_endpoint_executions (
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL UNIQUE,
+                wake_id TEXT NOT NULL UNIQUE,
+                start_identity_fingerprint TEXT NOT NULL CHECK(length(start_identity_fingerprint) = 64),
+                endpoint_id TEXT,
+                endpoint_controller_generation INTEGER,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(task_id, attempt_id),
+                CHECK(
+                    (endpoint_id IS NULL AND endpoint_controller_generation IS NULL)
+                    OR (endpoint_id IS NOT NULL AND endpoint_controller_generation >= 1)
+                ),
+                FOREIGN KEY(task_id) REFERENCES wc_agent_tasks(task_id),
+                FOREIGN KEY(attempt_id) REFERENCES wc_agent_task_attempts(attempt_id),
+                FOREIGN KEY(wake_id) REFERENCES wc_agent_wakes(wake_id),
+                FOREIGN KEY(endpoint_id) REFERENCES wc_agent_endpoints(endpoint_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wc_agent_task_endpoint_executions_task
+                ON wc_agent_task_endpoint_executions(task_id, updated_at_unix_ms DESC);
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_wc_agent_task_attempts_one_active
                 ON wc_agent_task_attempts(task_id) WHERE state = 'active';
             CREATE INDEX IF NOT EXISTS idx_wc_agent_task_attempts_task_number
@@ -639,7 +746,7 @@ impl Database {
             "referenced_project_id": referenced_project_id,
         }));
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -671,7 +778,11 @@ impl Database {
             source_message_id.as_deref(),
         )?;
 
-        let task_id = new_id(AGENT_TASK_ID_PREFIX);
+        let task_id = allocate_identity(
+            &transaction,
+            AGENT_TASK_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_tasks WHERE task_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_tasks (
@@ -734,7 +845,7 @@ impl Database {
             ));
         }
         let now = now_unix_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let (total_count, task_ids) = if let Some(agent_id) = assignee_agent_id.as_deref() {
             let total_count = conn
                 .query_row(
@@ -837,7 +948,7 @@ impl Database {
     ) -> Result<AgentTaskDetail, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         validate_id(task_id, AGENT_TASK_ID_PREFIX, "invalid_agent_task_id")?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AgentTask);
         Ok(load_owned_task(&conn, principal, task_id, now)?.detail(now))
     }
 
@@ -875,7 +986,7 @@ impl Database {
             DURABLE_AGENT_ID_PREFIX,
             "invalid_agent_id",
         )?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -991,7 +1102,7 @@ impl Database {
             "task_id": task_id,
             "assignee_agent_id": assignee_agent_id,
         }));
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1060,8 +1171,12 @@ impl Database {
             .as_ref()
             .map(|attempt| attempt.attempt_number.saturating_add(1))
             .unwrap_or(1);
-        let attempt_id = new_id(AGENT_TASK_ATTEMPT_ID_PREFIX);
-        let attempt_fence = new_id(AGENT_TASK_ATTEMPT_FENCE_PREFIX);
+        let attempt_id = allocate_identity(
+            &transaction,
+            AGENT_TASK_ATTEMPT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_task_attempts WHERE attempt_id = ?1)",
+        )?;
+        let attempt_fence = new_proof(AGENT_TASK_ATTEMPT_FENCE_PREFIX);
         let lease_expires_at = now.saturating_add(DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS);
         transaction
             .execute(
@@ -1120,6 +1235,195 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn start_agent_task_endpoint_continuation(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        attempt_id: &str,
+        assignee_agent_id: &str,
+        attempt_fence: &str,
+        attempt_controller_generation: i64,
+    ) -> Result<AgentTaskEndpointExecutionMutation, CommunicationStoreError> {
+        self.start_agent_task_endpoint_continuation_with_now(
+            principal,
+            task_id,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+            now_unix_ms(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_agent_task_endpoint_continuation_at(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        attempt_id: &str,
+        assignee_agent_id: &str,
+        attempt_fence: &str,
+        attempt_controller_generation: i64,
+        now: i64,
+    ) -> Result<AgentTaskEndpointExecutionMutation, CommunicationStoreError> {
+        self.start_agent_task_endpoint_continuation_with_now(
+            principal,
+            task_id,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_agent_task_endpoint_continuation_with_now(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        attempt_id: &str,
+        assignee_agent_id: &str,
+        attempt_fence: &str,
+        attempt_controller_generation: i64,
+        now: i64,
+    ) -> Result<AgentTaskEndpointExecutionMutation, CommunicationStoreError> {
+        validate_attempt_mutation_inputs(
+            principal,
+            task_id,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+        )?;
+        let start_identity_fingerprint = digest_json(
+            "webcodex.agent-task.endpoint-continuation.start.v1",
+            &json!({
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "assignee_agent_id": assignee_agent_id,
+                "attempt_fence": attempt_fence,
+                "attempt_controller_generation": attempt_controller_generation,
+            }),
+        )
+        .expect("AgentTask endpoint continuation identity serializes");
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let task = load_owned_task(&transaction, principal, task_id, now)?;
+
+        if let Some(existing_fingerprint) = transaction
+            .query_row(
+                "SELECT start_identity_fingerprint
+                 FROM wc_agent_task_endpoint_executions
+                 WHERE task_id = ?1 AND attempt_id = ?2",
+                params![task_id, attempt_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(store_error)?
+        {
+            if existing_fingerprint != start_identity_fingerprint {
+                return Err(CommunicationStoreError::new(
+                    "agent_task_endpoint_execution_binding_conflict",
+                    "AgentTaskAttempt Endpoint execution already exists for a different exact start identity",
+                ));
+            }
+            let execution = load_endpoint_execution_for_attempt(&transaction, task_id, attempt_id)?
+                .ok_or_else(|| {
+                    CommunicationStoreError::new(
+                        "agent_task_storage_invariant",
+                        "AgentTask Endpoint execution disappeared during exact replay",
+                    )
+                })?;
+            transaction.commit().map_err(store_error)?;
+            return Ok(AgentTaskEndpointExecutionMutation {
+                execution,
+                replayed: true,
+                state_changed: false,
+            });
+        }
+
+        let _attempt = require_current_attempt(
+            &transaction,
+            &task,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+            now,
+        )?;
+        if load_coding_run_binding_for_attempt(&transaction, task_id, attempt_id)?.is_some() {
+            return Err(CommunicationStoreError::new(
+                "agent_task_execution_backend_conflict",
+                "AgentTaskAttempt is already bound to the CodingAgentRun execution backend",
+            ));
+        }
+
+        let wake_id = allocate_identity(
+            &transaction,
+            AGENT_WAKE_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO wc_agent_wakes (
+                    wake_id, target_agent_id, trigger_kind,
+                    first_triggering_delivery_id, latest_triggering_delivery_id,
+                    latest_conversation_id, latest_message_id,
+                    inbox_high_watermark, queued_delivery_count_snapshot,
+                    source_task_id, source_task_attempt_id, source_event_id,
+                    state, revision, created_at_unix_ms, updated_at_unix_ms,
+                    claimed_attempt_id, claimed_endpoint_id,
+                    claimed_controller_generation, claim_lease_expires_at_unix_ms,
+                    consumed_at_unix_ms, consumed_by_endpoint_id,
+                    consumed_controller_generation
+                 ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL, ?4, ?5, NULL,
+                           'pending', 1, ?6, ?6, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                params![
+                    wake_id,
+                    assignee_agent_id,
+                    WAKE_TRIGGER_AGENT_TASK_ATTEMPT,
+                    task_id,
+                    attempt_id,
+                    now,
+                ],
+            )
+            .map_err(store_error)?;
+        transaction
+            .execute(
+                "INSERT INTO wc_agent_task_endpoint_executions (
+                    task_id, attempt_id, wake_id, start_identity_fingerprint,
+                    endpoint_id, endpoint_controller_generation,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?5)",
+                params![
+                    task_id,
+                    attempt_id,
+                    wake_id,
+                    start_identity_fingerprint,
+                    now,
+                ],
+            )
+            .map_err(store_error)?;
+        let execution = load_endpoint_execution_for_attempt(&transaction, task_id, attempt_id)?
+            .ok_or_else(|| {
+                CommunicationStoreError::new(
+                    "agent_task_storage_invariant",
+                    "AgentTask Endpoint execution disappeared after creation",
+                )
+            })?;
+        transaction.commit().map_err(store_error)?;
+        Ok(AgentTaskEndpointExecutionMutation {
+            execution,
+            replayed: false,
+            state_changed: true,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn heartbeat_agent_task_attempt(
         &self,
         principal: &CommunicationPrincipal,
@@ -1136,6 +1440,33 @@ impl Database {
             assignee_agent_id,
             attempt_fence,
             attempt_controller_generation,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn heartbeat_agent_task_attempt_with_active_turn_proof(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        attempt_id: &str,
+        assignee_agent_id: &str,
+        attempt_fence: &str,
+        attempt_controller_generation: i64,
+        active_turn_wake_id: Option<&str>,
+        active_turn_consume_token: Option<&str>,
+    ) -> Result<AgentTaskAttemptHeartbeatMutation, CommunicationStoreError> {
+        self.heartbeat_agent_task_attempt_with_now(
+            principal,
+            task_id,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+            active_turn_wake_id,
+            active_turn_consume_token,
             None,
         )
     }
@@ -1159,6 +1490,35 @@ impl Database {
             assignee_agent_id,
             attempt_fence,
             attempt_controller_generation,
+            None,
+            None,
+            Some(now),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn heartbeat_agent_task_attempt_with_active_turn_proof_at(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        attempt_id: &str,
+        assignee_agent_id: &str,
+        attempt_fence: &str,
+        attempt_controller_generation: i64,
+        active_turn_wake_id: Option<&str>,
+        active_turn_consume_token: Option<&str>,
+        now: i64,
+    ) -> Result<AgentTaskAttemptHeartbeatMutation, CommunicationStoreError> {
+        self.heartbeat_agent_task_attempt_with_now(
+            principal,
+            task_id,
+            attempt_id,
+            assignee_agent_id,
+            attempt_fence,
+            attempt_controller_generation,
+            active_turn_wake_id,
+            active_turn_consume_token,
             Some(now),
         )
     }
@@ -1172,6 +1532,8 @@ impl Database {
         assignee_agent_id: &str,
         attempt_fence: &str,
         attempt_controller_generation: i64,
+        active_turn_wake_id: Option<&str>,
+        active_turn_consume_token: Option<&str>,
         now: Option<i64>,
     ) -> Result<AgentTaskAttemptHeartbeatMutation, CommunicationStoreError> {
         validate_attempt_mutation_inputs(
@@ -1182,7 +1544,29 @@ impl Database {
             attempt_fence,
             attempt_controller_generation,
         )?;
-        let mut conn = self.conn.lock().unwrap();
+        let active_turn_proof = match (active_turn_wake_id, active_turn_consume_token) {
+            (None, None) => None,
+            (Some(wake_id), Some(consume_token)) => {
+                validate_id(
+                    wake_id,
+                    AGENT_WAKE_ID_PREFIX,
+                    "invalid_agent_task_active_turn_wake_id",
+                )?;
+                validate_proof(
+                    consume_token,
+                    AGENT_WAKE_CONSUME_TOKEN_PREFIX,
+                    "invalid_agent_task_active_turn_consume_token",
+                )?;
+                Some((wake_id, consume_token))
+            }
+            _ => {
+                return Err(CommunicationStoreError::new(
+                    "invalid_agent_task_active_turn_proof",
+                    "active-turn wake_id and consume_token must be provided together",
+                ));
+            }
+        };
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1197,24 +1581,80 @@ impl Database {
             attempt_controller_generation,
             now,
         )?;
+
+        let renewal_window_ms = if let Some((wake_id, consume_token)) = active_turn_proof {
+            let consume_token_hash =
+                digest_text("webcodex.agent-wake.consume-token.v1", consume_token);
+            let proof_matches: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM wc_agent_wakes w
+                         JOIN wc_agent_wake_attempts wa
+                           ON wa.attempt_id = w.claimed_attempt_id
+                          AND wa.wake_id = w.wake_id
+                         JOIN wc_agent_task_endpoint_executions e
+                           ON e.wake_id = w.wake_id
+                          AND e.task_id = w.source_task_id
+                          AND e.attempt_id = w.source_task_attempt_id
+                         WHERE w.wake_id = ?1
+                           AND w.trigger_kind = 'agent_task_attempt'
+                           AND w.source_task_id = ?2
+                           AND w.source_task_attempt_id = ?3
+                           AND w.target_agent_id = ?4
+                           AND w.state = 'consumed'
+                           AND w.consumed_at_unix_ms IS NOT NULL
+                           AND wa.state = 'consumed'
+                           AND wa.consumed_at_unix_ms IS NOT NULL
+                           AND wa.consume_token_hash = ?5
+                           AND wa.endpoint_id = w.consumed_by_endpoint_id
+                           AND wa.controller_generation = w.consumed_controller_generation
+                           AND e.endpoint_id IS NOT NULL
+                           AND e.endpoint_id = w.consumed_by_endpoint_id
+                           AND e.endpoint_controller_generation = w.consumed_controller_generation
+                     )",
+                    params![
+                        wake_id,
+                        task_id,
+                        attempt_id,
+                        assignee_agent_id,
+                        consume_token_hash,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(store_error)?;
+            if !proof_matches {
+                return Err(CommunicationStoreError::new(
+                    "agent_task_active_turn_proof_invalid",
+                    "active-turn proof does not identify the exact consumed A4b model turn",
+                ));
+            }
+            AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS
+        } else {
+            DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS
+        };
+
         let new_lease_expires_at = attempt
             .lease_expires_at_unix_ms
-            .max(now.saturating_add(DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS));
-        transaction
-            .execute(
-                "UPDATE wc_agent_task_attempts
-                 SET lease_expires_at_unix_ms = ?2
-                 WHERE attempt_id = ?1",
-                params![attempt_id, new_lease_expires_at],
-            )
-            .map_err(store_error)?;
-        transaction
-            .execute(
-                "UPDATE wc_agent_tasks SET updated_at_unix_ms = MAX(updated_at_unix_ms, ?2)
-                 WHERE task_id = ?1",
-                params![task_id, now],
-            )
-            .map_err(store_error)?;
+            .max(now.saturating_add(renewal_window_ms));
+        let state_changed = new_lease_expires_at > attempt.lease_expires_at_unix_ms;
+        if state_changed {
+            transaction
+                .execute(
+                    "UPDATE wc_agent_task_attempts
+                     SET lease_expires_at_unix_ms = ?2
+                     WHERE attempt_id = ?1",
+                    params![attempt_id, new_lease_expires_at],
+                )
+                .map_err(store_error)?;
+            transaction
+                .execute(
+                    "UPDATE wc_agent_tasks SET updated_at_unix_ms = MAX(updated_at_unix_ms, ?2)
+                     WHERE task_id = ?1",
+                    params![task_id, now],
+                )
+                .map_err(store_error)?;
+        }
         let task = load_owned_task(&transaction, principal, task_id, now)?;
         let attempt =
             load_attempt_for_task(&transaction, task_id, attempt_id, now)?.ok_or_else(|| {
@@ -1227,7 +1667,7 @@ impl Database {
         Ok(AgentTaskAttemptHeartbeatMutation {
             task: task.summary(now),
             attempt: attempt.record(now),
-            state_changed: true,
+            state_changed,
         })
     }
 
@@ -1255,44 +1695,20 @@ impl Database {
             attempt_fence,
             expected_controller_generation,
         )?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
-        let task = load_owned_task(&transaction, principal, task_id, now)?;
-        let attempt = require_current_attempt(
+        let record = replace_agent_task_attempt_controller_in_transaction(
             &transaction,
-            &task,
+            principal,
+            task_id,
             attempt_id,
             assignee_agent_id,
             attempt_fence,
             expected_controller_generation,
             now,
         )?;
-        let next_generation = attempt.attempt_controller_generation.saturating_add(1);
-        transaction
-            .execute(
-                "UPDATE wc_agent_task_attempts
-                 SET attempt_controller_generation = ?2
-                 WHERE attempt_id = ?1",
-                params![attempt_id, next_generation],
-            )
-            .map_err(store_error)?;
-        transaction
-            .execute(
-                "UPDATE wc_agent_tasks SET updated_at_unix_ms = MAX(updated_at_unix_ms, ?2)
-                 WHERE task_id = ?1",
-                params![task_id, now],
-            )
-            .map_err(store_error)?;
-        let attempt =
-            load_attempt_for_task(&transaction, task_id, attempt_id, now)?.ok_or_else(|| {
-                CommunicationStoreError::new(
-                    "agent_task_attempt_not_found",
-                    "AgentTaskAttempt disappeared after controller replacement",
-                )
-            })?;
-        let record = attempt.record(now);
         transaction.commit().map_err(store_error)?;
         Ok(record)
     }
@@ -1399,7 +1815,7 @@ impl Database {
             "terminal_result": terminal_result,
             "terminal_reason": terminal_reason,
         }));
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1432,6 +1848,9 @@ impl Database {
                 attempt: attempt.record(now),
                 replayed: true,
                 state_changed: false,
+                attention_event_count: 0,
+                attention_target_agent_ids: Vec::new(),
+                wait_target_agent_ids: Vec::new(),
             });
         }
 
@@ -1475,6 +1894,25 @@ impl Database {
                 params![task_id, outcome.as_str(), attempt_id, now],
             )
             .map_err(store_error)?;
+        retire_pre_dispatch_endpoint_execution_for_attempt(&transaction, attempt_id, now)?;
+        let (attention_event_count, attention_target_agent_ids) =
+            create_agent_task_terminal_attention_in_transaction(
+                &transaction,
+                principal,
+                task_id,
+                attempt_id,
+                assignee_agent_id,
+                outcome,
+                now,
+            )?;
+        let wait_matches = record_agent_task_terminal_wait_matches_in_transaction(
+            &transaction,
+            principal,
+            task_id,
+            attempt_id,
+            outcome,
+            now,
+        )?;
         record_idempotent_resource(
             &transaction,
             principal,
@@ -1498,6 +1936,9 @@ impl Database {
             attempt: attempt.record(now),
             replayed: false,
             state_changed: true,
+            attention_event_count,
+            attention_target_agent_ids,
+            wait_target_agent_ids: wait_matches.schedule_agent_ids,
         })
     }
 
@@ -1569,7 +2010,7 @@ impl Database {
             attempt_fence,
             attempt_controller_generation,
         )?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let task = load_owned_task(&conn, principal, task_id, now)?;
         let referenced_project = task.referenced_project_id.as_deref().ok_or_else(|| {
             CommunicationStoreError::new(
@@ -1592,6 +2033,12 @@ impl Database {
             attempt_controller_generation,
             now,
         )?;
+        if load_endpoint_execution_for_attempt(&conn, task_id, attempt_id)?.is_some() {
+            return Err(CommunicationStoreError::new(
+                "agent_task_execution_backend_conflict",
+                "AgentTaskAttempt is already bound to the Agent Endpoint continuation backend",
+            ));
+        }
         Ok(AgentTaskCodingRunStartContext {
             task: task.detail(now),
             attempt: attempt.record(now),
@@ -1671,7 +2118,7 @@ impl Database {
             attempt_fence,
             attempt_controller_generation,
         )?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1698,6 +2145,12 @@ impl Database {
             attempt_controller_generation,
             now,
         )?;
+        if load_endpoint_execution_for_attempt(&transaction, task_id, attempt_id)?.is_some() {
+            return Err(CommunicationStoreError::new(
+                "agent_task_execution_backend_conflict",
+                "AgentTaskAttempt is already bound to the Agent Endpoint continuation backend",
+            ));
+        }
         if let Some(mut existing) =
             load_coding_run_binding_for_attempt(&transaction, task_id, attempt_id)?
         {
@@ -1812,7 +2265,7 @@ impl Database {
             AGENT_TASK_ATTEMPT_ID_PREFIX,
             "invalid_agent_task_attempt_id",
         )?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let task = load_owned_task(&conn, principal, task_id, now_unix_ms())?;
         load_attempt_for_task(&conn, task_id, attempt_id, now_unix_ms())?.ok_or_else(|| {
             CommunicationStoreError::new(
@@ -1847,7 +2300,7 @@ impl Database {
             attempt_fence,
             attempt_controller_generation,
         )?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1912,7 +2365,7 @@ impl Database {
         run_id: &str,
     ) -> Result<AgentTaskCodingRunBindingRecord, CommunicationStoreError> {
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1959,7 +2412,7 @@ impl Database {
         observation: &AgentTaskCodingRunObservation,
     ) -> Result<AgentTaskCodingRunBindingRecord, CommunicationStoreError> {
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1984,7 +2437,7 @@ impl Database {
         attempt_id: &str,
     ) -> Result<AgentTaskCodingRunBindingRecord, CommunicationStoreError> {
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -2030,7 +2483,7 @@ impl Database {
         let terminal_result = validate_optional_terminal_text(terminal_result, "terminal_result")?;
         let terminal_reason = validate_optional_terminal_text(terminal_reason, "terminal_reason")?;
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -2108,6 +2561,9 @@ impl Database {
                 attempt: attempt.record(now),
                 binding,
                 state_changed: false,
+                attention_event_count: 0,
+                attention_target_agent_ids: Vec::new(),
+                wait_target_agent_ids: Vec::new(),
             });
         }
         let attempt_state = match desired_task_state {
@@ -2155,6 +2611,24 @@ impl Database {
                 "terminal CodingAgent binding revision CAS did not update the exact durable binding",
             ));
         }
+        let (attention_event_count, attention_target_agent_ids) =
+            create_agent_task_terminal_attention_in_transaction(
+                &transaction,
+                principal,
+                task_id,
+                attempt_id,
+                &attempt.assignee_agent_id,
+                desired_task_state,
+                now,
+            )?;
+        let wait_matches = record_agent_task_terminal_wait_matches_in_transaction(
+            &transaction,
+            principal,
+            task_id,
+            attempt_id,
+            desired_task_state,
+            now,
+        )?;
         let task = load_owned_task(&transaction, principal, task_id, now)?;
         let attempt =
             load_attempt_for_task(&transaction, task_id, attempt_id, now)?.ok_or_else(|| {
@@ -2176,6 +2650,9 @@ impl Database {
             attempt: attempt.record(now),
             binding,
             state_changed: true,
+            attention_event_count,
+            attention_target_agent_ids,
+            wait_target_agent_ids: wait_matches.schedule_agent_ids,
         })
     }
 }
@@ -2435,10 +2912,7 @@ fn merge_agent_task_coding_run_observation(
 }
 
 fn task_request_hash(value: &serde_json::Value) -> String {
-    digest_text(
-        "webcodex.agent-task.request.v1",
-        &serde_json::to_string(value).expect("AgentTask request serializes"),
-    )
+    digest_json("webcodex.agent-task.request.v1", value).expect("AgentTask request serializes")
 }
 
 fn validate_title(value: &str) -> Result<String, CommunicationStoreError> {
@@ -2633,11 +3107,14 @@ fn load_owned_task(
                 terminal_at_unix_ms: row.11,
                 latest_attempt: None,
                 latest_coding_run: None,
+                latest_endpoint_execution: None,
             })
         }
     };
     let latest_coding_run =
         load_coding_run_binding_for_attempt(conn, task_id, &latest_attempt.attempt_id)?;
+    let latest_endpoint_execution =
+        load_endpoint_execution_for_attempt(conn, task_id, &latest_attempt.attempt_id)?;
     Ok(StoredTask {
         task_id: row.0,
         assignee_agent_id: row.1,
@@ -2652,6 +3129,7 @@ fn load_owned_task(
         terminal_at_unix_ms: row.11,
         latest_attempt: Some(latest_attempt),
         latest_coding_run,
+        latest_endpoint_execution,
     })
 }
 
@@ -2689,6 +3167,37 @@ fn load_attempt_for_task(
                 terminal_at_unix_ms: row.get(10)?,
                 terminal_result: row.get(11)?,
                 terminal_reason: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(store_error)
+}
+
+fn load_endpoint_execution_for_attempt(
+    conn: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Option<AgentTaskEndpointExecutionRecord>, CommunicationStoreError> {
+    conn.query_row(
+        "SELECT e.task_id, e.attempt_id, e.wake_id, w.state,
+                e.endpoint_id, e.endpoint_controller_generation,
+                e.created_at_unix_ms, e.updated_at_unix_ms
+         FROM wc_agent_task_endpoint_executions e
+         JOIN wc_agent_wakes w ON w.wake_id = e.wake_id
+         WHERE e.task_id = ?1 AND e.attempt_id = ?2",
+        params![task_id, attempt_id],
+        |row| {
+            let wake_state: String = row.get(3)?;
+            Ok(AgentTaskEndpointExecutionRecord {
+                task_id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                wake_id: row.get(2)?,
+                wake_state: AgentWakeState::from_db(&wake_state, 3)?,
+                endpoint_id: row.get(4)?,
+                endpoint_controller_generation: row.get(5)?,
+                created_at_unix_ms: row.get(6)?,
+                updated_at_unix_ms: row.get(7)?,
             })
         },
     )
@@ -2828,7 +3337,60 @@ fn materialize_expired_latest_attempt(
     }
     attempt.stored_state = AgentTaskAttemptState::Expired;
     attempt.terminal_at_unix_ms = Some(now);
+    retire_pre_dispatch_endpoint_execution_for_attempt(transaction, &attempt.attempt_id, now)?;
     task.updated_at_unix_ms = task.updated_at_unix_ms.max(now);
+    Ok(())
+}
+
+fn retire_pre_dispatch_endpoint_execution_for_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+    now: i64,
+) -> Result<(), CommunicationStoreError> {
+    transaction
+        .execute(
+            "UPDATE wc_agent_wake_attempts
+             SET state = 'revoked', revoked_at_unix_ms = COALESCE(revoked_at_unix_ms, ?2)
+             WHERE state = 'claimed'
+               AND wake_id IN (
+                   SELECT w.wake_id
+                   FROM wc_agent_wakes w
+                   JOIN wc_agent_task_endpoint_executions e ON e.wake_id = w.wake_id
+                   WHERE e.attempt_id = ?1
+                     AND w.trigger_kind = 'agent_task_attempt'
+                     AND w.state = 'claimed'
+               )",
+            params![attempt_id, now],
+        )
+        .map_err(store_error)?;
+    transaction
+        .execute(
+            "UPDATE wc_agent_task_endpoint_executions
+             SET endpoint_id = NULL, endpoint_controller_generation = NULL,
+                 updated_at_unix_ms = MAX(updated_at_unix_ms, ?2)
+             WHERE attempt_id = ?1
+               AND wake_id IN (
+                   SELECT wake_id FROM wc_agent_wakes
+                   WHERE trigger_kind = 'agent_task_attempt'
+                     AND state IN ('pending', 'claimed')
+               )",
+            params![attempt_id, now],
+        )
+        .map_err(store_error)?;
+    transaction
+        .execute(
+            "UPDATE wc_agent_wakes
+             SET state = 'retired', revision = revision + 1,
+                 updated_at_unix_ms = MAX(updated_at_unix_ms, ?2),
+                 claimed_attempt_id = NULL, claimed_endpoint_id = NULL,
+                 claimed_controller_generation = NULL,
+                 claim_lease_expires_at_unix_ms = NULL
+             WHERE trigger_kind = 'agent_task_attempt'
+               AND source_task_attempt_id = ?1
+               AND state IN ('pending', 'claimed')",
+            params![attempt_id, now],
+        )
+        .map_err(store_error)?;
     Ok(())
 }
 
@@ -2852,7 +3414,7 @@ fn validate_attempt_mutation_inputs(
         DURABLE_AGENT_ID_PREFIX,
         "invalid_agent_id",
     )?;
-    validate_id(
+    validate_proof(
         attempt_fence,
         AGENT_TASK_ATTEMPT_FENCE_PREFIX,
         "invalid_agent_task_attempt_fence",
@@ -2921,6 +3483,53 @@ fn require_current_attempt(
         ));
     }
     Ok(attempt)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_agent_task_attempt_controller_in_transaction(
+    transaction: &Transaction<'_>,
+    principal: &CommunicationPrincipal,
+    task_id: &str,
+    attempt_id: &str,
+    assignee_agent_id: &str,
+    attempt_fence: &str,
+    expected_controller_generation: i64,
+    now: i64,
+) -> Result<AgentTaskAttemptRecord, CommunicationStoreError> {
+    let task = load_owned_task(transaction, principal, task_id, now)?;
+    let attempt = require_current_attempt(
+        transaction,
+        &task,
+        attempt_id,
+        assignee_agent_id,
+        attempt_fence,
+        expected_controller_generation,
+        now,
+    )?;
+    let next_generation = attempt.attempt_controller_generation.saturating_add(1);
+    transaction
+        .execute(
+            "UPDATE wc_agent_task_attempts
+             SET attempt_controller_generation = ?2
+             WHERE attempt_id = ?1",
+            params![attempt_id, next_generation],
+        )
+        .map_err(store_error)?;
+    transaction
+        .execute(
+            "UPDATE wc_agent_tasks SET updated_at_unix_ms = MAX(updated_at_unix_ms, ?2)
+             WHERE task_id = ?1",
+            params![task_id, now],
+        )
+        .map_err(store_error)?;
+    let attempt =
+        load_attempt_for_task(transaction, task_id, attempt_id, now)?.ok_or_else(|| {
+            CommunicationStoreError::new(
+                "agent_task_attempt_not_found",
+                "AgentTaskAttempt disappeared after controller replacement",
+            )
+        })?;
+    Ok(attempt.record(now))
 }
 
 fn task_terminal_error() -> CommunicationStoreError {

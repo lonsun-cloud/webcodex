@@ -53,6 +53,8 @@ fn project_summary(id: &str, path: &str) -> RunnerProjectSummary {
         hooks: vec!["doctor".to_string(), "precommit".to_string()],
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: Some("codex".to_string()),
         git_head: Some("9a7d3ce".to_string()),
         git_dirty: Some(false),
@@ -116,8 +118,8 @@ fn file_request(op: &str) -> ShellFileOpRequest {
         pattern: None,
         expected_sha256: None,
         expected_prefix: None,
-        start_line: None,
-        end_line: None,
+        start_line: (op == "read").then_some(1),
+        end_line: (op == "read").then_some(1),
         line: None,
         create_dirs: false,
         wait_timeout_secs: 0,
@@ -295,10 +297,14 @@ mod abandoned_sync;
 mod apply_patch;
 #[path = "tests/apply_text_edit_line_scope.rs"]
 mod apply_text_edit_line_scope;
+#[path = "tests/apply_text_edit_local_guard.rs"]
+mod apply_text_edit_local_guard;
 #[path = "tests/apply_text_edit_occurrence.rs"]
 mod apply_text_edit_occurrence;
 #[path = "tests/artifact_export.rs"]
 mod artifact_export;
+#[path = "tests/browser.rs"]
+mod browser;
 #[path = "tests/capabilities.rs"]
 mod capabilities;
 #[path = "tests/computer_accessibility.rs"]
@@ -311,8 +317,6 @@ mod computer_observe;
 mod computer_snapshot_artifact;
 #[path = "tests/computer_text_input.rs"]
 mod computer_text_input;
-#[path = "tests/configured_skills.rs"]
-mod configured_skills;
 #[path = "tests/connection_lease.rs"]
 mod connection_lease;
 #[path = "tests/disconnect_reconciliation.rs"]
@@ -323,6 +327,8 @@ mod file_validation;
 mod instance_lease;
 #[path = "tests/internal_posix.rs"]
 mod internal_posix;
+#[path = "tests/job_handoff.rs"]
+mod job_handoff;
 #[path = "tests/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "tests/job_log_wait.rs"]
@@ -335,6 +341,8 @@ mod mcp_gateway;
 mod plugin_gateway;
 #[path = "tests/polling.rs"]
 mod polling;
+#[path = "tests/project_file_read.rs"]
+mod project_file_read;
 #[path = "tests/project_inventory.rs"]
 mod project_inventory;
 #[path = "tests/project_projection.rs"]
@@ -361,9 +369,11 @@ mod runner_liveness;
 mod shared_key_limits;
 #[path = "tests/shared_key_ttl.rs"]
 mod shared_key_ttl;
-#[path = "tests/skill_store.rs"]
-mod skill_store;
+#[path = "tests/skills.rs"]
+mod skills;
 #[path = "tests/ssh_resource.rs"]
 mod ssh_resource;
 #[path = "tests/structured_file_delete.rs"]
 mod structured_file_delete;
+#[path = "tests/throughput_telemetry.rs"]
+mod throughput_telemetry;

@@ -28,6 +28,12 @@ struct UpdateOAuthClientScopesRequest {
     allowed_scopes: Vec<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct UpdateOAuthClientRedirectUriRequest {
+    client_id: String,
+    redirect_uri: String,
+}
+
 /// Exact OAuth permission default that existed before application launch.
 /// Keep this list closed and explicit: adding a scope to the supported registry
 /// must never widen clients that omit or empty `allowed_scopes`.
@@ -56,6 +62,14 @@ mod detached_scope_tests {
     }
 
     #[test]
+    fn legacy_default_client_does_not_gain_browser_authority() {
+        for scope in ["browser:read", "browser:control", "browser:launch"] {
+            assert!(super::super::scope_registry::oauth_scopes_supported().contains(&scope));
+            assert!(!default_client_allowed_scopes().contains(&scope));
+        }
+    }
+
+    #[test]
     fn legacy_default_client_does_not_gain_memory_authority() {
         assert!(super::super::scope_registry::oauth_scopes_supported()
             .contains(&crate::auth::SCOPE_MEMORY_READ));
@@ -77,6 +91,9 @@ pub(crate) fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() {
         return Err("redirect_uri cannot be empty".to_string());
+    }
+    if trimmed.chars().any(|ch| ch.is_ascii_control()) {
+        return Err("redirect_uri must not contain ASCII control characters".to_string());
     }
     let parsed =
         url::Url::parse(trimmed).map_err(|_| "redirect_uri is not a valid URL".to_string())?;
@@ -344,6 +361,135 @@ pub(crate) async fn oauth_clients_list(depot: &mut Depot, res: &mut Response) {
         "success": true,
         "clients": clients_json,
     })));
+}
+
+#[handler]
+pub(crate) async fn oauth_clients_add_redirect_uri(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    oauth_clients_update_redirect_uri(req, depot, res, true).await;
+}
+
+#[handler]
+pub(crate) async fn oauth_clients_remove_redirect_uri(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    oauth_clients_update_redirect_uri(req, depot, res, false).await;
+}
+
+async fn oauth_clients_update_redirect_uri(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    add: bool,
+) {
+    let Some(auth) = depot.obtain::<AuthContext>().ok() else {
+        res.status_code(StatusCode::UNAUTHORIZED);
+        res.render(Json(
+            serde_json::json!({"error": "authenticated user required"}),
+        ));
+        return;
+    };
+    if !is_authorize_identity_allowed(auth) {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(
+            serde_json::json!({"error": "OAuth2 access tokens cannot manage OAuth clients"}),
+        ));
+        return;
+    }
+    let Some(db) = crate::auth::get_db(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(serde_json::json!({"error": "DB not available"})));
+        return;
+    };
+    let body: UpdateOAuthClientRedirectUriRequest = match req.parse_json().await {
+        Ok(body) => body,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(
+                serde_json::json!({"error": "invalid request body", "detail": e.to_string()}),
+            ));
+            return;
+        }
+    };
+    let redirect_uri = body.redirect_uri.trim().to_string();
+    if let Err(error) = validate_redirect_uri(&redirect_uri) {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(serde_json::json!({"error": error})));
+        return;
+    }
+    let current = match db.get_oauth_client_by_client_id(&body.client_id) {
+        Ok(Some(client)) if auth_can_manage_managed_oauth_client(auth, &client) => client,
+        Ok(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(serde_json::json!({"error": "OAuth client not found"})));
+            return;
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(
+                serde_json::json!({"error": "failed to read client", "detail": e.to_string()}),
+            ));
+            return;
+        }
+    };
+    let mut redirects = current.redirect_uris_vec();
+    let contains = redirects.iter().any(|uri| uri == &redirect_uri);
+    if add {
+        if contains {
+            apply_oauth_no_store_headers(res);
+            res.render(Json(serde_json::json!({"success": true, "changed": false, "client": {"client_id": current.client_id, "redirect_uris": redirects}})));
+            return;
+        }
+        if redirects.len() >= MAX_CLIENT_REDIRECT_URIS {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({"error": format!("too many redirect_uris; maximum is {}", MAX_CLIENT_REDIRECT_URIS)})));
+            return;
+        }
+        redirects.push(redirect_uri);
+    } else {
+        if !contains {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(
+                serde_json::json!({"error": "redirect_uri is not registered"}),
+            ));
+            return;
+        }
+        if redirects.len() <= 1 {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(
+                serde_json::json!({"error": "OAuth client must retain at least one redirect_uri"}),
+            ));
+            return;
+        }
+        redirects.retain(|uri| uri != &redirect_uri);
+    }
+    let updated = redirects.join("\n");
+    match db.update_oauth_client_redirect_uris(&current.client_id, &current.redirect_uris, &updated)
+    {
+        Ok(true) => {
+            apply_oauth_no_store_headers(res);
+            res.render(Json(serde_json::json!({
+                "success": true, "changed": true,
+                "client": {"client_id": current.client_id, "redirect_uris": redirects},
+                "tokens_revoked": false,
+            })));
+        }
+        Ok(false) => {
+            res.status_code(StatusCode::CONFLICT);
+            res.render(Json(
+                serde_json::json!({"error": "OAuth client changed or is no longer active"}),
+            ));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({"error": "failed to update redirect_uris", "detail": e.to_string()})));
+        }
+    }
 }
 
 #[handler]

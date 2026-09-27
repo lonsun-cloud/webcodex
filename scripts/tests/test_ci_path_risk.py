@@ -39,6 +39,20 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows"], "false")
         self.assertEqual(result["needs_macos"], "false")
 
+    def test_shared_frontend_source_and_dependencies_also_check_desktop(self) -> None:
+        for path in (
+            "frontend/src/ui/ProjectPicker.tsx",
+            "frontend/src/ui/foundation.css",
+            "frontend/package.json",
+            "frontend/package-lock.json",
+        ):
+            with self.subTest(path=path):
+                result = classify(path)
+                self.assertEqual(result["needs_frontend"], "true")
+                self.assertEqual(result["needs_desktop_frontend"], "true")
+                self.assertEqual(result["needs_windows"], "false")
+                self.assertEqual(result["needs_macos"], "false")
+
     def test_desktop_frontend_isolated_from_main_frontend_and_native(self) -> None:
         result = classify("apps/desktop/src/main.tsx")
         self.assertEqual(result["needs_frontend"], "false")
@@ -97,6 +111,15 @@ class PathRiskFixtureTests(unittest.TestCase):
             "plugins/repo-info/src/plugin.ts",
             "plugins/repo-info/plugin.test.mjs",
             "plugins/repo-info/package-lock.json",
+            "plugins/repo-context/src/plugin.ts",
+            "plugins/repo-context/plugin.test.mjs",
+            "plugins/repo-context/package-lock.json",
+            "plugins/campus-application/src/plugin.ts",
+            "plugins/campus-application/tests/application-flow.test.mjs",
+            "plugins/campus-application/package-lock.json",
+            "plugins/agent-browser/src/plugin.ts",
+            "plugins/agent-browser/tests/core.test.mjs",
+            "plugins/agent-browser/package-lock.json",
         ):
             with self.subTest(path=path):
                 result = classify(path)

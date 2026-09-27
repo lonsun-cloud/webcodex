@@ -3,8 +3,8 @@ use std::time::Duration;
 use crate::auth::AuthContext;
 use crate::runner_http::{requested_by_from_auth, runner_access_from_auth, RunnerFeature};
 use crate::runner_protocol::{
-    RunnerConfigAction, RunnerConfigExecutionState, RunnerConfigOperationRequest,
-    RunnerConfigOperationResponse, RUNNER_CONFIG_RESPONSE_MAX_BYTES,
+    RunnerConfigAction, RunnerConfigErrorCode, RunnerConfigExecutionState,
+    RunnerConfigOperationRequest, RunnerConfigOperationResponse, RUNNER_CONFIG_RESPONSE_MAX_BYTES,
 };
 use serde_json::Value;
 
@@ -35,14 +35,14 @@ fn config_response(
     action: RunnerConfigAction,
     state: RunnerConfigExecutionState,
     current_generation: Option<u64>,
-    code: &str,
+    code: RunnerConfigErrorCode,
 ) -> RunnerConfigOperationResponse {
     RunnerConfigOperationResponse {
         action,
         execution_state: state,
         valid: None,
         current_generation,
-        error_code: Some(code.to_string()),
+        error_code: Some(code),
         error_field: None,
         error_reason: None,
         restart_required: false,
@@ -55,14 +55,14 @@ fn config_failure(
     message: &'static str,
     recovery: RecoveryKind,
 ) -> ToolResult {
-    ToolResult::err_with_output(message, response_value(&response)).with_recovery(recovery, None)
+    ToolResult::err_with_output(message, response_value(&response)).with_recovery(recovery)
 }
 
-fn not_started(action: RunnerConfigAction, code: &str) -> ToolResult {
+fn not_started(action: RunnerConfigAction, code: RunnerConfigErrorCode) -> ToolResult {
     config_failure(
         config_response(action, RunnerConfigExecutionState::NotStarted, None, code),
         "Runner config operation was not started",
-        if code == "invalid_request" {
+        if code == RunnerConfigErrorCode::InvalidRequest {
             RecoveryKind::FixInput
         } else {
             RecoveryKind::Reobserve
@@ -72,14 +72,14 @@ fn not_started(action: RunnerConfigAction, code: &str) -> ToolResult {
 
 fn delivery_failure(action: RunnerConfigAction, dispatched: Option<bool>) -> ToolResult {
     if dispatched == Some(false) {
-        return not_started(action, "runner_unavailable");
+        return not_started(action, RunnerConfigErrorCode::RunnerUnavailable);
     }
     config_failure(
         config_response(
             action,
             RunnerConfigExecutionState::OutcomeUnknown,
             None,
-            "outcome_unknown",
+            RunnerConfigErrorCode::OutcomeUnknown,
         ),
         "Runner config operation may have executed but no trustworthy terminal response was received",
         RecoveryKind::Reconcile,
@@ -88,27 +88,27 @@ fn delivery_failure(action: RunnerConfigAction, dispatched: Option<bool>) -> Too
 
 fn invalid_response(action: RunnerConfigAction, dispatched: Option<bool>) -> ToolResult {
     if dispatched == Some(false) {
-        return not_started(action, "invalid_runner_response");
+        return not_started(action, RunnerConfigErrorCode::InvalidRunnerResponse);
     }
     config_failure(
         config_response(
             action,
             RunnerConfigExecutionState::OutcomeUnknown,
             None,
-            "invalid_runner_response",
+            RunnerConfigErrorCode::InvalidRunnerResponse,
         ),
         "Runner config operation returned an invalid terminal response; execution outcome is unknown",
         RecoveryKind::Reconcile,
     )
 }
 
-fn safe_pre_dispatch_code(error: &str) -> &'static str {
+fn safe_pre_dispatch_code(error: &str) -> RunnerConfigErrorCode {
     if error.starts_with("runner_replaced:") {
-        "runner_replaced"
+        RunnerConfigErrorCode::RunnerReplaced
     } else if error.starts_with("capability_unavailable:") {
-        "capability_unavailable"
+        RunnerConfigErrorCode::CapabilityUnavailable
     } else {
-        "runner_unavailable"
+        RunnerConfigErrorCode::RunnerUnavailable
     }
 }
 
@@ -141,7 +141,7 @@ impl ToolRuntime {
         if !valid_client_id(&client_id)
             || expected_generation.is_some_and(|generation| generation == 0)
         {
-            return not_started(action, "invalid_request");
+            return not_started(action, RunnerConfigErrorCode::InvalidRequest);
         }
 
         let access = runner_access_from_auth(auth);
@@ -151,14 +151,14 @@ impl ToolRuntime {
             .await
         {
             Ok(semantic) => semantic,
-            Err(_) => return not_started(action, "runner_unavailable"),
+            Err(_) => return not_started(action, RunnerConfigErrorCode::RunnerUnavailable),
         };
         if !semantic.supports(RunnerFeature::RunnerConfigControl) {
-            return not_started(action, "capability_unavailable");
+            return not_started(action, RunnerConfigErrorCode::CapabilityUnavailable);
         }
         let runner_instance_id = semantic.view.runner_instance_id.clone();
         if runner_instance_id.is_empty() {
-            return not_started(action, "runner_replaced");
+            return not_started(action, RunnerConfigErrorCode::RunnerReplaced);
         }
 
         let operation = RunnerConfigOperationRequest {
@@ -166,7 +166,7 @@ impl ToolRuntime {
             expected_generation,
         };
         if operation.validate().is_err() {
-            return not_started(action, "invalid_request");
+            return not_started(action, RunnerConfigErrorCode::InvalidRequest);
         }
         let requested_by = requested_by_from_auth(auth);
         let (request_id, receiver) = match self
@@ -206,7 +206,7 @@ impl ToolRuntime {
                     .error
                     .as_deref()
                     .map(safe_pre_dispatch_code)
-                    .unwrap_or("runner_unavailable");
+                    .unwrap_or(RunnerConfigErrorCode::RunnerUnavailable);
                 return not_started(action, code);
             }
             return delivery_failure(action, response.request_dispatched);

@@ -1,6 +1,6 @@
 use super::*;
 use crate::runner_protocol::{
-    ShellProjectInventoryPage, PROJECT_INVENTORY_MAX_CONCURRENT_SYNCS,
+    RunnerProjectLineage, ShellProjectInventoryPage, PROJECT_INVENTORY_MAX_CONCURRENT_SYNCS,
     PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
     PROJECT_INVENTORY_STAGING_TTL_SECS,
 };
@@ -81,6 +81,132 @@ fn assert_resolves_edges(projects: &[RunnerProjectSummary], count: usize) {
             "missing expected project {id}"
         );
     }
+}
+
+#[tokio::test]
+async fn inventory_preserves_explicit_managed_lineage_and_rejects_malformed_identity() {
+    let registry = RunnerRegistry::default();
+    let client_id = "lineage-inventory";
+    let instance_id = "lineage-inventory-instance";
+    registry
+        .register(paged_registration(client_id, instance_id))
+        .await
+        .unwrap();
+
+    let source_fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let mut source = project_summary("source", "/tmp/source");
+    source.root_fingerprint = Some(source_fingerprint.clone());
+    let mut managed = project_summary("managed", "/tmp/managed");
+    managed.root_fingerprint = Some(format!("wc_projroot_{}", "2".repeat(64)));
+    managed.lineage = Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id: "source".to_string(),
+        source_root_fingerprint: source_fingerprint.clone(),
+        base_sha: "a".repeat(40),
+    });
+
+    let status = apply_snapshot(
+        &registry,
+        client_id,
+        instance_id,
+        "lineage",
+        1,
+        &[source, managed],
+    )
+    .await;
+    assert_eq!(status.sync_state, "complete");
+    let published = registry.list_runner_projects(client_id).await.unwrap();
+    assert!(published
+        .iter()
+        .find(|project| project.id == "source")
+        .unwrap()
+        .lineage
+        .is_none());
+    assert!(matches!(
+        published
+            .iter()
+            .find(|project| project.id == "managed")
+            .unwrap()
+            .lineage,
+        Some(RunnerProjectLineage::ManagedWorktreeSource { .. })
+    ));
+
+    let invalid_registry = RunnerRegistry::default();
+    let invalid_client = "invalid-lineage-inventory";
+    let invalid_instance = "invalid-lineage-instance";
+    invalid_registry
+        .register(paged_registration(invalid_client, invalid_instance))
+        .await
+        .unwrap();
+    let mut invalid = project_summary("managed", "/tmp/managed");
+    invalid.lineage = Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id: "source".to_string(),
+        source_root_fingerprint: "not-a-root-fingerprint".to_string(),
+        base_sha: "a".repeat(40),
+    });
+    let status = invalid_registry
+        .apply_project_inventory_page(
+            invalid_client,
+            invalid_instance,
+            ShellProjectInventoryPage {
+                generation: "invalid-lineage".to_string(),
+                snapshot_sequence: 1,
+                page_index: 0,
+                total_reported: 1,
+                complete: true,
+                projects: vec![invalid],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.sync_state, "degraded");
+    assert_eq!(
+        status.last_error_code.as_deref(),
+        Some("project_summary_invalid_lineage")
+    );
+    assert!(invalid_registry
+        .list_runner_projects(invalid_client)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let self_registry = RunnerRegistry::default();
+    let self_client = "self-lineage-inventory";
+    let self_instance = "self-lineage-instance";
+    self_registry
+        .register(paged_registration(self_client, self_instance))
+        .await
+        .unwrap();
+    let mut self_associated = project_summary("self", "/tmp/self");
+    self_associated.lineage = Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id: "self".to_string(),
+        source_root_fingerprint: source_fingerprint,
+        base_sha: "b".repeat(40),
+    });
+    let status = self_registry
+        .apply_project_inventory_page(
+            self_client,
+            self_instance,
+            ShellProjectInventoryPage {
+                generation: "self-lineage".to_string(),
+                snapshot_sequence: 1,
+                page_index: 0,
+                total_reported: 1,
+                complete: true,
+                projects: vec![self_associated],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.sync_state, "degraded");
+    assert_eq!(
+        status.last_error_code.as_deref(),
+        Some("project_summary_invalid_lineage")
+    );
+    assert!(self_registry
+        .list_runner_projects(self_client)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

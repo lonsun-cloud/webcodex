@@ -9,13 +9,13 @@ fn descriptor_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "memory_id": {"type":"string","pattern":"^wc_mem_[0-9a-f]{32}$"},
+            "memory_id": {"type":"string","pattern":"^wc_mem_[A-Za-z0-9_-]{16}$"},
             "memory_key": {"type":"string"},
             "summary": {"type":"string","maxLength":MAX_MEMORY_SUMMARY_CHARS},
             "priority": {"type":"string","enum":["high","normal","low"]},
             "bootstrap": {"type":"boolean"},
             "tags": {"type":"array","maxItems":MAX_MEMORY_TAGS,"items":{"type":"string","maxLength":MAX_MEMORY_TAG_CHARS}},
-            "revision": {"type":"string","pattern":"^wc_memrev_[0-9a-f]{64}$"},
+            "revision": {"type":"string","pattern":"^wc_memrev_[A-Za-z0-9_-]{43}$"},
             "matched_fields": {"type":"array","items":{"type":"string","enum":["memory_key","summary","body","tags"]}}
         },
         "required": ["memory_id","memory_key","summary","priority","bootstrap","tags","revision"],
@@ -40,16 +40,16 @@ fn memory_scope_descriptor_schema() -> Value {
     json!({
         "type":"object",
         "properties": {
-            "memory_scope_id":{"type":"string","pattern":"^wc_memscope_[0-9a-f]{64}$"},
+            "memory_scope_id":{"type":"string","pattern":"^wc_memscope_[A-Za-z0-9_-]{43}$"},
             "identity_state":{"type":"string","enum":["attributed"]},
             "current_status":{"type":"string","enum":["current","not_current","unknown"]},
             "project_runtime_id":{"type":["string","null"]},
             "runner_client_id":{"type":["string","null"]},
-            "root_fingerprint":{"type":["string","null"],"pattern":"^wc_memroot_[0-9a-f]{64}$"},
+            "root_fingerprint":{"type":["string","null"],"pattern":"^wc_memroot_[A-Za-z0-9_-]{43}$"},
             "current_project_runtime_id":{"type":["string","null"]},
             "memory_count":{"type":"integer","minimum":1},
             "bootstrap_count":{"type":"integer","minimum":0},
-            "catalog_revision":{"type":"string","pattern":"^wc_memcat_[0-9a-f]{64}$"},
+            "catalog_revision":{"type":"string","pattern":"^wc_memcat_[A-Za-z0-9_-]{43}$"},
             "oldest_memory_created_at_unix_ms":{"type":"integer"},
             "latest_memory_updated_at_unix_ms":{"type":"integer"},
             "scope_created_at_unix_ms":{"type":"integer"},

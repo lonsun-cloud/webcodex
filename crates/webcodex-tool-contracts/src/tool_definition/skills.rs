@@ -1,17 +1,129 @@
-use super::RunnerCapabilityRequirement::{FileRead, SkillStoreManage};
-use super::ToolVisibility::ModelHidden;
-use super::{def, ToolDefinition, TOOL_CATEGORY_RUNTIME};
+use super::RunnerCapabilityRequirement::{FileRead, SkillManagement};
+use super::ToolVisibility::{ModelHidden, ModelVisible};
+use super::{
+    adaptive_runtime_direct, def, model_spec, require_all_scopes, ToolDefinition,
+    ToolOperatorExtensionFamily, TOOL_CATEGORY_RUNTIME,
+};
 use crate::metadata::{
     ToolPathHint::None as NoPath,
-    ToolRisk::{Read, SkillManage},
-    ADMIN, PROJECT_READ, TOOL_PROVIDER_RUNNER,
+    ToolRisk::{JobRun, Read, SkillManage},
+    ADMIN, JOB_RUN, PROJECT_READ, TOOL_PROVIDER_RUNNER,
 };
 
-/// Fixed Phase-3 project Skill runtime tools. They are known to the kernel but
-/// intentionally hidden from the generic registry; Stateless MCP 2026 Full
-/// Operator projects them explicitly, and the kernel capability gate remains
-/// authoritative for execution.
+/// Project Skill runtime tools. `skill_load` is the narrow direct model path;
+/// the broader discovery/read compatibility tools remain hidden operator
+/// extensions. Kernel capability and authority gates remain authoritative.
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    adaptive_runtime_direct(
+        model_spec(
+            def(
+                "skill_load",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("project"),
+                    super::ToolAuditResultField::value("catalog_revision"),
+                    super::ToolAuditResultField::value("skill_id"),
+                    super::ToolAuditResultField::value("source_scope"),
+                    super::ToolAuditResultField::value("trust"),
+                    super::ToolAuditResultField::value("package_revision"),
+                    super::ToolAuditResultField::value("definition_revision"),
+                    super::ToolAuditResultField::value("path"),
+                    super::ToolAuditResultField::value("sha256"),
+                    super::ToolAuditResultField::value("returned_lines"),
+                    super::ToolAuditResultField::value("has_more"),
+                    super::ToolAuditResultField::value("next_start_line"),
+                    super::ToolAuditResultField::value("candidate_count"),
+                    super::ToolAuditResultField::value("error_kind"),
+                    super::ToolAuditResultField::value("state_changed"),
+                ])
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&["name"]))
+                .context(super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::value("catalog_revision"),
+                    super::ToolAuditResultField::value("skill_id"),
+                    super::ToolAuditResultField::value("source_scope"),
+                    super::ToolAuditResultField::value("trust"),
+                    super::ToolAuditResultField::value("package_revision"),
+                    super::ToolAuditResultField::value("definition_revision"),
+                    super::ToolAuditResultField::value("path"),
+                    super::ToolAuditResultField::value("sha256"),
+                    super::ToolAuditResultField::value("returned_lines"),
+                    super::ToolAuditResultField::value("has_more"),
+                    super::ToolAuditResultField::value("next_start_line"),
+                    super::ToolAuditResultField::value("candidate_count"),
+                    super::ToolAuditResultField::value("error_kind"),
+                    super::ToolAuditResultField::value("state_changed"),
+                ])),
+                ModelVisible,
+                TOOL_CATEGORY_RUNTIME,
+                Some(FileRead),
+                TOOL_PROVIDER_RUNNER,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Observe,
+                    risk: Read,
+                    approval: super::ToolApprovalPolicy::None,
+                    idempotency: super::ToolIdempotency::PureRead,
+                },
+                Some(PROJECT_READ),
+                true,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            ),
+            "Load one uniquely named Skill by exact Unicode case folding. Returns its descriptor, bounded SKILL.md, and revisions in one read-only Project call. Missing, ambiguous, or truncated discovery fails closed; scripts and other Skill resources are never executed.",
+        ),
+        27,
+    ),
+    adaptive_runtime_direct(
+        require_all_scopes(
+            model_spec(
+                def(
+                    "run_skill_resource",
+                    super::ToolAuditPolicy::typed_fields(&[
+                        super::ToolAuditResultField::value("skill_id"),
+                        super::ToolAuditResultField::value("skill_path"),
+                        super::ToolAuditResultField::value("skill_sha256"),
+                        super::ToolAuditResultField::value("skill_trust"),
+                        super::ToolAuditResultField::value("skill_definition_revision"),
+                        super::ToolAuditResultField::value("skill_package_revision"),
+                        super::ToolAuditResultField::value("execution_state"),
+                        super::ToolAuditResultField::value("exit_code"),
+                        super::ToolAuditResultField::value("failure_kind"),
+                        super::ToolAuditResultField::value("tool_failure"),
+                    ])
+                    .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
+                        "args",
+                        "process_summary",
+                    ])),
+                    ModelVisible,
+                    TOOL_CATEGORY_RUNTIME,
+                    Some(super::RunnerCapabilityRequirement::SkillResourceExecution),
+                    TOOL_PROVIDER_RUNNER,
+                    super::ToolSemanticContract {
+                        effect: super::ToolEffect::Execute,
+                        risk: JobRun,
+                        approval: super::ToolApprovalPolicy::Standard,
+                        idempotency: super::ToolIdempotency::NonIdempotent,
+                    },
+                    Some(JOB_RUN),
+                    true,
+                    NoPath,
+                    true,
+                    true,
+                    super::ToolSessionEvidencePolicy::NONE,
+                ),
+                "Execute one supported scripts/*.py or scripts/*.sh resource from a trusted Runner-configured live Skill or Runner-installed managed Skill without exposing or retransmitting its source through model context. Configured Skills are live resources: expected_definition_revision fences the selected SKILL.md definition, while resource bytes are read at execution and package-relative helpers remain live; skill_sha256 reports the exact main-script bytes executed. Managed installed Skills additionally require expected_package_revision and execute against a Runner-owned immutable package snapshot. The Runner preserves the selected Skill script/package identity for __file__, Python sibling imports, and shell $0-relative helpers while keeping the requested Project cwd; project-content Skills are rejected.",
+            )
+            .with_gpt_action_description("Execute a trusted Runner Skill script. Configured Skills are live and definition-fenced by expected_definition_revision; managed Skills additionally require expected_package_revision. WebCodex selects the .py/.sh interpreter; project-content Skills are rejected.")
+            .with_execution(super::ToolExecutionContract::new(
+                super::ToolExecutionForm::NativeArgv,
+                super::ToolExecutionLifetime::Runner,
+                super::ToolExecutionStart::SyncFirst,
+                super::ToolExecutionContinuation::ObserveJobs,
+            )),
+            &[PROJECT_READ, JOB_RUN],
+        ),
+        71,
+    ),
     def(
         "skill_list",
         super::ToolAuditPolicy::typed_fields(&[
@@ -53,7 +165,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillRuntime),
     def(
         "skill_read_file",
         super::ToolAuditPolicy::typed_fields(&[
@@ -103,7 +216,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillRuntime),
     def(
         "skill_versions",
         super::ToolAuditPolicy::typed_fields(&[
@@ -120,7 +234,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ]),
         ModelHidden,
         TOOL_CATEGORY_RUNTIME,
-        Some(SkillStoreManage),
+        Some(SkillManagement),
         TOOL_PROVIDER_RUNNER,
         super::ToolSemanticContract {
             effect: super::ToolEffect::Observe,
@@ -134,7 +248,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillManagement),
     def(
         "skill_install",
         super::ToolAuditPolicy::typed_fields(&[
@@ -157,7 +272,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ]),
         ModelHidden,
         TOOL_CATEGORY_RUNTIME,
-        Some(SkillStoreManage),
+        Some(SkillManagement),
         TOOL_PROVIDER_RUNNER,
         super::ToolSemanticContract {
             effect: super::ToolEffect::Mutate,
@@ -171,7 +286,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillManagement),
     def(
         "skill_activate",
         super::ToolAuditPolicy::typed_fields(&[
@@ -189,7 +305,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ]),
         ModelHidden,
         TOOL_CATEGORY_RUNTIME,
-        Some(SkillStoreManage),
+        Some(SkillManagement),
         TOOL_PROVIDER_RUNNER,
         super::ToolSemanticContract {
             effect: super::ToolEffect::Mutate,
@@ -203,7 +319,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         false,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillManagement),
     def(
         "skill_remove_revision",
         super::ToolAuditPolicy::typed_fields(&[
@@ -220,7 +337,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ]),
         ModelHidden,
         TOOL_CATEGORY_RUNTIME,
-        Some(SkillStoreManage),
+        Some(SkillManagement),
         TOOL_PROVIDER_RUNNER,
         super::ToolSemanticContract {
             effect: super::ToolEffect::Mutate,
@@ -234,5 +351,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         true,
         false,
         super::ToolSessionEvidencePolicy::NONE,
-    ),
+    )
+    .with_operator_extension_family(ToolOperatorExtensionFamily::SkillManagement),
 ];

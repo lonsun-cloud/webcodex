@@ -19,11 +19,11 @@
 use crate::auth::{AuthContext, SCOPE_AGENT_REGISTER};
 use crate::runner_http::{
     effective_register_owner, enforce_register_owner, require_runner_transport_scope,
-    RunnerRegistry,
+    RunnerRegistry, RunnerStreamMetricOutcome, RunnerTransport,
 };
 use crate::runner_protocol::{RunnerEnvelope, RunnerPollRequest, RunnerRegisterRequest};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
@@ -139,8 +139,8 @@ pub(crate) struct SessionContext<'a> {
     /// Exact process-local cancellation lease for this streaming connection.
     /// Successful replacement signals it only after the new connection commits.
     pub(crate) cancel: watch::Receiver<bool>,
-    /// Log label: `"websocket"` or `"quic"`.
-    pub(crate) transport_label: &'static str,
+    /// Canonical closed transport label. Streaming sessions use WebSocket or QUIC.
+    pub(crate) transport: RunnerTransport,
 }
 
 /// Drive the post-register session to completion: request pump, reader-loop,
@@ -181,6 +181,7 @@ fn spawn_request_pump(
     let pump_instance_id = ctx.runner_instance_id.to_string();
     let pump_connection_id = ctx.connection_id.to_string();
     let pump_notify = Arc::clone(&ctx.notify);
+    let pump_transport = ctx.transport;
     tokio::spawn(async move {
         loop {
             // Create the notified future before polling so an enqueue that
@@ -195,15 +196,31 @@ fn spawn_request_pump(
                 .await
             {
                 Ok(Some(request)) => {
-                    // Do not retain/log SendError<RunnerEnvelope>: it can include
-                    // command/stdin payloads. The semantic channel exit is enough.
+                    // Preserve the canonical awaited-send ordering semantics.
+                    // SendError payloads are never logged because requests can
+                    // contain command/stdin data.
+                    let send_started = Instant::now();
                     if pump_tx
                         .send(RunnerEnvelope::Request { request })
                         .await
                         .is_err()
                     {
+                        crate::runner_http::observe_server_stream_outgoing_channel(
+                            pump_transport,
+                            "request",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Closed,
+                        );
                         return PumpExit::ChannelClosed;
                     }
+                    crate::runner_http::observe_server_stream_outgoing_channel(
+                        pump_transport,
+                        "request",
+                        Some(send_started.elapsed()),
+                        false,
+                        RunnerStreamMetricOutcome::Success,
+                    );
                 }
                 Ok(None) => notified.await,
                 Err(error) => return classify_pump_poll_error(&error),
@@ -226,8 +243,9 @@ async fn run_runner_session_with_pump(
         connection_id,
         notify: _,
         mut cancel,
-        transport_label,
+        transport,
     } = ctx;
+    let transport_label = transport.as_str();
 
     let mut pump_task = pump_task;
     let mut writer_task = writer_task;
@@ -297,7 +315,7 @@ async fn run_runner_session_with_pump(
                             runner_instance_id,
                             connection_id,
                             &out_tx,
-                            transport_label,
+                            transport,
                         )
                         .await;
                         if is_goodbye {
@@ -369,6 +387,7 @@ async fn run_runner_session_with_pump(
     registry
         .reconcile_disconnect_for_connection(client_id, runner_instance_id, connection_id)
         .await;
+    crate::runner_http::observe_server_stream_disconnect(transport);
 }
 
 /// Dispatch one inbound envelope into the connection-scoped registry lease.
@@ -379,13 +398,23 @@ async fn dispatch_inbound(
     runner_instance_id: &str,
     connection_id: &str,
     out_tx: &mpsc::Sender<RunnerEnvelope>,
-    transport_label: &'static str,
+    transport: RunnerTransport,
 ) {
+    let envelope_kind = env.kind();
+    let transport_label = transport.as_str();
+    crate::runner_http::observe_server_stream_incoming_envelope(transport, envelope_kind);
     match env {
         RunnerEnvelope::Result { payload } => {
+            let processing_started = Instant::now();
             if payload.result.client_id != client_id
                 || payload.result.runner_instance_id != runner_instance_id
             {
+                crate::runner_http::observe_server_stream_ingress_processing(
+                    transport,
+                    "result",
+                    processing_started.elapsed(),
+                    RunnerStreamMetricOutcome::Rejected,
+                );
                 tracing::warn!(
                     client_id = client_id,
                     "runner {} result rejected: envelope identity does not match registered connection",
@@ -397,20 +426,37 @@ async fn dispatch_inbound(
             // when this connection still holds the lease; a late result on a
             // stale same-instance connection is still applied but does not
             // revive the new connection's liveness.
-            if let Err(e) = registry
+            let outcome = match registry
                 .complete_for_connection(payload, connection_id)
                 .await
             {
-                tracing::warn!(
-                    client_id = client_id,
-                    error = %e,
-                    "runner {} result rejected",
-                    transport_label
-                );
-            }
+                Ok(()) => RunnerStreamMetricOutcome::Success,
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        error = %e,
+                        "runner {} result rejected",
+                        transport_label
+                    );
+                    RunnerStreamMetricOutcome::Rejected
+                }
+            };
+            crate::runner_http::observe_server_stream_ingress_processing(
+                transport,
+                "result",
+                processing_started.elapsed(),
+                outcome,
+            );
         }
         RunnerEnvelope::PersistentShellResult { payload } => {
+            let processing_started = Instant::now();
             if payload.client_id != client_id || payload.runner_instance_id != runner_instance_id {
+                crate::runner_http::observe_server_stream_ingress_processing(
+                    transport,
+                    "persistent_shell_result",
+                    processing_started.elapsed(),
+                    RunnerStreamMetricOutcome::Rejected,
+                );
                 tracing::warn!(
                     client_id = client_id,
                     "runner {} persistent shell result rejected: envelope identity does not match registered connection",
@@ -418,20 +464,37 @@ async fn dispatch_inbound(
                 );
                 return;
             }
-            if let Err(e) = registry
+            let outcome = match registry
                 .complete_persistent_shell_for_connection(payload, connection_id)
                 .await
             {
-                tracing::warn!(
-                    client_id = client_id,
-                    error = %e,
-                    "runner {} persistent shell result rejected",
-                    transport_label
-                );
-            }
+                Ok(()) => RunnerStreamMetricOutcome::Success,
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        error = %e,
+                        "runner {} persistent shell result rejected",
+                        transport_label
+                    );
+                    RunnerStreamMetricOutcome::Rejected
+                }
+            };
+            crate::runner_http::observe_server_stream_ingress_processing(
+                transport,
+                "persistent_shell_result",
+                processing_started.elapsed(),
+                outcome,
+            );
         }
         RunnerEnvelope::JobUpdate { payload } => {
+            let processing_started = Instant::now();
             if payload.client_id != client_id || payload.runner_instance_id != runner_instance_id {
+                crate::runner_http::observe_server_stream_ingress_processing(
+                    transport,
+                    "job_update",
+                    processing_started.elapsed(),
+                    RunnerStreamMetricOutcome::Rejected,
+                );
                 tracing::warn!(
                     client_id = client_id,
                     "runner {} job_update rejected: envelope identity does not match registered connection",
@@ -439,17 +502,27 @@ async fn dispatch_inbound(
                 );
                 return;
             }
-            if let Err(e) = registry
+            let outcome = match registry
                 .update_job_for_connection(payload, connection_id)
                 .await
             {
-                tracing::warn!(
-                    client_id = client_id,
-                    error = %e,
-                    "runner {} job_update rejected",
-                    transport_label
-                );
-            }
+                Ok(_) => RunnerStreamMetricOutcome::Success,
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        error = %e,
+                        "runner {} job_update rejected",
+                        transport_label
+                    );
+                    RunnerStreamMetricOutcome::Rejected
+                }
+            };
+            crate::runner_http::observe_server_stream_ingress_processing(
+                transport,
+                "job_update",
+                processing_started.elapsed(),
+                outcome,
+            );
         }
         RunnerEnvelope::Ping { ts } => {
             // Keepalive: refresh liveness before replying so an idle Runner (no
@@ -471,17 +544,44 @@ async fn dispatch_inbound(
             // channel is full (a slow Runner must not stall inbound processing).
             // try_send drops the pong when saturated; the Runner treats a
             // missing pong as a soft liveness signal, not a fatal error.
-            if let Err(e) = out_tx.try_send(RunnerEnvelope::Pong { ts }) {
-                let reason = match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
-                };
-                tracing::debug!(
-                    client_id = client_id,
-                    reason,
-                    "runner {} pong send dropped",
-                    transport_label
-                );
+            match out_tx.try_send(RunnerEnvelope::Pong { ts }) {
+                Ok(()) => crate::runner_http::observe_server_stream_outgoing_channel(
+                    transport,
+                    "pong",
+                    None,
+                    false,
+                    RunnerStreamMetricOutcome::Success,
+                ),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    crate::runner_http::observe_server_stream_outgoing_channel(
+                        transport,
+                        "pong",
+                        None,
+                        true,
+                        RunnerStreamMetricOutcome::Backpressure,
+                    );
+                    tracing::debug!(
+                        client_id = client_id,
+                        reason = "full",
+                        "runner {} pong send dropped",
+                        transport_label
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    crate::runner_http::observe_server_stream_outgoing_channel(
+                        transport,
+                        "pong",
+                        None,
+                        false,
+                        RunnerStreamMetricOutcome::Closed,
+                    );
+                    tracing::debug!(
+                        client_id = client_id,
+                        reason = "closed",
+                        "runner {} pong send dropped",
+                        transport_label
+                    );
+                }
             }
         }
         RunnerEnvelope::Pong { .. } => {
@@ -501,13 +601,17 @@ async fn dispatch_inbound(
                 );
             }
         }
-        RunnerEnvelope::RuntimeMetadata { tool_providers } => {
+        RunnerEnvelope::RuntimeMetadata {
+            tool_providers,
+            mcp_gateway_providers,
+        } => {
             let _ = registry
-                .update_tool_providers_for_connection(
+                .update_runtime_metadata_for_connection(
                     client_id,
                     runner_instance_id,
                     connection_id,
                     Some(tool_providers),
+                    mcp_gateway_providers,
                 )
                 .await;
         }
@@ -525,7 +629,33 @@ async fn dispatch_inbound(
                     // Bounded best-effort acknowledgement. A full outbound
                     // channel must not make project inventory a liveness fence;
                     // the Runner can restart the snapshot on reconnect.
-                    let _ = out_tx.try_send(RunnerEnvelope::ProjectInventoryStatus { status });
+                    match out_tx.try_send(RunnerEnvelope::ProjectInventoryStatus { status }) {
+                        Ok(()) => crate::runner_http::observe_server_stream_outgoing_channel(
+                            transport,
+                            "project_inventory_status",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Success,
+                        ),
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            crate::runner_http::observe_server_stream_outgoing_channel(
+                                transport,
+                                "project_inventory_status",
+                                None,
+                                true,
+                                RunnerStreamMetricOutcome::Backpressure,
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            crate::runner_http::observe_server_stream_outgoing_channel(
+                                transport,
+                                "project_inventory_status",
+                                None,
+                                false,
+                                RunnerStreamMetricOutcome::Closed,
+                            );
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(

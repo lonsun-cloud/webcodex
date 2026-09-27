@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_normal_success_preserves_output_and_exit_code() {
@@ -42,6 +43,7 @@ fn runner_real_process_shell_job_normal_success_preserves_output_and_exit_code()
     );
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_timeout_kills_whole_tree() {
@@ -81,6 +83,7 @@ fn runner_real_process_shell_job_timeout_kills_whole_tree() {
     markers.assert_tree_dead("timeout");
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_stop_kills_whole_tree() {
@@ -121,6 +124,7 @@ fn runner_real_process_shell_job_stop_kills_whole_tree() {
     markers.assert_tree_dead("stop");
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_parent_exit_first_descendant_holds_pipe() {
@@ -177,7 +181,7 @@ fn runner_real_process_shell_job_parent_exit_first_descendant_holds_pipe() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_unix_graceful_sigterm_responsive_tree() {
@@ -214,7 +218,7 @@ fn runner_real_process_shell_job_unix_graceful_sigterm_responsive_tree() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_unix_sigterm_resistant_tree_escalates() {
@@ -256,6 +260,7 @@ fn runner_real_process_shell_job_unix_sigterm_resistant_tree_escalates() {
     markers.assert_tree_dead("resist");
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_repeated_stop_is_idempotent() {
@@ -306,6 +311,7 @@ fn runner_real_process_shell_job_repeated_stop_is_idempotent() {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns a real shell/process tree"]
 fn runner_real_process_shell_job_timeout_racing_stop_is_bounded() {

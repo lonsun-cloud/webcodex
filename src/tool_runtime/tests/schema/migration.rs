@@ -64,7 +64,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         json!({"action":"list","unknown":true}),
         json!({"action":"list","plugin":"repo-tools"}),
         json!({"action":"call","binding":"wc_pbind_bad","arguments":{}}),
-        json!({"action":"call","binding":"wc_pbind_00000000000000000000000000000000"}),
+        json!({"action":"call","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         json!({"action":"describe","runner":"runner-a","plugin":"repo-tools"}),
     ] {
         assert!(
@@ -76,7 +76,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         "plugin_tool",
         json!({
             "action":"call",
-            "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+            "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
             "arguments":{}
         }),
     )
@@ -136,25 +136,33 @@ fn tool_definition_metadata_fallback_facade_is_unknown_only() {
 }
 
 #[test]
-fn tool_definition_surface_counts_stay_fixed() {
+fn tool_definition_surface_counts_and_action_projection_stay_canonical() {
     use crate::tool_runtime::tool_definition::{lookup_tool_definition, model_hidden_tool_names};
 
     let openapi = crate::openapi::build_openapi_spec();
-    let openapi_operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(openapi_operation_count, 22, "OpenAPI operation count");
-
     let operation_ids = openapi["paths"]
         .as_object()
         .unwrap()
         .values()
         .flat_map(|methods| methods.as_object().unwrap().values())
         .map(|operation| operation["operationId"].as_str().unwrap())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let expected = webcodex_tool_contracts::gpt_action_direct_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .chain(std::iter::once(
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        ))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        operation_ids, expected,
+        "generic OpenAPI must derive from Adaptive Direct plus gateway"
+    );
+    assert!(
+        operation_ids.len() < 30,
+        "GPT Action operation budget exceeded"
+    );
+    assert!(openapi["components"].get("schemas").is_none());
     for forbidden in [
         "runCodex",
         "RunCodex",
@@ -164,46 +172,15 @@ fn tool_definition_surface_counts_stay_fixed() {
         "ApplyTextEdits",
         "artifactUpload",
         "ArtifactUpload",
+        "callRuntimeTool",
     ] {
         assert!(
             !operation_ids
                 .iter()
                 .any(|operation_id| operation_id.contains(forbidden)),
-            "{forbidden} must remain hidden/runtime-only and not become a dedicated GPT Action: {operation_ids:?}"
+            "retired GPT Action vocabulary leaked: {forbidden}: {operation_ids:?}"
         );
     }
-
-    let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .expect("ToolCallRequest properties");
-    for field in ["summary_only", "include_command_preview", "compact"] {
-        assert!(
-            tool_call_properties.contains_key(field),
-            "callRuntimeTool must keep flattened GPT Action field {field}"
-        );
-    }
-    assert!(
-        !tool_call_properties.contains_key("detail"),
-        "hidden start-only detail must not be published by callRuntimeTool"
-    );
-    for field in [
-        "expected_failure",
-        "expected_failure_kind",
-        "assertion_name",
-        "test_expect_failure_kind",
-    ] {
-        assert!(
-            !tool_call_properties.contains_key(field),
-            "callRuntimeTool model-facing schema must not publish testing metadata field {field}"
-        );
-    }
-    let tool_description = tool_call_properties["tool"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        !tool_description.contains("run_codex"),
-        "callRuntimeTool model-facing accepted-name description must not advertise run_codex"
-    );
 
     let model_facing_names = registered_tool_names();
     assert!(
@@ -256,15 +233,6 @@ fn current_session_tools_are_absent_from_all_discovery_surfaces() {
     }
 }
 
-#[test]
-fn tool_definition_dead_code_residue_is_narrow_and_documented() {
-    let source = include_str!("../../tool_definition.rs");
-    assert!(
-        !source.contains("#![allow(dead_code)]"),
-        "tool_definition.rs must not use a module-wide dead_code allowance"
-    );
-}
-
 fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
     let specs = registered_tool_specs();
     let spec_names = specs
@@ -293,13 +261,16 @@ fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
     );
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_description = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        [TOOL_CALL_TOOL_FIELD]["description"]
-        .as_str()
-        .expect("ToolCallRequest.tool description");
+    let action_ids = openapi["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|methods| methods.as_object().unwrap().values())
+        .filter_map(|operation| operation["operationId"].as_str())
+        .collect::<BTreeSet<_>>();
     assert!(
-        !tool_description.contains(name),
-        "{name} must not appear in callRuntimeTool accepted-name text"
+        !action_ids.contains(name),
+        "{name} must not appear as a direct GPT Action operation"
     );
 
     let runtime = test_runtime();

@@ -125,6 +125,13 @@ impl AuthContext {
         matches!(self.kind, AuthKind::ProjectCredential)
     }
 
+    /// Model/API credentials whose Runner visibility is constrained to one
+    /// ProjectGrant. Runner Agent Tokens deliberately do not participate: they
+    /// are transport credentials and are rejected from model/API surfaces.
+    pub(crate) fn is_project_scoped_model_subject(&self) -> bool {
+        self.is_project_credential() || self.is_oauth_project_subject()
+    }
+
     pub fn is_open_anonymous(&self) -> bool {
         matches!(self.kind, AuthKind::OpenAnonymous)
     }

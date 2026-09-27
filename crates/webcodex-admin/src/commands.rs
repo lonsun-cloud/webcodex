@@ -52,7 +52,7 @@ impl FlagParser {
 }
 
 pub fn is_admin_group(arg: &str) -> bool {
-    matches!(arg, "users" | "tokens" | "runner-tokens" | "agent-tokens")
+    matches!(arg, "users" | "tokens" | "runner-tokens")
 }
 
 pub fn usage() -> &'static str {
@@ -74,6 +74,11 @@ pub fn usage() -> &'static str {
 }
 
 pub fn parse_admin_cli(args: &[String]) -> Result<AdminCliCommand, String> {
+    if args.first().map(String::as_str) == Some("agent-tokens") {
+        return Err(
+            "webcodex agent-tokens was removed; use webcodex runner-tokens instead".to_string(),
+        );
+    }
     if args.len() < 2 {
         return Err(format!("missing admin subcommand\n{}", usage()));
     }
@@ -87,12 +92,10 @@ pub fn parse_admin_cli(args: &[String]) -> Result<AdminCliCommand, String> {
         ("tokens", "register-hash") => parse_tokens_register_hash(rest),
         ("tokens", "list") => parse_tokens_list(rest),
         ("tokens", "revoke") => parse_tokens_revoke(rest),
-        ("runner-tokens" | "agent-tokens", "create") => parse_runner_tokens_create(rest),
-        ("runner-tokens" | "agent-tokens", "register-hash") => {
-            parse_runner_tokens_register_hash(rest)
-        }
-        ("runner-tokens" | "agent-tokens", "list") => parse_runner_tokens_list(rest),
-        ("runner-tokens" | "agent-tokens", "revoke") => parse_runner_tokens_revoke(rest),
+        ("runner-tokens", "create") => parse_runner_tokens_create(rest),
+        ("runner-tokens", "register-hash") => parse_runner_tokens_register_hash(rest),
+        ("runner-tokens", "list") => parse_runner_tokens_list(rest),
+        ("runner-tokens", "revoke") => parse_runner_tokens_revoke(rest),
         _ => Err(format!(
             "unknown admin command: {} {}\n{}",
             group,

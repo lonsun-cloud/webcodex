@@ -17,8 +17,7 @@ const ACTIVITY_ID: &str = "tray.activity";
 const SETTINGS_ID: &str = "tray.settings";
 const RESUME_RUNTIME_ID: &str = "tray.resume_runtime";
 const STOP_RUNTIME_ID: &str = "tray.stop_runtime";
-const CONNECT_ID: &str = "tray.connect";
-const DISCONNECT_ID: &str = "tray.disconnect";
+const CONNECT_ID: &str = "tray.connections";
 const STOP_QUICK_SHARE_ID: &str = "tray.stop_quick_share";
 const CANCEL_OPERATION_PREFIX: &str = "tray.cancel_operation:";
 const LAUNCH_AT_LOGIN_ID: &str = "tray.launch_at_login";
@@ -48,8 +47,7 @@ enum RuntimeAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionAction {
-    Connect,
-    Disconnect,
+    Manage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,9 +84,8 @@ impl TrayProjection {
         } else {
             RuntimeStatus::NeedsAttention
         };
-        let tunnel_error = snapshot.regular_tunnel.as_ref().is_some_and(|tunnel| {
-            tunnel.status == crate::models::RegularTunnelStatus::Error
-        });
+        let tunnel_error =
+            snapshot.connections.running == 0 && snapshot.connections.needs_attention > 0;
         let observed_use = snapshot.readiness.runtime_ready
             && snapshot
                 .chatgpt_activity
@@ -100,11 +97,9 @@ impl TrayProjection {
             ConnectionStatus::NeedsAttention
         } else if observed_use {
             ConnectionStatus::ObservedUse
-        } else if snapshot.regular_tunnel.as_ref().is_some_and(|tunnel| {
-            tunnel.status == crate::models::RegularTunnelStatus::Ready && tunnel.ready_for_chatgpt
-        }) {
+        } else if snapshot.connections.running > 0 {
             ConnectionStatus::WaitingForChatGpt
-        } else if snapshot.regular_tunnel.is_some() {
+        } else if snapshot.connections.any_active() {
             ConnectionStatus::NeedsAttention
         } else {
             ConnectionStatus::NotConnected
@@ -118,17 +113,7 @@ impl TrayProjection {
         } else {
             None
         };
-        let connection_action = if local_full && snapshot.regular_tunnel.is_some() {
-            Some(ConnectionAction::Disconnect)
-        } else if local_full
-            && snapshot.readiness.runtime_ready
-            && snapshot.openai_tunnel_configured
-            && snapshot.regular_tunnel_available
-        {
-            Some(ConnectionAction::Connect)
-        } else {
-            None
-        };
+        let connection_action = local_full.then_some(ConnectionAction::Manage);
         let cancel_operation_id = snapshot
             .current_operation
             .as_ref()
@@ -302,8 +287,7 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     }
     if let Some(action) = projection.connection_action {
         let (id, text) = match action {
-            ConnectionAction::Connect => (CONNECT_ID, "Start OpenAI Secure Tunnel"),
-            ConnectionAction::Disconnect => (DISCONNECT_ID, "Stop OpenAI Secure Tunnel"),
+            ConnectionAction::Manage => (CONNECT_ID, "Connections…"),
         };
         let item = MenuItem::with_id(app, id, text, !projection.operation_busy, None::<&str>)?;
         if !has_context_action {
@@ -373,8 +357,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         RESUME_RUNTIME_ID => spawn_state_action(app, TrayStateAction::ResumeRuntime),
         STOP_RUNTIME_ID => spawn_state_action(app, TrayStateAction::StopRuntime),
-        CONNECT_ID => spawn_state_action(app, TrayStateAction::StartRegularTunnel),
-        DISCONNECT_ID => spawn_state_action(app, TrayStateAction::StopRegularTunnel),
+        CONNECT_ID => {
+            let _ = desktop_shell::navigate(app, NavigationTarget::Connections);
+        }
         STOP_QUICK_SHARE_ID => spawn_state_action(app, TrayStateAction::StopQuickShare),
         LAUNCH_AT_LOGIN_ID => match desktop_shell::launch_at_login_enabled(app) {
             Ok(current) => match desktop_shell::set_launch_at_login(app, !current) {
@@ -408,8 +393,6 @@ fn cancel_action_from_menu_id(id: &str) -> Option<TrayStateAction> {
 enum TrayStateAction {
     ResumeRuntime,
     StopRuntime,
-    StartRegularTunnel,
-    StopRegularTunnel,
     StopQuickShare,
     CancelOperation(String),
 }
@@ -421,8 +404,6 @@ fn spawn_state_action(app: &AppHandle, action: TrayStateAction) {
         let result = match action {
             TrayStateAction::ResumeRuntime => state.resume_saved_runtime().await,
             TrayStateAction::StopRuntime => state.stop_local_runtime().await,
-            TrayStateAction::StartRegularTunnel => state.start_regular_tunnel().await,
-            TrayStateAction::StopRegularTunnel => state.stop_regular_tunnel().await,
             TrayStateAction::StopQuickShare => state.stop_quick_share().await,
             // Keep the operation observed by the menu, even if a newer operation
             // starts before this task runs. AppState rejects stale IDs.
@@ -445,7 +426,7 @@ mod tests {
     use super::*;
     use crate::models::{
         ChatGptActivitySnapshot, DesktopOperationKind, DesktopOperationSnapshot, Exposure,
-        RegularTunnelState, RegularTunnelStatus, RunnerTopology, RuntimeTopology,
+        RunnerTopology, RuntimeTopology,
     };
 
     fn local_snapshot() -> DesktopStateSnapshot {
@@ -482,10 +463,7 @@ mod tests {
         assert_eq!(projection.runtime_status, RuntimeStatus::Ready);
         assert_eq!(projection.runtime_action, Some(RuntimeAction::Stop));
         assert_eq!(projection.connection_status, ConnectionStatus::NotConnected);
-        assert_eq!(
-            projection.connection_action,
-            Some(ConnectionAction::Connect)
-        );
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
@@ -502,7 +480,7 @@ mod tests {
         assert_eq!(projection.connection_status, ConnectionStatus::ObservedUse);
         assert_eq!(
             projection.connection_action,
-            Some(ConnectionAction::Connect),
+            Some(ConnectionAction::Manage),
             "observed use must not pretend Desktop owns a tunnel"
         );
     }
@@ -513,24 +491,18 @@ mod tests {
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Ready;
         snapshot.readiness.runtime_ready = true;
-        snapshot.regular_tunnel = Some(RegularTunnelState {
-            provider: "openai".to_string(),
-            status: RegularTunnelStatus::Ready,
-            clipboard_state: "copied".to_string(),
-            clipboard_contains: "tunnel_id".to_string(),
-            ready_for_chatgpt: true,
-        });
+        snapshot.connections.running = 2;
         snapshot.chatgpt_activity = Some(ChatGptActivitySnapshot {
             observed: true,
             last_meaningful_activity_at_ms: Some(1234),
         });
         let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
         assert_eq!(projection.connection_status, ConnectionStatus::ObservedUse);
-        assert_eq!(projection.connection_action, Some(ConnectionAction::Disconnect));
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
-    fn unconfigured_tunnel_does_not_offer_connect_action() {
+    fn unconfigured_tunnel_offers_connections_management_not_implicit_start() {
         let mut snapshot = local_snapshot();
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Ready;
@@ -538,7 +510,7 @@ mod tests {
         snapshot.openai_tunnel_configured = false;
         let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
         assert_eq!(projection.connection_status, ConnectionStatus::NotConnected);
-        assert_eq!(projection.connection_action, None);
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
@@ -551,25 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn locally_ready_tunnel_waits_for_chatgpt_and_offers_stop_action() {
+    fn locally_ready_connections_wait_for_chatgpt_and_offer_profile_management() {
         let mut snapshot = local_snapshot();
-        snapshot.regular_tunnel = Some(RegularTunnelState {
-            provider: "openai".into(),
-            status: RegularTunnelStatus::Ready,
-            clipboard_state: "copied".into(),
-            clipboard_contains: "tunnel_id".into(),
-            ready_for_chatgpt: true,
-        });
+        snapshot.connections.running = 2;
         snapshot.readiness.ready_for_chatgpt = false;
         let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
         assert_eq!(
             projection.connection_status,
             ConnectionStatus::WaitingForChatGpt
         );
-        assert_eq!(
-            projection.connection_action,
-            Some(ConnectionAction::Disconnect)
-        );
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]

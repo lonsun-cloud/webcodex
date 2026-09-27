@@ -24,6 +24,7 @@
 
 use crate::client_window::ClientWindow;
 use crate::config::ToolRequestTraceMode;
+use crate::json_digest::update_sha256_with_json;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -199,6 +200,16 @@ pub(crate) fn current_full_trace_ref() -> Option<String> {
     full_trace_enabled().then(current_active_trace_id).flatten()
 }
 
+fn json_sha256_or_empty<T: Serialize + ?Sized>(value: &T) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if update_sha256_with_json(&mut hasher, value).is_err() {
+        // Preserve the historical `to_vec(...).unwrap_or_default()` fallback:
+        // serialization failure hashes an empty byte sequence, never a partial one.
+        hasher = Sha256::new();
+    }
+    hasher.finalize().into()
+}
+
 /// Safe JSON-RPC id summary: type + length + short digest. Never the raw string.
 pub fn jsonrpc_id_safe(id: Option<&serde_json::Value>) -> String {
     use serde_json::Value;
@@ -219,8 +230,7 @@ pub fn jsonrpc_id_safe(id: Option<&serde_json::Value>) -> String {
             )
         }
         Some(Value::Array(a)) => {
-            let raw = serde_json::to_vec(a).unwrap_or_default();
-            let digest = Sha256::digest(&raw);
+            let digest = json_sha256_or_empty(a);
             format!(
                 "array:len={}:sha256_8={:02x}{:02x}{:02x}{:02x}",
                 a.len(),
@@ -231,8 +241,7 @@ pub fn jsonrpc_id_safe(id: Option<&serde_json::Value>) -> String {
             )
         }
         Some(Value::Object(o)) => {
-            let raw = serde_json::to_vec(o).unwrap_or_default();
-            let digest = Sha256::digest(&raw);
+            let digest = json_sha256_or_empty(o);
             format!(
                 "object:keys={}:sha256_8={:02x}{:02x}{:02x}{:02x}",
                 o.len(),
@@ -249,11 +258,11 @@ pub fn jsonrpc_id_safe(id: Option<&serde_json::Value>) -> String {
 ///
 /// Returns `None` when tracing is disabled so callers never pay for a size-only
 /// serialization of the response body.
-pub fn estimate_json_bytes(value: &serde_json::Value) -> Option<usize> {
+pub fn estimate_json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Option<usize> {
     if !tool_request_trace_enabled() {
         return None;
     }
-    serde_json::to_vec(value).ok().map(|bytes| bytes.len())
+    crate::json_measurement::serialized_json_len(value).ok()
 }
 
 fn now_ts() -> i64 {
@@ -1275,7 +1284,7 @@ fn persist_payload(
     )
 }
 
-fn capture_payload_for_trace(trace_id: &str, phase: &str, value: &Value) {
+fn capture_owned_payload_for_trace(trace_id: &str, phase: &str, value: Value) {
     if !full_trace_enabled() {
         return;
     }
@@ -1283,13 +1292,20 @@ fn capture_payload_for_trace(trace_id: &str, phase: &str, value: &Value) {
         TraceWrite::Payload {
             trace_id: trace_id.to_string(),
             phase: phase.to_string(),
-            value: value.clone(),
+            value,
             event: base_event(trace_id, "tool_trace_payload_captured"),
             config: trace_store_config(),
         },
         trace_id,
         phase,
     );
+}
+
+fn capture_payload_for_trace(trace_id: &str, phase: &str, value: &Value) {
+    if !full_trace_enabled() {
+        return;
+    }
+    capture_owned_payload_for_trace(trace_id, phase, value.clone());
 }
 
 fn correlations() -> &'static Mutex<TraceCorrelations> {
@@ -1351,7 +1367,7 @@ pub(crate) fn record_runner_request_enqueued<T: Serialize>(
     };
     if full_trace_enabled() {
         match serde_json::to_value(request_payload) {
-            Ok(value) => capture_payload_for_trace(&trace_id, "runner_request", &value),
+            Ok(value) => capture_owned_payload_for_trace(&trace_id, "runner_request", value),
             Err(error) => tracing::warn!(
                 event = "tool_trace_capture_failed",
                 server_trace_id = %trace_id,
@@ -1452,10 +1468,13 @@ pub(crate) fn capture_runner_result<T: Serialize>(request_id: &str, payload: &T)
     let Some(correlation) = lookup_request_correlation(request_id) else {
         return;
     };
+    if !full_trace_enabled() {
+        return;
+    }
     match serde_json::to_value(payload) {
         Ok(value) => {
-            let value = runner_result_trace_payload(&correlation.runner_kind, &value);
-            capture_payload_for_trace(&correlation.trace_id, "runner_result", &value)
+            let value = runner_result_trace_payload(&correlation.runner_kind, value);
+            capture_owned_payload_for_trace(&correlation.trace_id, "runner_result", value)
         }
         Err(error) => tracing::warn!(
             event = "tool_trace_capture_failed",
@@ -1467,9 +1486,9 @@ pub(crate) fn capture_runner_result<T: Serialize>(request_id: &str, payload: &T)
     }
 }
 
-fn runner_result_trace_payload(kind: &str, payload: &Value) -> Value {
+fn runner_result_trace_payload(kind: &str, payload: Value) -> Value {
     if kind != "ssh_resource" {
-        return payload.clone();
+        return payload;
     }
     let result = payload.get("result");
     json!({
@@ -1518,8 +1537,13 @@ pub(crate) fn capture_runner_job_update<T: Serialize>(
     let Some(correlation) = lookup_job_correlation(request_id, job_id) else {
         return;
     };
+    if !full_trace_enabled() {
+        return;
+    }
     match serde_json::to_value(payload) {
-        Ok(value) => capture_payload_for_trace(&correlation.trace_id, "runner_job_update", &value),
+        Ok(value) => {
+            capture_owned_payload_for_trace(&correlation.trace_id, "runner_job_update", value)
+        }
         Err(error) => tracing::warn!(
             event = "tool_trace_capture_failed",
             server_trace_id = %correlation.trace_id,
@@ -1560,10 +1584,32 @@ pub struct ToolRequestLifecycle {
     method: String,
     tool_name: Option<String>,
     client_window: Option<ClientWindow>,
+    app_call_id: Option<String>,
     suppress_payload_capture: bool,
     request_observed_at_ms: i64,
     started: Instant,
     completed: AtomicBool,
+}
+
+fn tool_suppresses_payload_capture(tool_name: Option<&str>) -> bool {
+    matches!(
+        tool_name,
+        Some(
+            "read_tool_trace"
+                | "agent_continuation_bind"
+                | "agent_continuation_recover_endpoint"
+                | "agent_continuation_state"
+                | "agent_continuation_wake_acquire"
+                | "agent_continuation_wake_prepare"
+                | "agent_continuation_wake_finish"
+                | "agent_continuation_unbind"
+                | "job_terminal_continuation_bind"
+                | "job_terminal_continuation_state"
+                | "job_terminal_continuation_prepare"
+                | "job_terminal_continuation_finish"
+                | "job_terminal_continuation_unbind"
+        )
+    )
 }
 
 impl ToolRequestLifecycle {
@@ -1574,7 +1620,7 @@ impl ToolRequestLifecycle {
         method: impl Into<String>,
         tool_name: Option<String>,
     ) -> Self {
-        let suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        let suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
         let request_observed_at_ms = chrono::Utc::now().timestamp_millis();
         Self {
             prefix,
@@ -1584,6 +1630,7 @@ impl ToolRequestLifecycle {
             method: method.into(),
             tool_name,
             client_window: None,
+            app_call_id: None,
             suppress_payload_capture,
             request_observed_at_ms,
             started: Instant::now(),
@@ -1616,12 +1663,21 @@ impl ToolRequestLifecycle {
         }
     }
 
+    pub fn capture_payload_lazy<F>(&self, phase: &str, build: F)
+    where
+        F: FnOnce() -> Value,
+    {
+        if self.full_enabled() && !self.suppress_payload_capture {
+            capture_owned_payload_for_trace(&self.trace_id, phase, build());
+        }
+    }
+
     pub fn set_method(&mut self, method: impl Into<String>) {
         self.method = method.into();
     }
 
     pub fn set_tool_name(&mut self, tool_name: Option<String>) {
-        self.suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        self.suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
         self.tool_name = tool_name;
     }
 
@@ -1634,6 +1690,13 @@ impl ToolRequestLifecycle {
     /// identifier so tracing cannot become another opaque-identity parser.
     pub(crate) fn set_client_window(&mut self, window: Option<&ClientWindow>) {
         self.client_window = window.cloned();
+    }
+
+    /// Attach one bounded App-generated correlation id for diagnostics only.
+    /// The MCP adapter validates and strips this field before ToolRuntime parsing;
+    /// it is never authority and never contains Agent, Endpoint, Wake, or binding ids.
+    pub(crate) fn set_app_call_id(&mut self, app_call_id: Option<String>) {
+        self.app_call_id = app_call_id;
     }
 
     pub fn duration_ms(&self) -> u64 {
@@ -1710,6 +1773,7 @@ impl ToolRequestLifecycle {
             tool_name = self.tool_name.as_deref().unwrap_or("-"),
             client_window_key = self.client_window.as_ref().map(ClientWindow::key).unwrap_or("-"),
             client_window_source = self.client_window.as_ref().map(ClientWindow::source).unwrap_or("-"),
+            app_call_id = self.app_call_id.as_deref().unwrap_or("-"),
             duration_ms,
             estimated_json_bytes = estimated_json_bytes.map(|b| b as i64).unwrap_or(-1),
             http_status = http_status.map(|s| s as i32).unwrap_or(-1),
@@ -1733,6 +1797,7 @@ impl ToolRequestLifecycle {
                     "tool_name": self.tool_name.as_deref(),
                     "client_window_key": self.client_window.as_ref().map(ClientWindow::key),
                     "client_window_source": self.client_window.as_ref().map(ClientWindow::source),
+                    "app_call_id": self.app_call_id.as_deref(),
                     "duration_ms": duration_ms,
                     "estimated_json_bytes": estimated_json_bytes,
                     "http_status": http_status,
@@ -1846,6 +1911,7 @@ impl Drop for ToolRequestLifecycle {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn payload_files(root: &Path, trace_id: &str) -> Vec<PathBuf> {
         let payload_dir = root.join(trace_id).join("payloads");
@@ -1862,6 +1928,21 @@ mod tests {
 
     fn event_line_len(event: &Value) -> u64 {
         serde_json::to_vec(event).unwrap().len() as u64 + 1
+    }
+
+    struct CountingSerialize<'a> {
+        calls: &'a AtomicUsize,
+        value: Value,
+    }
+
+    impl serde::Serialize for CountingSerialize<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            serde::Serialize::serialize(&self.value, serializer)
+        }
     }
 
     #[test]
@@ -1925,13 +2006,79 @@ mod tests {
     }
 
     #[test]
+    fn jsonrpc_id_safe_streaming_digest_matches_buffered_json() {
+        for value in [
+            json!(["quote=\"", "slash=\\", "Unicode 你好 🦀", {"nested": [1, 2, 3]}]),
+            json!({
+                "escaped": "line\nnext\tvalue",
+                "unicode": "日本語 🌍",
+                "nested": {"array": [null, true, 42]}
+            }),
+        ] {
+            let raw = serde_json::to_vec(&value).unwrap();
+            let digest = Sha256::digest(&raw);
+            let expected = match &value {
+                Value::Array(values) => format!(
+                    "array:len={}:sha256_8={:02x}{:02x}{:02x}{:02x}",
+                    values.len(),
+                    digest[0],
+                    digest[1],
+                    digest[2],
+                    digest[3]
+                ),
+                Value::Object(values) => format!(
+                    "object:keys={}:sha256_8={:02x}{:02x}{:02x}{:02x}",
+                    values.len(),
+                    digest[0],
+                    digest[1],
+                    digest[2],
+                    digest[3]
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(jsonrpc_id_safe(Some(&value)), expected);
+        }
+    }
+
+    #[test]
     fn estimate_json_bytes_is_none_when_trace_disabled() {
         let mut env = crate::test_support::TestEnvGuard::new();
+        let calls = AtomicUsize::new(0);
+        let measured = CountingSerialize {
+            calls: &calls,
+            value: json!({"escaped": "line\n\"quoted\"", "unicode": "你好"}),
+        };
+
         env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
-        assert!(estimate_json_bytes(&json!({"a": 1})).is_none());
+        assert!(estimate_json_bytes(&measured).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
         env.set("WEBCODEX_TOOL_REQUEST_TRACE", "true");
-        assert!(estimate_json_bytes(&json!({"a": 1})).is_some());
+        assert_eq!(
+            estimate_json_bytes(&measured),
+            Some(serde_json::to_vec(&measured.value).unwrap().len())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
+    }
+
+    #[test]
+    fn job_terminal_app_tools_suppress_full_payload_capture() {
+        for name in [
+            "job_terminal_continuation_bind",
+            "job_terminal_continuation_state",
+            "job_terminal_continuation_prepare",
+            "job_terminal_continuation_finish",
+            "job_terminal_continuation_unbind",
+        ] {
+            assert!(
+                tool_suppresses_payload_capture(Some(name)),
+                "{name} must not persist App-private binding/message payloads in full traces"
+            );
+        }
+        assert!(!tool_suppresses_payload_capture(Some(
+            "present_job_terminal_continuation"
+        )));
     }
 
     #[test]
@@ -1952,6 +2099,94 @@ mod tests {
         );
         guard.capture_payload("raw_arguments", &json!({"content": "private"}));
         assert!(!temp.path().join("trace-metadata").exists());
+    }
+
+    #[test]
+    fn lazy_payload_capture_only_materializes_unsuppressed_full_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+
+        env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
+        let off_calls = AtomicUsize::new(0);
+        let off = ToolRequestLifecycle::new(
+            "mcp",
+            "trace-lazy-off".into(),
+            "none",
+            "tools/call",
+            Some("write_project_file".into()),
+        );
+        off.capture_payload_lazy("raw_arguments", || {
+            off_calls.fetch_add(1, Ordering::SeqCst);
+            json!({"mode": "off"})
+        });
+        assert_eq!(off_calls.load(Ordering::SeqCst), 0);
+        drop(off);
+
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "true");
+        let metadata_calls = AtomicUsize::new(0);
+        let metadata = ToolRequestLifecycle::new(
+            "mcp",
+            "trace-lazy-metadata".into(),
+            "none",
+            "tools/call",
+            Some("write_project_file".into()),
+        );
+        metadata.capture_payload_lazy("raw_arguments", || {
+            metadata_calls.fetch_add(1, Ordering::SeqCst);
+            json!({"mode": "metadata"})
+        });
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 0);
+        drop(metadata);
+
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+
+        let full_calls = AtomicUsize::new(0);
+        let expected = json!({"mode": "full", "nested": [1, 2, 3]});
+        let full = ToolRequestLifecycle::new(
+            "mcp",
+            "trace-lazy-full".into(),
+            "none",
+            "tools/call",
+            Some("write_project_file".into()),
+        );
+        full.capture_payload_lazy("raw_arguments", || {
+            full_calls.fetch_add(1, Ordering::SeqCst);
+            expected.clone()
+        });
+        assert_eq!(full_calls.load(Ordering::SeqCst), 1);
+        drop(full);
+        flush_full_trace_writer();
+        let payload = payload_files(temp.path(), "trace-lazy-full")
+            .into_iter()
+            .next()
+            .expect("full lazy trace payload");
+        let compressed = fs::read(payload).unwrap();
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), expected);
+
+        let suppressed_calls = AtomicUsize::new(0);
+        let mut suppressed = ToolRequestLifecycle::new(
+            "mcp",
+            "trace-lazy-suppressed".into(),
+            "none",
+            "tools/call",
+            Some("call_runtime_tool".into()),
+        );
+        suppressed.set_tool_name(Some("read_tool_trace".into()));
+        suppressed.capture_payload_lazy("effective_arguments", || {
+            suppressed_calls.fetch_add(1, Ordering::SeqCst);
+            json!({"trace_ref": "must-not-materialize"})
+        });
+        assert_eq!(suppressed_calls.load(Ordering::SeqCst), 0);
+        drop(suppressed);
+        flush_full_trace_writer();
+        assert!(payload_files(temp.path(), "trace-lazy-suppressed").is_empty());
     }
 
     #[test]
@@ -2038,7 +2273,7 @@ mod tests {
             Some("write_project_file".into()),
         );
         let payload = json!({
-            "ack_session_context_revision": 42,
+            "ack_session_message_ids": ["wc_msg_abcd-efgh_ijklmn"],
             "content": "large-body-".repeat(100_000),
         });
         guard.capture_payload("raw_arguments", &payload);
@@ -2159,6 +2394,62 @@ mod tests {
     }
 
     #[test]
+    fn agent_continuation_app_lifecycle_never_captures_host_binding_or_resume_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+
+        for tool_name in [
+            "agent_continuation_bind",
+            "agent_continuation_recover_endpoint",
+            "agent_continuation_state",
+            "agent_continuation_wake_acquire",
+            "agent_continuation_wake_prepare",
+            "agent_continuation_wake_finish",
+            "agent_continuation_unbind",
+        ] {
+            let trace_id = Uuid::new_v4().to_string();
+            let mut guard = ToolRequestLifecycle::new(
+                "mcp",
+                trace_id.clone(),
+                "none",
+                "tools/call",
+                Some(tool_name.to_string()),
+            );
+            guard.set_app_call_id(Some("wc_app_call_0123456789abcdef_1".to_string()));
+            guard.parsed("ok");
+            guard.capture_payload(
+                "raw_request",
+                &json!({"binding_id": "wc_host_binding_PRIVATE", "consume_token": "PRIVATE"}),
+            );
+            guard.capture_payload(
+                "final_response",
+                &json!({"structuredContent": {"success": true, "output": {
+                    "app_protocol": {"automatic_message": "consume_token=wc_wake_consume_PRIVATE_RESUME_ENVELOPE"}
+                }}}),
+            );
+            drop(guard);
+            flush_full_trace_writer();
+            assert!(
+                payload_files(temp.path(), &trace_id).is_empty(),
+                "{tool_name} must suppress forensic payload capture"
+            );
+            let events = fs::read_to_string(temp.path().join(&trace_id).join("events.jsonl"))
+                .expect("continuation trace metadata");
+            assert!(events.contains("wc_app_call_0123456789abcdef_1"));
+            assert!(events.contains("mcp_tool_request_parsed"));
+            assert!(!events.contains("wc_host_binding_PRIVATE"));
+            assert!(!events.contains("PRIVATE_RESUME_ENVELOPE"));
+        }
+    }
+
+    #[test]
     fn full_mode_capture_does_not_wait_for_trace_io_lock() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = crate::test_support::TestEnvGuard::new();
@@ -2179,7 +2470,7 @@ mod tests {
                 "trace-background-writer".into(),
                 "none",
                 "tools/call",
-                Some("read_file".into()),
+                Some("read_files".into()),
             );
             guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
             let _ = done_tx.send(());
@@ -2214,7 +2505,7 @@ mod tests {
             "trace-fail-open".into(),
             "-",
             "POST /api/tools/call",
-            Some("read_file".into()),
+            Some("read_files".into()),
         );
         guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
         drop(guard);
@@ -2649,6 +2940,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_payload_serialization_is_full_trace_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+        let metadata_trace_id = format!("trace-runner-metadata-{}", Uuid::new_v4());
+        let metadata_request_id = format!("request-metadata-{}", Uuid::new_v4());
+        let metadata_job_id = format!("job-metadata-{}", Uuid::new_v4());
+
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "true");
+        let metadata_guard = ToolRequestLifecycle::new(
+            "mcp",
+            metadata_trace_id,
+            "none",
+            "tools/call",
+            Some("run_process".into()),
+        );
+        scope_active_trace(metadata_guard.active_trace_id(), async {
+            record_runner_request_enqueued(
+                &json!({"kind": "run_process"}),
+                &metadata_request_id,
+                "runner-metadata",
+                "run_process",
+                Some(&metadata_job_id),
+                None,
+                None,
+                None,
+                None,
+            );
+        })
+        .await;
+        assert!(lookup_request_correlation(&metadata_request_id).is_some());
+        assert!(lookup_job_correlation(Some(&metadata_request_id), &metadata_job_id).is_some());
+
+        let metadata_calls = AtomicUsize::new(0);
+        let metadata_payload = CountingSerialize {
+            calls: &metadata_calls,
+            value: json!({"exit_code": 0, "stdout": "metadata"}),
+        };
+        capture_runner_result(&metadata_request_id, &metadata_payload);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 0);
+        capture_runner_job_update(
+            Some(&metadata_request_id),
+            &metadata_job_id,
+            &metadata_payload,
+        );
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 0);
+        finalize_runner_job_correlation(Some(&metadata_request_id), &metadata_job_id);
+        drop(metadata_guard);
+
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+        let full_trace_id = format!("trace-runner-full-{}", Uuid::new_v4());
+        let full_request_id = format!("request-full-{}", Uuid::new_v4());
+        let full_job_id = format!("job-full-{}", Uuid::new_v4());
+        let full_guard = ToolRequestLifecycle::new(
+            "mcp",
+            full_trace_id.clone(),
+            "none",
+            "tools/call",
+            Some("run_process".into()),
+        );
+        scope_active_trace(full_guard.active_trace_id(), async {
+            record_runner_request_enqueued(
+                &json!({"kind": "run_process"}),
+                &full_request_id,
+                "runner-full",
+                "run_process",
+                Some(&full_job_id),
+                None,
+                None,
+                None,
+                None,
+            );
+        })
+        .await;
+
+        let full_calls = AtomicUsize::new(0);
+        let full_payload = CountingSerialize {
+            calls: &full_calls,
+            value: json!({"exit_code": 0, "stdout": "full"}),
+        };
+        capture_runner_result(&full_request_id, &full_payload);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 1);
+        capture_runner_job_update(Some(&full_request_id), &full_job_id, &full_payload);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 2);
+        finalize_runner_job_correlation(Some(&full_request_id), &full_job_id);
+        drop(full_guard);
+        flush_full_trace_writer();
+
+        let events =
+            fs::read_to_string(temp.path().join(&full_trace_id).join("events.jsonl")).unwrap();
+        for phase in ["runner_result", "runner_job_update"] {
+            let relative = events
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|event| {
+                    event["event"] == "tool_trace_payload_captured" && event["phase"] == phase
+                })
+                .and_then(|event| event["payload_path"].as_str().map(str::to_string))
+                .unwrap_or_else(|| panic!("missing trace payload phase {phase}"));
+            let compressed = fs::read(temp.path().join(&full_trace_id).join(relative)).unwrap();
+            let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&raw).unwrap(),
+                json!({"exit_code": 0, "stdout": "full"})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn runner_correlation_survives_original_dispatch_scope() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = crate::test_support::TestEnvGuard::new();
@@ -2721,7 +3126,7 @@ mod tests {
             },
             "command_execution_state": "completed"
         });
-        let sanitized = runner_result_trace_payload("ssh_resource", &payload);
+        let sanitized = runner_result_trace_payload("ssh_resource", payload.clone());
         let serialized = serde_json::to_string(&sanitized).unwrap();
         assert!(!serialized.contains(target));
         assert_eq!(sanitized["kind"], "ssh_resource");
@@ -2731,7 +3136,7 @@ mod tests {
         assert_eq!(sanitized["exit_code"], 0);
 
         assert_eq!(
-            runner_result_trace_payload("run_process", &payload),
+            runner_result_trace_payload("run_process", payload.clone()),
             payload
         );
     }

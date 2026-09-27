@@ -5,13 +5,12 @@ use super::helpers::{
     bounded_tail, command_failed_message, command_outcome_unknown_message,
     command_rejected_message, command_timeout_message, explicit_shell_dispatch_command,
     looks_like_command_timeout, project_relative_runner_cwd, resolve_runner_cwd,
-    resolve_sync_timeout_secs, sync_timeout_out_of_range_result, validate_raw_shell_command_length,
-    COMMAND_STDIO_TAIL_CHARS, DEFAULT_RUN_SHELL_TIMEOUT_SECS, MAX_SYNC_TIMEOUT_SECS,
+    validate_raw_shell_command_length, COMMAND_STDIO_TAIL_CHARS, MAX_SYNC_TIMEOUT_SECS,
     MIN_SYNC_TIMEOUT_SECS,
 };
 use super::process::add_structured_continuation_facts;
 use super::structured_execution::{
-    await_hidden_structured_job, HiddenStructuredJobWait, STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
+    await_hidden_structured_job, HiddenStructuredJobWait, StructuredExecutionBudget,
 };
 use super::tool_result::ToolResult;
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
@@ -27,6 +26,8 @@ pub(crate) struct ProjectCommandOutput {
     pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
     pub(crate) duration_ms: u64,
     pub(crate) error: Option<String>,
     pub(crate) execution_state: ShellCommandExecutionState,
@@ -187,6 +188,11 @@ impl ToolRuntime {
             || lower.contains("unknown_project")
         {
             "agent_offline"
+        } else if lower.contains("capability_unavailable")
+            || lower.contains("agent_capability_unavailable")
+            || lower.contains("does not support")
+        {
+            "capability_unavailable"
         } else if lower.contains("permission")
             || lower.contains("denied")
             || lower.contains("outside")
@@ -259,6 +265,7 @@ impl ToolRuntime {
             self.runner_registry
                 .enqueue_run(
                     ShellRunRequest {
+                        login: false,
                         client_id,
                         cwd: effective_cwd,
                         command,
@@ -279,6 +286,8 @@ impl ToolRuntime {
                     exit_code,
                     stdout: response.stdout.unwrap_or_default(),
                     stderr,
+                    stdout_truncated: response.stdout_truncated,
+                    stderr_truncated: response.stderr_truncated,
                     duration_ms: response.duration_ms.unwrap_or_default(),
                     execution_state,
                     error: response.error,
@@ -294,6 +303,8 @@ impl ToolRuntime {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: 0,
                     error: Some(
                         if execution_state == ShellCommandExecutionState::NotStarted {
@@ -317,6 +328,8 @@ impl ToolRuntime {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: wait_timeout.saturating_mul(1_000),
                     error: Some(format!(
                         "timed out waiting {wait_timeout} seconds for agent shell result"
@@ -400,7 +413,7 @@ impl ToolRuntime {
         timeout_secs: Option<u64>,
         cwd: Option<String>,
     ) -> ToolResult {
-        self.run_shell_with_contract(project, command, timeout_secs, cwd, None, None)
+        self.run_shell_with_contract(project, command, timeout_secs, None, cwd, None, None)
             .await
     }
 
@@ -410,6 +423,7 @@ impl ToolRuntime {
         project: String,
         command: String,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         cwd: Option<String>,
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
@@ -418,9 +432,11 @@ impl ToolRuntime {
             project,
             command,
             timeout_secs,
+            sync_wait_secs,
             cwd,
             purpose,
             shell,
+            false,
             None,
             None,
             None,
@@ -434,13 +450,22 @@ impl ToolRuntime {
         project: String,
         command: String,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         cwd: Option<String>,
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
+        login: bool,
         ssh_resource: Option<&str>,
         session_id: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if login && (shell != Some(ExecutionShell::Bash) || ssh_resource.is_some()) {
+            return Self::run_shell_tool_failure_result(
+                "run_shell login=true requires local shell=bash".to_string(),
+                "invalid_arguments",
+                ShellCommandExecutionState::NotStarted,
+            );
+        }
         if let Err(error) = validate_raw_shell_command_length(&command) {
             return Self::run_shell_tool_failure_result(
                 command_rejected_message(
@@ -451,16 +476,43 @@ impl ToolRuntime {
                 ShellCommandExecutionState::NotStarted,
             );
         }
-        let timeout = match resolve_sync_timeout_secs(timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS)
-        {
-            Ok(timeout) => timeout,
-            Err(_) => {
-                return sync_timeout_out_of_range_result(
-                    "run_shell",
-                    DEFAULT_RUN_SHELL_TIMEOUT_SECS,
+        let budget = match StructuredExecutionBudget::resolve_with_sync_wait(
+            timeout_secs,
+            sync_wait_secs,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                return Self::run_shell_tool_failure_result(
+                    command_rejected_message(
+                        format!("run_shell {error}"),
+                        "pass positive timeout_secs/sync_wait_secs values or omit them for defaults; oversized values are clamped to the shared structured-execution ceilings.",
+                    ),
+                    "invalid_arguments",
+                    ShellCommandExecutionState::NotStarted,
                 )
             }
         };
+        let timeout = budget.effective_timeout_secs;
+        if ssh_resource.is_some() && sync_wait_secs.is_some() {
+            return Self::run_shell_tool_failure_result(
+                command_rejected_message(
+                    "named Session SSH resources do not support sync_wait_secs because remote shell execution has no Runner-owned durable Job handoff",
+                    "omit sync_wait_secs for direct SSH execution, or use Runner-host run_shell when same-execution Job handoff is required.",
+                ),
+                "unsupported_resource",
+                ShellCommandExecutionState::NotStarted,
+            );
+        }
+        if ssh_resource.is_some() && timeout > MAX_SYNC_TIMEOUT_SECS {
+            return Self::run_shell_tool_failure_result(
+                command_rejected_message(
+                    format!("named Session SSH run_shell supports at most {MAX_SYNC_TIMEOUT_SECS}s total runtime because remote durable shell handoff is unavailable"),
+                    "request a direct SSH timeout within the supported ceiling; remote durable shell execution is not provided by run_shell.",
+                ),
+                "capability_unavailable",
+                ShellCommandExecutionState::NotStarted,
+            );
+        }
         let proj = match self.resolve_project(&project).await {
             Ok(p) => p,
             Err(e) => {
@@ -521,41 +573,99 @@ impl ToolRuntime {
                 ShellCommandExecutionState::NotStarted,
             );
         }
-        let actual_shell = shell
-            .map(ExecutionShell::as_str)
-            .unwrap_or(if ssh_resource.is_some() {
-                "remote"
-            } else {
-                "configured"
-            });
-        let dispatched_command =
-            match shell {
-                Some(shell) => match explicit_shell_dispatch_command(&command, shell.as_str()) {
+        let actual_shell = if login {
+            "bash_login"
+        } else {
+            shell
+                .map(ExecutionShell::as_str)
+                .unwrap_or(if ssh_resource.is_some() {
+                    "remote"
+                } else {
+                    "configured"
+                })
+        };
+        let dispatched_command = match (ssh_resource, shell) {
+            // Named SSH keeps the existing remote-login-shell compatibility
+            // wrapper. Local explicit shells are selected structurally by the
+            // Runner, so never expose this POSIX wrapper to configured PowerShell.
+            (Some(_), Some(shell)) => {
+                match explicit_shell_dispatch_command(&command, shell.as_str()) {
                     Ok(command) => command,
-                    Err(error) => return Self::run_shell_tool_failure_result(
+                    Err(error) => {
+                        return Self::run_shell_tool_failure_result(
+                            command_rejected_message(
+                                error,
+                                "use run_script for substantially larger typed program text.",
+                            ),
+                            "runtime_error",
+                            ShellCommandExecutionState::NotStarted,
+                        )
+                    }
+                }
+            }
+            _ => command.clone(),
+        };
+        let handoff_requested = ssh_resource.is_none() && timeout > budget.sync_wait_secs;
+        let async_handoff_available = if handoff_requested {
+            let features = match self
+                .runner_registry
+                .get_runner_feature_set(&client_id)
+                .await
+            {
+                Ok(features) => features,
+                Err(error) => {
+                    let mut result = Self::run_shell_tool_failure_result(
                         command_rejected_message(
                             error,
-                            "use run_script for large or quote-dense explicit-shell program text.",
+                            "confirm the Runner is registered and connected, then retry; the command was not started.",
                         ),
-                        "runtime_error",
+                        "agent_offline",
                         ShellCommandExecutionState::NotStarted,
-                    ),
-                },
-                None => command.clone(),
+                    );
+                    add_structured_continuation_facts(
+                        &mut result,
+                        timeout,
+                        budget.sync_wait_secs,
+                        false,
+                    );
+                    decorate_execution_output(
+                        &mut result.output,
+                        declared_purpose,
+                        &command_summary,
+                        &resolved_cwd,
+                        actual_shell,
+                        "agent",
+                    );
+                    return result;
+                }
             };
-        let async_handoff_available =
-            if timeout > DEFAULT_RUN_SHELL_TIMEOUT_SECS && ssh_resource.is_none() {
-                self.runner_registry
-                    .get_runner_feature_set(&client_id)
-                    .await
-                    .is_ok_and(|features| {
-                        features.supports(RunnerFeature::Shell)
-                            && (features.supports(RunnerFeature::AsyncJobs)
-                                || features.supports(RunnerFeature::AsyncShellJobs))
-                    })
-            } else {
-                false
-            };
+            features.supports(RunnerFeature::Shell)
+                && shell.is_none_or(|_| features.supports(RunnerFeature::ExplicitShellSelection))
+                && (features.supports(RunnerFeature::AsyncJobs)
+                    || features.supports(RunnerFeature::AsyncShellJobs))
+        } else {
+            false
+        };
+        if handoff_requested && !async_handoff_available && timeout > MAX_SYNC_TIMEOUT_SECS {
+            let mut result = Self::run_shell_tool_failure_result(
+                command_rejected_message(
+                    format!("capability_unavailable: this Runner cannot preserve the requested {timeout}s run_shell lifetime because durable shell Job handoff is unavailable"),
+                    format!("use a Runner advertising durable shell Jobs or keep timeout_secs <= {MAX_SYNC_TIMEOUT_SECS}; the command was not started."),
+                ),
+                "capability_unavailable",
+                ShellCommandExecutionState::NotStarted,
+            );
+            add_structured_continuation_facts(&mut result, timeout, budget.sync_wait_secs, false);
+            decorate_execution_output(
+                &mut result.output,
+                declared_purpose,
+                &command_summary,
+                &resolved_cwd,
+                actual_shell,
+                "agent",
+            );
+            return result;
+        }
         if async_handoff_available {
             let job = self
                 .runner_registry
@@ -565,6 +675,7 @@ impl ToolRuntime {
                         client_id: Some(client_id.clone()),
                         cwd: effective_cwd.clone(),
                         command: Some(dispatched_command.clone()),
+                        login,
                         timeout_secs: Some(timeout),
                         job_id: None,
                         since_stdout_line: None,
@@ -580,6 +691,7 @@ impl ToolRuntime {
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
+                        explicit_shell: if ssh_resource.is_none() { shell } else { None },
                         visibility: ShellJobVisibility::HiddenUntilHandoff,
                         ..Default::default()
                     },
@@ -601,7 +713,7 @@ impl ToolRuntime {
                     add_structured_continuation_facts(
                         &mut result,
                         timeout,
-                        STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
+                        budget.sync_wait_secs,
                         true,
                     );
                     decorate_execution_output(
@@ -617,7 +729,7 @@ impl ToolRuntime {
             };
             let wait = self
                 .structured_execution_sync_wait
-                .min(Duration::from_secs(STRUCTURED_EXECUTION_SYNC_WAIT_SECS));
+                .min(Duration::from_secs(budget.sync_wait_secs));
             let handoff = await_hidden_structured_job(
                 self.runner_registry.clone(),
                 job.job_id.clone(),
@@ -626,37 +738,38 @@ impl ToolRuntime {
             )
             .await;
             let mut result = match handoff {
-                    Ok(HiddenStructuredJobWait::Terminal {
-                        job,
-                        stdout,
-                        stderr,
-                    }) => {
-                        let result = Self::run_shell_terminal_job_result(
-                            &job,
-                            stdout,
-                            stderr,
-                            timeout,
-                        );
-                        self.runner_registry
-                            .remove_projected_hidden_terminal_job_record(&job.job_id)
-                            .await;
-                        result
-                    }
-                    Ok(HiddenStructuredJobWait::Continued {
-                        observation,
-                        execution_state,
-                        command_started,
-                    }) => {
-                        let detected_summary = crate::tool_runtime::jobs::detected_job_summary_with_activity(
+                Ok(HiddenStructuredJobWait::Terminal {
+                    job,
+                    stdout,
+                    stderr,
+                }) => {
+                    let result = Self::run_shell_terminal_job_result(&job, stdout, stderr, timeout);
+                    self.runner_registry
+                        .remove_projected_hidden_terminal_job_record(&job.job_id)
+                        .await;
+                    result
+                }
+                Ok(HiddenStructuredJobWait::Continued {
+                    observation,
+                    execution_state,
+                    command_started,
+                }) => {
+                    let detected_summary =
+                        crate::tool_runtime::jobs::detected_job_summary_with_activity(
                             Some(&command_summary),
                             Some(declared_purpose.as_str()),
                             &observation.job.status,
                             observation.job.exit_code.map(i64::from),
                             &observation.stdout_tail,
                             &observation.stderr_tail,
+                            observation.stdout_truncated || observation.stderr_truncated,
                             observation.job.activity.as_ref(),
                         );
-                        ToolResult::ok(json!({
+                    let continuation = crate::tool_runtime::jobs::observe_job_continuation(
+                        &observation.job.job_id,
+                        observation.job.observation_token.as_deref(),
+                    );
+                    ToolResult::ok(json!({
                         "execution_state": execution_state,
                         "command_started": command_started,
                         "command_completed": false,
@@ -669,9 +782,10 @@ impl ToolRuntime {
                         "job_id": observation.job.job_id,
                         "job_status": observation.job.status,
                         "observation_token": observation.job.observation_token,
+                        "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
                         "activity": observation.job.activity,
                         "effective_timeout_secs": timeout,
-                        "sync_wait_secs": STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
+                        "sync_wait_secs": budget.sync_wait_secs,
                         "async_handoff_available": true,
                         "stdout_tail": observation.stdout_tail,
                         "stderr_tail": observation.stderr_tail,
@@ -680,18 +794,16 @@ impl ToolRuntime {
                         "stdout_truncated": observation.stdout_truncated,
                         "stderr_truncated": observation.stderr_truncated,
                         "detected_summary": detected_summary,
+                        "continuation": continuation,
                     }))
-                    },
-                    Err(error) => Self::run_shell_outcome_unknown_result(format!(
-                        "the hidden durable shell Job {} could not be safely promoted or observed during handoff: {error}. Do not redispatch this command; inspect Job inventory and target state before deciding whether any retry is safe.",
-                        job.job_id
-                    )),
-                };
+                }
+                Err(failure) => return failure.into_tool_result(&project, budget),
+            };
             if result.output["promoted_to_job"] != json!(true) {
                 add_structured_continuation_facts(
                     &mut result,
                     timeout,
-                    STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
+                    budget.sync_wait_secs,
                     true,
                 );
             }
@@ -714,6 +826,7 @@ impl ToolRuntime {
                     client_id,
                     cwd: effective_cwd,
                     command: dispatched_command,
+                    login,
                     stdin: None,
                     timeout_secs: timeout,
                     wait_timeout_secs: wait_timeout,
@@ -723,6 +836,7 @@ impl ToolRuntime {
                 ssh_resource
                     .zip(session_id)
                     .map(|(_, session_id)| session_id.to_string()),
+                if ssh_resource.is_none() { shell } else { None },
             )
             .await
         {
@@ -732,7 +846,7 @@ impl ToolRuntime {
                 return Self::run_shell_tool_failure_result(
                         command_rejected_message(
                             e,
-                            "confirm the agent is connected and the command request is allowed, then retry or use run_job for long-running work.",
+                            "confirm the agent is connected and the command request is allowed, then retry with the same shell path. Use run_job only when immediate asynchronous shell start is intentional; if a native child must survive Runner restart/replacement, use run_detached_process from the start.",
                         ),
                         failure_kind,
                         ShellCommandExecutionState::NotStarted,
@@ -819,7 +933,7 @@ impl ToolRuntime {
                     Self::run_shell_tool_failure_result(
                             command_rejected_message(
                                 "shell request waiter was dropped before the queued request was dispatched",
-                                "check Runner connectivity, then retry or use run_job for recoverable long-running work.",
+                                "check Runner connectivity, then retry with the same shell path. Use run_job only for intentional asynchronous shell start; use run_detached_process only when a native child must survive Runner restart/replacement.",
                             ),
                             "runtime_error",
                             ShellCommandExecutionState::NotStarted,
@@ -841,7 +955,7 @@ impl ToolRuntime {
                                 format!(
                                     "timed out waiting {wait_timeout} seconds before the queued Runner request was dispatched"
                                 ),
-                                "check Runner connectivity and availability, then retry or use run_job for long-running work.",
+                                "check Runner connectivity and availability, then retry with the same shell path. Use run_job only for intentional asynchronous shell start; use run_detached_process only when a native child must survive Runner restart/replacement.",
                             ),
                             "timeout",
                             ShellCommandExecutionState::NotStarted,
@@ -904,6 +1018,8 @@ mod lifecycle_tests {
             exit_code: None,
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: None,
             error: Some("Rejected before starting command".to_string()),
             request_dispatched: Some(true),

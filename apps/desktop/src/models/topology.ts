@@ -111,15 +111,7 @@ export interface QuickShareState {
   ready_for_chatgpt: boolean;
 }
 
-export type RegularTunnelStatus = "starting" | "ready" | "error";
-
-export interface RegularTunnelState {
-  provider: string;
-  status: RegularTunnelStatus;
-  clipboard_state: string;
-  clipboard_contains: string;
-  ready_for_chatgpt: boolean;
-}
+export type { ConnectionsSnapshot, TunnelConnection, McpProvidersSnapshot, McpProviderProfile } from "./connections-tools";
 
 export type RegularConnectionPreference = "no_chat_gpt" | "open_ai_tunnel";
 export type TunnelProxyMode = "auto" | "direct" | "custom";
@@ -128,13 +120,14 @@ export interface TunnelProxySnapshot {
   mode: TunnelProxyMode;
   custom_url?: string | null;
   effective_source: string;
-  effective_url?: string | null;
-  detected_url?: string | null;
+  effective_proxy_present: boolean;
+  system_proxy_detected: boolean;
 }
 
 export type DesktopOperationKind =
   | "local_setup"
   | "local_project_activate"
+  | "project_unregister"
   | "remote_setup"
   | "quick_share_start"
   | "quick_share_stop"
@@ -144,7 +137,10 @@ export type DesktopOperationKind =
   | "runtime_refresh"
   | "runtime_resume"
   | "tunnel_proxy_update"
-  | "tunnel_config_update";
+  | "tunnel_config_update"
+  | "runner_settings_update"
+  | "runner_restart"
+  | "runtime_probe" | "runtime_switch" | "trace_update" | "configuration_restore";
 
 export type DesktopOperationPhase = "running" | "cancelling";
 
@@ -175,6 +171,9 @@ export interface ChatGptActivitySnapshot {
 }
 
 export interface DesktopState {
+  workspace_runner?: SettingsTarget | null;
+  configuration_issue?: string | null;
+  saved_projects?: ProjectSelection[];
   topology?: RuntimeTopology | null;
   readiness: ReadinessSnapshot;
   project?: ProjectSelection | null;
@@ -182,7 +181,9 @@ export interface DesktopState {
   powershell_runtime?: PowerShellRuntimeSnapshot | null;
   chatgpt_activity?: ChatGptActivitySnapshot | null;
   quick_share?: QuickShareState | null;
-  regular_tunnel?: RegularTunnelState | null;
+  connections?: import("./connections-tools").ConnectionsSnapshot;
+  mcp_providers?: import("./connections-tools").McpProvidersSnapshot;
+  coding_agents?: import("./runner-capabilities").CodingAgentsSnapshot;
   current_operation?: DesktopOperation | null;
   activity_sequence: number;
   openai_tunnel_configured: boolean;
@@ -204,6 +205,7 @@ export interface ActivityEntry {
   sequence: number;
   timestamp_ms: number;
   source: string;
+  tunnel_profile_id?: string | null;
   level: "info" | "warning" | "error";
   event_kind:
     | "process_started"
@@ -231,3 +233,9 @@ export interface ActivityEntry {
   message: string;
 }
 
+
+export interface RunnerPaths { instruction_files: string[]; skill_roots: string[] }
+export interface SettingsTarget { config_path: string; client_id: string; server_url: string }
+export interface RunnerSettings { paths: RunnerPaths; plugin_ids: string[]; target: SettingsTarget; can_restart: boolean }
+export interface PluginRegistration { id: string; name: string; command: string; args: string[]; cwd: string | null }
+export interface ComputerPermissions { supported: boolean; foreground: boolean; desktop_accessibility: boolean; desktop_screen_recording: boolean }

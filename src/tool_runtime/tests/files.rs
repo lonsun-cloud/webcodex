@@ -5,6 +5,7 @@ use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerRequest, RunnerResultRequest};
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -281,7 +282,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
                         content: "do-not-log-this-content\n".to_string(),
                         session_id: Some(session_id),
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
                     Some(&bootstrap),
                 )
@@ -351,7 +352,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
             include_workspace: Some(false),
             include_checkpoints: Some(false),
             include_validation: Some(false),
-            summary_only: false,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -622,6 +623,8 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
             exit_code: Some(0),
             stdout: Some(r#"{"deleted_paths":["tmp.txt"]}"#.to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -1074,7 +1077,7 @@ async fn conversation_import_durable_session_events_do_not_store_host_file_refs(
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("explicitly trusted OAuth MCP client"));
+        .contains("trusted MCP host-file provenance"));
 
     let summary = runtime
         .sessions
@@ -1166,7 +1169,7 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
         .dispatch_with_auth(
             ToolCall::ArtifactUploadBegin {
                 project,
-                path: "artifacts/smoke/raw.bin".to_string(),
+                path: ".env".to_string(),
                 session_id: Some(session.session_id.clone()),
                 expected_bytes: Some(1),
                 expected_sha256: None,
@@ -1182,8 +1185,7 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
     assert_eq!(result.output["failure_kind"], "policy_rejected");
     assert_eq!(result.output["error_kind"], "policy_rejected");
     let error = result.error.as_deref().unwrap();
-    assert!(error.contains(".artifact"), "{error}");
-    assert!(error.contains("artifacts/smoke/<name>.artifact"), "{error}");
+    assert!(error.contains("sensitive artifact path"), "{error}");
     assert!(
         probe_patch_agent_request(&runtime, "artifact-policy-session")
             .await
@@ -1491,7 +1493,7 @@ fn search_project_text_command_excludes_sensitive_dirs_and_bounds_output() {
     assert!(cmd.contains("\"$head_cmd\" -n 26") || cmd.contains("$head_cmd -n 26"));
     assert!(cmd.contains("trap 'cleanup_search_status' EXIT"));
     assert!(cmd.contains("trap 'cleanup_search_status; exit 143' HUP INT TERM"));
-    assert!(cmd.contains("grep -rnI"));
+    assert!(cmd.contains("grep -rHnI --null"));
     assert!(cmd.contains("command -v head"));
     assert!(cmd.contains("/usr/bin/head") || cmd.contains("/bin/head"));
     // No global path sort: matches must stream in traversal order so a small
@@ -1671,6 +1673,344 @@ fn search_project_text_command_falls_back_to_grep_without_rg() {
 
 #[cfg(unix)]
 #[test]
+fn search_project_text_grep_single_file_matches_and_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+
+    for (pattern, expected_exit) in [("needle", 0), ("definitely_missing", 1)] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some("one.txt".to_string()),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        if expected_exit == 0 {
+            assert_eq!(result.output["count"], 1);
+            assert_eq!(result.output["matches"][0]["path"], "one.txt");
+            assert_eq!(result.output["matches"][0]["line"], 2);
+            assert_eq!(result.output["matches"][0]["preview"], "needle");
+        } else {
+            assert_eq!(result.output["matches"], json!([]));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_directory_matches_multiple_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.txt"), "needle\nneedle\n").unwrap();
+    std::fs::write(root.join("src/b.txt"), "needle\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+    let options = SearchOptions::normalize(SearchRequest {
+        path: Some("src".to_string()),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let result = run_search_with_path(&bin, &root, &options);
+    assert_eq!(result.output["backend"], "grep");
+    assert_eq!(result.output["count"], 3);
+    let mut paths = result.output["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths, vec!["src/a.txt", "src/a.txt", "src/b.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_files_with_matches_scopes_and_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.txt"), "needle\nneedle\n").unwrap();
+    std::fs::write(root.join("src/b.txt"), "needle\n").unwrap();
+    std::fs::write(root.join("src/c.txt"), "quiet\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+
+    for (path, pattern, limit, expected_exit, expected_files, truncated) in [
+        ("src/a.txt", "needle", 10, 0, vec!["src/a.txt"], false),
+        ("src/c.txt", "needle", 10, 1, vec![], false),
+        (
+            "src",
+            "needle",
+            10,
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+            false,
+        ),
+        ("src", "missing", 10, 1, vec![], false),
+        ("src", "needle", 1, 0, vec!["src/a.txt", "src/b.txt"], true),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some(path.to_string()),
+                limit: Some(limit),
+                result_mode: Some(SearchResultMode::FilesWithMatches),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        assert!(!options.requires_ripgrep());
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        assert!(command.contains("grep -rlI -F"), "{command}");
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        let files = result.output["files"].as_array().unwrap();
+        assert_eq!(files.len(), expected_files.len().min(limit));
+        assert!(files
+            .iter()
+            .all(|item| expected_files.contains(&item["path"].as_str().unwrap())));
+        assert_eq!(result.output["returned_file_count"], files.len());
+        assert_eq!(result.output["truncated"], truncated);
+        if truncated {
+            assert_eq!(result.output["truncation_reason"], "limit");
+        }
+    }
+
+    for (pattern_mode, expected_exit) in [
+        (SearchPatternMode::Regex, 0),
+        (SearchPatternMode::Literal, 1),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: "need.e".to_string(),
+                path: Some("src".to_string()),
+                result_mode: Some(SearchResultMode::FilesWithMatches),
+                ..raw_search_request()
+            },
+            Some(pattern_mode),
+        )
+        .unwrap();
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            result.output["returned_file_count"],
+            if expected_exit == 0 { 2 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn search_project_text_grep_output_contract_handles_crlf_and_multiple_records() {
+    let marker = "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\r\n";
+    let raw_path = if cfg!(windows) {
+        "src\\foo.rs"
+    } else {
+        "src/foo.rs"
+    };
+    let expected_path = "src/foo.rs";
+    let matches_options = SearchOptions::normalize(raw_search_request()).unwrap();
+    let matches_stdout = format!("{marker}{raw_path}\01:needle\r\n{raw_path}\02:needle again\r\n");
+    let matches =
+        search_project_text_output("demo", &matches_options, &matches_stdout, Some(0), "");
+    assert!(matches.success, "{matches:?}");
+    assert_eq!(matches.output["backend"], "grep");
+    assert_eq!(matches.output["count"], 2);
+    assert_eq!(matches.output["matches"][0]["path"], expected_path);
+    assert_eq!(matches.output["matches"][0]["line"], 1);
+    assert_eq!(matches.output["matches"][0]["preview"], "needle");
+    assert_eq!(matches.output["matches"][1]["line"], 2);
+
+    let files_options = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::FilesWithMatches),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let files_stdout = format!("{marker}{raw_path}\r\nsrc/bar.rs\r\n");
+    let files = search_project_text_output("demo", &files_options, &files_stdout, Some(0), "");
+    assert!(files.success, "{files:?}");
+    assert_eq!(files.output["returned_file_count"], 2);
+    assert_eq!(files.output["files"][0]["path"], expected_path);
+    assert_eq!(files.output["files"][1]["path"], "src/bar.rs");
+    assert_eq!(files.output["truncated"], false);
+
+    for options in [&matches_options, &files_options] {
+        let empty = search_project_text_output("demo", options, marker, Some(1), "");
+        assert!(empty.success, "{empty:?}");
+        assert_eq!(empty.output["exit_code"], 1);
+        let field = if options.result_mode == SearchResultMode::Matches {
+            "matches"
+        } else {
+            "files"
+        };
+        assert_eq!(empty.output[field], json!([]));
+
+        let inconsistent = search_project_text_output("demo", options, marker, Some(0), "");
+        assert!(!inconsistent.success);
+        assert_eq!(
+            inconsistent.output["reason_code"],
+            "backend_output_inconsistent"
+        );
+        let missing_marker =
+            search_project_text_output("demo", options, "src/foo.rs:1:needle\n", Some(0), "");
+        assert!(!missing_marker.success);
+        assert_eq!(
+            missing_marker.output["reason_code"],
+            "backend_identity_missing"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn search_project_text_grep_windows_backend_smoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/a.txt"), "needle\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.txt"), "needle\n").unwrap();
+    for (mode, path, pattern, expected_exit, expected_paths) in [
+        (
+            SearchResultMode::Matches,
+            "one.txt",
+            "needle",
+            0,
+            vec!["one.txt"],
+        ),
+        (
+            SearchResultMode::FilesWithMatches,
+            "one.txt",
+            "needle",
+            0,
+            vec!["one.txt"],
+        ),
+        (SearchResultMode::Matches, "one.txt", "missing", 1, vec![]),
+        (
+            SearchResultMode::FilesWithMatches,
+            "one.txt",
+            "missing",
+            1,
+            vec![],
+        ),
+        (
+            SearchResultMode::Matches,
+            "src",
+            "needle",
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+        ),
+        (
+            SearchResultMode::FilesWithMatches,
+            "src",
+            "needle",
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+        ),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some(path.to_string()),
+                result_mode: Some(mode),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        // Git for Windows provides grep and head together in usr/bin. Scope
+        // PATH to that directory so an unrelated installed rg cannot mask the
+        // fallback branch being tested.
+        let command = format!(
+            "grep_bin=$(command -v grep)\nPATH=${{grep_bin%/*}}; export PATH\n{}",
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, tmp.path(), 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        assert_eq!(result.output["truncated"], false);
+        match mode {
+            SearchResultMode::Matches => {
+                let mut paths = result.output["matches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["path"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                assert_eq!(paths, expected_paths);
+                assert_eq!(result.output["count"], paths.len());
+                if path == "one.txt" && expected_exit == 0 {
+                    assert_eq!(result.output["matches"][0]["line"], 2);
+                    assert_eq!(result.output["matches"][0]["preview"], "needle");
+                }
+            }
+            SearchResultMode::FilesWithMatches => {
+                let mut paths = result.output["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["path"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                assert_eq!(paths, expected_paths);
+                assert_eq!(result.output["returned_file_count"], paths.len());
+            }
+            SearchResultMode::Count => unreachable!(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn search_project_text_basic_regex_semantics_match_rg_and_grep_fallback() {
     if !host_ripgrep_available() {
         eprintln!("skipping regex backend-parity test: rg is unavailable");
@@ -1727,8 +2067,8 @@ fn search_project_text_basic_regex_semantics_match_rg_and_grep_fallback() {
         )
         .unwrap();
         let command = search_project_text_command(&options);
-        assert!(command.contains("grep -rnI --null -E"), "{command}");
-        assert!(!command.contains("grep -rnI --null -F"), "{command}");
+        assert!(command.contains("-A 0 -E"), "{command}");
+        assert!(!command.contains("-A 0 -F"), "{command}");
 
         let rg = run_search_with_path(&rg_bin, &root, &options);
         let grep = run_search_with_path(&grep_bin, &root, &options);
@@ -1781,8 +2121,8 @@ fn search_project_text_grep_fallback_keeps_literal_patterns_literal() {
         )
         .unwrap();
         let command = search_project_text_command(&options);
-        assert!(command.contains("grep -rnI --null -F"), "{command}");
-        assert!(!command.contains("grep -rnI --null -E"), "{command}");
+        assert!(command.contains("-A 0 -F"), "{command}");
+        assert!(!command.contains("-A 0 -E"), "{command}");
 
         let result = run_search_with_path(&bin, &root, &options);
         assert_eq!(result.output["backend"], "grep", "pattern {pattern}");
@@ -1900,38 +2240,72 @@ fn raw_search_request() -> SearchRequest {
 }
 
 fn search_call(project: String, request: SearchRequest) -> ToolCall {
-    ToolCall::SearchProjectText {
-        project,
-        pattern: request.pattern,
-        pattern_mode: None,
+    ToolCall::SearchProjectTexts {
+        project: project,
+        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+            pattern: request.pattern,
+            pattern_mode: None,
+            path: request.path,
+            limit: request.limit,
+            context_before: request.context_before,
+            context_after: request.context_after,
+            include_globs: request.include_globs,
+            exclude_globs: request.exclude_globs,
+            result_mode: request.result_mode,
+            timeout_secs: request.timeout_secs,
+        }],
         session_id: None,
-        path: request.path,
-        limit: request.limit,
-        context_before: request.context_before,
-        context_after: request.context_after,
-        include_globs: request.include_globs,
-        exclude_globs: request.exclude_globs,
-        result_mode: request.result_mode,
-        timeout_secs: request.timeout_secs,
+        max_result_bytes: None,
+    }
+}
+
+fn extract_single_search_batch_result(batch: ToolResult) -> ToolResult {
+    if !batch.success {
+        return batch;
+    }
+    let items = batch.output["items"]
+        .as_array()
+        .expect("one-query search batch items");
+    assert_eq!(items.len(), 1, "one-query search batch: {}", batch.output);
+    let item = &items[0];
+    ToolResult {
+        success: item["success"]
+            .as_bool()
+            .expect("one-query search item success"),
+        output: item.get("output").cloned().unwrap_or(Value::Null),
+        error: item
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
 fn assert_search_output_keys_are_declared(output: &Value) {
-    let properties = registered_tool_specs()
-        .into_iter()
-        .find(|spec| spec.name == "search_project_text")
-        .expect("search_project_text spec")
-        .output_schema["properties"]["output"]["properties"]
-        .as_object()
-        .expect("search_project_text output properties")
-        .clone();
+    if output.get("code").is_some() {
+        return;
+    }
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("search_project_texts");
+    let item_output = &schema["properties"]["output"]["anyOf"][0]["anyOf"][0]["properties"]
+        ["items"]["items"]["properties"]["output"];
+    let mut declared = std::collections::BTreeSet::new();
+    for variant in item_output["anyOf"][0]["anyOf"]
+        .as_array()
+        .expect("search success variants")
+    {
+        if let Some(properties) = variant["properties"].as_object() {
+            declared.extend(properties.keys().cloned());
+        }
+    }
+    if let Some(properties) = item_output["anyOf"][1]["properties"].as_object() {
+        declared.extend(properties.keys().cloned());
+    }
     let Some(output) = output.as_object() else {
         return;
     };
     for key in output.keys() {
         assert!(
-            properties.contains_key(key),
-            "runtime search output key {key} is not declared in output schema"
+            declared.contains(key),
+            "runtime search output key {key} is not declared in search_project_texts item output schema"
         );
     }
 }
@@ -1954,7 +2328,7 @@ async fn execute_agent_search(
     let req = wait_for_patch_agent_request(runtime, client_id).await;
     let inspected = req.clone();
     complete_agent_request_by_running_locally(runtime, client_id, req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert_search_output_keys_are_declared(&result.output);
     (result, inspected)
 }
@@ -2255,6 +2629,57 @@ fn search_status_and_records_must_agree_before_empty_is_trusted() {
     assert!(proven_empty.success, "{:?}", proven_empty.error);
     assert_eq!(proven_empty.output["matches"], json!([]));
     assert_eq!(proven_empty.output["exit_code"], 1);
+}
+
+#[test]
+fn search_count_uses_backend_evidence_without_claiming_filtered_absence() {
+    let options = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::Count),
+        limit: Some(10),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let marker = "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n";
+
+    let no_match = search_project_text_output("demo", &options, marker, Some(1), "");
+    assert!(no_match.success, "{:?}", no_match.error);
+    assert_eq!(no_match.output["files"], json!([]));
+    assert_eq!(no_match.output["count_complete"], true);
+    assert_eq!(no_match.output["total_matches"], 0);
+
+    let safe_stdout = format!("{marker}src/lib.rs\u{0}2\n");
+    let safe = search_project_text_output("demo", &options, &safe_stdout, Some(0), "");
+    assert!(safe.success, "{:?}", safe.error);
+    assert_eq!(safe.output["count_complete"], true);
+    assert_eq!(safe.output["total_matches"], 2);
+    assert_eq!(safe.output["files"][0]["path"], "src/lib.rs");
+
+    let malformed_stdout = format!("{marker}src/lib.rs:not-a-number\n");
+    let malformed = search_project_text_output("demo", &options, &malformed_stdout, Some(0), "");
+    assert!(!malformed.success);
+    assert_eq!(
+        malformed.output["reason_code"],
+        "backend_output_inconsistent"
+    );
+
+    let filtered_stdout = format!("{marker}/private/absolute/secret.rs\u{0}2\n");
+    let filtered = search_project_text_output("demo", &options, &filtered_stdout, Some(0), "");
+    assert!(filtered.success, "{:?}", filtered.error);
+    assert_eq!(filtered.output["files"], json!([]));
+    assert_eq!(filtered.output["returned_match_count"], 0);
+    assert_eq!(filtered.output["count_complete"], false);
+    assert_eq!(filtered.output["total_matches"], Value::Null);
+    assert_eq!(filtered.output["truncated"], false);
+    assert!(!serde_json::to_string(&filtered)
+        .unwrap()
+        .contains("/private/absolute/secret.rs"));
+
+    let contradictory = search_project_text_output("demo", &options, &filtered_stdout, Some(1), "");
+    assert!(!contradictory.success);
+    assert_eq!(
+        contradictory.output["reason_code"],
+        "backend_output_inconsistent"
+    );
 }
 
 #[cfg(unix)]
@@ -2837,17 +3262,13 @@ fn search_overlong_match_line_does_not_overflow_byte_budget() {
     std::fs::create_dir_all(&root).unwrap();
     // Fake rg emits one small complete match followed by a single enormous
     // match line that itself exceeds the byte budget; it then exits cleanly.
-    // Pure shell so it needs nothing from the restricted PATH.
-    write_executable_script(
-        &bin.join("rg"),
-        "#!/bin/sh\n\
-         printf 'src/small.rs:1:needle ok\\n'\n\
-         printf 'src/big.rs:2:'\n\
-         i=0\n\
-         while [ \"$i\" -lt 200000 ]; do printf 'x'; i=$((i + 1)); done\n\
-         printf '\\n'\n\
-         exit 0\n",
+    // Materialize the long payload once in the fixture instead of performing
+    // hundreds of thousands of shell-loop iterations under the test deadline.
+    let oversized_preview = "x".repeat(SEARCH_OUTPUT_BYTE_BUDGET + 1024);
+    let fake_rg = format!(
+        "#!/bin/sh\nprintf 'src/small.rs:1:needle ok\\n'\nprintf 'src/big.rs:2:{oversized_preview}\\n'\nexit 0\n"
     );
+    write_executable_script(&bin.join("rg"), &fake_rg);
     // Real-head semantics: byte-accurate -n/-c truncation. The restricted PATH
     // contains only this delegating head plus the fake rg.
     write_executable_script(&bin.join("head"), "#!/bin/sh\nexec /usr/bin/head \"$@\"\n");
@@ -2903,12 +3324,26 @@ fn search_requires_ripgrep_based_on_effective_features_not_field_presence() {
     .unwrap();
     assert!(!timeout_only.requires_ripgrep());
 
+    let files_mode = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::FilesWithMatches),
+        ..raw_search_request()
+    })
+    .unwrap();
+    assert!(!files_mode.requires_ripgrep());
+
     let with_include = SearchOptions::normalize(SearchRequest {
         include_globs: Some(vec!["**/*.rs".to_string()]),
         ..raw_search_request()
     })
     .unwrap();
     assert!(with_include.requires_ripgrep());
+
+    let with_exclude = SearchOptions::normalize(SearchRequest {
+        exclude_globs: Some(vec!["**/vendor/**".to_string()]),
+        ..raw_search_request()
+    })
+    .unwrap();
+    assert!(with_exclude.requires_ripgrep());
 
     let count_mode = SearchOptions::normalize(SearchRequest {
         result_mode: Some(SearchResultMode::Count),
@@ -2985,15 +3420,16 @@ async fn search_invalid_request_dispatch_returns_structured_error() {
             Some(&auth_context(None, true)),
         )
         .await;
+    let result = extract_single_search_batch_result(result);
 
     // Validation fails before any agent search request is enqueued.
     assert!(!result.success);
     assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "invalid_search_request");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "request_validation");
     assert_eq!(result.output["reason_code"], "invalid_glob");
-    assert_eq!(result.output["field"], "include_globs");
-    assert_eq!(result.output["reason"], "negated");
+    assert_eq!(result.output["detail_code"], "invalid_glob");
+    assert_eq!(result.output["state_changed"], false);
     let rendered = serde_json::to_string(&result.output).unwrap();
     assert!(!rendered.contains("NEVER_ECHO_THIS_GLOB_VALUE"));
     assert!(!result.error.as_deref().unwrap_or("").contains("NEVER_ECHO"));
@@ -3039,17 +3475,21 @@ async fn search_agent_command_timeout_returns_search_timeout() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
         .await
         .unwrap();
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_timeout");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "backend_execution");
     assert_eq!(result.output["reason_code"], "timeout");
+    assert_eq!(result.output["detail_code"], "timeout");
+    assert_eq!(result.output["state_changed"], false);
+    assert_search_output_keys_are_declared(&result.output);
     assert_eq!(result.output["result_mode"], "matches");
     assert_eq!(result.output["effective_timeout_secs"], 1);
     assert_eq!(result.output["backend"], "rg");
@@ -3087,18 +3527,22 @@ async fn search_agent_execution_failure_is_structured_and_does_not_leak_diagnost
                     .to_string(),
             ),
             stderr: Some(private_diagnostic.to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(5),
             error: Some(private_diagnostic.to_string()),
         })
         .await
         .unwrap();
 
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_execution_failed");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "agent_execution");
-    assert_eq!(result.output["reason_code"], "agent_execution_failed");
+    assert_eq!(result.output["reason_code"], "search_execution_failed");
+    assert_eq!(result.output["detail_code"], "agent_execution_failed");
+    assert_eq!(result.output["state_changed"], false);
+    assert_search_output_keys_are_declared(&result.output);
     assert_eq!(result.output["backend"], "rg");
     assert_eq!(result.output["exit_code"], 9);
     let rendered = serde_json::to_string(&result).unwrap();
@@ -3141,18 +3585,22 @@ async fn search_agent_timeout_without_trusted_marker_cannot_return_partial_succe
             exit_code: Some(-1),
             stdout: Some("src/a.rs:1:needle\n".to_string()),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
         .await
         .unwrap();
 
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_timeout");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "agent_execution");
     assert_eq!(result.output["reason_code"], "timeout");
+    assert_eq!(result.output["detail_code"], "timeout");
+    assert_eq!(result.output["state_changed"], false);
+    assert_search_output_keys_are_declared(&result.output);
     assert!(result.output["backend"].is_null());
     assert!(result.output.get("matches").is_none());
 }
@@ -3199,12 +3647,14 @@ async fn search_agent_timeout_with_complete_records_returns_partial_success() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
         .await
         .unwrap();
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(result.success, "{:?}", result.error);
     assert_search_output_keys_are_declared(&result.output);
     assert_eq!(result.output["backend"], "rg");
@@ -3249,12 +3699,14 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
     let request_id = req.request_id.clone();
     assert_eq!(req.timeout_secs, 1);
     // Do not complete the agent request; outer tokio timeout should fire.
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_timeout");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "agent_transport");
     assert_eq!(result.output["reason_code"], "timeout");
+    assert_eq!(result.output["detail_code"], "timeout");
+    assert_eq!(result.output["state_changed"], false);
+    assert_search_output_keys_are_declared(&result.output);
     assert_eq!(result.output["result_mode"], "matches");
     assert_eq!(result.output["effective_timeout_secs"], 1);
     assert!(
@@ -3272,6 +3724,8 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
             exit_code: Some(0),
             stdout: Some(String::new()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -3307,21 +3761,28 @@ async fn search_agent_request_dropped_returns_structured_error() {
                 .await
         }
     });
-    let req = wait_for_patch_agent_request(&runtime, "search-dropped").await;
-    // Drop the oneshot waiter without completing — agent disconnect / channel drop.
+    let first = wait_for_patch_agent_request(&runtime, "search-dropped").await;
+    // A one-query canonical batch retries one dropped Runner request once.
     runtime
         .runner_registry
-        .cancel_request(&req.request_id)
+        .cancel_request(&first.request_id)
         .await;
-    let result = task.await.unwrap();
+    let second = wait_for_patch_agent_request(&runtime, "search-dropped").await;
+    runtime
+        .runner_registry
+        .cancel_request(&second.request_id)
+        .await;
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(!result.success);
-    assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_request_dropped");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "agent_transport");
     assert_eq!(result.output["reason_code"], "search_request_dropped");
+    assert_eq!(result.output["detail_code"], "search_request_dropped");
+    assert_eq!(result.output["state_changed"], false);
+    assert_search_output_keys_are_declared(&result.output);
     assert_eq!(result.output["result_mode"], "matches");
-    assert_eq!(result.output["effective_timeout_secs"], 30);
-    assert_ne!(result.output["code"], "search_timeout");
+    let effective_timeout = result.output["effective_timeout_secs"].as_u64().unwrap();
+    assert!((29..=30).contains(&effective_timeout));
     assert!(
         result.error.as_deref().unwrap_or("").contains("dropped"),
         "{:?}",
@@ -3376,7 +3837,7 @@ async fn search_timeout_only_without_rg_still_allows_grep_fallback() {
     );
     assert_eq!(req.timeout_secs, 5);
     complete_agent_request_by_running_locally(&runtime, "search-timeout-fallback", req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["backend"], "grep");
     assert_eq!(result.output["effective_timeout_secs"], 5);
@@ -3453,25 +3914,24 @@ fn search_glob_validation_enforces_count_and_byte_limits() {
 fn search_audit_arguments_record_bounded_feature_summary_without_pattern_or_globs() {
     let raw = json!({
         "project": "agent:demo:project",
-        "pattern": "NEVER_LOG_PATTERN_VALUE",
-        "path": "src",
-        "limit": 7,
-        "context_before": 1,
-        "context_after": 2,
-        "include_globs": ["private name/**/*.rs"],
-        "exclude_globs": ["generated secret name/**"],
-        "result_mode": "count",
-        "timeout_secs": 45
+        "queries": [{
+            "pattern": "NEVER_LOG_PATTERN_VALUE",
+            "path": "src",
+            "limit": 7,
+            "context_before": 1,
+            "context_after": 2,
+            "include_globs": ["private name/**/*.rs"],
+            "exclude_globs": ["generated secret name/**"],
+            "result_mode": "count",
+            "timeout_secs": 45
+        }]
     });
     let raw_summary = super::super::tool_audit::session_log_arguments_for_tool_request(
-        "search_project_text",
+        "search_project_texts",
         &raw,
     );
-    assert_eq!(raw_summary["pattern_present"], true);
-    assert_eq!(raw_summary["include_glob_count"], 1);
-    assert_eq!(raw_summary["exclude_glob_count"], 1);
-    assert_eq!(raw_summary["result_mode"], "count");
-    assert_eq!(raw_summary["timeout_secs"], 45);
+    assert_eq!(raw_summary["query_count"], 1);
+    assert_eq!(raw_summary["patterns_present"], true);
     let raw_json = serde_json::to_string(&raw_summary).unwrap();
     assert!(!raw_json.contains("NEVER_LOG_PATTERN_VALUE"));
     assert!(!raw_json.contains("private name"));
@@ -3489,10 +3949,8 @@ fn search_audit_arguments_record_bounded_feature_summary_without_pattern_or_glob
         },
     )
     .session_log_arguments();
-    assert_eq!(call_summary["include_glob_count"], 1);
-    assert_eq!(call_summary["exclude_glob_count"], 1);
-    assert_eq!(call_summary["result_mode"], "count");
-    assert_eq!(call_summary["timeout_secs"], 45);
+    assert_eq!(call_summary["query_count"], 1);
+    assert_eq!(call_summary["patterns_present"], true);
     let call_json = serde_json::to_string(&call_summary).unwrap();
     assert!(!call_json.contains("NEVER_LOG_PATTERN_VALUE"));
     assert!(!call_json.contains("private name"));
@@ -3535,6 +3993,79 @@ fn search_command_passes_shell_metacharacter_globs_as_one_literal_argument() {
         !stdout.contains("\ndouble\" `tick`\n"),
         "glob split into a command: {stdout}"
     );
+}
+
+#[tokio::test]
+async fn search_project_text_zero_match_include_glob_reports_nonleaking_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "search-glob-hint";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    search_call(
+                        project,
+                        SearchRequest {
+                            pattern: "SCOPE_NEEDLE".to_string(),
+                            include_globs: Some(vec!["docs/**/*.md".to_string()]),
+                            ..raw_search_request()
+                        },
+                    ),
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+
+    let scoped = wait_for_patch_agent_request(&runtime, client_id).await;
+    let scoped_payload: Value = serde_json::from_str(scoped.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(scoped_payload["include_globs"], json!(["docs/**/*.md"]));
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &scoped.request_id,
+        1,
+        "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
+        "",
+    )
+    .await;
+
+    let diagnostic = wait_for_patch_agent_request(&runtime, client_id).await;
+    let diagnostic_payload: Value =
+        serde_json::from_str(diagnostic.stdin.as_deref().unwrap()).unwrap();
+    assert!(diagnostic_payload["include_globs"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    assert_eq!(diagnostic_payload["limit"], 1);
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &diagnostic.request_id,
+        0,
+        concat!(
+            "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n",
+            "src/private.rs\0",
+            "1:SCOPE_NEEDLE\n"
+        ),
+        "",
+    )
+    .await;
+
+    let result = extract_single_search_batch_result(task.await.unwrap());
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["matches"], json!([]));
+    assert_eq!(
+        result.output["zero_match_hint"],
+        "include_globs_excluded_matches"
+    );
+    assert!(!serde_json::to_string(&result.output)
+        .unwrap()
+        .contains("src/private.rs"));
+    assert_search_output_keys_are_declared(&result.output);
 }
 
 #[tokio::test]
@@ -3594,9 +4125,6 @@ async fn search_project_text_include_and_exclude_globs_are_additive() {
 
 #[tokio::test]
 async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
-    // files_with_matches is ripgrep-only; without host rg this is a capability
-    // error, not a product regression (see
-    // advanced_search_without_rg_returns_structured_capability_error).
     if !host_ripgrep_available() {
         eprintln!("skipping real-ripgrep integration test: rg is unavailable");
         return;
@@ -3636,6 +4164,35 @@ async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
     assert_eq!(result.output["returned_file_count"], 1);
     assert_eq!(result.output["truncated"], true);
     assert_eq!(result.output["truncation_reason"], "limit");
+}
+
+#[tokio::test]
+async fn search_project_text_single_file_count_preserves_filename() {
+    if !host_ripgrep_available() {
+        eprintln!("skipping real-ripgrep integration test: rg is unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = "count file.rs";
+    std::fs::write(tmp.path().join(path), "COUNT_NEEDLE\nCOUNT_NEEDLE\n").unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "single-file-count", "demo", tmp.path()).await;
+    let (result, _) = execute_agent_search(
+        &runtime,
+        "single-file-count",
+        project,
+        SearchRequest {
+            pattern: "COUNT_NEEDLE".to_string(),
+            path: Some(path.to_string()),
+            result_mode: Some(SearchResultMode::Count),
+            ..raw_search_request()
+        },
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["total_matches"], 2);
+    assert_eq!(result.output["files"][0]["path"], path);
 }
 
 #[tokio::test]
@@ -3770,8 +4327,9 @@ async fn search_project_text_reports_effective_clamped_timeout() {
     )
     .await;
     assert!(high.success, "{:?}", high.error);
-    assert_eq!(high_req.timeout_secs, 120);
-    assert_eq!(high.output["effective_timeout_secs"], 120);
+    assert!((29..=30).contains(&high_req.timeout_secs));
+    let high_effective_timeout = high.output["effective_timeout_secs"].as_u64().unwrap();
+    assert!((29..=30).contains(&high_effective_timeout));
 }
 
 #[tokio::test]
@@ -3809,19 +4367,23 @@ async fn advanced_search_without_rg_returns_structured_capability_error() {
         req.command
     );
     complete_agent_request_by_running_locally(&runtime, "search-no-rg", req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
 
     assert!(!result.success);
     assert_search_output_keys_are_declared(&result.output);
-    assert_eq!(result.output["code"], "search_backend_feature_unavailable");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
     assert_eq!(result.output["failure_stage"], "backend_selection");
-    assert_eq!(result.output["reason_code"], "backend_feature_unavailable");
-    assert_eq!(result.output["backend"], "grep");
     assert_eq!(
-        result.output["requested_features"],
-        json!(["result_mode=count"])
+        result.output["reason_code"],
+        "search_backend_feature_unavailable"
     );
-    assert!(result.error.unwrap().contains("ripgrep"));
+    assert_eq!(result.output["detail_code"], "backend_feature_unavailable");
+    assert_eq!(result.output["backend"], "grep");
+    assert_eq!(result.output["state_changed"], false);
+    assert!(result
+        .error
+        .unwrap()
+        .contains("search_backend_feature_unavailable"));
 }
 
 #[tokio::test]
@@ -3838,19 +4400,22 @@ async fn search_project_text_no_matches_returns_empty_matches() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "absent_needle".to_string(),
-                        pattern_mode: None,
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "absent_needle".to_string(),
+                            pattern_mode: None,
+                            path: None,
+                            limit: Some(5),
+                            context_before: None,
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: None,
-                        path: None,
-                        limit: Some(5),
-                        context_before: None,
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -3858,9 +4423,9 @@ async fn search_project_text_no_matches_returns_empty_matches() {
         }
     });
     let req = wait_for_patch_agent_request(&runtime, "search-empty").await;
-    assert_eq!(req.timeout_secs, 30);
+    assert!((29..=30).contains(&req.timeout_secs));
     complete_agent_request_by_running_locally(&runtime, "search-empty", req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["matches"], json!([]));
@@ -3895,19 +4460,22 @@ async fn search_project_text_excludes_sensitive_and_build_dirs() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "KEEP_SEARCH_NEEDLE".to_string(),
-                        pattern_mode: None,
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "KEEP_SEARCH_NEEDLE".to_string(),
+                            pattern_mode: None,
+                            path: None,
+                            limit: Some(10),
+                            context_before: None,
+                            context_after: None,
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: None,
-                        path: None,
-                        limit: Some(10),
-                        context_before: None,
-                        context_after: None,
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -3916,7 +4484,7 @@ async fn search_project_text_excludes_sensitive_and_build_dirs() {
     });
     let req = wait_for_patch_agent_request(&runtime, "search-excludes").await;
     complete_agent_request_by_running_locally(&runtime, "search-excludes", req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["matches"].as_array().unwrap().len(), 1);
@@ -4019,49 +4587,65 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
     let calls = vec![
         (
             "read_file parent traversal",
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: project.clone(),
-                path: "../outside.txt".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "../outside.txt".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             None,
         ),
         (
             "read_file nested parent traversal",
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: project.clone(),
-                path: "src/../../outside.txt".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "src/../../outside.txt".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             None,
         ),
         (
             "read_file absolute path",
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: project.clone(),
-                path: "/etc/passwd".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "/etc/passwd".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             None,
         ),
         (
             "read_file deep parent traversal",
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: project.clone(),
-                path: "sub/../../../etc/passwd".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "sub/../../../etc/passwd".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             None,
         ),
@@ -4111,44 +4695,59 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
         ),
         (
             "search_project_text absolute path",
-            ToolCall::SearchProjectText {
+            ToolCall::SearchProjectTexts {
                 project: project.clone(),
-                pattern: "needle".to_string(),
-                pattern_mode: None,
+                queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                    pattern: "needle".to_string(),
+                    pattern_mode: None,
+                    path: Some("/etc".to_string()),
+                    limit: None,
+                    context_before: None,
+                    context_after: None,
+                    include_globs: None,
+                    exclude_globs: None,
+                    result_mode: None,
+                    timeout_secs: None,
+                }],
                 session_id: None,
-                path: Some("/etc".to_string()),
-                limit: None,
-                context_before: None,
-                context_after: None,
-                include_globs: None,
-                exclude_globs: None,
-                result_mode: None,
-                timeout_secs: None,
+                max_result_bytes: None,
             },
             Some("path"),
         ),
         (
             "search_project_text parent traversal",
-            ToolCall::SearchProjectText {
+            ToolCall::SearchProjectTexts {
                 project,
-                pattern: "needle".to_string(),
-                pattern_mode: None,
+                queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                    pattern: "needle".to_string(),
+                    pattern_mode: None,
+                    path: Some("../outside".to_string()),
+                    limit: None,
+                    context_before: None,
+                    context_after: None,
+                    include_globs: None,
+                    exclude_globs: None,
+                    result_mode: None,
+                    timeout_secs: None,
+                }],
                 session_id: None,
-                path: Some("../outside".to_string()),
-                limit: None,
-                context_before: None,
-                context_after: None,
-                include_globs: None,
-                exclude_globs: None,
-                result_mode: None,
-                timeout_secs: None,
+                max_result_bytes: None,
             },
             Some("path"),
         ),
     ];
 
     for (case, call, structured_field) in calls {
+        let is_batch = matches!(
+            &call,
+            ToolCall::ReadFiles { .. } | ToolCall::SearchProjectTexts { .. }
+        );
         let result = runtime.dispatch_with_auth(call, Some(&bootstrap)).await;
+        let result = if is_batch {
+            extract_single_search_batch_result(result)
+        } else {
+            result
+        };
         assert!(!result.success, "{case} escaped the project boundary");
         let error = result.error.as_deref().unwrap_or("");
         assert!(
@@ -4157,9 +4756,17 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                 || error.contains("path"),
             "{case}: {error}"
         );
-        if let Some(field) = structured_field {
-            assert_eq!(result.output["code"], "invalid_search_request", "{case}");
-            assert_eq!(result.output["field"], field, "{case}");
+        if structured_field.is_some() {
+            assert_eq!(
+                result.output["error_kind"], "search_project_text_failed",
+                "{case}"
+            );
+            assert_eq!(
+                result.output["failure_stage"], "request_validation",
+                "{case}"
+            );
+            assert_eq!(result.output["reason_code"], "invalid_path", "{case}");
+            assert_eq!(result.output["detail_code"], "invalid_path", "{case}");
         }
         assert!(
             probe_patch_agent_request(&runtime, "path-boundary")
@@ -4181,19 +4788,22 @@ async fn search_project_text_requires_shell_capability() {
     let bootstrap = auth_context(None, true);
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::SearchProjectText {
+            ToolCall::SearchProjectTexts {
                 project: agent_test_project_id("oe"),
-                pattern: "fn".to_string(),
-                pattern_mode: None,
+                queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                    pattern: "fn".to_string(),
+                    pattern_mode: None,
+                    path: None,
+                    limit: None,
+                    context_before: None,
+                    context_after: None,
+                    include_globs: None,
+                    exclude_globs: None,
+                    result_mode: None,
+                    timeout_secs: None,
+                }],
                 session_id: None,
-                path: None,
-                limit: None,
-                context_before: None,
-                context_after: None,
-                include_globs: None,
-                exclude_globs: None,
-                result_mode: None,
-                timeout_secs: None,
+                max_result_bytes: None,
             },
             Some(&bootstrap),
         )
@@ -4223,19 +4833,22 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::SearchProjectText {
-                        project,
-                        pattern: "needle".to_string(),
+                    ToolCall::SearchProjectTexts {
+                        project: project,
+                        queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                            pattern: "needle".to_string(),
+                            pattern_mode: None,
+                            path: None,
+                            limit: Some(5),
+                            context_before: Some(1),
+                            context_after: Some(1),
+                            include_globs: None,
+                            exclude_globs: None,
+                            result_mode: None,
+                            timeout_secs: None,
+                        }],
                         session_id: None,
-                        path: None,
-                        limit: Some(5),
-                        context_before: Some(1),
-                        pattern_mode: None,
-                        context_after: Some(1),
-                        include_globs: None,
-                        exclude_globs: None,
-                        result_mode: None,
-                        timeout_secs: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -4251,9 +4864,9 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
     );
     assert!(req.command.contains("command -v rg"));
     assert!(req.command.contains("rg --with-filename --null"));
-    assert!(req.command.contains("grep -rnI --null"));
+    assert!(req.command.contains("grep -rHnI --null"));
     complete_agent_request_by_running_locally(&runtime, "search-native", req).await;
-    let result = task.await.unwrap();
+    let result = extract_single_search_batch_result(task.await.unwrap());
 
     assert!(result.success, "{:?}", result.error);
     assert!(matches!(
@@ -4313,27 +4926,33 @@ async fn search_project_text_rejects_empty_pattern() {
     let bootstrap = auth_context(None, true);
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::SearchProjectText {
+            ToolCall::SearchProjectTexts {
                 project: agent_test_project_id("oe"),
-                pattern: "   ".to_string(),
-                pattern_mode: None,
+                queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
+                    pattern: "   ".to_string(),
+                    pattern_mode: None,
+                    path: None,
+                    limit: None,
+                    context_before: None,
+                    context_after: None,
+                    include_globs: None,
+                    exclude_globs: None,
+                    result_mode: None,
+                    timeout_secs: None,
+                }],
                 session_id: None,
-                path: None,
-                limit: None,
-                context_before: None,
-                context_after: None,
-                include_globs: None,
-                exclude_globs: None,
-                result_mode: None,
-                timeout_secs: None,
+                max_result_bytes: None,
             },
             Some(&bootstrap),
         )
         .await;
+    let result = extract_single_search_batch_result(result);
     assert!(!result.success);
-    assert!(result.error.unwrap().contains("pattern"));
-    assert_eq!(result.output["code"], "invalid_search_request");
-    assert_eq!(result.output["field"], "pattern");
+    assert_eq!(result.output["error_kind"], "search_project_text_failed");
+    assert_eq!(result.output["failure_stage"], "request_validation");
+    assert_eq!(result.output["reason_code"], "invalid_pattern");
+    assert_eq!(result.output["detail_code"], "invalid_pattern");
+    assert_eq!(result.output["state_changed"], false);
 }
 
 #[test]
@@ -4342,6 +4961,8 @@ fn validate_edit_file_path_rejects_unsafe_and_sensitive_paths() {
     assert!(validate_edit_file_path("README.md").is_ok());
     assert!(validate_edit_file_path("src/main.rs").is_ok());
     assert!(validate_edit_file_path("a/b/c.txt").is_ok());
+    assert!(validate_edit_file_path(".env.example").is_ok());
+    assert!(validate_edit_file_path(".ENV.SAMPLE").is_ok());
     // Empty / NUL / absolute / traversal rejected.
     assert!(validate_edit_file_path("").is_err());
     assert!(validate_edit_file_path("src\0main.rs").is_err());
@@ -4386,6 +5007,9 @@ fn is_sensitive_edit_path_is_component_wise_not_substring() {
     assert!(is_sensitive_edit_path(".git/HEAD"));
     assert!(is_sensitive_edit_path("node_modules/x"));
     assert!(is_sensitive_edit_path("a/b/.env"));
+    assert!(!is_sensitive_edit_path(".env.example"));
+    assert!(!is_sensitive_edit_path(".ENV.TEMPLATE"));
+    assert!(is_sensitive_edit_path(".env.example.local"));
 }
 
 #[test]
@@ -4429,18 +5053,18 @@ async fn write_project_file_rejects_invalid_input_before_agent_dispatch() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("sensitive"));
-    // bad expected_sha256 format
+    // invalid model-facing read revision
     let result = runtime
         .write_project_file(
             "agent:c:p".to_string(),
             "EDIT_PROBE.txt".to_string(),
             "x".to_string(),
             Some(true),
-            Some("not-a-hash".to_string()),
+            Some(0),
         )
         .await;
     assert!(!result.success);
-    assert!(result.error.unwrap().contains("expected_sha256"));
+    assert!(result.error.unwrap().contains("expected_read_revision"));
 }
 
 #[test]
@@ -4502,6 +5126,8 @@ async fn read_project_artifact_rejects_sensitive_path_before_resolving_project()
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
     assert!(!out.success);
@@ -4518,10 +5144,31 @@ async fn read_project_artifact_rejects_invalid_length_before_resolving_project()
             None,
             Some(crate::tool_runtime::files::MAX_READ_PROJECT_ARTIFACT_LENGTH + 1),
             None,
+            None,
+            None,
         )
         .await;
     assert!(!out.success);
     assert!(out.error.unwrap().contains("length too large"));
+}
+
+#[tokio::test]
+async fn read_project_artifact_rejects_invalid_expected_sha256_before_resolving_project() {
+    let out = test_runtime()
+        .read_project_artifact(
+            "agent:missing:missing".to_string(),
+            "docs/assets/file.bin".to_string(),
+            None,
+            None,
+            Some(4),
+            Some("A".repeat(64)),
+            None,
+            None,
+        )
+        .await;
+    assert!(!out.success);
+    assert_eq!(out.output["error_kind"], "invalid_expected_sha256");
+    assert!(out.error.unwrap().contains("expected_sha256"));
 }
 
 #[tokio::test]
@@ -4610,12 +5257,8 @@ async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
             .await;
         assert!(!octet.success, "{path}");
         assert!(
-            !octet
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("only allowed for safe artifact extensions"),
-            "Office extensions should be safe octet-stream artifact paths: {:?}",
+            !octet.error.as_deref().unwrap().contains("policy"),
+            "generic binary MIME should pass policy before project resolution: {:?}",
             octet.error
         );
 
@@ -4640,24 +5283,24 @@ async fn office_artifact_mime_policy_accepts_matching_save_and_upload_paths() {
         );
     }
 
-    let unsupported = runtime
+    let unknown_mime = runtime
         .save_project_artifact(
             missing_project,
-            "docs/report.docx".to_string(),
+            "docs/report.customblob".to_string(),
             "YQ==".to_string(),
-            Some("application/msword".to_string()),
+            Some("application/x-unknown".to_string()),
             Some(false),
         )
         .await;
-    assert!(!unsupported.success);
+    assert!(!unknown_mime.success);
     assert!(
-        unsupported
+        !unknown_mime
             .error
             .as_deref()
             .unwrap()
-            .contains("unsupported mime_type"),
-        "{:?}",
-        unsupported.error
+            .contains("mime_type"),
+        "unknown presentation MIME should normalize to generic binary before project resolution: {:?}",
+        unknown_mime.error
     );
 }
 
@@ -4722,12 +5365,8 @@ async fn common_media_artifact_mime_policy_accepts_save_upload_and_octet_paths()
             .await;
         assert!(!octet.success, "{path}");
         assert!(
-            !octet
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("only allowed for safe artifact extensions"),
-            "media extension should be safe for host octet-stream fallback: {:?}",
+            !octet.error.as_deref().unwrap().contains("mime_type"),
+            "generic binary MIME should pass policy before project resolution: {:?}",
             octet.error
         );
     }
@@ -4758,13 +5397,6 @@ async fn artifact_upload_begin_rejects_invalid_inputs_before_resolving_project()
             None,
             Some("text/plain"),
             "expected_bytes too large",
-        ),
-        (
-            "artifacts/imports/raw.bin",
-            Some(1),
-            None,
-            Some("application/octet-stream"),
-            "artifacts/smoke/<name>.artifact",
         ),
     ];
 
@@ -4878,6 +5510,11 @@ async fn read_file_routes_safe_and_bulk_skipped_explicit_paths_to_agent() {
             "node_modules/foo/package.json",
             "{}\n",
         ),
+        (
+            "dotenv-template-read",
+            ".env.example",
+            "EXAMPLE_ONLY=fake\n",
+        ),
     ] {
         let runtime = runtime_with_agent_project(client_id);
         register_agent(
@@ -4925,6 +5562,9 @@ async fn read_file_refuses_secret_paths_before_reaching_agent() {
         ".env",
         ".env.production",
         "app/.env.local",
+        ".env.example.local",
+        ".env.example.bak",
+        ".env.production.example",
         ".ENV",
         "certs/server.pem",
         "certs/server.key",

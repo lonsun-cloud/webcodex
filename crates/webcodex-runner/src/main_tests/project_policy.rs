@@ -125,7 +125,7 @@ fn default_policy_denies_paths_outside_allowed_roots() {
 }
 
 #[test]
-fn configured_skill_roots_do_not_expand_generic_file_authority() {
+fn configured_skill_storage_does_not_expand_generic_file_authority() {
     let project = tempfile::tempdir().unwrap();
     let skills = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();

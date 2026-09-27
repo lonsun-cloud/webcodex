@@ -113,6 +113,7 @@ async fn lease_stale_instance_result_rejected() {
     let (request_id, mut rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "oe".to_string(),
                 cwd: None,
                 command: "echo hi".to_string(),
@@ -147,6 +148,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -177,6 +180,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -201,6 +206,7 @@ async fn lease_stale_instance_job_update_rejected() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,
@@ -246,14 +252,13 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -276,14 +281,13 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -307,14 +311,13 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "completed".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })
@@ -348,6 +351,7 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     let old_job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,
@@ -381,6 +385,7 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     let b_job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,
@@ -448,14 +453,13 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -573,6 +577,7 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
     let job = registry
         .start_job_with_metadata(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: Some("/tmp".to_string()),
@@ -622,14 +627,13 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -667,6 +671,7 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             stdout: Default::default(),
             stderr: Default::default(),
             validation_progress: record.validation_progress.clone(),
+            test_count_evidence: record.test_count_evidence.clone(),
             activity: record.activity,
         }
     };
@@ -721,14 +726,13 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: Some("continued\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -746,14 +750,13 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })

@@ -20,7 +20,6 @@ Project / diagnostics:\n\
   setup                         Configure the current Git project without starting it\n\
   run                           Run the project-bound Server and Runner locally\n\
   disconnect                    Disconnect a local project from its hosted Server\n\
-  task                          Review tasks and make host-local decisions\n\n\
 Account:\n\
   auth status                   Show login status\n\
   logout                        Remove this device's credentials\n\n\
@@ -132,6 +131,7 @@ pub(crate) fn pairing_create_usage() -> &'static str {
        --ttl-secs SECS           Pairing code lifetime [default: 600; range: 60..3600]\n\
        --user-token-name NAME    Name for the user API token created during enroll\n\
        --runner-token-name NAME  Name for the Runner transport token created during enroll\n\
+       --runner-capabilities    Explicitly grant SSH resource management and ACP coding runs\n\
        --json                    Print machine-readable output\n\
        -h, --help                Print help and exit\n\n\
      Server/admin-side command:\n\
@@ -484,7 +484,6 @@ pub(crate) fn runner_init_usage() -> &'static str {
        --transport NAME           websocket (default), polling, quic, or auto\n\
        --poll-interval-ms N       Minimum idle polling interval; default 1000, max 30000 for polling/auto\n\
        --project-registry-dir PATH  Runner project registry directory [default: profile project-registry]\n\
-       --projects-dir PATH        Deprecated legacy alias for --project-registry-dir\n\
        --allowed-root PATH        Allowed project/root path; repeatable\n\
        --allow-cwd-anywhere BOOL  Allow cwd outside allowed_roots; default false\n\
        --output PATH|-            Output config path, or '-' for stdout [default: profile runner.toml]\n\

@@ -1,6 +1,7 @@
 use super::*;
 use crate::runner_protocol::{
-    RUNNER_PROTOCOL_GENERATION_V2, RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
+    RUNNER_ENVELOPE_MAX_BYTES, RUNNER_PROTOCOL_GENERATION_V2,
+    RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
 };
 
 fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::AuthContext {
@@ -86,6 +87,8 @@ fn project_summary(id: &str, path: &str) -> RunnerProjectSummary {
         hooks: vec!["doctor".to_string(), "precommit".to_string()],
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: Some("codex".to_string()),
         git_head: Some("9a7d3ce".to_string()),
         git_dirty: Some(false),

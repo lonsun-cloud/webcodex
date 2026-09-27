@@ -6,6 +6,8 @@ pub struct BuildInfo {
     pub git_commit: Option<&'static str>,
     pub git_dirty: Option<bool>,
     pub built_at: Option<&'static str>,
+    pub target: Option<&'static str>,
+    pub architecture: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -13,6 +15,8 @@ pub struct RuntimeBuildInfo {
     pub git_commit: Option<&'static str>,
     pub git_dirty: Option<bool>,
     pub built_at: Option<&'static str>,
+    pub target: Option<&'static str>,
+    pub architecture: Option<&'static str>,
 }
 
 pub fn current() -> BuildInfo {
@@ -21,6 +25,8 @@ pub fn current() -> BuildInfo {
         git_commit: option_env!("WEBCODEX_BUILD_GIT_COMMIT").and_then(non_empty),
         git_dirty: option_env!("WEBCODEX_BUILD_GIT_DIRTY").and_then(parse_bool),
         built_at: option_env!("WEBCODEX_BUILD_BUILT_AT").and_then(non_empty),
+        target: option_env!("WEBCODEX_BUILD_TARGET").and_then(non_empty),
+        architecture: option_env!("WEBCODEX_BUILD_ARCHITECTURE").and_then(non_empty),
     }
 }
 
@@ -30,6 +36,8 @@ pub fn runtime_build_info() -> RuntimeBuildInfo {
         git_commit: info.git_commit,
         git_dirty: info.git_dirty,
         built_at: info.built_at,
+        target: info.target,
+        architecture: info.architecture,
     }
 }
 
@@ -49,6 +57,38 @@ pub fn version_output(binary: &str) -> String {
     }
     output.push_str(")\n");
     output
+}
+
+/// Stable machine-readable metadata. This surface exits before config loading.
+pub fn machine_build_info(binary: &str) -> crate::desktop_runtime_contract::MachineBuildInfo {
+    use crate::desktop_runtime_contract::{
+        MachineBuildInfo, BUILD_INFO_SCHEMA_VERSION, DESKTOP_RUNTIME_CONTRACT,
+    };
+    let info = current();
+    MachineBuildInfo {
+        schema_version: BUILD_INFO_SCHEMA_VERSION,
+        binary: binary.to_string(),
+        version: info.version.to_string(),
+        git_commit: info.git_commit.map(str::to_string),
+        git_dirty: info.git_dirty,
+        built_at: info.built_at.map(str::to_string),
+        target: info.target.unwrap_or("unknown").to_string(),
+        architecture: info
+            .architecture
+            .unwrap_or(std::env::consts::ARCH)
+            .to_string(),
+        desktop_runtime_contract: DESKTOP_RUNTIME_CONTRACT,
+        agent_protocol_generation: matches!(binary, "webcodex-server" | "webcodex-runner")
+            .then_some(crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2.get()),
+    }
+}
+
+pub fn build_info_json(binary: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string(&machine_build_info(binary))
+            .expect("build identity contains only JSON primitives")
+    )
 }
 
 fn non_empty(value: &'static str) -> Option<&'static str> {
@@ -72,6 +112,10 @@ mod tests {
         let info = current();
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         assert!(!info.version.trim().is_empty());
+        assert!(info.target.is_some_and(|value| !value.trim().is_empty()));
+        assert!(info
+            .architecture
+            .is_some_and(|value| !value.trim().is_empty()));
     }
 
     #[test]

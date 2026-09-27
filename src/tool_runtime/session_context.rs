@@ -1,18 +1,13 @@
 use super::sessions;
 use super::tool_definition::runtime_tool_is_shell_like;
-use super::{RecoveryKind, ToolResult, ToolRuntime};
+use super::{RecoveryKind, ToolResult};
 use crate::auth::AuthContext;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub(crate) const SESSION_PROJECT_MISMATCH_KIND: &str = "session_project_mismatch";
-const SESSION_ATTENTION_MAX_MESSAGES: usize = 3;
+pub(crate) const SESSION_ATTENTION_MAX_MESSAGES: usize = 3;
 const SESSION_ATTENTION_MAX_BODY_BYTES: usize = 3072;
-const SESSION_CONTINUITY_RECOVERY_EVENT_LIMIT: usize = 20;
-pub(crate) const SESSION_CONTINUITY_RECOVERY_EVENT_BYTES: usize = 48 * 1024;
-const SESSION_RECOVERY_HANDOFF_CHANGED_PATH_LIMIT: usize = 40;
-const SESSION_RECOVERY_HANDOFF_CHANGED_PATH_BYTES: usize = 512;
-const SESSION_RECOVERY_VALIDATION_FAILURE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionProjectMismatch {
@@ -28,7 +23,7 @@ pub(crate) fn unknown_session_result(session_id: &str) -> ToolResult {
             "session_id": session_id,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str) -> ToolResult {
@@ -42,7 +37,7 @@ pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str)
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 pub(crate) fn session_project_mismatch_result(
@@ -66,7 +61,7 @@ pub(crate) fn session_project_mismatch_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_guard_denied_result(
@@ -92,7 +87,7 @@ pub(crate) fn session_guard_denied_result(
         ),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 /// Lifecycle denial for Closed workflow sessions (write/shell/mutation).
@@ -120,7 +115,7 @@ pub(crate) fn session_lifecycle_denied_result(
         format!("{error_kind}: {tool_name} blocked on {lifecycle} session"),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 pub(crate) fn session_message_error_result(
@@ -150,7 +145,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::NotTodo => ToolResult::err_with_output(
             "session_message_not_todo",
             json!({
@@ -169,6 +164,31 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         ),
+        sessions::SessionMessageError::DeliveryKeyConflict => ToolResult::err_with_output(
+            "delivery_key_conflict",
+            json!({
+                "error_kind": "delivery_key_conflict",
+                "failure_kind": "conflict",
+                "session_id": session_id,
+                "message_id": message_id,
+                "state_changed": false,
+            }),
+        )
+        .with_recovery(RecoveryKind::FixInput),
+        sessions::SessionMessageError::DeliveryPersistenceUncertain => {
+            ToolResult::err_with_output(
+                "message_delivery_persistence_uncertain",
+                json!({
+                    "error_kind": "message_delivery_persistence_uncertain",
+                    "failure_kind": "outcome_unknown",
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "state_changed": true,
+                    "retry_same_delivery": true,
+                }),
+            )
+            .with_recovery(RecoveryKind::RetrySame)
+        }
         sessions::SessionMessageError::AlreadyCompleted {
             answer_message_id,
             completion_id,
@@ -201,7 +221,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidAssignmentFence => ToolResult::err_with_output(
             "invalid_assignment_fence",
             json!({
@@ -213,7 +233,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "read the exact assignment with get_session_assignment and pass its opaque assignment_fence unchanged",
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
         sessions::SessionMessageError::AssignmentStale {
             current,
             fresh_assignment_fence,
@@ -230,7 +250,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "re-evaluate the returned current assignment; when fresh_assignment_fence is present it is the durable fence for exactly that returned state, otherwise call get_session_assignment again",
             }),
         )
-        .with_recovery(RecoveryKind::Reobserve, None),
+        .with_recovery(RecoveryKind::Reobserve),
         sessions::SessionMessageError::AssignmentHistoryLost { current } => ToolResult::err_with_output(
             "assignment_history_lost",
             json!({
@@ -243,7 +263,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "retained state cannot prove the full exact assignment; do not complete this todo from stale context",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::AssignmentTooLarge {
             reply_count,
             max_replies,
@@ -262,7 +282,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "the coordinator must consolidate or supersede this assignment before a fenced completion can be issued",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::PersistenceUncertain => ToolResult::err_with_output(
             "completion_persistence_uncertain",
             json!({
@@ -274,7 +294,7 @@ pub(crate) fn session_message_error_result(
                 "retry_same_completion": true,
             }),
         )
-        .with_recovery(RecoveryKind::RetrySame, None),
+        .with_recovery(RecoveryKind::RetrySame),
         sessions::SessionMessageError::SessionClosed { lifecycle } => ToolResult::err_with_output(
             "session_closed: session message mutation blocked",
             json!({
@@ -283,7 +303,7 @@ pub(crate) fn session_message_error_result(
                 "lifecycle": lifecycle.as_str(),
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidInput(message) => ToolResult::err_with_output(
             message.clone(),
             json!({
@@ -292,7 +312,7 @@ pub(crate) fn session_message_error_result(
                 "error": message,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
     }
 }
 
@@ -344,312 +364,6 @@ pub(crate) fn add_session_hint(
     }
 }
 
-fn model_facing_recovery_event(event: &sessions::SessionEvent) -> Value {
-    json!({
-        "context_revision": event.context_revision,
-        "tool_name": event.tool_name,
-        "status": event.status,
-        "changed_paths": event.changed_paths,
-        "job_id": event.job_id,
-        "error_kind": event.error_kind,
-        "effect_evidence": event.effect_evidence,
-        "context_result": event.context_result_summary,
-        "execution_summary": event.validation_output_summary,
-    })
-}
-
-fn bounded_model_facing_recovery_events(
-    recorded: &sessions::RecordedModelFacingToolCall,
-) -> Vec<Value> {
-    let mut events = Vec::new();
-    for event in recorded
-        .recovery_events
-        .iter()
-        .rev()
-        .take(SESSION_CONTINUITY_RECOVERY_EVENT_LIMIT)
-    {
-        events.insert(0, model_facing_recovery_event(event));
-        let fits = serde_json::to_vec(&events)
-            .map(|bytes| bytes.len() <= SESSION_CONTINUITY_RECOVERY_EVENT_BYTES)
-            .unwrap_or(false);
-        if !fits {
-            events.remove(0);
-            break;
-        }
-    }
-    events
-}
-
-fn caller_context_state_unknown(recorded: &sessions::RecordedModelFacingToolCall) -> bool {
-    match recorded.ack_session_context_revision {
-        sessions::SessionContextRevisionAck::Unacknowledged
-        | sessions::SessionContextRevisionAck::Invalid => true,
-        sessions::SessionContextRevisionAck::Revision(revision) => {
-            revision > recorded.pre_call_context_revision
-        }
-        sessions::SessionContextRevisionAck::Unsupported => false,
-    }
-}
-
-pub(crate) fn add_session_context_continuity(
-    result: &mut ToolResult,
-    recorded: &sessions::RecordedModelFacingToolCall,
-) -> bool {
-    debug_assert_eq!(
-        recorded.checkpoint_advanced,
-        recorded.context_revision > recorded.pre_response_context_revision,
-        "checkpoint allocation must match the recorded pre-response watermark"
-    );
-    if matches!(
-        recorded.ack_session_context_revision,
-        sessions::SessionContextRevisionAck::Unsupported
-    ) {
-        return false;
-    }
-    let pre_response_context_revision = recorded.pre_response_context_revision;
-    let (status, ack_revision, needs_recovery, events_after_ack) = match recorded
-        .ack_session_context_revision
-    {
-        // An ACK can only prove state that already existed when the request
-        // started. A numerically matching revision allocated by a concurrent
-        // completion after request admission is still a future/invalid ACK.
-        sessions::SessionContextRevisionAck::Revision(revision)
-            if revision > recorded.pre_call_context_revision =>
-        {
-            ("invalid", Some(revision), true, None)
-        }
-        sessions::SessionContextRevisionAck::Revision(revision)
-            if revision == pre_response_context_revision =>
-        {
-            ("exact", Some(revision), false, None)
-        }
-        sessions::SessionContextRevisionAck::Revision(revision) => (
-            "behind",
-            Some(revision),
-            true,
-            Some(pre_response_context_revision.saturating_sub(revision)),
-        ),
-        sessions::SessionContextRevisionAck::Unsupported => {
-            unreachable!("unsupported continuity requests return before response decoration")
-        }
-        sessions::SessionContextRevisionAck::Unacknowledged => ("unacknowledged", None, true, None),
-        sessions::SessionContextRevisionAck::Invalid => ("invalid", None, true, None),
-    };
-    if !needs_recovery && !recorded.checkpoint_advanced {
-        return false;
-    }
-    let mut output = match std::mem::take(&mut result.output) {
-        Value::Object(map) => map,
-        other => {
-            let mut map = serde_json::Map::new();
-            map.insert("value".to_string(), other);
-            map
-        }
-    };
-    output.insert(
-        "session_context_revision".to_string(),
-        Value::from(recorded.context_revision),
-    );
-    if !needs_recovery {
-        result.output = Value::Object(output);
-        return false;
-    }
-
-    let total_retained = recorded.recovery_events.len();
-    let events = bounded_model_facing_recovery_events(recorded);
-    let omitted_count = total_retained.saturating_sub(events.len());
-    let mut continuity = json!({
-        "status": status,
-        "ack_revision": ack_revision,
-        "pre_call_revision": recorded.pre_call_context_revision,
-        "history_lost": recorded.history_lost,
-    });
-    if let Some(events_after_ack) = events_after_ack {
-        continuity["events_after_ack"] = Value::from(events_after_ack);
-    }
-    output.insert("session_continuity".to_string(), continuity);
-    output.insert(
-        "session_recovery".to_string(),
-        json!({
-            "model_facing_events": events,
-            "omitted_count": omitted_count,
-            "truncated": omitted_count > 0,
-            "history_lost": recorded.history_lost,
-        }),
-    );
-    result.output = Value::Object(output);
-    true
-}
-
-fn bounded_recovery_handoff_changed_paths(value: Option<&Value>) -> Value {
-    let Some(paths) = value.and_then(Value::as_array) else {
-        return value.cloned().unwrap_or(Value::Null);
-    };
-    Value::Array(
-        paths
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|path| path.len() <= SESSION_RECOVERY_HANDOFF_CHANGED_PATH_BYTES)
-            .take(SESSION_RECOVERY_HANDOFF_CHANGED_PATH_LIMIT)
-            .map(|path| Value::String(path.to_string()))
-            .collect(),
-    )
-}
-
-fn recovery_validation_failure_event(event: &Value) -> Value {
-    json!({
-        "tool_name": event.get("tool_name"),
-        "execution_source": event.get("execution_source"),
-        "identity": event.get("identity"),
-        "assertion_name": event.get("assertion_name"),
-        "purpose": event.get("purpose"),
-        "validation_kind": event.get("validation_kind"),
-        "failure_kind": event.get("failure_kind"),
-        "failure_category": event.get("failure_category"),
-        "exit_code": event.get("exit_code"),
-        "summary": event.get("summary"),
-        "command_summary": event.get("command_summary"),
-        "cwd": event.get("cwd"),
-        "tests_run_count": event.get("tests_run_count"),
-        "tests_passed": event.get("tests_passed"),
-        "tests_failed": event.get("tests_failed"),
-        "zero_tests_run": event.get("zero_tests_run"),
-        "test_count_assertion": event.get("test_count_assertion"),
-    })
-}
-
-fn recovery_validation_failure_set(value: Option<&Value>) -> Value {
-    let count = value
-        .and_then(|value| value.get("count"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let mut events = Vec::new();
-    if let Some(source) = value
-        .and_then(|value| value.get("events"))
-        .and_then(Value::as_array)
-    {
-        for event in source
-            .iter()
-            .rev()
-            .take(SESSION_RECOVERY_VALIDATION_FAILURE_LIMIT)
-        {
-            events.insert(0, recovery_validation_failure_event(event));
-        }
-    }
-    let omitted_count = count.saturating_sub(events.len() as u64);
-    json!({
-        "count": count,
-        "events": events,
-        "omitted_count": omitted_count,
-        "truncated": omitted_count > 0,
-    })
-}
-
-fn recovery_validation_summary(value: Option<&Value>) -> Value {
-    let Some(validation) = value.filter(|value| value.is_object()) else {
-        return value.cloned().unwrap_or(Value::Null);
-    };
-    json!({
-        "available": validation.get("available"),
-        "status": validation.get("status"),
-        "reason": validation.get("reason"),
-        "latest_status": validation.get("latest_status"),
-        "current_evidence": validation.get("current_evidence"),
-        "historical_failures": validation.get("historical_failures"),
-        "resolved_failures": {
-            "count": validation
-                .pointer("/resolved_failures/count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        },
-        "unresolved_failures": recovery_validation_failure_set(
-            validation.get("unresolved_failures")
-        ),
-        "source": validation.get("source"),
-        "events_total": validation.get("events_total"),
-        "successes": validation.get("successes"),
-        "failures": validation.get("failures"),
-        "cargo_test_zero_tests_run": validation.get("cargo_test_zero_tests_run"),
-    })
-}
-
-impl ToolRuntime {
-    pub(crate) async fn add_session_history_recovery(
-        &self,
-        result: &mut ToolResult,
-        recorded: &sessions::RecordedModelFacingToolCall,
-        auth: Option<&AuthContext>,
-    ) {
-        let response_recovery_truncated = result
-            .output
-            .pointer("/session_recovery/truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let caller_state_unknown = caller_context_state_unknown(recorded);
-        let recovery_projected = result.output.get("session_recovery").is_some();
-        if !recovery_projected
-            || (!caller_state_unknown && !recorded.history_lost && !response_recovery_truncated)
-        {
-            return;
-        }
-        // Unknown caller state has no proven delta base, so recover the current
-        // Session state rather than replaying retained history from revision zero.
-        // A compact current handoff is also required when a known-behind ACK
-        // cannot receive a complete continuous delta because retention or the
-        // model-facing event/byte cap omitted consequences. In either case the
-        // newest revision is only safe to ACK together with current-state recovery.
-        let project = self
-            .sessions
-            .session_project(&recorded.session_id)
-            .flatten();
-        let handoff = self
-            .session_handoff_summary(
-                recorded.session_id.clone(),
-                project,
-                Some(true),
-                Some(true),
-                Some(true),
-                false,
-                Some(20),
-                auth,
-            )
-            .await;
-        if !handoff.success {
-            // Recovery was required before the newest prefix could be safely
-            // acknowledged. If current-state recovery itself cannot be
-            // produced, do not advertise a revision the caller did not fully
-            // recover; the caller keeps its previous ACK and can retry later.
-            if let Some(output) = result.output.as_object_mut() {
-                output.remove("session_context_revision");
-            }
-            return;
-        }
-        let current = json!({
-            "workspace": handoff.output.get("workspace"),
-            "checkpoints": handoff.output.get("checkpoints"),
-            "validation": recovery_validation_summary(handoff.output.get("validation")),
-            "jobs": handoff.output.get("jobs"),
-            "open_todos": handoff.output.get("open_todos"),
-            "open_risks": handoff.output.get("open_risks"),
-            "open_questions": handoff.output.get("open_questions"),
-            "open_guidance": handoff.output.get("open_guidance"),
-            "recent_decisions": handoff.output.get("recent_decisions"),
-            "work_performed": handoff.output.get("work_performed"),
-            "changed_paths": bounded_recovery_handoff_changed_paths(
-                handoff.output.get("changed_paths")
-            ),
-            "suggested_next_actions": handoff.output.get("suggested_next_actions"),
-        });
-        if let Some(recovery) = result
-            .output
-            .get_mut("session_recovery")
-            .and_then(Value::as_object_mut)
-        {
-            recovery.insert("current_handoff".to_string(), current);
-        }
-    }
-}
-
 pub(crate) fn observe_session_attention_acks(
     sessions: &sessions::SessionStore,
     session_id: &str,
@@ -662,10 +376,11 @@ pub(crate) fn add_session_attention_projection(
     result: &mut ToolResult,
     sessions: &sessions::SessionStore,
     session_id: &str,
+    source: &str,
     ack: &sessions::SessionAckObservation,
     ack_requested: bool,
 ) {
-    let attention = sessions.ack_required_guidance(session_id, &ack.accepted_ids);
+    let attention = sessions.ack_required_messages(session_id, &ack.accepted_ids);
     let unsuppressed_count = attention.messages.len();
     let mut remaining_bytes = SESSION_ATTENTION_MAX_BODY_BYTES;
     let mut messages = Vec::new();
@@ -703,9 +418,9 @@ pub(crate) fn add_session_attention_projection(
         }
     };
     // Strong hint fields are a counts-only fallback. Once this response has
-    // fully conveyed every unacknowledged urgent body (or the request ACK has
-    // suppressed it), keep only the ordinary inbox counts/tool suggestion.
-    // Preserve the strong fallback when any urgent body is omitted or truncated.
+    // fully conveyed every unacknowledged ACK-required body (or the request ACK
+    // has suppressed it), keep only the ordinary inbox counts/tool suggestion.
+    // Preserve the strong fallback when any required body is omitted or truncated.
     if omitted_count == 0 && !body_truncated {
         if let Some(hint) = output
             .get_mut("session_hint")
@@ -719,6 +434,8 @@ pub(crate) fn add_session_attention_projection(
     output.insert(
         "session_attention".to_string(),
         json!({
+            "session_id": session_id,
+            "source": source,
             "requires_ack": attention.total_open_requires_ack > 0,
             "messages": messages,
             "omitted_count": omitted_count,
@@ -744,6 +461,7 @@ pub(crate) fn add_session_attention(
         result,
         sessions,
         session_id,
+        "recording_session",
         &ack,
         !ack_message_ids.is_empty(),
     );
@@ -760,15 +478,15 @@ fn bound_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
     (value[..end].to_string(), true)
 }
 
-pub(crate) fn workflow_session_authority_fingerprint(
+fn stable_caller_authority_identity(
     auth: Option<&AuthContext>,
-) -> Result<String, String> {
+) -> Result<(&'static str, String), String> {
     let (authority_kind, authority_id) = match auth {
         None => ("local-dev", "local-dev".to_string()),
         Some(auth) if auth.is_bootstrap => ("bootstrap", "server-bootstrap".to_string()),
         Some(auth) if auth.is_oauth_shared_key_subject() || auth.is_shared_key() => (
             "shared-key-group",
-            stable_workflow_authority_id(
+            stable_authority_id(
                 auth.shared_key_hash.as_deref(),
                 "shared-key authority has no stable group identity",
             )?,
@@ -780,7 +498,7 @@ pub(crate) fn workflow_session_authority_fingerprint(
         {
             (
                 "project-grant",
-                stable_workflow_authority_id(
+                stable_authority_id(
                     auth.project_grant_id.as_deref(),
                     "project-grant authority has no stable grant identity",
                 )?,
@@ -802,27 +520,42 @@ pub(crate) fn workflow_session_authority_fingerprint(
         {
             (
                 "managed-user",
-                stable_workflow_authority_id(
+                stable_authority_id(
                     auth.user_id.as_deref(),
                     "managed caller has no stable user identity",
                 )?,
             )
         }
         Some(_) => {
-            return Err(
-                "authenticated caller has no canonical Workflow Session authority identity"
-                    .to_string(),
-            );
+            return Err("authenticated caller has no canonical authority identity".to_string());
         }
     };
-    Ok(hash_workflow_session_authority(
+    Ok((authority_kind, authority_id))
+}
+
+pub(crate) fn workflow_session_authority_fingerprint(
+    auth: Option<&AuthContext>,
+) -> Result<String, String> {
+    let (authority_kind, authority_id) = stable_caller_authority_identity(auth)?;
+    Ok(hash_authority_identity(
         b"webcodex.workflow-session-authority.v1\0",
         authority_kind,
         &authority_id,
     ))
 }
 
-fn stable_workflow_authority_id(value: Option<&str>, error: &str) -> Result<String, String> {
+pub(crate) fn project_reference_principal_fingerprint(
+    auth: Option<&AuthContext>,
+) -> Result<String, String> {
+    let (authority_kind, authority_id) = stable_caller_authority_identity(auth)?;
+    Ok(hash_authority_identity(
+        b"webcodex.project-reference-principal.v1\0",
+        authority_kind,
+        &authority_id,
+    ))
+}
+
+fn stable_authority_id(value: Option<&str>, error: &str) -> Result<String, String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -830,7 +563,7 @@ fn stable_workflow_authority_id(value: Option<&str>, error: &str) -> Result<Stri
         .ok_or_else(|| error.to_string())
 }
 
-fn hash_workflow_session_authority(domain: &[u8], kind: &str, id: &str) -> String {
+fn hash_authority_identity(domain: &[u8], kind: &str, id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(kind.as_bytes());

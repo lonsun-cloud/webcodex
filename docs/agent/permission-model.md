@@ -87,26 +87,14 @@ decision for consequential tools.
 
 ### `restricted`
 
-- Consequential runtime tools are **denied** with
-  `reason=restricted_requires_human_authorization`.
-- The project-bound connector `commands_run` keeps the one-time human approval
-  loop (`wc_approvals`, `task_cli approve/deny`).
+- Consequential runtime tools are **denied** with `reason=restricted_requires_human_authorization`.
+- There is no separate Connector command-approval queue or host-side task approval namespace.
 
 ### Invalid configuration
 
 - Unknown authority/legacy values and conflicting current/legacy settings are rejected: consequential tools fail closed
   (`policy=invalid`, `status=denied`, `reason=invalid_authority_mode:...`).
   Invalid configuration never falls back to allow.
-
-### Connector surface (`commands_run`)
-
-- Under `trusted_agent`, `commands_run` no longer creates approval records or
-  `approval_required` interruptions. Instead a durable task event
-  `authority_auto_authorized` is recorded with the authority mode, source,
-  resolved rule, action hash/summary, risk, principal, and project.
-- Under `restricted`, the existing one-time approval loop is unchanged.
-
----
 
 ## 3. Hard boundaries not relaxed by `trusted_agent`
 
@@ -182,9 +170,7 @@ approval records. They remain subject to hard safety.
 4. **`restricted` never silently auto-approves** runtime tools.
 5. **Read-only / not-required tools never invent approval records.**
 6. **Hard-denied tool outcomes suppress the soft authority attach.**
-7. **Every trusted-agent auto-execution remains auditable** — session-ledger
-   decision records for runtime tools, `authority_auto_authorized` durable
-   task events for the connector `commands_run` path.
+7. **Every trusted-agent auto-execution remains auditable** through the canonical runtime/session evidence path; no parallel Connector approval/event ledger is required.
 8. **External release actions stay user-task-scoped** under `trusted_agent`;
    they are not blanket-authorized by the mode.
 

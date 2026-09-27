@@ -106,8 +106,12 @@ fn assignment_snapshot_is_atomic_and_unrelated_traffic_and_ack_do_not_stale() {
         .unwrap();
     assert_eq!(snapshot.todo.message_id, todo.message_id);
     assert_eq!(snapshot.direct_replies, vec![guidance.clone()]);
-    assert!(snapshot.assignment_fence.starts_with("wsa1_"));
-    assert_eq!(snapshot.assignment_fence.len(), 48);
+    assert!(snapshot.assignment_fence.starts_with("wsa2_"));
+    assert_eq!(snapshot.assignment_fence.len(), 27);
+    assert!(webcodex_core::compact::decode::<16>(
+        snapshot.assignment_fence.strip_prefix("wsa2_").unwrap()
+    )
+    .is_some());
 
     // Unrelated Session traffic advances the Session-wide observation high-water
     // but is not assignment-local meaning.
@@ -288,7 +292,7 @@ fn direct_reply_append_replace_withdraw_and_resolve_stale_without_completion() {
         };
         assert!(fresh_assignment_fence
             .as_deref()
-            .is_some_and(|fence| fence.starts_with("wsa1_")));
+            .is_some_and(|fence| fence.starts_with("wsa2_")));
         assert_eq!(current.todo.message_id, todo.message_id);
         assert!(!current
             .direct_replies
@@ -395,7 +399,7 @@ fn assignment_fence_is_bound_to_exact_session_and_todo() {
             &first.session_id,
             &first_todo.message_id,
             &"e".repeat(64),
-            format!("wsm1_{}", "A".repeat(43)),
+            format!("wsm2_{}", "A".repeat(43)),
         )),
         Err(SessionMessageError::InvalidAssignmentFence)
     ));
@@ -458,7 +462,7 @@ fn fenced_completion_replays_same_key_and_conflicts_on_same_key_body_change() {
     ));
 
     let mut different_author = input.clone();
-    different_author.author_session_id = Some("wc_sess_other_worker".to_string());
+    different_author.author_session_id = Some("wc_sess_aaaaaaaaaaaaaaaa".to_string());
     assert!(matches!(
         store.complete_message(different_author),
         Err(SessionMessageError::IdempotencyConflict)

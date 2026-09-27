@@ -194,6 +194,156 @@ fn internal_posix_interpreter_rejects_wsl_only_bash() {
 
 #[cfg(windows)]
 #[test]
+fn native_single_file_search_spec_builds_bounded_rg_argv() {
+    let payload = serde_json::json!({
+        "pattern": "needle\\.literal",
+        "path": "src/lib.rs",
+        "limit": 7,
+        "context_before": 3,
+        "context_after": 4,
+        "include_globs": [],
+        "exclude_globs": [],
+        "result_mode": "matches",
+        "timeout_secs": 30
+    })
+    .to_string();
+    let spec = native_single_file_search_spec(&payload).expect("eligible single-file search");
+    assert_eq!(spec.path, "src/lib.rs");
+    assert!(spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--max-count", "8"]));
+    assert!(spec.args.windows(2).any(|pair| pair == ["-B", "3"]));
+    assert!(spec.args.windows(2).any(|pair| pair == ["-A", "4"]));
+    assert!(spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-e", "needle\\.literal"]));
+    assert_eq!(spec.args.last().map(String::as_str), Some("src/lib.rs"));
+}
+
+#[cfg(windows)]
+#[test]
+fn native_single_file_search_count_keeps_filename_for_parser() {
+    let payload = serde_json::json!({
+        "pattern": "needle", "path": "file.txt", "limit": 8,
+        "context_before": 0, "context_after": 0, "result_mode": "count"
+    })
+    .to_string();
+    let spec = native_single_file_search_spec(&payload).unwrap();
+    assert!(spec.args.iter().any(|arg| arg == "--with-filename"));
+    assert!(spec.args.iter().any(|arg| arg == "--null"));
+}
+
+#[cfg(all(windows, feature = "runner-real-process-tests"))]
+#[test]
+#[ignore = "requires native rg.exe; run explicitly for Windows search validation"]
+fn runner_real_process_native_single_file_search_preserves_modes_and_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let path = "代码 file.txt";
+    std::fs::write(
+        project.join(path),
+        "needle.literal\r\nother\r\nneedle.literal\r\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("outside.txt"), "needle.literal").unwrap();
+    let shell = ShellConfig::default();
+    let policy = unrestricted_policy();
+    let cache = PreparedShellProfileCache::default();
+    let payload = |mode: &str, pattern: &str, path: &str| {
+        serde_json::json!({
+            "pattern": pattern, "path": path, "limit": 8,
+            "context_before": 0, "context_after": 0, "result_mode": mode
+        })
+    };
+    let run = |payload: &serde_json::Value| {
+        run_windows_native_single_file_search_with_profiles(
+            1,
+            &policy,
+            &shell,
+            root.path(),
+            &cache,
+            Some(project.to_str().unwrap()),
+            Some(&payload.to_string()),
+            10,
+            None,
+        )
+    };
+    for (mode, expected) in [
+        (
+            "matches",
+            vec![
+                format!("{path}\0{}:needle.literal", 1),
+                format!("{path}\0{}:needle.literal", 3),
+            ],
+        ),
+        ("files_with_matches", vec![path.to_string()]),
+        ("count", vec![format!("{path}\0{}", 2)]),
+    ] {
+        let result =
+            run(&payload(mode, r"needle\.literal", path)).expect("native rg.exe must be available");
+        assert_eq!(
+            result.execution_state,
+            ShellCommandExecutionState::Completed
+        );
+        assert_eq!(result.result.exit_code, Some(0), "{result:?}");
+        let stdout = result.result.stdout.as_deref().unwrap();
+        assert!(stdout.starts_with("{\"webcodex_search\":"));
+        assert_eq!(
+            stdout.lines().skip(1).collect::<Vec<_>>(),
+            expected,
+            "{mode}"
+        );
+        eprintln!(
+            "windows_native_search mode={mode} duration_ms={:?}",
+            result.result.duration_ms
+        );
+    }
+    let empty = run(&payload("matches", "absent", path)).unwrap();
+    assert_eq!(empty.result.exit_code, Some(1));
+    assert_eq!(empty.result.stdout.unwrap().lines().count(), 1);
+    for fallback_path in [".", "missing.txt", "../outside.txt"] {
+        assert!(run(&payload("matches", "needle", fallback_path)).is_none());
+    }
+    let mut glob = payload("matches", "needle", path);
+    glob["include_globs"] = serde_json::json!(["*.txt"]);
+    assert!(run(&glob).is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn native_single_file_search_spec_rejects_globs_and_absolute_paths() {
+    let with_glob = serde_json::json!({
+        "pattern": "needle",
+        "path": "src/lib.rs",
+        "limit": 1,
+        "context_before": 0,
+        "context_after": 0,
+        "include_globs": ["*.rs"],
+        "exclude_globs": [],
+        "result_mode": "matches"
+    })
+    .to_string();
+    assert!(native_single_file_search_spec(&with_glob).is_none());
+
+    let absolute = serde_json::json!({
+        "pattern": "needle",
+        "path": "C:\\secret.txt",
+        "limit": 1,
+        "context_before": 0,
+        "context_after": 0,
+        "include_globs": [],
+        "exclude_globs": [],
+        "result_mode": "matches"
+    })
+    .to_string();
+    assert!(native_single_file_search_spec(&absolute).is_none());
+}
+
+#[cfg(windows)]
+#[test]
 fn internal_posix_runtime_uses_git_bash_stdin_with_powershell_configured() {
     let cwd = tempfile::tempdir().unwrap();
     let project_registry_dir = tempfile::tempdir().unwrap();
@@ -354,6 +504,35 @@ fn phase_f_bounded_raw_tail_aligns_complete_utf8_before_windows_decode() {
 }
 
 #[test]
+fn synchronous_shell_capture_preserves_typed_truncation_evidence() {
+    let max = 32;
+    for stream in ["stdout", "stderr"] {
+        let captured =
+            read_bounded_pipe_tail(std::io::Cursor::new(vec![b'x'; max * 8]), max, stream).unwrap();
+        let (text, truncated) = captured.normalize_with_truncation(max);
+        assert!(captured.raw_truncated, "{stream}");
+        assert!(truncated, "{stream}");
+        assert!(text.len() <= max, "{stream}: {}", text.len());
+    }
+
+    let small = read_bounded_pipe_tail(std::io::Cursor::new(b"small"), max, "stdout").unwrap();
+    let (text, truncated) = small.normalize_with_truncation(max);
+    assert_eq!(text, "small");
+    assert!(!small.raw_truncated);
+    assert!(!truncated);
+
+    let captured_without_raw_loss =
+        read_bounded_pipe_tail(std::io::Cursor::new(vec![b'y'; max * 2]), max * 4, "stdout")
+            .unwrap();
+    assert!(!captured_without_raw_loss.raw_truncated);
+    let (_, truncated) = captured_without_raw_loss.normalize_with_truncation(max);
+    assert!(
+        truncated,
+        "presentation normalization truncation is also typed evidence"
+    );
+}
+
+#[test]
 fn phase_f_bounded_raw_tail_restores_utf8_bom_after_scalar_alignment() {
     let text = "中🙂".repeat(64);
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
@@ -510,6 +689,8 @@ fn pre_spawn_rejection_is_not_started() {
         None,
         "exit 0",
         None,
+        false,
+        None,
         10,
         None,
     );
@@ -529,6 +710,8 @@ fn terminal_process_result_is_completed() {
         None,
         None,
         "exit 7",
+        None,
+        false,
         None,
         10,
         None,
@@ -550,6 +733,8 @@ fn known_process_timeout_is_timed_out() {
         None,
         None,
         "sleep 2",
+        None,
+        false,
         None,
         1,
         None,
@@ -573,6 +758,34 @@ fn post_spawn_missing_output_pipe_is_outcome_unknown() {
         result.execution_state,
         ShellCommandExecutionState::OutcomeUnknown
     );
+}
+
+#[test]
+fn explicit_bash_uses_resolved_interpreter_instead_of_configured_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bash = temp
+        .path()
+        .join(format!("bash{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&fake_bash);
+    let shell = ShellConfig {
+        program: "powershell".to_string(),
+        args: vec!["-NoProfile".to_string(), "-Command".to_string()],
+        dialect: Some(ShellDialect::PowerShell),
+        path_prepend: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    };
+    let body = "printf '%s\\n' explicit-shell-ok";
+
+    let command =
+        configured_explicit_shell_command(&shell, None, ExecutionShell::Bash, false, body).unwrap();
+
+    assert_eq!(Path::new(command.get_program()), fake_bash.as_path());
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(args, vec!["-c".to_string(), body.to_string()]);
+    assert!(args.iter().all(|arg| !arg.starts_with("exec bash -c ")));
 }
 
 #[test]
@@ -645,7 +858,7 @@ fn structured_process_supports_empty_args_and_bounded_stdin() {
 fn structured_process_without_stdin_receives_eof_instead_of_runner_parent_lease() {
     let cwd = tempfile::tempdir().unwrap();
     let helper = process_argv_helper();
-    let result = run_direct_process(cwd.path(), &helper, &["stdin".to_string()], None, 2);
+    let result = run_direct_process(cwd.path(), &helper, &["stdin".to_string()], None, 10);
     assert_eq!(
         result.execution_state,
         ShellCommandExecutionState::Completed,
@@ -1539,6 +1752,112 @@ fn javascript_temp_file_uses_mjs_and_exact_script_bytes() {
 }
 
 #[test]
+fn python_script_uses_runner_resolved_interpreter_and_py_file() {
+    use std::ffi::OsStr;
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = if cfg!(windows) { "python" } else { "python3" };
+    let interpreter = temp
+        .path()
+        .join(format!("{candidate}{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&interpreter);
+    let mut shell = ShellConfig::default();
+    shell.program = "unrelated-shell".to_string();
+    shell.env.insert(
+        "PATH".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    let plan = configured_script_runtime_plan(
+        &shell,
+        None,
+        ShellScriptLanguage::Python,
+        temp.path(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(&plan.program), interpreter);
+    assert!(plan.prefix_args.is_empty());
+    let payload = ShellScriptPayload {
+        language: ShellScriptLanguage::Python,
+        script: "print('雪')\n".to_string(),
+        args: vec!["two words".to_string(), "$(literal)".to_string()],
+    };
+    let (temporary_path, _original, absolute) = create_temporary_script(&payload).unwrap();
+    assert_eq!(
+        absolute.extension().and_then(|value| value.to_str()),
+        Some("py")
+    );
+    assert_eq!(std::fs::read(&absolute).unwrap(), payload.script.as_bytes());
+    let command = build_script_command(&plan, &absolute, &payload.args);
+    let argv = command.get_args().collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        vec![
+            absolute.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("$(literal)")
+        ]
+    );
+    temporary_path.close().unwrap();
+}
+
+#[test]
+fn python_script_rejects_missing_interpreter_before_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut shell = ShellConfig::default();
+    shell.program = "unrelated-shell".to_string();
+    shell.env.insert(
+        "PATH".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    let error = configured_script_runtime_plan(
+        &shell,
+        None,
+        ShellScriptLanguage::Python,
+        temp.path(),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("interpreter_unavailable: python"));
+    assert!(error.contains("command was not started"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_bash_login_reads_isolated_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join(".bash_profile"),
+        "export WEBCODEX_LOGIN_FIXTURE=loaded\n",
+    )
+    .unwrap();
+    let mut shell = ShellConfig::default();
+    shell.env.insert(
+        "HOME".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    for (login, expected) in [(false, "absent"), (true, "loaded")] {
+        let mut command = configured_explicit_shell_command(
+            &shell,
+            None,
+            ExecutionShell::Bash,
+            login,
+            "printf '%s' \"${WEBCODEX_LOGIN_FIXTURE:-absent}\"; shopt -q login_shell",
+        )
+        .unwrap();
+        let output = command
+            .current_dir(temp.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), login);
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    assert!(
+        configured_explicit_shell_command(&shell, None, ExecutionShell::Sh, true, "true").is_err()
+    );
+}
+
+#[test]
 fn typescript_temp_file_uses_mts_and_exact_script_bytes() {
     let payload = ShellScriptPayload {
         language: ShellScriptLanguage::Typescript,
@@ -1555,6 +1874,7 @@ fn typescript_temp_file_uses_mts_and_exact_script_bytes() {
 }
 
 #[test]
+#[cfg(feature = "runner-real-process-tests")]
 #[ignore = "manual real-process smoke: requires compatible Node.js on PATH"]
 fn runner_real_process_node_script_runtime_preserves_argv_stdin_and_cwd() {
     let cwd = tempfile::tempdir().unwrap();
@@ -1609,7 +1929,7 @@ const payload: Payload = identity<Payload>({ value: process.argv[2] ?? '' });
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "real-process stdin isolation: runs an isolated test process with a fake Node runtime"]
 fn runner_real_process_typescript_probe_receives_eof_instead_of_runner_stdin() {
@@ -1818,8 +2138,11 @@ fn phase_f_windows_powershell_shell_and_param_script_keep_semantics() {
         Some(cwd.path().to_string_lossy().as_ref()),
         "[Console]::Out.WriteLine('shell 中文 🙂'); [Console]::Error.WriteLine('error 中文 🙂'); exit 19",
         None,
+        false,
+        None,
         10,
-        None,);
+        None,
+    );
     assert_eq!(
         shell_result.execution_state,
         ShellCommandExecutionState::Completed
@@ -2064,5 +2387,20 @@ fn default_shell_preserves_non_unicode_environment_without_panicking() {
         "WEBCODEX_OPAQUE_TOOLCHAIN_ENV",
         OsString::from_vec(vec![0xff]),
     );
-    configured_process_command(&ShellConfig::default(), None, "true", &[], None).unwrap();
+    let shell = ShellConfig::default();
+    configured_process_command(&shell, None, "true", &[], None).unwrap();
+    let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert!(
+        !snapshot.contains_key("WEBCODEX_OPAQUE_TOOLCHAIN_ENV"),
+        "String-backed prepared environments must ignore inherited values they cannot represent instead of panicking"
+    );
+    PreparedExecutionEnvironment::prepare(
+        1,
+        &shell,
+        None,
+        Path::new("."),
+        &PreparedShellProfileCache::default(),
+        None,
+    )
+    .unwrap();
 }

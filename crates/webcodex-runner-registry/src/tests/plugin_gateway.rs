@@ -152,6 +152,8 @@ async fn plugin_reload_can_target_exact_plugin_capable_runner_without_registrati
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -214,6 +216,8 @@ async fn plugin_check_targets_exact_runner_without_registration_provider_invento
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -283,6 +287,8 @@ async fn plugin_check_rejects_mismatched_provider_report_after_dispatch() {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -304,6 +310,67 @@ async fn plugin_check_rejects_mismatched_provider_report_after_dispatch() {
                         diagnostic: None,
                     },
                 },
+            )),
+            coding_agent: None,
+        })
+        .await
+        .unwrap();
+    let response = receiver.await.unwrap();
+    assert_eq!(response.dispatch_state, PluginDispatchState::OutcomeUnknown);
+    assert_eq!(
+        response.error.as_ref().map(|error| error.code.as_str()),
+        Some("invalid_runner_response")
+    );
+    assert!(response.payload.is_none());
+}
+
+#[tokio::test]
+async fn project_catalog_rejects_mixed_runner_response_kind() {
+    let registry = RunnerRegistry::default();
+    register_plugin_runner(&registry).await;
+    let alice = auth_context(Some("alice"), false);
+    let (_request_id, receiver) = registry
+        .enqueue_plugin_gateway(
+            "plugin-runner",
+            "runner-instance",
+            PluginGatewayRequest::ProjectCatalog {
+                project_id: "repo".to_string(),
+            },
+            Some(&alice),
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(RunnerPollRequest {
+            client_id: "plugin-runner".to_string(),
+            runner_instance_id: "runner-instance".to_string(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        request.plugin_gateway,
+        Some(PluginGatewayRequest::ProjectCatalog { ref project_id }) if project_id == "repo"
+    ));
+    registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
+                client_id: "plugin-runner".to_string(),
+                runner_instance_id: "runner-instance".to_string(),
+                request_id: request.request_id,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: None,
+                error: None,
+            },
+            command_execution_state: None,
+            mcp_gateway: None,
+            plugin_gateway: Some(PluginGatewayResponse::success(
+                PluginGatewayResponsePayload::Providers { providers: vec![] },
             )),
             coding_agent: None,
         })
@@ -381,6 +448,8 @@ async fn plugin_enqueue_rechecks_owner_and_exact_runner_but_not_provider_invento
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },

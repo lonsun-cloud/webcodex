@@ -490,12 +490,12 @@ if check_success "tool_manifest(category=artifact) succeeds" "$body"; then
     fi
 fi
 
-body="$(api_post /api/projects/list '{}')"
-if check_success "listProjects succeeds" "$body"; then
+body="$(api_post /api/tools/call '{"tool":"list_projects","params":{}}')"
+if check_success "list_projects succeeds" "$body"; then
     if json_contains_strings "$body" "$PROJECT_ID"; then
-        pass "listProjects includes $PROJECT_ID"
+        pass "list_projects includes $PROJECT_ID"
     else
-        fail "listProjects does not include $PROJECT_ID"
+        fail "list_projects does not include $PROJECT_ID"
     fi
 fi
 

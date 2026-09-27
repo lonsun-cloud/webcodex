@@ -7,15 +7,18 @@ use std::time::Instant;
 use webcodex_core::project_instructions::{
     ProjectInstructionsSnapshot, ProjectInstructionsSummarySnapshot,
 };
-use webcodex_core::workflow_session_contract::{ExecutionShell, PermissionDecision, SessionMode};
+use webcodex_core::workflow_session_contract::PermissionDecision;
+pub use webcodex_core::workflow_session_contract::{
+    SessionExecutionContext, SessionMessageKind, SessionMessagePriority, SessionMessageStatus,
+    SessionMode,
+};
 pub use webcodex_core::workflow_session_contract::{
     MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS, SESSION_ID_PREFIX,
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION,
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
-    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
-    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
+    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD,
+    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
 
 pub const EVENT_ID_PREFIX: &str = "evt_";
@@ -24,7 +27,10 @@ pub const LOGICAL_INVOCATION_ID_PREFIX: &str = "wc_inv_";
 pub const LOGICAL_INVOCATION_ROLE_RECORDER: &str = "recorder";
 pub const LOGICAL_INVOCATION_ROLE_BUSINESS: &str = "business";
 pub const DEFAULT_MAX_SESSIONS: usize = 100;
-pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200;
+/// Durable per-Session event retention. This is intentionally larger than the
+/// model-facing summary ceiling: long-running coding Sessions keep forensic and
+/// recovery evidence without forcing that history into one model response.
+pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 2000;
 /// Exact terminal-validation Job identities retained per Workflow Session. This
 /// matches the Runner's authoritative terminal Job inventory bound: while a
 /// terminal Job can still be a reconciliation candidate, one of these bounded
@@ -37,6 +43,8 @@ pub const MAX_MATERIALIZED_VALIDATION_JOB_IDS: usize =
 /// while keeping every event independently bounded.
 pub const MAX_OBSERVED_PATHS_PER_EVENT: usize = 201;
 pub const DEFAULT_SUMMARY_LIMIT: usize = 50;
+/// Maximum event tail projected by one model-facing Session summary. Durable
+/// retention is independently bounded by `DEFAULT_MAX_EVENTS_PER_SESSION`.
 pub const MAX_SUMMARY_LIMIT: usize = 200;
 pub const MAX_SUMMARY_STRING_CHARS: usize = 240;
 pub const MAX_INPUT_STRING_CHARS: usize = 120;
@@ -49,12 +57,13 @@ pub const DEFAULT_MAX_MESSAGES_PER_SESSION: usize = 200;
 pub const MAX_CODING_INSTRUCTION_CHARS: usize = 4000;
 pub const DEFAULT_MESSAGE_LIST_LIMIT: usize = 50;
 pub const MAX_MESSAGE_LIST_LIMIT: usize = 100;
-pub const MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN: usize = 192;
+pub const MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN: usize = 37;
 pub const MAX_MESSAGE_CHARS: usize = 8000;
 pub const MAX_MESSAGE_TAGS: usize = 16;
 pub const MAX_MESSAGE_TAG_CHARS: usize = 64;
 pub const MAX_MESSAGE_RESOLUTION_CHARS: usize = 8000;
 pub const MAX_MESSAGE_COMPLETION_KEY_CHARS: usize = 128;
+pub const MAX_MESSAGE_DELIVERY_KEY_CHARS: usize = 128;
 pub const MESSAGE_COMPLETION_FINGERPRINT_HEX_CHARS: usize = 64;
 pub const MAX_MESSAGE_SUMMARY_CHARS: usize = 240;
 pub const SUMMARY_MESSAGE_GROUP_LIMIT: usize = 5;
@@ -64,138 +73,6 @@ pub const TOOL_EXPECTATION_RESULT_MATCHED_RESULT: &str = "matched_expected_resul
 pub const TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE: &str = "unexpected_failure";
 pub const TOOL_EXPECTATION_RESULT_MISMATCH: &str = "expectation_mismatch";
 pub const TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS: &str = "unexpected_success";
-/// Durable execution defaults inherited by a closed set of execution tools
-/// attached to a project-scoped Workflow Session.
-///
-/// This intentionally contains no environment, credential, connection, or
-/// arbitrary option bag. `resource` is only a named Runner-local SSH resource;
-/// it never stores an SSH host, config, key, password, or transport.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionExecutionContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_shell: Option<ExecutionShell>,
-    /// Optional named SSH resource on the Runner that owns this Session's
-    /// project. It changes `run_shell`, `run_job`, and newly opened
-    /// `open_session_shell` execution location.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
-}
-
-impl SessionExecutionContext {
-    pub fn is_empty(&self) -> bool {
-        self.default_cwd.is_none() && self.default_shell.is_none() && self.resource.is_none()
-    }
-
-    /// Validate and normalize persisted execution-context fields.
-    ///
-    /// Without an SSH resource, `default_cwd` remains project-relative and
-    /// follows the existing project-bound validation. With one, it is a remote
-    /// path instead and never reaches Runner-local project path validation.
-    pub fn validated(mut self) -> Result<Self, String> {
-        if let Some(raw_resource) = self.resource.take() {
-            let resource = raw_resource.trim();
-            if resource.is_empty()
-                || resource.len() > 80
-                || resource.contains("..")
-                || !resource
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-            {
-                return Err(
-                    "execution_context.resource must be a safe named SSH resource".to_string(),
-                );
-            }
-            self.resource = Some(resource.to_string());
-        }
-        if let Some(raw_cwd) = self.default_cwd.take() {
-            let cwd = raw_cwd.trim();
-            if self.resource.is_some() {
-                if cwd.is_empty() || cwd.len() > 4096 || cwd.chars().any(char::is_control) {
-                    return Err(
-                        "execution_context.default_cwd must be a bounded remote path without control characters"
-                            .to_string(),
-                    );
-                }
-                self.default_cwd = Some(cwd.to_string());
-            } else {
-                webcodex_core::validation_bridge::validate_project_relative_path(cwd)
-                    .map_err(|error| format!("execution_context.default_cwd {error}"))?;
-                let normalized = cwd
-                    .split(['/', '\\'])
-                    .filter(|component| !component.is_empty() && *component != ".")
-                    .collect::<Vec<_>>()
-                    .join("/");
-                self.default_cwd = Some(if normalized.is_empty() {
-                    ".".to_string()
-                } else {
-                    normalized
-                });
-            }
-        }
-        Ok(self)
-    }
-
-    /// Restore valid fields independently so a malformed persisted cwd cannot
-    /// bypass the project boundary or erase a valid explicit shell choice.
-    pub fn sanitized_for_restore(mut self) -> Self {
-        self.resource = self.resource.take().and_then(|raw_resource| {
-            Self {
-                default_cwd: None,
-                default_shell: None,
-                resource: Some(raw_resource),
-            }
-            .validated()
-            .ok()
-            .and_then(|context| context.resource)
-        });
-        if let Some(raw_cwd) = self.default_cwd.take() {
-            let cwd_only = Self {
-                default_cwd: Some(raw_cwd),
-                default_shell: None,
-                resource: self.resource.clone(),
-            };
-            self.default_cwd = cwd_only
-                .validated()
-                .ok()
-                .and_then(|context| context.default_cwd);
-        }
-        self
-    }
-
-    /// Audit-safe form for pre-validation request logging. Invalid cwd text is
-    /// represented only by booleans and never copied into evidence.
-    pub fn audit_summary(&self) -> Value {
-        let resource = Self {
-            default_cwd: None,
-            default_shell: None,
-            resource: self.resource.clone(),
-        }
-        .validated()
-        .ok()
-        .and_then(|context| context.resource);
-        let cwd = Self {
-            default_cwd: self.default_cwd.clone(),
-            default_shell: None,
-            resource: resource.clone(),
-        }
-        .validated()
-        .ok()
-        .and_then(|context| context.default_cwd);
-        serde_json::json!({
-            "default_cwd": cwd,
-            "default_cwd_present": self.default_cwd.is_some(),
-            "default_cwd_valid": self.default_cwd.is_none() || cwd.is_some(),
-            "default_shell": self.default_shell,
-            "resource": resource,
-            "resource_present": self.resource.is_some(),
-            "resource_valid": self.resource.is_none() || resource.is_some(),
-        })
-    }
-}
-
 /// Workflow session lifecycle state.
 ///
 /// Canonical wire values are `"active"` and `"closed"`. Lifecycle is explicit
@@ -275,15 +152,23 @@ pub struct SessionRecord {
     /// than are retained now". The persisted counterpart carries the additive
     /// serde default; the in-memory record is always constructed explicitly.
     pub events_observed: u64,
-    /// Durable Session-local model-facing continuity watermark. This advances
-    /// exactly once for each recorded ToolResult returned to the model;
-    /// generic/background Session events never advance it.
-    pub context_revision: u64,
+    /// Git tree captured exactly once when a fresh coding Workflow Session is
+    /// created. `None` means startup was not a Git repository; continuation
+    /// never retroactively creates or replaces this baseline.
+    pub git_baseline_tree: Option<String>,
+    /// Sticky monotonic fact: this exact Workflow Session has observed at least
+    /// one successful canonical first-class repository Edit whose ToolResult
+    /// reported `state_changed=true`. It is independent of retained event history.
+    pub repository_edit_observed: bool,
     /// Bounded durable exact identities for terminal structured-validation Jobs
     /// already synthesized into this Session. Independent of the retained event
     /// deque so event FIFO eviction cannot resurrect an authoritative Job.
     pub materialized_validation_job_ids: VecDeque<String>,
     pub messages: VecDeque<Arc<SessionMessage>>,
+    /// Durable replay identity for optional message delivery keys. Both map keys
+    /// and payload fingerprints are domain-separated SHA-256 digests; raw keys,
+    /// principals, Window metadata, and message bodies are never retained here.
+    pub message_delivery_replays: BTreeMap<String, SessionMessageDeliveryReplay>,
     /// Durable Session-local monotonic message-state revision. This is never
     /// exposed as a public cursor; callers receive an opaque Session-bound token.
     pub message_observation_revision: u64,
@@ -332,7 +217,6 @@ pub struct ColdSessionRecord {
     pub lifecycle: SessionLifecycle,
     pub updated_at: i64,
     pub project_instructions: Option<ProjectInstructionsSummarySnapshot>,
-    pub context_revision: u64,
     pub raw: Arc<RawValue>,
 }
 
@@ -376,13 +260,6 @@ impl StoredSession {
         match self {
             Self::Hot(record) => record.updated_at,
             Self::Cold(record) => record.updated_at,
-        }
-    }
-
-    pub fn context_revision(&self) -> u64 {
-        match self {
-            Self::Hot(record) => record.context_revision,
-            Self::Cold(record) => record.context_revision,
         }
     }
 
@@ -481,6 +358,8 @@ pub struct CodingSessionRequest {
 
 #[derive(Debug, Clone)]
 pub struct CodingSessionOutcome {
+    /// In-memory observation after independent scope retention and stale fencing.
+    pub project_instructions: Option<ProjectInstructionsSnapshot>,
     pub summary: SessionSummary,
     /// For a reused/resumed session, a bounded summary taken *before* the new
     /// `task_instruction` was appended. Continuation feedback projects over this
@@ -578,11 +457,20 @@ pub struct PersistedSessionRecord {
     pub mode: SessionMode,
     pub guards: SessionGuards,
     pub execution_context: SessionExecutionContext,
+    /// Optional Git baseline tree for coding Sessions. Legacy rows default to
+    /// `None` and therefore cannot retroactively gain a Changes card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_baseline_tree: Option<String>,
+    /// Sticky first-class repository Edit evidence, durable across event eviction.
+    #[serde(default)]
+    pub repository_edit_observed: bool,
     pub lifecycle: SessionLifecycle,
     pub created_at: i64,
     pub updated_at: i64,
     pub events: Vec<Arc<SessionEvent>>,
     pub messages: Vec<Arc<SessionMessage>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub message_delivery_replays: BTreeMap<String, SessionMessageDeliveryReplay>,
     pub message_observation_revision: u64,
     pub message_observation_floor: u64,
     pub message_observation_revisions: BTreeMap<String, u64>,
@@ -594,7 +482,12 @@ pub struct PersistedSessionRecord {
     pub completion_assignment_fence_fingerprints: BTreeMap<String, String>,
     pub completion_assignment_fence_tracking_complete: bool,
     pub events_observed: u64,
-    pub context_revision: u64,
+    /// Persistence compatibility only: accepts the retired current-v2 field.
+    /// The value is inert, never restored into live Session semantics, and current
+    /// writers always omit it.
+    #[allow(dead_code)]
+    #[serde(default, rename = "context_revision", skip_serializing)]
+    pub legacy_context_revision: Option<u64>,
     /// Omit this bounded list when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materialized_validation_job_ids: Vec<String>,
@@ -655,9 +548,6 @@ pub struct ToolCallStart {
     pub started_instant: Instant,
     pub permission: Option<PermissionDecision>,
     pub expectation: ToolCallExpectation,
-    pub pre_call_context_revision: u64,
-    pub advances_context_checkpoint: bool,
-    pub ack_session_context_revision: SessionContextRevisionAck,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,38 +584,6 @@ pub struct ToolCallRecorderMetadata {
     pub expectation: ToolCallExpectation,
     pub ack_session_message_ids: Vec<String>,
     pub session_message_resolution: Option<ToolCallSessionMessageResolution>,
-    pub ack_session_context_revision: SessionContextRevisionAck,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SessionContextRevisionAck {
-    /// The current tool/surface does not accept the context-continuity ACK
-    /// protocol. Checkpoint advancement is a separate ToolDefinition policy and
-    /// may still advance the cross-surface watermark.
-    #[default]
-    Unsupported,
-    Unacknowledged,
-    Revision(u64),
-    Invalid,
-}
-
-#[derive(Debug, Clone)]
-pub struct RecordedModelFacingToolCall {
-    pub session_id: String,
-    pub context_revision: u64,
-    /// Session checkpoint watermark immediately before the current model-facing
-    /// result was recorded. This must not be inferred from `context_revision - 1`
-    /// because continuity-aware recovery calls may not advance a checkpoint.
-    pub pre_response_context_revision: u64,
-    pub checkpoint_advanced: bool,
-    pub pre_call_context_revision: u64,
-    pub ack_session_context_revision: SessionContextRevisionAck,
-    /// Retained model-facing results strictly after a caller's explicitly proven
-    /// revision and before the current ToolResult. Unknown caller state keeps this
-    /// empty and recovers through a compact current handoff instead of revision-zero
-    /// replay. The current ToolResult is always excluded from this history delta.
-    pub recovery_events: Vec<SessionEvent>,
-    pub history_lost: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -802,13 +660,11 @@ pub struct SessionEvent {
     pub logical_invocation_role: Option<String>,
     pub session_id: String,
     pub kind: String,
-    /// Model-facing context checkpoint revision assigned atomically only when the
-    /// finished ToolResult advances model knowledge. Non-checkpoint results and
-    /// started/background/system events leave this unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_revision: Option<u64>,
-    /// Closed, bounded consequence projection used only for model-context
-    /// recovery. It never stores arbitrary ToolResult bodies.
+    /// Persistence compatibility only: accepts the retired current-v2 event field.
+    /// The value is inert and current writers always omit it.
+    #[serde(default, rename = "context_revision", skip_serializing)]
+    pub legacy_context_revision: Option<u64>,
+    /// Closed, bounded durable consequence evidence for diagnostic recovery. It never stores arbitrary ToolResult bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_result_summary: Option<Value>,
     pub timestamp: i64,
@@ -896,43 +752,6 @@ pub struct SessionEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionMessageKind {
-    Note,
-    Proposal,
-    Question,
-    Answer,
-    Decision,
-    Risk,
-    Progress,
-    Guidance,
-    Todo,
-}
-
-impl SessionMessageKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Note => "note",
-            Self::Proposal => "proposal",
-            Self::Question => "question",
-            Self::Answer => "answer",
-            Self::Decision => "decision",
-            Self::Risk => "risk",
-            Self::Progress => "progress",
-            Self::Guidance => "guidance",
-            Self::Todo => "todo",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMessageStatus {
-    Open,
-    Resolved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SessionMessageClosureKind {
     Withdrawn,
     Superseded,
@@ -950,15 +769,6 @@ where
         Some("superseded") => Some(SessionMessageClosureKind::Superseded),
         _ => None,
     })
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMessagePriority {
-    Low,
-    #[default]
-    Normal,
-    High,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1001,8 +811,8 @@ pub struct SessionMessage {
 /// todo thread exceeds this bound the assignment read fails closed rather than
 /// returning an incomplete fence.
 pub const MAX_SESSION_ASSIGNMENT_DIRECT_REPLIES: usize = 16;
-/// `wsa1_` plus one base64url-no-pad SHA-256 semantic snapshot fingerprint.
-pub const MAX_SESSION_ASSIGNMENT_FENCE_LEN: usize = 48;
+/// `wsa2_` plus a base64url-no-pad 128-bit scoped semantic snapshot fingerprint.
+pub const MAX_SESSION_ASSIGNMENT_FENCE_LEN: usize = 27;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionAssignmentSnapshot {
@@ -1029,6 +839,28 @@ pub struct PostSessionMessageInput {
     pub priority: SessionMessagePriority,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionMessageDelivery {
+    /// Runtime-derived, domain-separated stable sender-scope digest.
+    pub sender_scope: String,
+    /// Caller replay key. Persistence retains only its domain-separated digest.
+    pub delivery_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMessageDeliveryReplay {
+    pub payload_fingerprint: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMessageDeliveryOutcome {
+    pub message: SessionMessage,
+    pub replayed: bool,
+    pub state_changed: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionAckObservation {
     pub accepted_ids: Vec<String>,
@@ -1053,7 +885,7 @@ pub struct CompleteSessionMessageInput {
     pub completion_id: String,
     pub author_session_id: Option<String>,
     /// Required opaque semantic snapshot fence returned by get_session_assignment.
-    /// It is independent of completion idempotency, observation, and context ACKs.
+    /// It is independent of completion idempotency, observation, and collaboration ACKs.
     pub expected_assignment_fence: String,
 }
 
@@ -1109,7 +941,6 @@ pub enum SessionMessageObservationError {
     UnknownSession,
     MalformedToken,
     OversizedToken,
-    WrongSession,
     FutureRevision,
     InvalidObservationState,
 }
@@ -1201,6 +1032,8 @@ pub enum SessionMessageError {
     MessageNotOpen,
     NotTodo,
     IdempotencyConflict,
+    DeliveryKeyConflict,
+    DeliveryPersistenceUncertain,
     AlreadyCompleted {
         answer_message_id: Option<String>,
         completion_id: Option<String>,
@@ -1250,30 +1083,47 @@ pub struct SessionSummary {
     pub guards: SessionGuards,
     pub execution_context: SessionExecutionContext,
     pub lifecycle: SessionLifecycle,
+    /// Internal Final Changes presentation baseline. Runtime projections read it
+    /// directly; it is not part of the model-facing Session summary payload.
+    #[serde(skip_serializing)]
+    pub git_baseline_tree: Option<String>,
+    /// Internal sticky presentation eligibility fact; never model-facing state.
+    #[serde(skip_serializing)]
+    pub repository_edit_observed: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub counts: SessionCounts,
     pub events: Vec<SessionEvent>,
-    /// Total number of events retained in the durable ledger for the session
-    /// *before* the returned window was sliced. This is the source of truth for
-    /// whether older events (e.g. an attempt boundary `task_instruction`) were
-    /// evicted by the per-session event cap. Older persisted sessions that predate
-    /// these additive fields deserialize to 0/0/true and are treated as the
-    /// returned window being the whole retained ledger (no eviction observed).
+    /// Total events ever observed for this Session, including events already
+    /// evicted by the bounded durable ledger.
     #[serde(default)]
     pub events_total: usize,
-    /// Number of events actually returned in `events` (the retained tail).
+    /// Events currently retained in the durable ledger before model-facing tail
+    /// slicing is applied.
+    #[serde(default)]
+    pub events_retained: usize,
+    /// Events already evicted by the durable per-Session retention bound.
+    #[serde(default)]
+    pub events_evicted: usize,
+    /// True only when durable Session history has actually been evicted. This is
+    /// distinct from `events_truncated`, which may be true solely because one
+    /// model-facing summary returns at most `MAX_SUMMARY_LIMIT` events.
+    #[serde(default)]
+    pub retention_truncated: bool,
+    /// 0-based sequence of the first event still present in the durable ledger.
+    #[serde(default)]
+    pub ledger_first_retained_sequence: usize,
+    /// Number of events actually returned in `events` (the bounded tail).
     #[serde(default)]
     pub events_returned: usize,
-    /// True when the durable ledger retained more events than were returned
-    /// (`events_total > events_returned`), i.e. the returned window is a tail
-    /// slice and older events are not present.
+    /// True when the Session has more observed events than this response returns.
+    /// This covers both ordinary model-facing tail slicing and durable eviction;
+    /// use `retention_truncated` to distinguish actual history loss.
     #[serde(default)]
     pub events_truncated: bool,
-    /// 0-based sequence of the first returned event within the retained ledger
-    /// (`events_total - events_returned`). `0` means the returned window starts
-    /// at the ledger head. Read-only projections use this to avoid mistaking a
-    /// truncated tail for the session start.
+    /// 0-based absolute sequence of the first event returned in `events`.
+    /// The legacy field name is retained for compatibility with continuation
+    /// consumers that already interpret it as the returned-window base.
     #[serde(default)]
     pub first_retained_sequence: usize,
     pub messages: SessionMessagesSummary,

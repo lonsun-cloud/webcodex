@@ -1155,9 +1155,9 @@ impl ToolRuntime {
             "reason_code": null,
         });
         let result = ToolResult::ok(payload);
-        if serde_json::to_vec(&result)
+        if crate::json_measurement::serialized_json_len(&result)
             .map(|bytes| {
-                bytes.len()
+                bytes
                     <= MAX_SERIALIZED_OUTPUT_BYTES
                         .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
             })

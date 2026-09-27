@@ -78,13 +78,17 @@ async fn read_file_accepts_unique_short_id() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "other-repo".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -102,6 +106,8 @@ async fn read_file_accepts_unique_short_id() {
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_output("hello\n", 1)),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -112,7 +118,7 @@ async fn read_file_accepts_unique_short_id() {
 }
 
 #[tokio::test]
-async fn read_file_short_id_continuation_binds_resolved_project_across_registry_churn() {
+async fn read_files_short_id_continuation_binds_resolved_project_across_registry_churn() {
     let runtime = runtime_with_resolver_projects().await;
     let auth = auth_context(None, true);
     let first = tokio::spawn({
@@ -121,13 +127,17 @@ async fn read_file_short_id_continuation_binds_resolved_project_across_registry_
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "other-repo".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: Some(1),
+                            limit: Some(1),
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: Some(1),
-                        limit: Some(1),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -145,6 +155,8 @@ async fn read_file_short_id_continuation_binds_resolved_project_across_registry_
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 1, 1)),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -152,7 +164,7 @@ async fn read_file_short_id_continuation_binds_resolved_project_across_registry_
         .unwrap();
     let first = first.await.unwrap();
     assert!(first.success, "{:?}", first.error);
-    let suggested = &first.output["continuation"]["suggested_call"];
+    let suggested = &first.output["suggested_call"];
     assert_eq!(
         suggested["arguments"]["project"],
         "agent:workstation:other-repo"
@@ -218,6 +230,8 @@ async fn read_file_short_id_continuation_binds_resolved_project_across_registry_
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 2, 1)),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -225,7 +239,7 @@ async fn read_file_short_id_continuation_binds_resolved_project_across_registry_
         .unwrap();
     let second = second.await.unwrap();
     assert!(second.success, "{:?}", second.error);
-    assert_eq!(second.output["text"], "two");
+    assert_eq!(second.output["items"][0]["output"]["text"], "two");
 }
 
 #[tokio::test]
@@ -244,6 +258,7 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
                             path: "README.md".to_string(),
                             start_line: Some(1),
                             limit: Some(1),
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -264,6 +279,8 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 1, 1)),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -272,14 +289,12 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
-        result.output["items"][0]["continuation"]["suggested_call"]["arguments"]["project"],
+        result.output["suggested_call"]["arguments"]["project"],
         "agent:workstation:other-repo"
     );
-    assert!(
-        result.output["items"][0]["continuation"]["suggested_call"]["arguments"]
-            .get("session_id")
-            .is_none()
-    );
+    assert!(result.output["suggested_call"]["arguments"]
+        .get("session_id")
+        .is_none());
 }
 
 #[tokio::test]
@@ -311,6 +326,8 @@ async fn git_status_accepts_unique_short_id() {
             exit_code: Some(0),
             stdout: Some(String::new()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -326,13 +343,17 @@ async fn ambiguous_short_id_returns_candidates_for_project_tools() {
     let bootstrap = auth_context(None, true);
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "my-repo".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&bootstrap),
         )
@@ -352,13 +373,17 @@ async fn full_id_remains_compatible_for_project_tools() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "agent:workstation:other-repo".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -375,6 +400,8 @@ async fn full_id_remains_compatible_for_project_tools() {
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_output("hello\n", 1)),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

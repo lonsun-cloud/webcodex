@@ -57,6 +57,18 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         "line scope is additive and must not become a generation-2 registration baseline"
     );
     assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&"apply_text_edit_local_guard_without_sha"),
+        "SHA-less local exact edit proof is additive and must not become a generation-2 registration baseline"
+    );
+    assert_eq!(
+        capabilities
+            .get("apply_text_edit_local_guard_without_sha")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "current Runner must explicitly advertise SHA-less local exact edit proof"
+    );
+    assert!(
         !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_patch"),
         "apply_patch is additive and must not become a generation-2 registration baseline"
     );
@@ -69,11 +81,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
             .contains(&"apply_patch_matching_mode"),
         "matching_mode is additive and must not become a generation-2 registration baseline"
-    );
-    assert!(
-        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
-            .contains(&"apply_patch_strict_matching"),
-        "strict patch matching is additive and must not become a generation-2 registration baseline"
     );
     assert_eq!(
         capabilities
@@ -88,13 +95,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
             .and_then(serde_json::Value::as_bool),
         Some(true),
         "current Runner must explicitly advertise enum-based apply_patch matching"
-    );
-    assert_eq!(
-        capabilities
-            .get("apply_patch_strict_matching")
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "current Runner must explicitly advertise strict patch matching"
     );
     for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
         assert_eq!(
@@ -146,6 +146,7 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_file_delete);
     assert!(caps.apply_text_edit_occurrence);
     assert!(caps.apply_text_edit_line_scope);
+    assert!(caps.apply_text_edit_local_guard_without_sha);
     assert!(caps.apply_patch);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);
@@ -167,6 +168,8 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_validation_argv);
     assert!(caps.structured_cargo_test_count_assertion);
     assert!(caps.structured_cargo_test_execution_policy);
+    assert!(caps.structured_cargo_test_lib);
+    assert!(caps.structured_cargo_check_packages);
     assert!(caps.structured_go_test_json);
     assert!(caps.structured_go_test_tool);
     assert!(caps.structured_go_test_packages);

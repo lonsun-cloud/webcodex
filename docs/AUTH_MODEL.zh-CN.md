@@ -21,7 +21,7 @@ WebCodex 之所以有多种认证方式，是因为 Server 管理、模型/API �
 | 个人 API 令牌（PAT） | `wc_pat_...` | managed user 的 MCP、GPT Actions 与 runtime API |
 | Runner token | `wc_agent_...` | 仅 `webcodex-runner` 传输 |
 | Shared key | `wck_...` | hosted shared-key MCP/runtime 与对应 Runner group |
-| Project Credential | 受保护的项目私有文件 | 单个 project-first Connector/share 环境 |
+| Project Credential | 受保护的项目私有文件 | 一个 ProjectGrant 的普通 runtime API/MCP 访问 |
 | OAuth access token | `wc_oat_...` | 启用 OAuth 后的委派 MCP/GPT 访问 |
 | Account credential | `wc_acct_...` | 高级 managed-account 本地令牌创建 |
 
@@ -77,7 +77,9 @@ Shared key 是 `webcodex connect` 使用的简单 hosted connection credential�
 
 ## Project Credential
 
-`webcodex setup` 与临时 project-first 流程使用一把受保护的 Project Credential，只属于一个项目环境。它不是通用 user/admin token，也不应跨项目复用。
+`webcodex setup` 与临时 project-first 流程使用一把受保护的 Project Credential，只属于一个 ProjectGrant。它不是通用 user/admin token，也不应跨项目复用。ProjectGrant Runner visibility 与 canonical Project resolution 会阻止它列出、resolve 或调用其它 grant 的 Project；Adaptive direct tool 与 `call_runtime_tool` gateway 使用同一条 authority boundary。
+
+Project-scoped credential 也不能通过普通 `register_project`、`create_project`、`unregister_project` 扩张 Runner Project registry。path-based coding 只能复用 exact caller-visible registered Project；唯一 canonical 的派生路径是从这个已授权 source Project 使用 `work_on_project(mode=worktree)` 创建 managed worktree Project。
 
 WebCodex 验证该 credential 后只在内部保留所需的非 secret authorization metadata；它不是另一把需要用户复制或管理的 credential。
 

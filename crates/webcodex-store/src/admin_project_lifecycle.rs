@@ -30,7 +30,7 @@ impl Database {
         audit: &AdminProjectAudit<'_>,
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AdminProjectLifecycle);
         conn.execute(
             "INSERT INTO admin_project_lifecycle_audit
              (created_at, correlation_id, subject_type, subject_id, operation, project,
@@ -66,7 +66,7 @@ impl Database {
         target: &str,
         key_hash: &str,
     ) -> anyhow::Result<Option<AdminProjectIdempotencyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AdminProjectLifecycle);
         let mut statement = conn.prepare(
             "SELECT request_hash, http_status, response_json
              FROM admin_project_idempotency
@@ -87,7 +87,7 @@ impl Database {
         target: &str,
         key_hash: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::AdminProjectLifecycle);
         conn.execute(
             "DELETE FROM admin_project_idempotency
              WHERE subject = ?1 AND action = ?2 AND target = ?3 AND key_hash = ?4",
@@ -107,7 +107,7 @@ impl Database {
         response_json: &str,
     ) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::AdminProjectLifecycle);
         let transaction = conn.transaction()?;
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO admin_project_idempotency

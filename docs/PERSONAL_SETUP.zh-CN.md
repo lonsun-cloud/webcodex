@@ -4,7 +4,7 @@
 
 这条路径适合 CLI、已有 Server，或需要比 Desktop 更多控制的配置。普通 Windows / macOS 个人安装最推荐先看 [WebCodex Desktop + 官方 OpenAI Secure Tunnel](desktop-install.zh-CN.md)。无论哪种入口，完整 WebCodex 的模型都一样：ChatGPT 连接普通 Server，再由长期运行的 Runner 使用你机器上的真实项目、Git、编译器和测试工具。
 
-如果你只想先试几分钟，不想配置长期服务，请直接看[快速试用](QUICK_START.zh-CN.md)并使用 `webcodex share`。`share` 是临时、单项目的受限体验；关闭命令后连接就会结束。
+如果你只想先试几分钟，不想配置长期服务，请直接看[快速试用](QUICK_START.zh-CN.md)并使用 `webcodex share`。`share` 是临时、单项目、Project-scoped 的普通 Adaptive Runtime；关闭命令后连接就会结束。
 
 ## 你最终会得到什么
 
@@ -182,7 +182,7 @@ Runner 运行后，WebCodex 才真正拥有调用本机文件、Git、编译器�
 
 | 场景 | 推荐入口 | 特点 |
 | --- | --- | --- |
-| 我只想几分钟体验一下一个仓库 | `webcodex share` | 一条命令、临时、单项目、关闭即失效、能力更受限 |
+| 我只想几分钟体验一下一个仓库 | `webcodex share` | 一条命令、临时、单项目、普通 Adaptive Runtime、关闭即失效 |
 | Windows / macOS 日常使用 | [Desktop + 官方 OpenAI Secure Tunnel](desktop-install.zh-CN.md) | 本机 Server + Runner、多个项目、最简单的推荐个人路径 |
 | CLI、Linux 或已有 Server | 普通 Server + Runner（本文） | 长期身份、多个项目、完整开发工具、网络入口可独立选择 |
 | 我在维护团队/生产部署 | [部署指南](DEPLOYMENT.zh-CN.md) | systemd、Docker、OAuth、多用户和运维参考 |

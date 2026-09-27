@@ -1043,7 +1043,7 @@ fn build_attempt_outcome(
     if validation.status == "stale" {
         push_unique(&mut reasons, "validation_stale_after_changes");
     }
-    if validation.status == "inconclusive" {
+    if matches!(validation.status.as_str(), "unproven" | "inconclusive") {
         push_unique(&mut reasons, "validation_inconclusive");
     }
     let status = if reasons.is_empty() {
@@ -1109,6 +1109,12 @@ fn build_suggested_next_actions(
         push_unique(
             &mut actions,
             "run validation before proceeding when the task warrants it",
+        );
+    }
+    if validation.status == "unproven" {
+        push_unique(
+            &mut actions,
+            "review source_state and external workspace stability; rerunning validation alone cannot prove current source",
         );
     }
     if suggest_exploration_continuity

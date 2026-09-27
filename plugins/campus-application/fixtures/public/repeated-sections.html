@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>多段经历秋招网申 Fixture</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="shell">
+  <h1>2027 届校园招聘 — 多段经历 Fixture</h1>
+  <div class="note">用于验证 education[i] / experience[i] / projects[i] 结构化映射。所有内容均为本地虚构数据。</div>
+  <form>
+    <div class="grid">
+      <div><label for="candidate-name">姓名</label><input id="candidate-name"></div>
+      <div><label for="candidate-email">邮箱</label><input id="candidate-email" type="email"></div>
+    </div>
+
+    <section class="section">
+      <h2>教育经历</h2>
+      <fieldset class="repeat-card">
+        <legend>教育经历 1</legend>
+        <div class="grid">
+          <div><label for="edu1-school">学校</label><input id="edu1-school"></div>
+          <div><label for="edu1-degree">学历</label><select id="edu1-degree"><option value="">请选择</option><option>本科</option><option>硕士</option><option>博士</option></select></div>
+          <div><label for="edu1-major">专业</label><input id="edu1-major"></div>
+          <div><label for="edu1-start">入学时间</label><input id="edu1-start" type="month"></div>
+          <div><label for="edu1-end">毕业时间</label><input id="edu1-end" type="month"></div>
+          <div><label for="edu1-gpa">GPA / 绩点</label><input id="edu1-gpa"></div>
+        </div>
+      </fieldset>
+      <fieldset class="repeat-card">
+        <legend>教育经历 2</legend>
+        <div class="grid">
+          <div><label for="edu2-school">学校</label><input id="edu2-school"></div>
+          <div><label for="edu2-degree">学历</label><select id="edu2-degree"><option value="">请选择</option><option>本科</option><option>硕士</option><option>博士</option></select></div>
+          <div><label for="edu2-major">专业</label><input id="edu2-major"></div>
+          <div><label for="edu2-start">入学时间</label><input id="edu2-start" type="month"></div>
+          <div><label for="edu2-end">毕业时间</label><input id="edu2-end" type="month"></div>
+          <div><label for="edu2-gpa">GPA / 绩点</label><input id="edu2-gpa"></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="section">
+      <h2>实习经历</h2>
+      <fieldset class="repeat-card">
+        <legend>实习经历 1</legend>
+        <div class="grid">
+          <div><label for="exp1-company">公司</label><input id="exp1-company"></div>
+          <div><label for="exp1-title">职位</label><input id="exp1-title"></div>
+          <div><label for="exp1-location">地点</label><input id="exp1-location"></div>
+          <div><label for="exp1-start">开始时间</label><input id="exp1-start" type="month"></div>
+          <div><label for="exp1-end">结束时间</label><input id="exp1-end" type="month"></div>
+          <div class="full"><label for="exp1-summary">工作内容</label><textarea id="exp1-summary"></textarea></div>
+        </div>
+      </fieldset>
+      <fieldset class="repeat-card">
+        <legend>实习经历 2</legend>
+        <div class="grid">
+          <div><label for="exp2-company">公司</label><input id="exp2-company"></div>
+          <div><label for="exp2-title">职位</label><input id="exp2-title"></div>
+          <div><label for="exp2-location">地点</label><input id="exp2-location"></div>
+          <div><label for="exp2-start">开始时间</label><input id="exp2-start" type="month"></div>
+          <div><label for="exp2-end">结束时间</label><input id="exp2-end" type="month"></div>
+          <div class="full"><label for="exp2-summary">工作内容</label><textarea id="exp2-summary"></textarea></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="section">
+      <h2>项目经历</h2>
+      <fieldset class="repeat-card">
+        <legend>项目经历 1</legend>
+        <div class="grid">
+          <div><label for="project1-name">项目名称</label><input id="project1-name"></div>
+          <div><label for="project1-role">项目角色</label><input id="project1-role"></div>
+          <div><label for="project1-start">开始时间</label><input id="project1-start" type="month"></div>
+          <div><label for="project1-end">结束时间</label><input id="project1-end" type="month"></div>
+          <div class="full"><label for="project1-tech">技术栈</label><input id="project1-tech"></div>
+          <div class="full"><label for="project1-summary">项目描述</label><textarea id="project1-summary"></textarea></div>
+          <div class="full"><label for="project1-url">项目链接</label><input id="project1-url" type="url"></div>
+        </div>
+      </fieldset>
+      <fieldset class="repeat-card">
+        <legend>项目经历 2</legend>
+        <div class="grid">
+          <div><label for="project2-name">项目名称</label><input id="project2-name"></div>
+          <div><label for="project2-role">项目角色</label><input id="project2-role"></div>
+          <div><label for="project2-start">开始时间</label><input id="project2-start" type="month"></div>
+          <div><label for="project2-end">结束时间</label><input id="project2-end" type="month"></div>
+          <div class="full"><label for="project2-tech">技术栈</label><input id="project2-tech"></div>
+          <div class="full"><label for="project2-summary">项目描述</label><textarea id="project2-summary"></textarea></div>
+          <div class="full"><label for="project2-url">项目链接</label><input id="project2-url" type="url"></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <div class="actions"><button type="submit">保存并进入下一步</button><button type="button" class="secondary">暂存</button></div>
+    <div id="status" class="status">尚未保存。</div>
+  </form>
+</main>
+<script src="/fixture.js"></script>
+</body>
+</html>

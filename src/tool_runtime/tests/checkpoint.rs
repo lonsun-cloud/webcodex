@@ -359,7 +359,7 @@ async fn checkpoint_defaults_metadata_for_old_or_minimal_checkpoint() {
     let storage_dir = storage_path.parent().unwrap();
     let mut legacy: Value =
         serde_json::from_str(&fs::read_to_string(&storage_path).unwrap()).unwrap();
-    let legacy_id = "wc_ckpt_legacy_missing_metadata";
+    let legacy_id = "wc_ckpt_AAAAAAAAAAAAAAAB";
     legacy["checkpoint_id"] = json!(legacy_id);
     legacy["title"] = json!("legacy checkpoint");
     legacy["created_at"] = json!(created.output["created_at"].as_i64().unwrap_or_default() + 1);
@@ -762,7 +762,7 @@ async fn checkpoint_restore_requires_confirm() {
         .dispatch_with_auth(
             ToolCall::WorkspaceCheckpointRestore {
                 project,
-                checkpoint_id: "wc_ckpt_missing".to_string(),
+                checkpoint_id: "wc_ckpt_AAAAAAAAAAAAAAAC".to_string(),
                 confirm: false,
                 session_id: None,
             },
@@ -963,7 +963,7 @@ async fn checkpoint_restore_rejects_malicious_untracked_paths() {
     let mut checkpoint: Value =
         serde_json::from_str(&fs::read_to_string(&storage_path).unwrap()).unwrap();
 
-    let traversal_id = "wc_ckpt_reject_traversal";
+    let traversal_id = "wc_ckpt_AAAAAAAAAAAAAAAD";
     checkpoint["checkpoint_id"] = json!(traversal_id);
     checkpoint["untracked_files"] = json!([{"path": "../escape.txt", "content": "escape\n"}]);
     fs::write(
@@ -986,7 +986,7 @@ async fn checkpoint_restore_rejects_malicious_untracked_paths() {
     assert_eq!(traversal.output["error_kind"], "invalid_checkpoint");
     assert!(!tmp.path().join("escape.txt").exists());
 
-    let sensitive_id = "wc_ckpt_reject_sensitive";
+    let sensitive_id = "wc_ckpt_AAAAAAAAAAAAAAAE";
     checkpoint["checkpoint_id"] = json!(sensitive_id);
     checkpoint["untracked_files"] =
         json!([{"path": "secrets/agent-token.txt", "content": "secret\n"}]);

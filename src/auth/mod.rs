@@ -62,7 +62,8 @@ pub(crate) use project_credential::read_protected_secret;
 pub(crate) use project_credential::{
     validate_agent_token as validate_project_agent_token,
     validate_credential as validate_project_credential, ProjectAgentTokenVerifier,
-    ProjectCredentialVerifier,
+    ProjectAuthState, PROJECT_AGENT_TOKEN_FILE_ENV, PROJECT_CREDENTIAL_FILE_ENV,
+    PROJECT_GRANT_ID_ENV, PROJECT_RUNNER_CLIENT_ID_ENV,
 };
 pub(crate) use project_share::{
     configured_project_share_subject, generate_project_share_session_id,
@@ -73,13 +74,13 @@ pub(crate) use project_share::{
 
 pub use scopes::{
     AGENT_SCOPES, SCOPE_ADMIN, SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER,
-    SCOPE_AGENT_RESULT, SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_COMMUNICATION_READ, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
-    SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL,
-    SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE,
-    SCOPE_PLUGIN_MANAGE, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
+    SCOPE_AGENT_RESULT, SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ,
+    SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ,
+    SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL,
+    SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL,
+    SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ,
+    SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE, SCOPE_PROJECT_READ,
+    SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
 };
 #[cfg(test)]
 pub use scopes::{SCOPE_ACCOUNT_MANAGE, SCOPE_JOB_DETACH};
@@ -88,8 +89,8 @@ pub(crate) use scopes::{is_agent_scope, scopes_to_string, validate_agent_scopes,
 
 pub(crate) use middleware::{
     bearer_token, get_config, get_db, json_error, oauth_insufficient_scope_challenge,
-    render_scope_forbidden, require_json_same_origin, require_same_origin, scope_forbidden_body,
-    AuthMiddleware,
+    render_scope_forbidden, require_json_same_origin, require_mcp_json_request,
+    require_mcp_request_authority, scope_forbidden_body, AuthMiddleware,
 };
 #[cfg(test)]
 pub(crate) use middleware::{

@@ -3,7 +3,10 @@
 use serde::Serialize;
 use serde_json::Value;
 
-pub use webcodex_core::runtime_contract::RECOVERY_KIND_VALUES;
+pub use webcodex_core::runtime_contract::{
+    ContinuationCarrier, ContinuationKind, ContinuationSemantics, CONTINUATION_CARRIER_VALUES,
+    CONTINUATION_KIND_VALUES, RECOVERY_KIND_VALUES,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryKind {
@@ -30,28 +33,23 @@ impl RecoveryKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryTool {
-    ListJobs,
-    ComputerFindElements,
-    ComputerListWindows,
-    ComputerListApplications,
-    ComputerListDisplays,
-    ComputerSnapshotDisplay,
-    ReadProjectArtifactMetadata,
+/// Parser-ready advisory expression of one possible next tool call. It carries
+/// no authority, never executes by itself, and is not a retry, cursor, or
+/// idempotency identity. Domain producers remain responsible for bounding and
+/// validating the arguments they place here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SuggestedToolCall {
+    pub tool: &'static str,
+    pub arguments: Value,
 }
 
-impl RecoveryTool {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ListJobs => "list_jobs",
-            Self::ComputerFindElements => "computer_find_elements",
-            Self::ComputerListWindows => "computer_list_windows",
-            Self::ComputerListApplications => "computer_list_applications",
-            Self::ComputerListDisplays => "computer_list_displays",
-            Self::ComputerSnapshotDisplay => "computer_snapshot_display",
-            Self::ReadProjectArtifactMetadata => "read_project_artifact_metadata",
-        }
+impl SuggestedToolCall {
+    pub fn new(tool: &'static str, arguments: Value) -> Self {
+        Self { tool, arguments }
+    }
+
+    pub fn to_value(self) -> Value {
+        serde_json::to_value(self).expect("SuggestedToolCall serialization is infallible")
     }
 }
 
@@ -91,11 +89,7 @@ impl ToolResult {
         }
     }
 
-    pub fn with_recovery(
-        mut self,
-        recovery_kind: RecoveryKind,
-        recovery_tool: Option<RecoveryTool>,
-    ) -> Self {
+    pub fn with_recovery(mut self, recovery_kind: RecoveryKind) -> Self {
         if self.success {
             return self;
         }
@@ -106,12 +100,6 @@ impl ToolResult {
             "recovery_kind".to_string(),
             Value::String(recovery_kind.as_str().to_string()),
         );
-        if let Some(recovery_tool) = recovery_tool {
-            output.insert(
-                "recovery_tool".to_string(),
-                Value::String(recovery_tool.as_str().to_string()),
-            );
-        }
         self
     }
 }
@@ -122,27 +110,87 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn recovery_metadata_is_bounded_and_never_decorates_success() {
-        let success = ToolResult::ok(json!({"value": true})).with_recovery(
-            RecoveryKind::Reobserve,
-            Some(RecoveryTool::ComputerListWindows),
+    fn continuation_vocabulary_is_closed_unique_and_separate_from_recovery() {
+        assert_eq!(
+            CONTINUATION_KIND_VALUES,
+            ["page", "batch", "observe", "checkpoint", "refine"]
         );
+        assert_eq!(
+            CONTINUATION_CARRIER_VALUES,
+            [
+                "position",
+                "index",
+                "opaque_token",
+                "observation_token",
+                "revision",
+                "none"
+            ]
+        );
+        let kinds = [
+            ContinuationKind::Page,
+            ContinuationKind::Batch,
+            ContinuationKind::Observe,
+            ContinuationKind::Checkpoint,
+            ContinuationKind::Refine,
+        ];
+        assert_eq!(
+            kinds.map(ContinuationKind::as_str),
+            CONTINUATION_KIND_VALUES
+        );
+        let carriers = [
+            ContinuationCarrier::Position,
+            ContinuationCarrier::Index,
+            ContinuationCarrier::OpaqueToken,
+            ContinuationCarrier::ObservationToken,
+            ContinuationCarrier::Revision,
+            ContinuationCarrier::None,
+        ];
+        assert_eq!(
+            carriers.map(ContinuationCarrier::as_str),
+            CONTINUATION_CARRIER_VALUES
+        );
+        assert_eq!(
+            RECOVERY_KIND_VALUES,
+            [
+                "fix_input",
+                "retry_same",
+                "reobserve",
+                "reconcile",
+                "wait",
+                "user_action",
+                "none"
+            ],
+            "T2 must not create or mutate the existing failure-recovery vocabulary"
+        );
+    }
+
+    #[test]
+    fn suggested_tool_call_is_only_a_parser_ready_expression() {
+        let call = SuggestedToolCall::new(
+            "observe_jobs",
+            json!({"items": [{"job_id": "job-1"}], "wait_secs": 30}),
+        )
+        .to_value();
+        assert_eq!(call["tool"], "observe_jobs");
+        assert_eq!(call["arguments"]["items"][0]["job_id"], "job-1");
+        assert_eq!(call.as_object().unwrap().len(), 2);
+        assert!(call.get("authority").is_none());
+        assert!(call.get("retry_token").is_none());
+        assert!(call.get("continuation_token").is_none());
+    }
+
+    #[test]
+    fn recovery_metadata_is_bounded_and_never_decorates_success() {
+        let success = ToolResult::ok(json!({"value": true})).with_recovery(RecoveryKind::Reobserve);
         assert!(success.output.get("recovery_kind").is_none());
         assert!(success.output.get("recovery_tool").is_none());
 
         let secret = "PRIVATE_FREE_FORM_BODY";
         let failure = ToolResult::err_with_output(secret, json!({"message": secret}))
-            .with_recovery(
-                RecoveryKind::Reobserve,
-                Some(RecoveryTool::ComputerListWindows),
-            );
+            .with_recovery(RecoveryKind::Reobserve);
         assert_eq!(failure.output["recovery_kind"], "reobserve");
-        assert_eq!(failure.output["recovery_tool"], "computer_list_windows");
+        assert!(failure.output.get("recovery_tool").is_none());
         assert!(!failure.output["recovery_kind"]
-            .as_str()
-            .unwrap()
-            .contains(secret));
-        assert!(!failure.output["recovery_tool"]
             .as_str()
             .unwrap()
             .contains(secret));

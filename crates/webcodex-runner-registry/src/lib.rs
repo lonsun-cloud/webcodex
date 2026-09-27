@@ -14,7 +14,12 @@ mod polling;
 mod project_inventory;
 mod projects;
 mod protocol;
+mod receipts;
 mod reconciliation;
+pub use receipts::{
+    JobReceiptStore, JobTerminalEvent, JobTerminalEventSink, JobTerminalRegistrationSnapshot,
+    RetainedJobReceipt,
+};
 mod registry;
 mod requests;
 mod runners;
@@ -138,6 +143,6 @@ pub(crate) use registry::{
     now_ts, LIVE_JOB_STREAM_RETENTION_BYTES, MAX_QUEUED_REQUESTS_PER_RUNNER,
     MAX_RETIRED_INSTANCES_PER_RUNNER, ORDINARY_RESULT_STREAM_RETENTION_BYTES,
 };
-pub use requests::EnqueueLspError;
+pub use requests::{EnqueueLspError, EnqueueRunnerSkillError};
 pub use state::{RunnerSemanticView, ShellJobVisibility};
 pub use telemetry::{NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry};

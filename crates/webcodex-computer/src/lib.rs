@@ -7,7 +7,6 @@ use std::sync::Mutex;
 #[cfg(any(test, target_os = "macos"))]
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 pub const MAX_WINDOWS: usize = 64;
 pub const MAX_APPLICATIONS: usize = 64;
@@ -40,15 +39,24 @@ const COMPUTER_KEY_INPUT_KEYS: &[&str] = &[
 ];
 const COMPUTER_KEY_INPUT_MODIFIERS: &[&str] = &["shift", "control", "option", "command"];
 
+// Snapshot selectors are non-secret identities. Their owning collection decides
+// occupancy; no process-wide identity registry or authority is introduced.
+fn allocate_selector(prefix: &str, occupied: impl Fn(&str) -> bool) -> Result<String, String> {
+    for _ in 0..16 {
+        let id = format!("{prefix}{}", webcodex_core::compact::random_suffix::<12>());
+        if !occupied(&id) {
+            return Ok(id);
+        }
+    }
+    Err("computer_state_error: selector allocation exhausted".into())
+}
+
 fn valid_application_id(application_id: &str) -> bool {
     let Some(suffix) = application_id.strip_prefix("application_") else {
         return false;
     };
     application_id.len() <= MAX_APPLICATION_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn valid_display_id(display_id: &str) -> bool {
@@ -56,10 +64,7 @@ fn valid_display_id(display_id: &str) -> bool {
         return false;
     };
     display_id.len() <= MAX_DISPLAY_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn validate_key_modifiers(modifiers: &[String]) -> Result<(), String> {
@@ -569,6 +574,13 @@ impl ElementRegistry {
         surface_id: &str,
         elements: Vec<(String, ElementRecord)>,
     ) -> Result<u32, String> {
+        let mut incoming = std::collections::HashSet::new();
+        if elements
+            .iter()
+            .any(|(id, _)| self.entries.contains_key(id) || !incoming.insert(id))
+        {
+            return Err("computer_state_error: element identity collision".into());
+        }
         // Compute the next generation before mutating the registry so an exhausted
         // counter fails without invalidating the currently usable handles.
         let generation = self
@@ -890,10 +902,16 @@ impl ComputerRuntime {
         }
         let candidates = platform::list_windows(MAX_WINDOWS + 1)?;
         let truncated = candidates.len() > limit;
+        let mut surface_registry = self
+            .surfaces
+            .lock()
+            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?;
         let mut surfaces = HashMap::new();
         let mut windows = Vec::new();
         for candidate in candidates.into_iter().take(limit) {
-            let surface_id = format!("surface_{}", Uuid::new_v4().simple());
+            let surface_id = allocate_selector("surface_", |id| {
+                surfaces.contains_key(id) || surface_registry.contains_key(id)
+            })?;
             let record = SurfaceRecord {
                 native_id: candidate.native_id,
                 pid: candidate.pid,
@@ -915,10 +933,7 @@ impl ComputerRuntime {
             surfaces.insert(surface_id, record);
         }
         let count = windows.len();
-        let mut surface_registry = self
-            .surfaces
-            .lock()
-            .map_err(|_| "computer_state_error: surface registry lock poisoned".to_string())?;
+
         let mut element_registry = self
             .elements
             .lock()
@@ -937,6 +952,10 @@ impl ComputerRuntime {
             return Err("invalid_request: application discovery limit is invalid".to_string());
         }
         let truncated = candidates.len() > limit;
+        let mut registry = self
+            .applications
+            .lock()
+            .map_err(|_| "computer_state_error: application registry lock poisoned".to_string())?;
         let mut applications = HashMap::new();
         let mut output = Vec::with_capacity(limit.min(candidates.len()));
         for candidate in candidates.into_iter().take(limit) {
@@ -949,7 +968,9 @@ impl ComputerRuntime {
                     "application_failed: native application metadata is invalid".to_string()
                 );
             }
-            let application_id = format!("application_{}", Uuid::new_v4().simple());
+            let application_id = allocate_selector("application_", |id| {
+                applications.contains_key(id) || registry.contains_key(id)
+            })?;
             applications.insert(
                 application_id.clone(),
                 ApplicationRecord {
@@ -963,10 +984,7 @@ impl ComputerRuntime {
             }));
         }
         let count = output.len();
-        let mut registry = self
-            .applications
-            .lock()
-            .map_err(|_| "computer_state_error: application registry lock poisoned".to_string())?;
+
         *registry = applications;
         Ok(json!({"applications": output, "count": count, "truncated": truncated}))
     }
@@ -988,6 +1006,10 @@ impl ComputerRuntime {
             return Err("invalid_request: display discovery limit is invalid".to_string());
         }
         let truncated = candidates.len() > limit;
+        let mut display_registry = self
+            .displays
+            .lock()
+            .map_err(|_| "computer_state_error: display registry lock poisoned".to_string())?;
         let mut displays = HashMap::new();
         let mut output = Vec::with_capacity(limit.min(candidates.len()));
         for candidate in candidates.into_iter().take(limit) {
@@ -995,7 +1017,9 @@ impl ComputerRuntime {
             {
                 return Err("display_failed: native display metadata is invalid".to_string());
             }
-            let display_id = format!("display_{}", Uuid::new_v4().simple());
+            let display_id = allocate_selector("display_", |id| {
+                displays.contains_key(id) || display_registry.contains_key(id)
+            })?;
             let record = DisplayRecord {
                 native_identity: candidate.native_identity,
                 width: candidate.width,
@@ -1011,10 +1035,7 @@ impl ComputerRuntime {
             displays.insert(display_id, record);
         }
         let count = output.len();
-        let mut display_registry = self
-            .displays
-            .lock()
-            .map_err(|_| "computer_state_error: display registry lock poisoned".to_string())?;
+
         let mut snapshot_registry = self.display_snapshots.lock().map_err(|_| {
             "computer_state_error: display snapshot registry lock poisoned".to_string()
         })?;
@@ -2005,6 +2026,26 @@ mod ax_observation_bound_tests {
 
 #[cfg(test)]
 mod element_registry_tests {
+    #[test]
+    fn compact_selectors_retry_collision_and_stop_at_budget() {
+        let calls = std::cell::Cell::new(0);
+        let id = super::allocate_selector("surface_", |_| {
+            calls.set(calls.get() + 1);
+            calls.get() == 1
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(id.len(), 24);
+        assert!(webcodex_core::compact::decode::<12>(&id[8..]).is_some());
+        calls.set(0);
+        assert!(super::allocate_selector("element_", |_| {
+            calls.set(calls.get() + 1);
+            true
+        })
+        .is_err());
+        assert_eq!(calls.get(), 16);
+    }
+
     use super::*;
 
     fn fingerprint(label: &str) -> ElementFingerprint {
@@ -2316,13 +2357,11 @@ mod application_runtime_tests {
             "",
             "application_",
             "application_0123456789abcdef0123456789abcdeg",
-            "surface_0123456789abcdef0123456789abcdef",
+            "surface_iavN7wEjRWeJq83v",
         ] {
             assert!(!valid_application_id(invalid), "{invalid}");
         }
-        assert!(valid_application_id(
-            "application_0123456789abcdef0123456789abcdef"
-        ));
+        assert!(valid_application_id("application_iavN7wEjRWeJq83v"));
     }
 
     #[test]
@@ -2427,12 +2466,12 @@ mod display_runtime_tests {
 
     #[test]
     fn display_ids_remain_closed() {
-        assert!(valid_display_id("display_0123456789abcdef0123456789abcdef"));
+        assert!(valid_display_id("display_iavN7wEjRWeJq83v"));
         for invalid in [
             "",
             "display_",
             "display_0123456789abcdef0123456789abcdeg",
-            "surface_0123456789abcdef0123456789abcdef",
+            "surface_iavN7wEjRWeJq83v",
         ] {
             assert!(!valid_display_id(invalid), "{invalid}");
         }
@@ -2545,7 +2584,7 @@ mod pointer_runtime_tests {
             primary: false,
         };
         let mut snapshots = DisplaySnapshotRegistry::default();
-        let display_id = "display_0123456789abcdef0123456789abcdef";
+        let display_id = "display_iavN7wEjRWeJq83v";
         let first = snapshots.bind(display_id, &display).unwrap();
         let second = snapshots.bind(display_id, &display).unwrap();
         assert!(snapshots

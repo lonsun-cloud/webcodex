@@ -16,6 +16,10 @@ pub(crate) fn runner_access_from_auth(
                 .shared_key_hash
                 .clone()
                 .map(RunnerAccessGroup::SharedKey),
+            crate::auth::AuthKind::OAuth2Token if auth.is_oauth_project_subject() => auth
+                .project_grant_id
+                .clone()
+                .map(RunnerAccessGroup::ProjectGrant),
             crate::auth::AuthKind::OAuth2Token if auth.is_oauth_shared_key_subject() => auth
                 .shared_key_hash
                 .clone()

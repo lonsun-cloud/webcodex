@@ -12,15 +12,80 @@ fn write_skill(root: &Path, package: &str, name: &str, body: &str) {
 }
 
 #[test]
-fn empty_roots_preserve_empty_source() {
-    let result = handle_configured_skill_roots_request(
-        &SkillsConfig::default(),
-        ConfiguredSkillRootsRequest::List,
+fn configured_skill_scan_triggers_are_closed_and_identity_free() {
+    assert_eq!(
+        ConfiguredSkillScanTrigger::CatalogList.as_str(),
+        "catalog_list"
     );
-    let response: ConfiguredSkillRootsListResponse =
-        serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
-    assert!(response.skills.is_empty());
-    assert!(response.diagnostics.is_empty());
+    assert_eq!(
+        ConfiguredSkillScanTrigger::ExactReadResolution.as_str(),
+        "exact_read_resolution"
+    );
+}
+
+#[test]
+fn exact_resolution_scans_identities_but_reads_only_target_definition() {
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..24 {
+        write_skill(
+            temp.path(),
+            &format!("skill-{index:02}"),
+            &format!("skill-{index:02}"),
+            "body",
+        );
+    }
+    fs::write(temp.path().join("skill-03/SKILL.md"), "not frontmatter").unwrap();
+    fs::write(
+        temp.path().join("skill-04/SKILL.md"),
+        vec![b'x'; MAX_SKILL_DEFINITION_BYTES + 1],
+    )
+    .unwrap();
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+    };
+    let target_id = configured_skill_id(temp.path(), "skill-23");
+
+    let (resolved, stats) = resolve_live_skill_by_id(&config, &target_id).unwrap();
+    let resolved = resolved.expect("target configured Skill should resolve");
+    assert_eq!(resolved.descriptor.skill_id(), target_id);
+    assert_eq!(resolved.descriptor.name(), "skill-23");
+    assert_eq!(stats.roots_examined, 1);
+    assert_eq!(stats.directory_entries_scanned, 24);
+    assert_eq!(stats.definitions_attempted, 1);
+    assert_eq!(stats.definitions_read, 1);
+    assert!(stats.definition_bytes_read > 0);
+
+    let resource = read_resource(
+        &config,
+        &target_id,
+        "references/guide.md",
+        1,
+        20,
+        Some(resolved.descriptor.definition_revision()),
+    )
+    .unwrap();
+    assert_eq!(resource.text, "line one\nline two");
+
+    let malformed_id = configured_skill_id(temp.path(), "skill-03");
+    let (malformed, malformed_stats) = resolve_live_skill_by_id(&config, &malformed_id).unwrap();
+    assert!(malformed.is_none());
+    assert_eq!(malformed_stats.definitions_attempted, 1);
+    assert_eq!(malformed_stats.definitions_read, 1);
+
+    let oversized_id = configured_skill_id(temp.path(), "skill-04");
+    let (oversized, oversized_stats) = resolve_live_skill_by_id(&config, &oversized_id).unwrap();
+    assert!(oversized.is_none());
+    assert_eq!(oversized_stats.definitions_attempted, 1);
+    assert_eq!(oversized_stats.definitions_read, 0);
+}
+
+#[test]
+fn empty_roots_preserve_empty_source() {
+    let discovery = discover(&SkillsConfig::default()).unwrap();
+    assert!(discovery.skills.is_empty());
+    assert!(discovery.diagnostics.is_empty());
+    assert_eq!(discovery.invalid_count, 0);
+    assert!(!discovery.discovery_truncated);
 }
 
 #[test]
@@ -32,10 +97,9 @@ fn live_discovery_and_resource_read_observe_changes() {
     };
     let first = discover(&config).unwrap();
     assert_eq!(first.skills.len(), 1);
-    let id = first.skills[0].descriptor.skill_id.clone();
-    let revision = first.skills[0].descriptor.definition_revision.clone();
-    let listed = handle_configured_skill_roots_request(&config, ConfiguredSkillRootsRequest::List);
-    let listed_text = listed.stdout.as_deref().unwrap();
+    let id = first.skills[0].descriptor.skill_id().to_string();
+    let revision = first.skills[0].descriptor.definition_revision().to_string();
+    let listed_text = serde_json::to_string(&first.skills[0].descriptor).unwrap();
     assert!(!listed_text.contains(temp.path().to_string_lossy().as_ref()));
     let definition =
         read_resource(&config, &id, SKILL_DEFINITION_FILE, 1, 20, Some(&revision)).unwrap();
@@ -46,13 +110,13 @@ fn live_discovery_and_resource_read_observe_changes() {
 
     write_skill(temp.path(), "demo", "demo", "version two");
     let second = discover(&config).unwrap();
-    assert_eq!(second.skills[0].descriptor.skill_id, id);
-    assert_ne!(second.skills[0].descriptor.definition_revision, revision);
+    assert_eq!(second.skills[0].descriptor.skill_id(), id);
+    assert_ne!(second.skills[0].descriptor.definition_revision(), revision);
     assert_eq!(
         read_resource(&config, &id, SKILL_DEFINITION_FILE, 1, 20, Some(&revision)).unwrap_err(),
         "skill_definition_changed"
     );
-    let fresh_revision = &second.skills[0].descriptor.definition_revision;
+    let fresh_revision = second.skills[0].descriptor.definition_revision();
     let fresh = read_resource(
         &config,
         &id,
@@ -71,21 +135,18 @@ fn live_discovery_and_resource_read_observe_changes() {
 fn missing_root_is_a_bounded_path_free_diagnostic_not_an_empty_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let missing = temp.path().join("missing-live-skills");
-    let result = handle_configured_skill_roots_request(
-        &SkillsConfig {
-            roots: vec![missing.clone()],
-        },
-        ConfiguredSkillRootsRequest::List,
-    );
-    assert_eq!(result.exit_code, Some(0));
-    let stdout = result.stdout.as_deref().unwrap();
-    assert!(!stdout.contains(missing.to_string_lossy().as_ref()));
-    let response: ConfiguredSkillRootsListResponse = serde_json::from_str(stdout).unwrap();
-    assert!(response.skills.is_empty());
+    let discovery = discover(&SkillsConfig {
+        roots: vec![missing.clone()],
+    })
+    .unwrap();
+    assert!(discovery.skills.is_empty());
     assert_eq!(
-        response.diagnostics,
+        discovery.diagnostics,
         vec!["configured_skill_root_not_found".to_string()]
     );
+    assert!(!serde_json::to_string(&discovery.diagnostics)
+        .unwrap()
+        .contains(missing.to_string_lossy().as_ref()));
 }
 
 #[test]
@@ -100,49 +161,19 @@ fn same_package_in_two_roots_has_distinct_opaque_identity() {
     .unwrap();
     assert_eq!(discovery.skills.len(), 2);
     assert_ne!(
-        discovery.skills[0].descriptor.skill_id,
-        discovery.skills[1].descriptor.skill_id
+        discovery.skills[0].descriptor.skill_id(),
+        discovery.skills[1].descriptor.skill_id()
     );
     for skill in discovery.skills {
         assert!(!skill
             .descriptor
-            .skill_id
+            .skill_id()
             .contains(&first.path().to_string_lossy().as_ref()));
         assert!(!skill
             .descriptor
-            .skill_id
+            .skill_id()
             .contains(&second.path().to_string_lossy().as_ref()));
     }
-}
-
-#[test]
-fn list_response_truncates_valid_unicode_descriptors_to_wire_budget() {
-    let temp = tempfile::tempdir().unwrap();
-    let description = "界".repeat(webcodex_core::skill_metadata::MAX_SKILL_DESCRIPTION_CHARS);
-    for index in 0..MAX_CONFIGURED_SKILL_PACKAGES {
-        let package = temp.path().join(format!("skill-{index:03}"));
-        fs::create_dir_all(&package).unwrap();
-        fs::write(
-            package.join(SKILL_DEFINITION_FILE),
-            format!("---\nname: skill-{index:03}\ndescription: {description}\n---\nbody\n"),
-        )
-        .unwrap();
-    }
-
-    let result = handle_configured_skill_roots_request(
-        &SkillsConfig {
-            roots: vec![temp.path().to_path_buf()],
-        },
-        ConfiguredSkillRootsRequest::List,
-    );
-    assert_eq!(result.exit_code, Some(0));
-    let stdout = result.stdout.as_deref().unwrap();
-    assert!(stdout.len() <= CONFIGURED_SKILL_ROOTS_RESPONSE_MAX_BYTES);
-    let response: ConfiguredSkillRootsListResponse = serde_json::from_str(stdout).unwrap();
-    response.validate().unwrap();
-    assert!(response.discovery_truncated);
-    assert!(!response.skills.is_empty());
-    assert!(response.skills.len() < MAX_CONFIGURED_SKILL_PACKAGES);
 }
 
 #[test]
@@ -175,7 +206,7 @@ fn traversal_and_symlink_escape_are_rejected() {
     assert_eq!(
         read_resource(
             &config,
-            &skill.descriptor.skill_id,
+            skill.descriptor.skill_id(),
             "../secret",
             1,
             20,
@@ -187,7 +218,7 @@ fn traversal_and_symlink_escape_are_rejected() {
     assert_eq!(
         read_resource(
             &config,
-            &skill.descriptor.skill_id,
+            skill.descriptor.skill_id(),
             "/etc/passwd",
             1,
             20,
@@ -210,7 +241,7 @@ fn traversal_and_symlink_escape_are_rejected() {
         assert_eq!(
             read_resource(
                 &config,
-                &skill.descriptor.skill_id,
+                skill.descriptor.skill_id(),
                 "references/escape.md",
                 1,
                 20,
@@ -275,16 +306,14 @@ fn resource_reads_enforce_actual_byte_bound_and_preserve_range_metadata() {
     fs::write(&resource, &bytes).unwrap();
     let read = read_resource(
         &config,
-        &skill.descriptor.skill_id,
+        skill.descriptor.skill_id(),
         "references/guide.md",
         2,
         1,
         None,
     )
     .unwrap();
-    assert_eq!(read.file_bytes, bytes.len());
     assert_eq!(read.sha256, sha256_hex(&bytes));
-    assert_eq!(read.total_lines, bytes.len());
     assert_eq!(read.returned_lines, 1);
     assert_eq!(read.next_start_line, Some(3));
     bytes.push(b'\n');
@@ -292,7 +321,7 @@ fn resource_reads_enforce_actual_byte_bound_and_preserve_range_metadata() {
     assert_eq!(
         read_resource(
             &config,
-            &skill.descriptor.skill_id,
+            skill.descriptor.skill_id(),
             "references/guide.md",
             2,
             1,
@@ -305,7 +334,7 @@ fn resource_reads_enforce_actual_byte_bound_and_preserve_range_metadata() {
     assert_eq!(
         read_resource(
             &config,
-            &skill.descriptor.skill_id,
+            skill.descriptor.skill_id(),
             "references/guide.md",
             1,
             1,

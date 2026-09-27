@@ -18,7 +18,7 @@ fn runner_capability_unavailable_result(message: impl Into<String>) -> ToolResul
         message,
         json!({"error_kind": "agent_capability_unavailable"}),
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 impl ToolRuntime {
@@ -59,12 +59,15 @@ impl ToolRuntime {
         if matches!(
             call,
             ToolCall::RunProcess { .. }
+                | ToolCall::RunSkillResource { .. }
                 | ToolCall::RunDetachedProcess { .. }
                 | ToolCall::RunScript { .. }
         ) && ssh_resource.is_some()
         {
             let (tool, representation) = if matches!(call, ToolCall::RunScript { .. }) {
                 ("run_script", "typed script payloads")
+            } else if matches!(call, ToolCall::RunSkillResource { .. }) {
+                ("run_skill_resource", "trusted Skill resource execution")
             } else if matches!(call, ToolCall::RunDetachedProcess { .. }) {
                 ("run_detached_process", "detached native argv ownership")
             } else {
@@ -85,7 +88,7 @@ impl ToolRuntime {
                     "tool_failure": true,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None));
+            .with_recovery(RecoveryKind::FixInput));
         }
         let client_id = proj.client_id.clone();
         let access = crate::runner_http::runner_access_from_auth(auth);
@@ -143,12 +146,18 @@ impl ToolRuntime {
                     if matches!(
                         required,
                         RunnerCapabilityRequirement::StructuredProcess
+                            | RunnerCapabilityRequirement::SkillResourceExecution
                             | RunnerCapabilityRequirement::DetachedProcess
                             | RunnerCapabilityRequirement::StructuredScript
                     ) {
                         let noun =
                             if matches!(required, RunnerCapabilityRequirement::StructuredScript) {
                                 "script"
+                            } else if matches!(
+                                required,
+                                RunnerCapabilityRequirement::SkillResourceExecution
+                            ) {
+                                "trusted Skill resource"
                             } else if matches!(
                                 required,
                                 RunnerCapabilityRequirement::DetachedProcess
@@ -174,7 +183,7 @@ impl ToolRuntime {
                                 "tool_failure": true,
                             }),
                         )
-                        .with_recovery(RecoveryKind::NoAction, None));
+                        .with_recovery(RecoveryKind::NoAction));
                     }
                     return Err(runner_capability_unavailable_result(message));
                 }

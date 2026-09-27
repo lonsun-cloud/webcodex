@@ -1,4 +1,6 @@
+use crate::registry::RunnerTransport;
 use std::fmt::Debug;
+use std::time::Duration;
 use webcodex_core::runner_operation::RunnerOperation;
 use webcodex_core::runner_protocol::{RunnerJobUpdateRequest, RunnerRequest, RunnerResultPayload};
 
@@ -21,7 +23,29 @@ pub trait RunnerRegistryTelemetry: Debug + Send + Sync {
         runner_git_commit: Option<&str>,
     );
 
+    /// A queued request was authoritatively dequeued for one Runner transport.
+    /// `queue_wait` is measured entirely on the Server monotonic clock.
+    fn runner_request_dequeued(
+        &self,
+        _request_id: &str,
+        _transport: RunnerTransport,
+        _queue_wait: Duration,
+    ) {
+    }
+
     fn runner_result_accepted(&self, request_id: &str, payload: &RunnerResultPayload);
+
+    /// The matching ordinary Result was accepted. `round_trip` is Server
+    /// enqueue -> Server result acceptance on one monotonic clock; it includes
+    /// queueing, Runner execution, transport and serialization, and is not
+    /// one-way network latency.
+    fn runner_request_round_trip(
+        &self,
+        _request_id: &str,
+        _transport: RunnerTransport,
+        _round_trip: Duration,
+    ) {
+    }
 
     fn runner_result_finalized(&self, request_id: &str);
 

@@ -348,7 +348,7 @@ async fn ops_projects_http_401_uses_ops_report() {
     let output = run_ops_with_routes(
         OpsCommand::Projects(ops_common_opts(String::new())),
         vec![(
-            "/api/projects/list",
+            "/api/tools/call",
             json_http_response(401, json!({"error": "missing token"})),
         )],
     )
@@ -375,7 +375,7 @@ async fn ops_smoke_preflight_projects_401_uses_ops_report() {
                 ),
             ),
             (
-                "/api/projects/list",
+                "/api/tools/call",
                 json_http_response(401, json!({"error": "missing token"})),
             ),
         ],
@@ -408,12 +408,14 @@ async fn ops_http_403_reports_forbidden() {
 #[tokio::test]
 async fn ops_connection_failure_reports_runtime_unreachable() {
     let (addr, handle) = spawn_connection_drop_server();
-    let output = run_ops_command(OpsCommand::Status(ops_common_opts(format!(
-        "http://{addr}"
-    ))))
-    .await
-    .unwrap()
-    .stdout;
+    let mut opts = ops_common_opts(format!("http://{addr}"));
+    // Keep this transport-failure fixture independent of any Runner token in
+    // the parent test environment; ops/runtime APIs require a user PAT.
+    opts.token = Some("wc_pat_connection_failure_fixture".to_string());
+    let output = run_ops_command(OpsCommand::Status(opts))
+        .await
+        .unwrap()
+        .stdout;
     handle.join().unwrap();
     assert!(output.contains("Overall: FAIL"), "{output}");
     assert!(output.contains("runtime_unreachable"), "{output}");
@@ -667,15 +669,17 @@ fn spawn_ops_route_server(
 }
 
 // Route fixtures may intentionally exercise the unauthenticated 401 contract.
-// Serialize them with the process-env credential test and remove any ambient
-// token for the duration, while still preserving explicit per-command tokens.
+// Serialize them with process-env credential tests and remove both ambient
+// user/API credential aliases while preserving explicit per-command tokens.
 #[allow(clippy::await_holding_lock)]
 async fn run_ops_with_routes(
     command: OpsCommand,
     routes: Vec<(&'static str, OpsHttpResponse)>,
 ) -> String {
     let _env_guard = env_test_guard();
-    let _env = EnvGuard::new().remove("WEBCODEX_TOKEN");
+    let _env = EnvGuard::new()
+        .remove("WEBCODEX_TOKEN")
+        .remove("WEBCODEX_PAT");
     let (server_url, stop_tx, handle) = spawn_ops_route_server(routes);
     let command = match command {
         OpsCommand::Status(mut opts) => {
@@ -792,7 +796,7 @@ fn spawn_smoke_preflight_server(
                     let first_line = request.lines().next().unwrap_or_default().to_string();
                     let body = if first_line.starts_with("POST /api/runtime/status ") {
                         json!({"success": true, "output": runtime_status_fixture()})
-                    } else if first_line.starts_with("POST /api/projects/list ") {
+                    } else if request.contains(r#""tool":"list_projects""#) {
                         json!({"success": true, "output": projects.clone()})
                     } else if request.contains(r#""tool":"show_changes""#) {
                         json!({"success": true, "output": clean_show_changes_fixture()})
@@ -847,8 +851,8 @@ fn smoke_request_kinds(requests: &[String]) -> Vec<&'static str> {
             let first_line = request.lines().next().unwrap_or_default();
             if first_line.starts_with("POST /api/runtime/status ") {
                 "runtime_status"
-            } else if first_line.starts_with("POST /api/projects/list ") {
-                "projects_list"
+            } else if request.contains(r#""tool":"list_projects""#) {
+                "list_projects"
             } else if request.contains(r#""tool":"show_changes""#) {
                 "show_changes"
             } else if request.contains(r#""tool":"workspace_hygiene_check""#) {
@@ -876,6 +880,51 @@ fn ops_status_runtime_ok_passes() {
         report.source["runtime_commit"],
         "15138884e3a8ddcf294cae98183ecaac37af7230"
     );
+}
+
+#[test]
+fn ops_status_tool_inventory_accepts_different_release_sizes() {
+    for count in [1_u64, 47, 66, 135, 200] {
+        let mut runtime = runtime_status_fixture();
+        runtime["tools"] = json!({"count": count});
+        let report = ops_status_report("https://ops.example.test", &Some(runtime.clone()));
+        assert_eq!(report.verdict.status, "pass", "compact count {count}");
+        runtime["tools"]["names"] =
+            json!((0..count).map(|i| format!("tool_{i}")).collect::<Vec<_>>());
+        let report = ops_status_report("https://ops.example.test", &Some(runtime));
+        assert_eq!(report.verdict.status, "pass", "full count {count}");
+        assert!(report.verdict.warning_reasons.is_empty());
+    }
+}
+
+#[test]
+fn ops_status_tool_inventory_rejects_missing_empty_or_inconsistent_data() {
+    for tools in [
+        Value::Null,
+        json!({}),
+        json!({"count": 0}),
+        json!({"count": -1}),
+        json!({"count": "135"}),
+        json!({"count": 1.5}),
+        json!({"count": 2, "names": ["one"]}),
+        json!({"count": 2, "names": ["one", "one"]}),
+        json!({"count": 1, "names": [""]}),
+        json!({"count": 1, "names": [" "]}),
+        json!({"count": 1, "names": [42]}),
+        json!({"count": 1, "names": null}),
+        json!({"count": 1, "names": "one"}),
+    ] {
+        let mut runtime = runtime_status_fixture();
+        runtime["tools"] = tools;
+        let report = ops_status_report("https://ops.example.test", &Some(runtime));
+        assert_eq!(report.verdict.status, "fail");
+        assert!(report.verdict.blocking);
+        assert!(report
+            .verdict
+            .blocking_reasons
+            .contains(&"malformed_tool_inventory".to_string()));
+        assert_eq!(ops_exit_code(true, report.verdict.status), 2);
+    }
 }
 
 #[test]
@@ -1189,14 +1238,14 @@ async fn ops_smoke_preflight_calls_only_read_only_endpoints() {
         smoke_request_kinds(&requests),
         vec![
             "runtime_status",
-            "projects_list",
+            "list_projects",
             "show_changes",
             "workspace_hygiene_check"
         ]
     );
     let joined = requests.join("\n---\n");
     assert!(joined.contains("POST /api/runtime/status "));
-    assert!(joined.contains("POST /api/projects/list "));
+    assert!(joined.contains(r#""tool":"list_projects""#));
     assert!(joined.contains(r#""tool":"show_changes""#));
     assert!(joined.contains(r#""tool":"workspace_hygiene_check""#));
     assert!(!joined.contains(r#""tool":"run_shell""#));
@@ -1211,7 +1260,7 @@ async fn ops_smoke_preflight_project_missing_short_circuits() {
         run_smoke_preflight_with_projects(projects_fixture(true), "agent:ops:missing").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1228,7 +1277,7 @@ async fn ops_smoke_preflight_disconnected_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1253,7 +1302,7 @@ async fn ops_smoke_preflight_non_git_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));

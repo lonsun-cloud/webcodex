@@ -4,7 +4,7 @@ use rusqlite::params;
 
 impl Database {
     pub fn get_user_by_username(&self, username: &str) -> anyhow::Result<Option<UserRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, username, created_at, disabled, display_name, role, disabled_at, updated_at
              FROM users WHERE username = ?1",
@@ -17,7 +17,7 @@ impl Database {
     }
 
     pub fn create_user(&self, user: &UserRecord) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "INSERT INTO users (id, username, created_at, disabled, display_name, role, disabled_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -37,7 +37,7 @@ impl Database {
 
     /// List all users ordered by username. Phase 2 admin surface.
     pub fn list_users(&self) -> anyhow::Result<Vec<UserRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, username, created_at, disabled, display_name, role, disabled_at, updated_at
              FROM users ORDER BY username ASC",
@@ -47,7 +47,7 @@ impl Database {
     }
 
     pub fn get_api_key_by_hash(&self, hash: &str) -> anyhow::Result<Option<ApiKeyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, name, key_prefix, created_at, last_used_at, revoked_at, scopes, expires_at, kind, allowed_client_id
              FROM api_keys
@@ -61,7 +61,7 @@ impl Database {
     }
 
     pub fn insert_api_key(&self, key: &ApiKeyRecord, key_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "INSERT INTO api_keys (id, user_id, name, key_hash, key_prefix, created_at, last_used_at, revoked_at, scopes, expires_at, kind, allowed_client_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -88,7 +88,7 @@ impl Database {
         record: &AccountCredentialRecord,
         credential_hash: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "INSERT INTO account_credentials (
                 id, user_id, credential_hash, credential_prefix, created_at, last_used_at, revoked_at
@@ -110,7 +110,7 @@ impl Database {
         &self,
         hash: &str,
     ) -> anyhow::Result<Option<AccountCredentialRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, credential_prefix, created_at, last_used_at, revoked_at
              FROM account_credentials
@@ -124,7 +124,7 @@ impl Database {
     }
 
     pub fn update_account_credential_last_used(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "UPDATE account_credentials SET last_used_at = ?2 WHERE id = ?1",
             params![id, ts],
@@ -137,13 +137,13 @@ impl Database {
         id: &str,
         ts: i64,
     ) -> anyhow::Result<Option<AccountCredentialRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "UPDATE account_credentials SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
         )?;
         drop(conn);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, credential_prefix, created_at, last_used_at, revoked_at
              FROM account_credentials WHERE id = ?1",
@@ -159,7 +159,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> anyhow::Result<Vec<AccountCredentialRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, credential_prefix, created_at, last_used_at, revoked_at
              FROM account_credentials WHERE user_id = ?1 ORDER BY created_at DESC",
@@ -168,13 +168,37 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Compare-and-swap scopes on one still-live user key. Account-management
+    /// callers must authorize the grant before entering this storage primitive.
+    /// Never changes token bytes, expiry, kind, owner or transport credentials.
+    pub fn compare_and_swap_user_key_scopes(
+        &self,
+        id: &str,
+        user_id: &str,
+        expected: &str,
+        desired: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
+        let changed = conn.execute(
+            "UPDATE api_keys SET scopes = ?4
+             WHERE id = ?1 AND user_id = ?2 AND scopes = ?3
+               AND kind = 'user' AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?5)
+               AND EXISTS (SELECT 1 FROM users WHERE users.id = api_keys.user_id
+                           AND users.disabled = 0 AND users.disabled_at IS NULL)",
+            params![id, user_id, expected, desired, now],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn insert_pairing_code(&self, record: &PairingCodeRecord) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "INSERT INTO pairing_codes (
                 id, code_hash, user_id, username, client_id, created_at, expires_at, used_at,
-                user_token_name, agent_token_name
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                user_token_name, agent_token_name, runner_capabilities
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.id,
                 record.code_hash,
@@ -186,6 +210,7 @@ impl Database {
                 record.used_at,
                 record.user_token_name,
                 record.agent_token_name,
+                record.runner_capabilities,
             ],
         )?;
         Ok(())
@@ -195,10 +220,10 @@ impl Database {
         &self,
         code_hash: &str,
     ) -> anyhow::Result<Option<PairingCodeRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, code_hash, user_id, username, client_id, created_at, expires_at, used_at,
-                    user_token_name, agent_token_name
+                    user_token_name, agent_token_name, runner_capabilities
              FROM pairing_codes WHERE code_hash = ?1",
         )?;
         let mut rows = stmt.query_map(params![code_hash], row_to_pairing_code)?;
@@ -214,12 +239,12 @@ impl Database {
         client_id: &str,
         now: i64,
     ) -> anyhow::Result<PairingConsumeResult> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Accounts);
         let tx = conn.transaction()?;
         let record = {
             let mut stmt = tx.prepare(
                 "SELECT id, code_hash, user_id, username, client_id, created_at, expires_at,
-                        used_at, user_token_name, agent_token_name
+                        used_at, user_token_name, agent_token_name, runner_capabilities
                  FROM pairing_codes WHERE code_hash = ?1",
             )?;
             let mut rows = stmt.query_map(params![code_hash], row_to_pairing_code)?;
@@ -264,7 +289,7 @@ impl Database {
     }
 
     pub fn list_api_keys_by_user(&self, user_id: &str) -> anyhow::Result<Vec<ApiKeyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, name, key_prefix, created_at, last_used_at, revoked_at, scopes, expires_at, kind, allowed_client_id
              FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC",
@@ -276,7 +301,7 @@ impl Database {
     /// List only agent tokens (`kind='agent'`) for a user. Phase 3 agent-token
     /// management surface. Ordered by `created_at DESC`.
     pub fn list_agent_api_keys_by_user(&self, user_id: &str) -> anyhow::Result<Vec<ApiKeyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, name, key_prefix, created_at, last_used_at, revoked_at, scopes, expires_at, kind, allowed_client_id
              FROM api_keys WHERE user_id = ?1 AND kind = 'agent' ORDER BY created_at DESC",
@@ -288,7 +313,7 @@ impl Database {
     /// Fetch a single api token by id (including revoked/expired rows). Used by
     /// the revoke endpoint and self-management lookups. Phase 2.
     pub fn get_api_key_by_id(&self, id: &str) -> anyhow::Result<Option<ApiKeyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, user_id, name, key_prefix, created_at, last_used_at, revoked_at, scopes, expires_at, kind, allowed_client_id
              FROM api_keys WHERE id = ?1",
@@ -304,7 +329,7 @@ impl Database {
     /// revoked token is a no-op. Returns the post-revoke record when a row
     /// exists. Phase 2.
     pub fn revoke_api_key(&self, id: &str, ts: i64) -> anyhow::Result<Option<ApiKeyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
@@ -323,7 +348,7 @@ impl Database {
         disabled: bool,
         ts: i64,
     ) -> anyhow::Result<Option<UserRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "UPDATE users
              SET disabled = ?2,
@@ -337,7 +362,7 @@ impl Database {
     }
 
     pub fn get_user_by_id(&self, id: &str) -> anyhow::Result<Option<UserRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         let mut stmt = conn.prepare(
             "SELECT id, username, created_at, disabled, display_name, role, disabled_at, updated_at
              FROM users WHERE id = ?1",
@@ -350,7 +375,7 @@ impl Database {
     }
 
     pub fn update_api_key_last_used(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Accounts);
         conn.execute(
             "UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1",
             params![id, ts],
@@ -371,6 +396,7 @@ fn row_to_pairing_code(row: &rusqlite::Row) -> rusqlite::Result<PairingCodeRecor
         used_at: row.get(7)?,
         user_token_name: row.get(8)?,
         agent_token_name: row.get(9)?,
+        runner_capabilities: row.get(10)?,
     })
 }
 

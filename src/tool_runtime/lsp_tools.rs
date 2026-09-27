@@ -3,12 +3,12 @@
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::lsp_bridge::{
     clamp_document_diagnostics_limit, clamp_document_symbols_limit, clamp_find_references_limit,
-    clamp_goto_definition_limit, clamp_workspace_symbols_limit, error_codes, is_known_error_code,
-    parse_runner_lsp_result_envelope, redact_absolute_paths, validate_call_hierarchy_bounds,
-    CallHierarchyResult, DocumentDiagnosticsResult, DocumentDiagnosticsStatus,
-    DocumentSymbolsResult, HoverResult, LocationsResult, LspStatusResult, RunnerLspPayload,
-    RunnerLspRequest, WorkspaceSymbolsResult, MAX_CALL_HIERARCHY_CALL_SITES_PER_EDGE,
-    MAX_CALL_HIERARCHY_ROOTS,
+    clamp_goto_definition_limit, clamp_workspace_symbols_limit, effective_call_hierarchy_limit,
+    error_codes, is_known_error_code, parse_runner_lsp_result_envelope, redact_absolute_paths,
+    validate_call_hierarchy_bounds, validate_call_hierarchy_depth, CallHierarchyResult,
+    DocumentDiagnosticsResult, DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult,
+    LocationsResult, LspStatusResult, RunnerLspPayload, RunnerLspRequest, WorkspaceSymbolsResult,
+    MAX_CALL_HIERARCHY_CALL_SITES_PER_EDGE, MAX_CALL_HIERARCHY_ROOTS,
 };
 use crate::runner_http::{EnqueueLspError, RunnerFeature};
 use serde::de::DeserializeOwned;
@@ -166,12 +166,21 @@ impl ToolRuntime {
                         error_codes::INVALID_ARGUMENTS
                     ));
                 }
-                if let Err(message) = validate_call_hierarchy_bounds(depth, limit) {
+                if let Err(message) = validate_call_hierarchy_depth(depth) {
                     return ToolResult::err(format!(
                         "{}: {message}",
                         error_codes::INVALID_ARGUMENTS
                     ));
                 }
+                let limit = match effective_call_hierarchy_limit(limit) {
+                    Ok(limit) => limit,
+                    Err(message) => {
+                        return ToolResult::err(format!(
+                            "{}: {message}",
+                            error_codes::INVALID_ARGUMENTS
+                        ))
+                    }
+                };
                 self.call_agent_lsp(
                     project,
                     RunnerLspRequest::CallHierarchy {

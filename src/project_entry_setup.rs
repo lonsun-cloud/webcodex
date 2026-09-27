@@ -1,10 +1,8 @@
 //! Private project setup, registration, and local-state ownership.
 
 use super::{
-    runner_runtime_available, LocalTaskState, ProductError, ProjectCommandOptions, ReadinessFact,
-    SetupReport,
+    runner_runtime_available, ProductError, ProjectCommandOptions, ReadinessFact, SetupReport,
 };
-use crate::connector_runtime::workspace::{WorkspaceManager, WritableWorkspaceReadinessStatus};
 use crate::runner_config::{
     generated_runner_config_toml, RunnerInitOptions, DEFAULT_POLL_INTERVAL_MS, TRANSPORT_WEBSOCKET,
 };
@@ -18,7 +16,7 @@ use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 const PROJECT_PORT_BASE: u16 = 20_000;
 const PROJECT_PORT_COUNT: u32 = 20_000;
 const PROJECT_PORT_PROBE_STEP: u32 = 7_919;
@@ -28,16 +26,12 @@ const PROJECT_PORT_PROBE_LIMIT: usize = 256;
 pub(super) struct ProjectPaths {
     pub(super) state: PathBuf,
     pub(super) data: PathBuf,
-    pub(super) cache: PathBuf,
-    pub(super) cargo_target: PathBuf,
     pub(super) credentials: PathBuf,
     pub(super) project_registry: PathBuf,
-    pub(super) runs: PathBuf,
-    pub(super) results: PathBuf,
     pub(super) logs: PathBuf,
     pub(super) config: PathBuf,
     pub(super) bootstrap_key: PathBuf,
-    pub(super) connector_key: PathBuf,
+    pub(super) project_credential: PathBuf,
     pub(super) agent_token: PathBuf,
     pub(super) runner_config: PathBuf,
     pub(super) legacy_agent_config: PathBuf,
@@ -47,21 +41,16 @@ impl ProjectPaths {
     fn new(state: PathBuf) -> Result<Self, ProductError> {
         let credentials = state.join("credentials");
         let runner_state_dir = state.join("agent");
-        let cache = state.join("cache");
         let project_registry =
             crate::runner_config::paths::select_project_registry_dir(&runner_state_dir)
                 .map_err(|message| invalid_registration(&message))?;
         Ok(Self {
             data: state.join("data"),
-            cargo_target: cache.join("cargo-target"),
-            cache,
             project_registry,
-            runs: state.join("runs"),
-            results: state.join("results"),
             logs: state.join("logs"),
             config: state.join("project.toml"),
             bootstrap_key: credentials.join("bootstrap-key"),
-            connector_key: credentials.join("connector-key"),
+            project_credential: credentials.join("project-credential"),
             agent_token: credentials.join("agent-token"),
             runner_config: runner_state_dir.join(webcodex_runner_config::paths::RUNNER_CONFIG_FILE),
             legacy_agent_config: runner_state_dir
@@ -91,12 +80,8 @@ impl ProjectPaths {
         for path in [
             &self.state,
             &self.data,
-            &self.cache,
-            &self.cargo_target,
             &self.credentials,
             &self.project_registry,
-            &self.runs,
-            &self.results,
             &self.logs,
         ] {
             create_private_dir(path)?;
@@ -162,8 +147,6 @@ pub(super) struct ProjectConfig {
     pub(super) root: PathBuf,
     pub(super) profile: String,
     pub(super) port: u16,
-    pub(super) logical_project_id: String,
-    pub(super) workspace_id: String,
     pub(super) executor_project_id: String,
     pub(super) executor_client_id: String,
 }
@@ -188,8 +171,6 @@ impl ProjectConfig {
                 root,
                 profile: options.profile.clone(),
                 port,
-                logical_project_id: format!("wc_proj_{}", &identity[..20]),
-                workspace_id: format!("wc_ws_{}", &identity[20..40]),
                 executor_project_id,
                 executor_client_id: format!("local-{}-{}", &identity[..8], &grant_id[10..18]),
             },
@@ -223,30 +204,6 @@ struct ProjectRegistration {
     disabled: bool,
 }
 
-pub(crate) fn resolve_local_task_state(
-    root: &Path,
-    profile: &str,
-    state_dir: Option<&Path>,
-) -> Result<LocalTaskState, String> {
-    let options = ProjectCommandOptions {
-        root: root.to_path_buf(),
-        profile: profile.to_string(),
-        state_dir: state_dir.map(Path::to_path_buf),
-        json: false,
-        console_assets_dir: None,
-    };
-    let (config, paths) = ProjectConfig::resolve(&options).map_err(|error| error.message)?;
-    Ok(LocalTaskState {
-        root: config.root,
-        state: paths.state,
-        data: paths.data,
-        runs: paths.runs,
-        project_registry: paths.project_registry,
-        cargo_target: paths.cargo_target,
-        logical_project_id: config.logical_project_id,
-    })
-}
-
 pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, ProductError> {
     let (mut expected, paths) = ProjectConfig::resolve(options)?;
     // Establish the private-state boundary before reading or creating any
@@ -272,8 +229,8 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
     }
 
     let mut changed = Vec::new();
-    if paths.connector_key.is_file() {
-        let _ = read_project_credential(&paths.connector_key)?;
+    if paths.project_credential.is_file() {
+        let _ = read_project_credential(&paths.project_credential)?;
     } else {
         if runner_config.exists() {
             return Err(ProductError::new(
@@ -283,7 +240,7 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
             ));
         }
         let value = generate_project_credential();
-        write_new_private(&paths.connector_key, format!("{value}\n").as_bytes())?;
+        write_new_private(&paths.project_credential, format!("{value}\n").as_bytes())?;
         changed.push("Connection".to_string());
     }
     if !paths.bootstrap_key.is_file() {
@@ -309,6 +266,13 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
     };
 
     if !runner_config.is_file() {
+        let allowed_root = config.root.parent().ok_or_else(|| {
+            ProductError::new(
+                "project_registration_invalid",
+                "the project root has no parent directory for canonical managed worktrees",
+                Some("Move the project below a normal filesystem directory, then run webcodex setup."),
+            )
+        })?.to_path_buf();
         let content = generated_runner_config_toml(&RunnerInitOptions {
             server_url: config.server_url(),
             token: Some(agent_token),
@@ -320,7 +284,7 @@ pub(crate) fn setup(options: &ProjectCommandOptions) -> Result<SetupReport, Prod
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             project_registry_dir: paths.project_registry.clone(),
             output: runner_config.clone(),
-            allowed_roots: vec![config.root.clone(), paths.runs.clone(), paths.cache.clone()],
+            allowed_roots: vec![allowed_root],
             allow_cwd_anywhere: false,
             overwrite: false,
         })
@@ -497,36 +461,6 @@ fn configured_readiness(config: ProjectConfig, paths: ProjectPaths) -> LocalRead
     .into_iter()
     .map(|(name, code, summary)| ReadinessFact::pass(name, code, summary))
     .collect::<Vec<_>>();
-    let writable_workspace = WorkspaceManager::writable_readiness(
-        &config.root,
-        &paths.runs,
-        &paths.results,
-        &paths.project_registry,
-    );
-    findings.push(match writable_workspace.status {
-        WritableWorkspaceReadinessStatus::Uninitialized
-        | WritableWorkspaceReadinessStatus::Reusable => ReadinessFact::pass(
-            "Writable workspace",
-            writable_workspace.reason_code,
-            writable_workspace.summary,
-        ),
-        WritableWorkspaceReadinessStatus::Occupied => ReadinessFact::warn(
-            "Writable workspace",
-            writable_workspace.reason_code,
-            writable_workspace.summary,
-            writable_workspace.next_action.unwrap_or(
-                "Finish, resume, or reject the current writable task before starting another normal task.",
-            ),
-        ),
-        WritableWorkspaceReadinessStatus::NotReady => ReadinessFact::fail(
-            "Writable workspace",
-            writable_workspace.reason_code,
-            writable_workspace.summary,
-            writable_workspace.next_action.unwrap_or(
-                "Resolve the Git/private-state issue before starting a normal task.",
-            ),
-        ),
-    });
     if runner_runtime_available() {
         findings.push(ReadinessFact::pass(
             "Runner runtime",
@@ -601,7 +535,7 @@ fn local_project_state(options: &ProjectCommandOptions) -> LocalProjectState {
     let validation = validate_product_config(&expected, &config)
         .and_then(|_| validate_existing_runner(&config, &paths))
         .and_then(|_| validate_existing_registration(&config, &paths))
-        .and_then(|_| read_project_credential(&paths.connector_key).map(|_| ()))
+        .and_then(|_| read_project_credential(&paths.project_credential).map(|_| ()))
         .and_then(|_| validate_agent_authentication(&config, &paths))
         .and_then(|_| read_private_value(&paths.bootstrap_key).map(|_| ()));
     if let Err(error) = validation {
@@ -613,7 +547,7 @@ fn local_project_state(options: &ProjectCommandOptions) -> LocalProjectState {
 fn contains_setup_state(paths: &ProjectPaths) -> bool {
     paths.runner_config.exists()
         || paths.legacy_agent_config.exists()
-        || paths.connector_key.exists()
+        || paths.project_credential.exists()
         || paths.agent_token.exists()
         || paths.bootstrap_key.exists()
         || paths.project_registry.exists()
@@ -638,7 +572,7 @@ pub(super) fn validate_product_config(
         ("profile", actual.profile == expected.profile),
         (
             "project identity",
-            actual.logical_project_id == expected.logical_project_id,
+            actual.executor_project_id == expected.executor_project_id,
         ),
         (
             "Runner identity",
@@ -665,6 +599,19 @@ pub(super) fn validate_existing_runner(
         return Ok(());
     }
     let value: toml::Value = read_toml(&runner_config)?;
+    let canonical_registry = value
+        .get("project_registry_dir")
+        .and_then(toml::Value::as_str);
+    let legacy_registry = value.get("projects_dir").and_then(toml::Value::as_str);
+    if value.get("project_registry_dir").is_some() && value.get("projects_dir").is_some() {
+        return Err(ProductError::new(
+            "project_registration_invalid",
+            "existing Runner configuration sets both 'project_registry_dir' and legacy 'projects_dir'",
+            Some(
+                "Keep exactly one Runner project registry setting; prefer 'project_registry_dir' for migrated state.",
+            ),
+        ));
+    }
     let expected = [
         ("server_url", config.server_url()),
         ("client_id", config.executor_client_id.clone()),
@@ -680,17 +627,9 @@ pub(super) fn validate_existing_runner(
             ));
         }
     }
-    let current_registry = value
-        .get("project_registry_dir")
-        .and_then(toml::Value::as_str);
-    let legacy_registry = value.get("projects_dir").and_then(toml::Value::as_str);
-    if current_registry.is_some() && legacy_registry.is_some() {
-        return Err(invalid_registration(
-            "existing Runner configuration contains both project_registry_dir and legacy projects_dir",
-        ));
-    }
+    let current_registry = canonical_registry.or(legacy_registry);
     let expected_registry = paths.project_registry.to_string_lossy();
-    if current_registry.or(legacy_registry) != Some(expected_registry.as_ref()) {
+    if current_registry != Some(expected_registry.as_ref()) {
         return Err(ProductError::new(
             "project_registration_invalid",
             "existing Runner configuration conflicts in field 'project_registry_dir'",

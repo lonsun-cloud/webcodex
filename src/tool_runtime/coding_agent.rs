@@ -1,5 +1,6 @@
 use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, AuthKind};
+use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::RunnerFeature;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
@@ -28,9 +29,9 @@ const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 const START_RESPONSE_WAIT_SECS: u64 = 32;
 const CONTROL_RESPONSE_WAIT_SECS: u64 = 65;
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
-const PUBLIC_TOKEN_PREFIX: &str = "wcar2_";
-const PUBLIC_TOKEN_MAX_BYTES: usize = 192;
-const PUBLIC_TOKEN_EPOCH_BYTES: usize = 32;
+const PUBLIC_TOKEN_PREFIX: &str = "wcar3_";
+const PUBLIC_TOKEN_MAX_BYTES: usize = 54;
+const PUBLIC_TOKEN_EPOCH_BYTES: usize = 12;
 const PUBLIC_TOKEN_SEQUENCE_BYTES: usize = 8;
 const PUBLIC_TOKEN_TAG_BYTES: usize = 16;
 const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
@@ -55,7 +56,7 @@ pub(crate) struct ServerRunBinding {
 }
 
 pub(crate) struct CodingAgentServerState {
-    epoch: String,
+    epoch: [u8; PUBLIC_TOKEN_EPOCH_BYTES],
     observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES],
     runs: Mutex<HashMap<String, ServerRunBinding>>,
 }
@@ -180,7 +181,7 @@ impl Default for CodingAgentServerState {
 impl CodingAgentServerState {
     fn with_observation_mac_key(observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES]) -> Self {
         Self {
-            epoch: Uuid::new_v4().simple().to_string(),
+            epoch: webcodex_core::compact::random_bytes(),
             observation_mac_key,
             runs: Mutex::new(HashMap::new()),
         }
@@ -428,13 +429,22 @@ impl ToolRuntime {
         {
             Some(provider) => provider.provider_instance_id.clone(),
             None => {
-                return Err(coding_agent_error(
+                let mut error = coding_agent_error(
                     "coding_agent_provider_unavailable",
-                    "logical ACP provider is not advertised by the exact Project Runner",
+                    "Logical ACP provider is not advertised by the exact Project Runner. Re-observe that Runner's coding_agent_providers; choose an advertised provider_id according to the user's instructions, not an executable from PATH.",
                     "not_started",
                     RecoveryKind::Reobserve,
                     Some(&run_id),
-                ))
+                );
+                error.output["available_providers"] =
+                    json!(webcodex_core::coding_agent::safe_provider_inventory(
+                        client.coding_agent_providers.as_deref()
+                    ));
+                error.output["suggested_call"] = json!({
+                    "tool": "runtime_status",
+                    "arguments": {"client_id": client.client_id, "compact": true},
+                });
+                return Err(error);
             }
         };
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
@@ -639,16 +649,9 @@ impl ToolRuntime {
         wait_secs: Option<u64>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let wait_secs = wait_secs.unwrap_or(0);
-        if wait_secs > CODING_AGENT_OBSERVE_WAIT_MAX_SECS {
-            return coding_agent_error(
-                "invalid_wait_secs",
-                "wait_secs exceeds CodingAgentRun bounded wait",
-                "not_started",
-                RecoveryKind::FixInput,
-                Some(&run_id),
-            );
-        }
+        let wait_secs = wait_secs
+            .unwrap_or(0)
+            .min(CODING_AGENT_OBSERVE_WAIT_MAX_SECS);
         let authority = match stable_principal(auth) {
             Ok(principal) => authority_fingerprint(&principal),
             Err(error) => {
@@ -1321,7 +1324,10 @@ fn deterministic_run_id(principal: &str, key: &str) -> String {
     hasher.update(principal.as_bytes());
     hasher.update(b"\0");
     hasher.update(key.as_bytes());
-    format!("wc_agent_run_{:x}", hasher.finalize())
+    format!(
+        "wc_agent_run_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 fn intent_fingerprint(
@@ -1331,17 +1337,22 @@ fn intent_fingerprint(
     config: &BTreeMap<String, CodingAgentConfigValue>,
     timeout_secs: u64,
 ) -> String {
-    let canonical = serde_json::to_vec(&json!({
+    const DOMAIN: &[u8] = b"webcodex-coding-agent-intent-v1\0";
+    let canonical = json!({
         "project": project,
         "provider": provider,
         "instruction": instruction,
         "config": config,
         "timeout_secs": timeout_secs,
-    }))
-    .unwrap_or_default();
+    });
     let mut hasher = Sha256::new();
-    hasher.update(b"webcodex-coding-agent-intent-v1\0");
-    hasher.update(&canonical);
+    hasher.update(DOMAIN);
+    if update_sha256_with_json(&mut hasher, &canonical).is_err() {
+        // Match the historical `to_vec(...).unwrap_or_default()` fallback:
+        // keep the domain prefix and hash no JSON bytes.
+        hasher = Sha256::new();
+        hasher.update(DOMAIN);
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -1433,7 +1444,7 @@ fn load_or_create_observation_mac_key(
 fn observation_token_hmac(
     key: &[u8; OBSERVATION_MAC_KEY_BYTES],
     domain: &[u8],
-    epoch: &str,
+    epoch: &[u8],
     run_id: &str,
     extra: &[u8],
 ) -> [u8; 32] {
@@ -1448,7 +1459,7 @@ fn observation_token_hmac(
     inner.update(ipad);
     inner.update(domain);
     inner.update((epoch.len() as u64).to_be_bytes());
-    inner.update(epoch.as_bytes());
+    inner.update(epoch);
     inner.update((run_id.len() as u64).to_be_bytes());
     inner.update(run_id.as_bytes());
     inner.update((extra.len() as u64).to_be_bytes());
@@ -1462,14 +1473,14 @@ fn observation_token_hmac(
 
 fn observation_token(
     key: &[u8; OBSERVATION_MAC_KEY_BYTES],
-    epoch: &str,
+    epoch: &[u8],
     run_id: &str,
     sequence: u64,
 ) -> String {
     debug_assert_eq!(epoch.len(), PUBLIC_TOKEN_EPOCH_BYTES);
     let mask = observation_token_hmac(
         key,
-        b"webcodex.coding-agent.observation.sequence-mask.v2\0",
+        b"webcodex.coding-agent.observation.sequence-mask.v3\0",
         epoch,
         run_id,
         &[],
@@ -1481,23 +1492,23 @@ fn observation_token(
     }
     let tag = observation_token_hmac(
         key,
-        b"webcodex.coding-agent.observation.tag.v2\0",
+        b"webcodex.coding-agent.observation.tag.v3\0",
         epoch,
         run_id,
         &masked_sequence,
     );
     let mut payload = Vec::with_capacity(PUBLIC_TOKEN_PAYLOAD_BYTES);
-    payload.extend_from_slice(epoch.as_bytes());
+    payload.extend_from_slice(epoch);
     payload.extend_from_slice(&masked_sequence);
     payload.extend_from_slice(&tag[..PUBLIC_TOKEN_TAG_BYTES]);
     let token = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload));
-    debug_assert!(token.len() <= PUBLIC_TOKEN_MAX_BYTES);
+    debug_assert_eq!(token.len(), PUBLIC_TOKEN_MAX_BYTES);
     token
 }
 
 fn parse_observation_token(
     key: &[u8; OBSERVATION_MAC_KEY_BYTES],
-    epoch: &str,
+    epoch: &[u8],
     run_id: &str,
     token: &str,
 ) -> Result<u64, TokenError> {
@@ -1516,13 +1527,7 @@ fn parse_observation_token(
     if payload.len() != PUBLIC_TOKEN_PAYLOAD_BYTES {
         return Err(TokenError::Invalid);
     }
-    let token_epoch = std::str::from_utf8(&payload[..PUBLIC_TOKEN_EPOCH_BYTES])
-        .map_err(|_| TokenError::Invalid)?;
-    if token_epoch.len() != PUBLIC_TOKEN_EPOCH_BYTES
-        || !token_epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(TokenError::Invalid);
-    }
+    let token_epoch = &payload[..PUBLIC_TOKEN_EPOCH_BYTES];
     let masked_start = PUBLIC_TOKEN_EPOCH_BYTES;
     let masked_end = masked_start + PUBLIC_TOKEN_SEQUENCE_BYTES;
     let masked_sequence: [u8; PUBLIC_TOKEN_SEQUENCE_BYTES] = payload[masked_start..masked_end]
@@ -1530,7 +1535,7 @@ fn parse_observation_token(
         .map_err(|_| TokenError::Invalid)?;
     let expected_tag = observation_token_hmac(
         key,
-        b"webcodex.coding-agent.observation.tag.v2\0",
+        b"webcodex.coding-agent.observation.tag.v3\0",
         token_epoch,
         run_id,
         &masked_sequence,
@@ -1546,7 +1551,7 @@ fn parse_observation_token(
     }
     let mask = observation_token_hmac(
         key,
-        b"webcodex.coding-agent.observation.sequence-mask.v2\0",
+        b"webcodex.coding-agent.observation.sequence-mask.v3\0",
         token_epoch,
         run_id,
         &[],
@@ -1678,7 +1683,7 @@ fn coding_agent_project_not_writable_result(run_id: &str) -> ToolResult {
             "execution_state": "not_started",
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn coding_agent_error(
@@ -1696,7 +1701,7 @@ fn coding_agent_error(
             "execution_state": execution_state,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
 fn coding_agent_start_failure_from_response(
@@ -2056,15 +2061,16 @@ mod tests {
     fn identities_are_domain_separated_and_tokens_are_run_bound_and_tamper_evident() {
         let principal = "oauth2:shared-key:abc";
         let run = deterministic_run_id(principal, "same-key");
-        let epoch = "11111111111111111111111111111111";
-        let stale_epoch = "22222222222222222222222222222222";
+        let epoch = &[1_u8; PUBLIC_TOKEN_EPOCH_BYTES];
+        let stale_epoch = &[2_u8; PUBLIC_TOKEN_EPOCH_BYTES];
         assert!(run.starts_with("wc_agent_run_"));
         assert_ne!(authority_fingerprint(principal), run);
 
         let key = [0x5au8; OBSERVATION_MAC_KEY_BYTES];
         let token = observation_token(&key, epoch, &run, 7);
         assert!(token.starts_with(PUBLIC_TOKEN_PREFIX));
-        assert!(token.len() <= PUBLIC_TOKEN_MAX_BYTES);
+        assert_eq!(token.len(), 54);
+        assert_eq!(PUBLIC_TOKEN_TAG_BYTES, 16);
         assert!(!token.contains(&run));
         assert_eq!(parse_observation_token(&key, epoch, &run, &token), Ok(7));
         let continuation = observation_token(&key, epoch, &run, 9);
@@ -2161,5 +2167,17 @@ mod tests {
         let c = intent_fingerprint("agent:x:p", "codex", "different", &config, 30);
         assert_eq!(a, b);
         assert_ne!(a, c);
+
+        let canonical = json!({
+            "project": "agent:x:p",
+            "provider": "codex",
+            "instruction": "inspect",
+            "config": &config,
+            "timeout_secs": 30,
+        });
+        let mut buffered = Sha256::new();
+        buffered.update(b"webcodex-coding-agent-intent-v1\0");
+        buffered.update(serde_json::to_vec(&canonical).unwrap());
+        assert_eq!(a, format!("{:x}", buffered.finalize()));
     }
 }

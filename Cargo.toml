@@ -1,11 +1,13 @@
 [workspace]
 members = [
     "crates/webcodex-admin",
+    "crates/webcodex-browser",
     "crates/webcodex-computer",
-    "crates/webcodex-connector-runtime",
+    "crates/webcodex-code-mode",
     "crates/webcodex-runner-config",
     "crates/webcodex-cli",
     "crates/webcodex-core",
+    "crates/webcodex-lsp",
     "crates/webcodex-persistent-shell",
     "crates/webcodex-process",
     "crates/webcodex-runner",
@@ -20,7 +22,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.3"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -30,13 +32,27 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+experimental-code-mode = [
+    "dep:webcodex-code-mode",
+    "webcodex-code-mode/v8-runtime",
+    "webcodex-tool-contracts/experimental-code-mode",
+    "webcodex-tool-runtime-contracts/experimental-code-mode",
+]
+workspace-checkpoints = [
+    "webcodex-tool-contracts/workspace-checkpoints",
+    "webcodex-tool-runtime-contracts/workspace-checkpoints",
+    "webcodex-workspace/workspace-checkpoints",
+]
+
 [[bin]]
 name = "webcodex-server"
 path = "src/bin/webcodex-server.rs"
 
 [dependencies]
 webcodex-admin = { path = "crates/webcodex-admin" }
-webcodex-connector-runtime = { path = "crates/webcodex-connector-runtime" }
+webcodex-code-mode = { path = "crates/webcodex-code-mode", optional = true }
 webcodex-runner-config = { path = "crates/webcodex-runner-config" }
 webcodex-runner-registry = { path = "crates/webcodex-runner-registry" }
 webcodex-core = { path = "crates/webcodex-core" }
@@ -67,6 +83,7 @@ sha2 = "0.10"
 tempfile = "3"
 zstd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+unicase = "2.9"
 # Custom QUIC agent transport. Quinn reuses the
 # rustls 0.23 + aws-lc-rs provider already present transitively (via
 # tokio-tungstenite / salvo). `rustls-pemfile` loads PEM cert/key on the
@@ -119,7 +136,6 @@ codegen-units = 16
 incremental = true
 
 [dev-dependencies]
-webcodex-connector-runtime = { path = "crates/webcodex-connector-runtime", features = ["root-test-support"] }
 webcodex-runner-registry = { path = "crates/webcodex-runner-registry", features = ["root-test-support"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 webcodex-store = { path = "crates/webcodex-store", features = ["root-test-support"] }

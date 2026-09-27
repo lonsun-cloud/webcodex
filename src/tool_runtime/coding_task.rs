@@ -5,6 +5,7 @@
 //! generate prose summaries, parse validation output, or hide underlying tool
 //! payloads.
 
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -32,11 +33,12 @@ use super::session_context::{
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
 use super::startup_brief::{
-    build_startup_brief, builtin_coding_workflow_projection, startup_brief_from_output,
-    StartupBriefInput, REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
+    bounded_extension_description, build_startup_brief, builtin_coding_workflow_projection,
+    startup_brief_from_output, StartupBriefInput, StartupExtensions, StartupPluginEntry,
+    StartupPluginsCatalog, REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
 };
 use super::tool_catalog::TOOL_RECOMMENDED_FLOWS;
-use super::tool_inputs::{SessionMode, StartupDetail};
+use super::tool_inputs::{CodingGuidanceProfile, SessionMode, StartupDetail};
 use super::tool_result::{RecoveryKind, ToolResult};
 use super::unknown_session_result;
 use super::validation_events::skipped_validation_summary;
@@ -94,32 +96,38 @@ enum CodingProjectSource {
 
 #[derive(Debug, Clone, Copy)]
 struct CodingStartupOptions {
+    guidance_profile: CodingGuidanceProfile,
     tool_name: &'static str,
     detail: StartupDetail,
     include_repository_overview: bool,
-    include_project_instructions: bool,
-    include_reused_instruction_content: bool,
+    include_instruction_content: bool,
+    include_extension_catalog: bool,
 }
 
 impl CodingStartupOptions {
     #[cfg(test)]
     fn diagnostic(detail: StartupDetail) -> Self {
         Self {
+            guidance_profile: CodingGuidanceProfile::Direct,
             detail,
             tool_name: "work_on_project",
             include_repository_overview: true,
-            include_project_instructions: true,
-            include_reused_instruction_content: false,
+            include_instruction_content: true,
+            include_extension_catalog: false,
         }
     }
 
-    fn work_on_project(include_project_instructions: bool) -> Self {
+    fn work_on_project(
+        include_extension_catalog: bool,
+        guidance_profile: CodingGuidanceProfile,
+    ) -> Self {
         Self {
+            guidance_profile,
             detail: StartupDetail::Standard,
             tool_name: "work_on_project",
             include_repository_overview: false,
-            include_project_instructions,
-            include_reused_instruction_content: include_project_instructions,
+            include_instruction_content: false,
+            include_extension_catalog,
         }
     }
 }
@@ -134,7 +142,7 @@ fn invalid_project_source(message: impl Into<String>, fields: Value) -> ToolResu
     if let (Some(output), Some(fields)) = (output.as_object_mut(), fields.as_object()) {
         output.extend(fields.clone());
     }
-    ToolResult::err_with_output(message, output).with_recovery(RecoveryKind::FixInput, None)
+    ToolResult::err_with_output(message, output).with_recovery(RecoveryKind::FixInput)
 }
 
 #[cfg(test)]
@@ -238,8 +246,30 @@ fn registration_scope_denied(auth: Option<&AuthContext>, operation: &str) -> Opt
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::UserAction, None)
+            .with_recovery(RecoveryKind::UserAction)
         })
+}
+
+fn runner_coding_capability_error(client_id: &str, error: String) -> ToolResult {
+    if error.contains("unknown shell client") {
+        return ToolResult::err_with_output(
+            format!("Runner client_id is unknown or not visible: {client_id}"),
+            json!({
+                "error_kind": "unknown_runner",
+                "failure_kind": "unknown_runner",
+                "client_id": client_id,
+                "state_changed": false,
+                "suggested_call": {
+                    "tool": "list_runners",
+                    "arguments": {
+                        "include_projects": false,
+                        "summary_only": true,
+                    }
+                }
+            }),
+        );
+    }
+    ToolResult::err(error)
 }
 
 fn attach_permission(
@@ -280,14 +310,14 @@ impl ToolRuntime {
             .runner_registry
             .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_SHELL, access.as_ref())
             .await
-            .map_err(ToolResult::err)?;
+            .map_err(|error| runner_coding_capability_error(client_id, error))?;
         let supports_git = if supports_shell {
             false
         } else {
             self.runner_registry
                 .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_GIT, access.as_ref())
                 .await
-                .map_err(ToolResult::err)?
+                .map_err(|error| runner_coding_capability_error(client_id, error))?
         };
         if supports_shell || supports_git {
             Ok(())
@@ -516,6 +546,12 @@ impl ToolRuntime {
                     }
                 }
                 if let Some(result) = registration_scope_denied(auth, "project path registration") {
+                    return result;
+                }
+                if let Err(result) = self
+                    .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+                    .await
+                {
                     return result;
                 }
                 let permission = super::permissions::evaluate_permission_for_tool(
@@ -757,33 +793,52 @@ impl ToolRuntime {
             }
         }
         // Semantic-navigation and fixed project-instruction observation remain
-        // mandatory startup probes. Diagnostic test projections also run the
-        // independent repository overview concurrently. The ordinary
-        // work_on_project entry deliberately omits that optional scan/request.
-        let (semantic_navigation, project_instructions, repository_overview) =
-            if startup.include_repository_overview {
-                futures_util::future::join3(
-                    self.probe_semantic_navigation_for_startup(&resolved),
-                    self.load_coding_project_instructions(&resolved.config),
-                    self.repository_overview_for_startup(&resolved, auth),
-                )
-                .await
+        // mandatory startup probes. Extension discovery is an independent,
+        // bounded observation that runs concurrently only when the caller keeps
+        // include_extension_catalog enabled. Diagnostic projections can still
+        // run the optional repository overview concurrently.
+        let extension_discovery = async {
+            if startup.include_extension_catalog {
+                Some(self.extension_discovery_for_startup(&resolved, auth).await)
             } else {
-                let (semantic_navigation, project_instructions) = futures_util::future::join(
-                    self.probe_semantic_navigation_for_startup(&resolved),
-                    self.load_coding_project_instructions(&resolved.config),
+                None
+            }
+        };
+        let (semantic_navigation, project_instructions, repository_overview, extensions) =
+            if startup.include_repository_overview {
+                let (semantic_navigation, project_instructions, repository_overview, extensions) =
+                    futures_util::future::join4(
+                        self.probe_semantic_navigation_for_startup(&resolved),
+                        self.load_effective_coding_instructions(&resolved, auth),
+                        self.repository_overview_for_startup(&resolved, auth),
+                        extension_discovery,
+                    )
+                    .await;
+                (
+                    semantic_navigation,
+                    project_instructions,
+                    repository_overview,
+                    extensions,
                 )
-                .await;
+            } else {
+                let (semantic_navigation, project_instructions, extensions) =
+                    futures_util::future::join3(
+                        self.probe_semantic_navigation_for_startup(&resolved),
+                        self.load_effective_coding_instructions(&resolved, auth),
+                        extension_discovery,
+                    )
+                    .await;
                 (
                     semantic_navigation,
                     project_instructions,
                     repository_overview_not_requested(),
+                    extensions,
                 )
             };
         let semantic_navigation = serde_json::to_value(semantic_navigation).unwrap_or_else(|_| {
             json!({
                 "supported": false,
-                "available": false,
+                "available": Value::Null,
                 "status": "probe_failed",
                 "reason_code": "status_probe_failed",
             })
@@ -826,6 +881,8 @@ impl ToolRuntime {
             &runtime_status_for_brief,
             runtime_status_call_failed,
         );
+        let coding_agent_providers =
+            project_coding_agent_providers(&resolved.config.client_id, &runtime_status_for_brief);
         let git = self
             .coding_startup_git_summary(
                 &resolved.resolved_id,
@@ -838,6 +895,12 @@ impl ToolRuntime {
         if !git.is_null() {
             append_workspace_warnings(&workspace_payload_from_git_summary(&git), &mut warnings);
         }
+        let git_baseline_tree = if resume_session_id.is_none() {
+            self.capture_coding_git_baseline_tree(&resolved.resolved_id, &git, &mut warnings)
+                .await
+        } else {
+            None
+        };
         let write_scope_verified =
             auth.is_none_or(|auth| auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE));
         let authority_fingerprint = match workflow_session_authority_fingerprint(auth) {
@@ -856,7 +919,7 @@ impl ToolRuntime {
                 );
             }
         };
-        let session_outcome = match self.sessions.ensure_coding_session(
+        let session_outcome = match self.sessions.ensure_coding_session_with_git_baseline(
             sessions::CodingSessionRequest {
                 project: resolved.resolved_id.clone(),
                 authority_fingerprint,
@@ -875,6 +938,7 @@ impl ToolRuntime {
                 context_refreshed: true,
                 write_scope_verified,
             },
+            git_baseline_tree,
         ) {
             Ok(outcome) => outcome,
             Err(sessions::CodingSessionError::InvalidResumeSessionId) => {
@@ -1001,6 +1065,10 @@ impl ToolRuntime {
                 );
             }
         };
+        let project_instructions = session_outcome
+            .project_instructions
+            .as_ref()
+            .unwrap_or(&project_instructions);
         let session_summary = &session_outcome.summary;
         let mut connection_state = runtime_status
             .get("connection_layers")
@@ -1011,7 +1079,6 @@ impl ToolRuntime {
                     "server_transport": {"status": "not_observed"},
                     "server_registration": {"status": "not_observed"},
                     "project_registry": {"status": "resolved", "resolved_project": resolved.resolved_id},
-                    "connector_endpoint": {"status": "not_observed"},
                     "last_successful_tool_call": {"status": "not_observed"},
                 })
             });
@@ -1035,7 +1102,12 @@ impl ToolRuntime {
         // potentially slow startup probes, then share it across continuation,
         // the legacy full verdict, and the model-facing brief.
         let active_jobs = self
-            .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
+            .active_jobs_summary(
+                Some(&resolved.resolved_id),
+                Some(&session_outcome.summary.session_id),
+                auth,
+                10,
+            )
             .await;
         let continuation_feedback = self
             .startup_continuation_feedback(
@@ -1089,7 +1161,7 @@ impl ToolRuntime {
             "runtime_status": runtime_status.clone(),
             "connection_state": connection_state,
             "authority": authority_profile_payload(),
-            "rules": rules_summary(Some(&project_instructions)),
+            "rules": rules_summary(Some(project_instructions)),
             "git": git.clone(),
             "semantic_navigation": semantic_navigation.clone(),
             "recommended_flow": recommended_flow,
@@ -1115,10 +1187,9 @@ impl ToolRuntime {
         // Reload rule bodies only when there is no prior snapshot to compare
         // against (fresh session, or a session whose rules were never
         // persisted, e.g. restored after a restart). Otherwise the shared
-        // brief compares fingerprints and reports reused/changed. Whether a
-        // reused body is projected is intentionally separate: diagnostic test
-        // projections stay incremental, while work_on_project follows
-        // its caller-explicit include_project_instructions preference.
+        // brief compares fingerprints and reports reused/changed. Diagnostic
+        // projections may include current/changed bodies; work_on_project keeps
+        // bodies out of its primary result and uses context_request when needed.
         let force_instruction_load = previous_instructions.is_none();
         let canonical_repository_root_matches = if resume_requested {
             None
@@ -1126,22 +1197,30 @@ impl ToolRuntime {
             // A fresh Session starts at the currently resolved canonical root.
             Some(true)
         };
+        let knowledge_association = self
+            .project_knowledge_association_diagnostic(&resolved, auth)
+            .await;
         let project_resolution_value =
             serde_json::to_value(&project_resolution).unwrap_or_else(|_| json!({}));
+        let project_ref = self.project_reference_for_resolved(&resolved, auth);
         let startup_brief = build_startup_brief(StartupBriefInput {
+            guidance_profile: startup.guidance_profile,
             detail,
             requested_project: &project,
             project_resolution: &project_resolution_value,
             resolved: &resolved,
+            project_ref: project_ref.as_deref(),
+            knowledge_association: knowledge_association.as_ref(),
             session: session_summary,
             continuation_kind,
             reused: session_outcome.reused,
             resume_requested,
-            instructions: &project_instructions,
+            instructions: project_instructions,
             previous_instructions,
             force_instruction_load,
-            include_project_instructions: startup.include_project_instructions,
-            include_reused_instruction_content: startup.include_reused_instruction_content,
+            include_instruction_content: startup.include_instruction_content,
+            extensions: extensions.as_ref(),
+            coding_agent_providers: &coding_agent_providers,
             git: &git,
             semantic_navigation: &semantic_navigation,
             repository: &repository_overview,
@@ -1202,6 +1281,46 @@ impl ToolRuntime {
         .await
     }
 
+    async fn extension_discovery_for_startup(
+        &self,
+        project: &ResolvedProject,
+        auth: Option<&AuthContext>,
+    ) -> StartupExtensions {
+        let skills = self.startup_skills_catalog(project, auth);
+        let plugins = async {
+            if auth.is_some_and(|auth| !auth.has_scope(crate::auth::SCOPE_PLUGIN_INSPECT)) {
+                return StartupPluginsCatalog::unavailable("plugin_inspect_scope_unavailable");
+            }
+            match self.project_plugin_catalog(project, auth).await {
+                Ok(catalog) => {
+                    let entries = catalog
+                        .entries
+                        .into_iter()
+                        .map(|entry| StartupPluginEntry {
+                            plugin: entry.plugin,
+                            name: entry.name,
+                            tool: entry.tool,
+                            title: entry.title,
+                            description: entry
+                                .description
+                                .as_deref()
+                                .map(bounded_extension_description),
+                            annotations: entry.annotations,
+                        })
+                        .collect();
+                    StartupPluginsCatalog::available(
+                        catalog.catalog_revision,
+                        catalog.total_count,
+                        entries,
+                    )
+                }
+                Err(reason_code) => StartupPluginsCatalog::unavailable(reason_code),
+            }
+        };
+        let (skills, plugins) = futures_util::future::join(skills, plugins).await;
+        StartupExtensions { skills, plugins }
+    }
+
     /// Canonical entry for the daily model coding loop.
     ///
     /// This validates the public inputs, maps them onto the shared coding
@@ -1217,8 +1336,8 @@ impl ToolRuntime {
         base_ref: Option<String>,
         instruction: String,
         session_id: Option<String>,
-        include_project_instructions: bool,
-        include_workflow_guidance: bool,
+        guidance_profile: CodingGuidanceProfile,
+        include_extension_catalog: bool,
         auth: Option<&AuthContext>,
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
@@ -1318,7 +1437,7 @@ impl ToolRuntime {
                 SessionMode::Normal,
                 false,
                 false,
-                CodingStartupOptions::work_on_project(include_project_instructions),
+                CodingStartupOptions::work_on_project(include_extension_catalog, guidance_profile),
                 session_id.clone(),
                 None,
                 auth,
@@ -1342,12 +1461,28 @@ impl ToolRuntime {
         } else {
             project
         };
-        project_work_on_project_output_with_workflow_inner(
+        // Fresh work always starts with Goal admission still undecided. Only an
+        // explicit exact Session re-entry projects previously correlated active
+        // Goals, avoiding an unnecessary Goal-store read (and any surprising
+        // concurrent correlation observation) for a newly created Session.
+        let goal_context = session_id.as_ref().and_then(|_| {
+            startup_brief_from_output(&result.output)
+                .and_then(|brief| brief.pointer("/session/session_id"))
+                .and_then(Value::as_str)
+                .and_then(|session_id| self.active_goal_context_for_session(auth, session_id))
+        });
+        let mut projected = project_work_on_project_output_inner(
             projected_project,
             result.output,
-            include_workflow_guidance,
+            guidance_profile,
             Some(correlation),
-        )
+        );
+        if projected.success {
+            if let Some(goal_context) = goal_context {
+                projected.output["goal_context"] = goal_context;
+            }
+        }
+        projected
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1492,7 +1627,7 @@ impl ToolRuntime {
         append_hygiene_warnings(&hygiene, &mut final_warnings);
 
         let jobs = self
-            .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
+            .active_jobs_summary(Some(&resolved.resolved_id), Some(&session_id), auth, 10)
             .await;
         if let Some(warnings) = jobs.get("warnings").and_then(Value::as_array) {
             final_warnings.extend(warnings.iter().cloned());
@@ -1506,7 +1641,7 @@ impl ToolRuntime {
                     Some(include_workspace),
                     Some(true),
                     Some(include_validation_summary),
-                    summary_only,
+                    true,
                     Some(20),
                     auth,
                 )
@@ -1543,9 +1678,34 @@ impl ToolRuntime {
             .sessions
             .summary(&session_id, Some(FINISH_SESSION_EVENT_LIMIT))
             .unwrap_or(closeout_pre_validation_summary);
-        let review_evidence = review_evidence_summary_for_session(&closeout_session_summary);
+        let work_result_presentation = match self
+            .final_changes_presentation_needed(&resolved.resolved_id, &closeout_session_summary)
+            .await
+        {
+            Ok(true) => Some(json!({
+                "suggested_call": {
+                    "tool": "present_work_result",
+                    "arguments": {
+                        "project": resolved.resolved_id.clone(),
+                        "session_id": session_id.clone(),
+                    }
+                }
+            })),
+            Ok(false) => None,
+            Err(message) => {
+                final_warnings.push(json!({
+                    "kind": "work_result_presentation_probe_failed",
+                    "message": message,
+                }));
+                None
+            }
+        };
+        let projection_closeout_session_summary =
+            self.refresh_validation_source_summary(&closeout_session_summary);
+        let review_evidence =
+            review_evidence_summary_for_session(&projection_closeout_session_summary);
         let (work_performed, changed_paths) =
-            closeout_work_projection(&closeout_session_summary.events);
+            closeout_work_projection(&projection_closeout_session_summary.events);
 
         // Continuation feedback reuses the same attempt summary and validation
         // delta projections as start/handoff. It is a read-only projection over
@@ -1560,18 +1720,21 @@ impl ToolRuntime {
         };
         let continuation_current_validation =
             super::validation_events::current_validation_evidence_for_session(
-                &closeout_session_summary,
+                &projection_closeout_session_summary,
                 20,
             );
         let raw_tool_failures =
-            tool_failure_summary_from_events(&closeout_session_summary.events, 10);
-        let reconciliation =
-            reconcile_closeout_evidence(&raw_tool_failures, &closeout_session_summary, &validation);
+            tool_failure_summary_from_events(&projection_closeout_session_summary.events, 10);
+        let reconciliation = reconcile_closeout_evidence(
+            &raw_tool_failures,
+            &projection_closeout_session_summary,
+            &validation,
+        );
         let continuation_feedback = if closeout_session_summary.events.is_empty() {
             not_applicable_continuation_feedback_value("empty_session")
         } else {
             continuation_feedback_value(ContinuationFeedbackInput {
-                session_summary: &closeout_session_summary,
+                session_summary: &projection_closeout_session_summary,
                 validation: &continuation_validation,
                 jobs: &jobs,
                 discussion: &discussion,
@@ -1591,6 +1754,27 @@ impl ToolRuntime {
                 ),
             })
         };
+
+        // Reuse the handoff's exact read when present. An omitted or failed
+        // handoff still gets a single local report read for its own brief.
+        let external_observations = handoff
+            .pointer("/handoff_brief/external_observations")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.handoff_external_observations(
+                    &session_id,
+                    projection_closeout_session_summary.project.as_deref(),
+                )
+            });
+        // When a nested handoff supplied the first snapshot, this comparison also
+        // spans the rest of closeout. With include_handoff=false it still fences
+        // the local read against a concurrent accepted external report.
+        let external_observations_changed_during_snapshot = external_observations
+            != self.handoff_external_observations(
+                &session_id,
+                projection_closeout_session_summary.project.as_deref(),
+            );
 
         let mut output = json!({
             "project": project,
@@ -1618,19 +1802,55 @@ impl ToolRuntime {
             "llm_summary": false,
             "final_warnings": final_warnings,
         });
+        if let Some(presentation) = work_result_presentation {
+            output["presentation"] = presentation;
+        }
         output["suggested_next_actions"] = json!(finish_suggested_next_actions(&output));
         output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
-            session_summary: &closeout_session_summary,
+            session_summary: &projection_closeout_session_summary,
             continuation_feedback: output.get("continuation_feedback").unwrap_or(&Value::Null),
             workspace_requested: include_workspace,
             workspace: output.get("workspace"),
             validation_requested: include_validation_summary,
             validation: output.get("validation"),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
             existing_suggested_actions: output.get("suggested_next_actions"),
+            session_changed_during_snapshot: false,
+            external_observations_changed_during_snapshot,
         });
-        let decision = finish_decision_output(&output);
+        if let Some(follow_up) = self.active_goal_context_for_session(auth, &session_id) {
+            output["goal_follow_up"] = follow_up;
+        }
+        let mut decision = finish_decision_output(&output);
+        if decision
+            .pointer("/task_outcome/blocking")
+            .and_then(Value::as_bool)
+            == Some(false)
+            && output.get("presentation").is_some()
+        {
+            if let Err(result) = self
+                .seal_work_result_changes_for_closeout(
+                    &resolved.resolved_id,
+                    &closeout_session_summary,
+                    auth,
+                )
+                .await
+            {
+                let message = result.error.unwrap_or_else(|| {
+                    "Final changes could not be sealed at coding closeout".to_string()
+                });
+                output["final_warnings"]
+                    .as_array_mut()
+                    .expect("finish final_warnings must remain an array")
+                    .push(json!({
+                        "kind": "work_result_seal_failed",
+                        "message": message,
+                    }));
+                decision = finish_decision_output(&output);
+            }
+        }
         if summary_only {
             return ToolResult::ok(compact_finish_output(&decision));
         }
@@ -1651,11 +1871,11 @@ impl ToolRuntime {
 
     /// Build the bounded continuation feedback projection for coding startup.
     ///
-    /// Pure read-only: validation is derived from the session ledger only
-    /// (`validation_summary_from_events`, no job-status enrichment), jobs come
-    /// from the bounded `active_jobs_summary` metadata, and guidance is read
-    /// from the message board without marking anything read or resolved. No
-    /// shell, no file reads, no Runner requests, no ledger mutation.
+    /// Pure read-only: validation is derived from the session ledger plus
+    /// process-local source-fence re-observation (no Job-status enrichment), jobs
+    /// come from the bounded `active_jobs_summary` metadata, and guidance is read
+    /// from the message board without marking anything read or resolved. No shell,
+    /// file reads, Runner requests, or ledger mutation.
     async fn startup_continuation_feedback(
         &self,
         summary: &sessions::SessionSummary,
@@ -1679,20 +1899,21 @@ impl ToolRuntime {
         if projection_summary.events.is_empty() {
             return not_applicable_continuation_feedback_value("empty_session");
         }
+        let projection_summary = self.refresh_validation_source_summary(projection_summary);
         let validation = super::validation_events::validation_summary_from_events(
             &projection_summary.events,
             20,
         );
         let current_validation = super::validation_events::current_validation_evidence_for_session(
-            projection_summary,
+            &projection_summary,
             20,
         );
         let raw_tool_failures = tool_failure_summary_from_events(&projection_summary.events, 10);
         let reconciliation =
-            reconcile_closeout_evidence(&raw_tool_failures, projection_summary, &validation);
+            reconcile_closeout_evidence(&raw_tool_failures, &projection_summary, &validation);
         let (discussion, _) = self.discussion_snapshot(&summary.session_id);
         continuation_feedback_value(ContinuationFeedbackInput {
-            session_summary: projection_summary,
+            session_summary: &projection_summary,
             validation: &validation,
             jobs,
             discussion: &discussion,
@@ -1743,6 +1964,118 @@ impl ToolRuntime {
         }
     }
 
+    async fn capture_coding_git_baseline_tree(
+        &self,
+        project: &str,
+        git: &Value,
+        warnings: &mut Vec<Value>,
+    ) -> Option<String> {
+        if git.get("available").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+
+        let observed_head = git
+            .pointer("/head/commit")
+            .and_then(Value::as_str)
+            .filter(|value| valid_git_object_id(value))
+            .map(str::to_string);
+        let head_commit = if let Some(commit) = observed_head {
+            Some(commit)
+        } else {
+            let probe = self
+                .run_internal_process_sync(
+                    project.to_string(),
+                    "git".to_string(),
+                    vec![
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    30,
+                )
+                .await;
+            if probe.success {
+                process_stdout_git_object_id(&probe)
+            } else {
+                None
+            }
+        };
+
+        if let Some(commit) = head_commit {
+            let result = self
+                .run_internal_process_sync(
+                    project.to_string(),
+                    "git".to_string(),
+                    vec![
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        format!("{commit}^{{tree}}"),
+                    ],
+                    30,
+                )
+                .await;
+            if let Some(tree) = result
+                .success
+                .then(|| process_stdout_git_object_id(&result))
+                .flatten()
+            {
+                return Some(tree);
+            }
+            warnings.push(json!({
+                "kind": "git_baseline_unavailable",
+                "message": "Git HEAD was observed but its baseline tree could not be resolved",
+            }));
+            return None;
+        }
+
+        // A Git repository with no resolvable HEAD is eligible for the unborn
+        // baseline only when HEAD is still a valid symbolic ref. This keeps a
+        // generic Git/read failure from being mistaken for an empty repository.
+        let symbolic_head = self
+            .run_internal_process_sync(
+                project.to_string(),
+                "git".to_string(),
+                vec![
+                    "symbolic-ref".to_string(),
+                    "-q".to_string(),
+                    "HEAD".to_string(),
+                ],
+                30,
+            )
+            .await;
+        if !symbolic_head.success {
+            warnings.push(json!({
+                "kind": "git_baseline_unavailable",
+                "message": "Git baseline could not distinguish an unborn HEAD from an unavailable HEAD",
+            }));
+            return None;
+        }
+
+        // Ask this exact repository to materialize its own empty tree. Do not
+        // hard-code the SHA-1 empty-tree id: SHA-256 repositories use a different
+        // object id. This writes only the immutable empty tree object.
+        let empty_tree = self
+            .run_internal_process_sync(
+                project.to_string(),
+                "git".to_string(),
+                vec!["mktree".to_string()],
+                30,
+            )
+            .await;
+        if let Some(tree) = empty_tree
+            .success
+            .then(|| process_stdout_git_object_id(&empty_tree))
+            .flatten()
+        {
+            return Some(tree);
+        }
+        warnings.push(json!({
+            "kind": "git_baseline_unavailable",
+            "message": "Unborn Git repository could not create its repository-native empty tree baseline",
+        }));
+        None
+    }
+
     async fn coding_startup_git_summary(
         &self,
         project: &str,
@@ -1778,6 +2111,11 @@ impl ToolRuntime {
             output["branch"] = result.output.get("branch").cloned().unwrap_or(Value::Null);
             output["head"] = result.output.get("head").cloned().unwrap_or(Value::Null);
             output["clean"] = result.output.get("clean").cloned().unwrap_or(Value::Null);
+            output["non_git_project"] = result
+                .output
+                .get("non_git_project")
+                .cloned()
+                .unwrap_or(json!(false));
             output["counts"] = result
                 .output
                 .get("counts")
@@ -1794,7 +2132,9 @@ impl ToolRuntime {
         }
 
         if include_recent_commits {
-            let result = self.git_log(project.to_string(), Some(5), None).await;
+            let result = self
+                .git_log(project.to_string(), None, Some(5), None, None)
+                .await;
             if result.success {
                 output["recent_commits"] = result
                     .output
@@ -1980,6 +2320,10 @@ struct WorkOnProjectBriefProjection {
     workflow: Value,
     instructions: WorkOnProjectInstructionsProjection,
     semantic_navigation: WorkOnProjectSemanticNavigationProjection,
+    #[serde(default)]
+    extensions: Option<Value>,
+    #[serde(default)]
+    coding_agent_providers: Vec<webcodex_core::coding_agent::CodingAgentProviderSummary>,
     repository: Value,
     continuation: WorkOnProjectContinuationProjection,
     blockers: Vec<String>,
@@ -1997,6 +2341,10 @@ struct WorkOnProjectSessionProjection {
 #[derive(Deserialize)]
 struct WorkOnProjectProjectProjection {
     resolved_id: String,
+    #[serde(default)]
+    project_ref: Option<String>,
+    #[serde(default)]
+    knowledge_association: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2026,11 +2374,18 @@ struct WorkOnProjectRequiredNullable<T>(Option<T>);
 #[derive(Deserialize)]
 struct WorkOnProjectWorkspaceProjection {
     status: String,
+    git: WorkOnProjectGitProjection,
     git_available: WorkOnProjectRequiredNullable<bool>,
     branch: WorkOnProjectRequiredNullable<String>,
     head: WorkOnProjectRequiredNullable<String>,
     clean: WorkOnProjectRequiredNullable<bool>,
     conflicts: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WorkOnProjectGitProjection {
+    status: String,
+    reason_code: WorkOnProjectRequiredNullable<String>,
 }
 
 #[derive(Deserialize)]
@@ -2049,6 +2404,7 @@ struct WorkOnProjectInstructionsProjection {
 
 #[derive(Deserialize, Serialize)]
 struct WorkOnProjectInstructionSourceProjection {
+    source_scope: String,
     path: String,
     fingerprint: String,
     truncated: bool,
@@ -2086,6 +2442,7 @@ fn sparse_work_on_project_instruction_source(
     source: WorkOnProjectInstructionSourceProjection,
 ) -> Value {
     let WorkOnProjectInstructionSourceProjection {
+        source_scope,
         path,
         fingerprint,
         truncated,
@@ -2094,6 +2451,7 @@ fn sparse_work_on_project_instruction_source(
         read_more,
     } = source;
     let mut projected = json!({
+        "source_scope": source_scope,
         "path": path,
         "fingerprint": fingerprint,
     });
@@ -2115,6 +2473,7 @@ fn sparse_work_on_project_instruction_source(
 fn sparse_work_on_project_workspace(workspace: WorkOnProjectWorkspaceProjection) -> Value {
     let WorkOnProjectWorkspaceProjection {
         status,
+        git,
         git_available,
         branch,
         head,
@@ -2122,7 +2481,13 @@ fn sparse_work_on_project_workspace(workspace: WorkOnProjectWorkspaceProjection)
         conflicts,
     } = workspace;
     let status_unavailable = status == "unavailable";
-    let mut projected = json!({"status": status});
+    let mut projected = json!({
+        "status": status,
+        "git": {
+            "status": git.status,
+            "reason_code": git.reason_code.0,
+        },
+    });
     if git_available.0 == Some(false) {
         projected["git_available"] = json!(false);
     }
@@ -2187,21 +2552,7 @@ fn is_default_work_on_project_repository(repository: &Value) -> bool {
 /// Session state, so protocol drift fails closed with `state_changed=true`.
 #[cfg(test)]
 pub(crate) fn project_work_on_project_output(project: String, output: Value) -> ToolResult {
-    project_work_on_project_output_with_workflow(project, output, true)
-}
-
-#[cfg(test)]
-pub(crate) fn project_work_on_project_output_with_workflow(
-    project: String,
-    output: Value,
-    include_workflow_guidance: bool,
-) -> ToolResult {
-    project_work_on_project_output_with_workflow_inner(
-        project,
-        output,
-        include_workflow_guidance,
-        None,
-    )
+    project_work_on_project_output_inner(project, output, CodingGuidanceProfile::Direct, None)
 }
 
 #[cfg(test)]
@@ -2210,13 +2561,18 @@ pub(crate) fn project_work_on_project_output_with_correlation_for_test(
     output: Value,
     correlation: &mut ToolCallCorrelation,
 ) -> ToolResult {
-    project_work_on_project_output_with_workflow_inner(project, output, true, Some(correlation))
+    project_work_on_project_output_inner(
+        project,
+        output,
+        CodingGuidanceProfile::Direct,
+        Some(correlation),
+    )
 }
 
-fn project_work_on_project_output_with_workflow_inner(
+fn project_work_on_project_output_inner(
     project: String,
     output: Value,
-    include_workflow_guidance: bool,
+    guidance_profile: CodingGuidanceProfile,
     correlation: Option<&mut ToolCallCorrelation>,
 ) -> ToolResult {
     let permission = output.get("permission").cloned();
@@ -2260,11 +2616,11 @@ fn project_work_on_project_output_with_workflow_inner(
     }
     if !matches!(
         projection.workspace.status.as_str(),
-        "clean" | "dirty" | "blocked" | "unavailable"
+        "available" | "clean" | "dirty" | "blocked" | "unavailable"
     ) {
         return work_on_project_projection_failed(
             "workspace.status",
-            "clean, dirty, blocked, or unavailable",
+            "available, clean, dirty, blocked, or unavailable",
             "unsupported string",
             None,
         );
@@ -2280,15 +2636,18 @@ fn project_work_on_project_output_with_workflow_inner(
             None,
         );
     }
-    if projection.instructions.sources.len() > 5 {
+    if projection.instructions.sources.len()
+        > webcodex_core::runner_instruction::RUNNER_INSTRUCTION_RESPONSE_MAX_FILES
+            + super::project_instructions::INSTRUCTION_CANDIDATE_PATHS.len()
+    {
         return work_on_project_projection_failed(
             "instructions.sources",
-            "at most 5 source objects",
+            "at most 21 source objects",
             "invalid array contents",
             None,
         );
     }
-    if projection.workflow != builtin_coding_workflow_projection() {
+    if projection.workflow != builtin_coding_workflow_projection(guidance_profile) {
         return work_on_project_projection_failed(
             "workflow",
             "canonical built-in coding workflow contract",
@@ -2370,8 +2729,17 @@ fn project_work_on_project_output_with_workflow_inner(
         "instructions": instructions,
         "semantic_navigation": semantic_navigation,
     }));
-    if include_workflow_guidance {
-        result.output["workflow"] = projection.workflow;
+    if let Some(knowledge_association) = projection.project.knowledge_association {
+        result.output["knowledge_association"] = knowledge_association;
+    }
+    if let Some(project_ref) = projection.project.project_ref {
+        result.output["project_ref"] = json!(project_ref);
+    }
+    if let Some(extensions) = projection.extensions {
+        result.output["extensions"] = extensions;
+    }
+    if !projection.coding_agent_providers.is_empty() {
+        result.output["coding_agent_providers"] = json!(projection.coding_agent_providers);
     }
     if !project_resolution_is_default {
         let mut project_resolution = json!(projection.project_resolution);
@@ -2563,10 +2931,7 @@ fn workspace_payload_from_show_changes(show_changes: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     json!({
-        "clean": show_changes
-            .get("clean")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        "clean": show_changes.get("clean").cloned().unwrap_or(Value::Null),
         "git_available": show_changes
             .get("git_available")
             .and_then(Value::as_bool)
@@ -2590,7 +2955,11 @@ fn workspace_payload_from_show_changes(show_changes: &Value) -> Value {
 fn workspace_payload_from_git_summary(git: &Value) -> Value {
     let counts = git.get("counts").cloned().unwrap_or_else(|| json!({}));
     json!({
-        "clean": git.get("clean").and_then(Value::as_bool).unwrap_or(false),
+        "clean": git.get("clean").cloned().unwrap_or(Value::Null),
+        "non_git_project": git
+            .get("non_git_project")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "git_available": git
             .get("available")
             .and_then(Value::as_bool)
@@ -2610,8 +2979,8 @@ fn finish_decision_output(output: &Value) -> Value {
     let workspace_clean = output
         .get("workspace")
         .and_then(|workspace| workspace.get("clean"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .cloned()
+        .unwrap_or(Value::Null);
     let workspace_conflicts = output
         .pointer("/workspace/counts/conflicted")
         .and_then(Value::as_u64)
@@ -2644,6 +3013,12 @@ fn finish_decision_output(output: &Value) -> Value {
         "warnings": output.get("final_warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
+    if let Some(presentation) = output.get("presentation") {
+        decision["presentation"] = presentation.clone();
+    }
+    if let Some(follow_up) = output.get("goal_follow_up") {
+        decision["goal_follow_up"] = follow_up.clone();
+    }
     apply_compact_workflow_outcomes(&mut decision, true, Some(hygiene_checked));
     let verdict = decision
         .get("verdict")
@@ -2658,9 +3033,9 @@ fn finish_decision_output(output: &Value) -> Value {
 }
 
 fn compact_finish_output(decision: &Value) -> Value {
-    json!({
+    let mut output = json!({
         "summary_only": true,
-        "workspace_clean": decision.get("workspace_clean").cloned().unwrap_or(json!(false)),
+        "workspace_clean": decision.get("workspace_clean").cloned().unwrap_or(Value::Null),
         "workspace_conflicts": decision.get("workspace_conflicts").cloned().unwrap_or(json!(0)),
         "hygiene_clean": decision.get("hygiene_clean").cloned().unwrap_or(json!(true)),
         "hygiene_secret_like_paths": decision.get("hygiene_secret_like_paths").cloned().unwrap_or(json!(0)),
@@ -2672,7 +3047,14 @@ fn compact_finish_output(decision: &Value) -> Value {
         "evidence_integrity": decision.get("evidence_integrity").cloned().unwrap_or(Value::Null),
         "warnings": decision.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": decision.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
-    })
+    });
+    if let Some(presentation) = decision.get("presentation") {
+        output["presentation"] = presentation.clone();
+    }
+    if let Some(follow_up) = decision.get("goal_follow_up") {
+        output["goal_follow_up"] = follow_up.clone();
+    }
+    output
 }
 
 fn compact_finish_validation(validation: &Value) -> Value {
@@ -2796,6 +3178,13 @@ fn runtime_status_check(
 
 fn workspace_check(output: &Value) -> (&'static str, Option<&'static str>) {
     let git = output.get("git").unwrap_or(&Value::Null);
+    if git
+        .get("non_git_project")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return ("pass", Some("non_git_project"));
+    }
     if git.get("available").and_then(Value::as_bool) == Some(false) {
         return ("warn", Some("git_unavailable"));
     }
@@ -2841,6 +3230,34 @@ fn startup_agent_check(
         Some(true) => ("pass", None),
         None => ("warn", Some("agent_health_unknown")),
     }
+}
+
+/// Reuse the already-authorized startup observation, selecting only the Project's
+/// owning Runner. Never combine fleet inventories or choose a default provider.
+pub(crate) fn project_coding_agent_providers(
+    client_id: &str,
+    runtime_status: &Value,
+) -> Vec<webcodex_core::coding_agent::CodingAgentProviderSummary> {
+    runtime_status
+        .pointer("/agents/clients")
+        .and_then(Value::as_array)
+        .and_then(|clients| {
+            clients.iter().find(|client| {
+                client.get("client_id").and_then(Value::as_str) == Some(client_id)
+                    && client.get("connected").and_then(Value::as_bool) == Some(true)
+            })
+        })
+        .and_then(|client| client.get("coding_agent_providers"))
+        .and_then(|providers| {
+            serde_json::from_value::<Vec<webcodex_core::coding_agent::CodingAgentProviderSummary>>(
+                providers.clone(),
+            )
+            .ok()
+        })
+        .filter(|providers| {
+            providers.len() <= webcodex_core::coding_agent::CODING_AGENT_MAX_PROVIDERS
+        })
+        .unwrap_or_default()
 }
 
 fn owning_runner_available(
@@ -2992,7 +3409,7 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
         == Some(false)
     {
         if output
-            .pointer("/changes/show_changes/diff_review_handoff/tool")
+            .pointer("/changes/show_changes/diff_review_handoff/next_call/tool")
             .and_then(Value::as_str)
             == Some("git_diff_hunks")
         {
@@ -3019,6 +3436,18 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
     actions
 }
 
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn process_stdout_git_object_id(result: &ToolResult) -> Option<String> {
+    let value = result.output.get("stdout_tail")?.as_str()?.trim();
+    valid_git_object_id(value).then(|| value.to_string())
+}
+
 fn changed_files_count_from_counts(counts: &Value) -> u64 {
     [
         "modified",
@@ -3035,11 +3464,7 @@ fn changed_files_count_from_counts(counts: &Value) -> u64 {
 }
 
 fn append_workspace_warnings(workspace: &Value, warnings: &mut Vec<Value>) {
-    if !workspace
-        .get("clean")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if workspace.get("clean").and_then(Value::as_bool) == Some(false) {
         let conflicted = workspace
             .pointer("/counts/conflicted")
             .and_then(Value::as_u64)
@@ -3063,6 +3488,10 @@ fn append_workspace_warnings(workspace: &Value, warnings: &mut Vec<Value>) {
         .get("git_available")
         .and_then(Value::as_bool)
         .unwrap_or(true)
+        && !workspace
+            .get("non_git_project")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     {
         warnings.push(json!({
             "kind": "git_unavailable",
@@ -3097,7 +3526,9 @@ mod startup_runner_tests {
             "workspace": {"clean": false},
             "changes": {
                 "show_changes": {
-                    "diff_review_handoff": {"tool": "git_diff_hunks"}
+                    "diff_review_handoff": {
+                        "next_call": {"tool": "git_diff_hunks", "arguments": {}}
+                    }
                 }
             },
             "jobs": {"blocking_active_count": 0},
@@ -3108,16 +3539,48 @@ mod startup_runner_tests {
         assert!(actions
             .iter()
             .any(|action| action == "continue the diff review with git_diff_hunks"));
-        assert!(
-            crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
-                output["changes"]["show_changes"]["diff_review_handoff"]["tool"]
-                    .as_str()
-                    .unwrap()
-            )
+        assert_eq!(
+            output["changes"]["show_changes"]["diff_review_handoff"]["next_call"]["tool"],
+            "git_diff_hunks"
         );
         assert!(!actions
             .iter()
             .any(|action| action == "review workspace changes with show_changes"));
+    }
+
+    #[test]
+    fn finish_summary_keeps_non_git_cleanliness_not_applicable() {
+        let canonical = json!({
+            "workspace": {
+                "clean": null,
+                "git_available": false,
+                "non_git_project": true,
+                "counts": {},
+            },
+            "jobs": {},
+            "validation": {},
+            "review_evidence": {},
+            "tool_failures": {},
+            "final_warnings": [],
+            "suggested_next_actions": [],
+        });
+        let decision = finish_decision_output(&canonical);
+        assert!(
+            decision["workspace_clean"].is_null(),
+            "non-Git cleanliness must stay unknown/N/A: {decision}"
+        );
+        let warnings = decision["warnings"].as_array().expect("warnings");
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.as_str() == Some("workspace_dirty")),
+            "non-Git workspace must not become dirty: {decision}"
+        );
+        let compact = compact_finish_output(&decision);
+        assert!(
+            compact["workspace_clean"].is_null(),
+            "summary_only must preserve non-Git N/A: {compact}"
+        );
     }
 
     fn resolved_agent(client_id: &str) -> ResolvedProject {
@@ -3129,6 +3592,8 @@ mod startup_runner_tests {
                 client_id: client_id.to_string(),
                 allow_patch: true,
             },
+            root_fingerprint: None,
+            knowledge_association: None,
         }
     }
 

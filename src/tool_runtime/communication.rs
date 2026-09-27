@@ -4,12 +4,35 @@ use crate::db::{
     AgentEndpointLifecycle, AgentProfilePatch, AgentWakeState, CommunicationPrincipal,
     CommunicationStoreError, ConversationAccess, NewAgentEndpoint, NewAgentIdentity,
     NewConversation, NewConversationMessage, COMMUNICATION_PRINCIPAL_DIGEST_PREFIX,
+    MAX_COMMUNICATION_LIST_LIMIT,
 };
 use serde::Serialize;
 use serde_json::{json, to_value};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_COMMUNICATION_LIST_LIMIT: usize = 50;
+
+#[derive(Serialize)]
+struct AgentIdentityReadinessProjection {
+    #[serde(flatten)]
+    agent: crate::db::DurableAgentIdentity,
+    production_auto_resume_available: bool,
+}
+
+#[derive(Serialize)]
+struct AgentIdentityReadinessPage {
+    total_count: i64,
+    offset: usize,
+    next_offset: Option<usize>,
+    truncated: bool,
+    agents: Vec<AgentIdentityReadinessProjection>,
+}
+
+fn communication_list_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_COMMUNICATION_LIST_LIMIT)
+        .min(MAX_COMMUNICATION_LIST_LIMIT)
+}
 
 pub(super) fn communication_principal(
     auth: Option<&AuthContext>,
@@ -88,7 +111,7 @@ fn communication_principal_unavailable(message: &str) -> ToolResult {
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn access_from_endpoint(
@@ -116,11 +139,11 @@ fn access_from_endpoint(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None)),
+        .with_recovery(RecoveryKind::FixInput)),
     }
 }
 
-fn communication_store_unavailable() -> ToolResult {
+pub(super) fn communication_store_unavailable() -> ToolResult {
     ToolResult::err_with_output(
         "Durable Agent and Conversation storage is unavailable in this runtime",
         json!({
@@ -128,7 +151,7 @@ fn communication_store_unavailable() -> ToolResult {
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn communication_recovery_kind(
@@ -148,7 +171,7 @@ fn communication_recovery_kind(
     }
 }
 
-fn communication_error(
+pub(super) fn communication_error(
     error: CommunicationStoreError,
     store_failure_recovery: RecoveryKind,
 ) -> ToolResult {
@@ -162,10 +185,10 @@ fn communication_error(
             "state_changed": false,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
-fn serialized_success<T: Serialize>(value: T) -> ToolResult {
+pub(super) fn serialized_success<T: Serialize>(value: T) -> ToolResult {
     match to_value(value) {
         Ok(value) => ToolResult::ok(value),
         Err(error) => ToolResult::err_with_output(
@@ -175,8 +198,53 @@ fn serialized_success<T: Serialize>(value: T) -> ToolResult {
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
     }
+}
+
+pub(super) fn agent_continuation_projection(
+    bootstrap: crate::db::AgentConversationBootstrapRecord,
+    binding: crate::agent_wake::AgentHostBindingStatus,
+    observation: Option<crate::agent_wake::McpAppHostBindingObservation>,
+    recovery_kind: Option<&str>,
+) -> serde_json::Value {
+    let wake = bootstrap.wake.as_ref();
+    let dispatch_observation = observation.as_ref().and_then(|observation| {
+        if observation.active_wake_id.is_some() && wake.is_none() {
+            Some("continuation_consumed")
+        } else if observation.active_wake_id.as_deref() == wake.map(|wake| wake.wake_id.as_str()) {
+            observation.dispatch_phase.map(|phase| phase.as_str())
+        } else {
+            // A successor Wake must not inherit the previous Attempt's phase.
+            None
+        }
+    });
+    json!({
+        "agent_continuation": {
+            "version": 1,
+            "agent_id": bootstrap.acting_agent.agent_id,
+            "display_name": bootstrap.acting_agent.display_name,
+            "endpoint_id": bootstrap.endpoint.endpoint_id,
+            "controller_generation": bootstrap.endpoint.controller_generation,
+            "endpoint_lease_expires_at_unix_ms": bootstrap.endpoint.lease_expires_at_unix_ms,
+            "host_binding": {
+                "bound": binding.adapter_registered,
+                "adapter_kind": binding.adapter_kind,
+                "production_auto_resume_available": binding.production_auto_resume_available,
+            },
+            "wake": wake.map(|wake| json!({
+                "wake_id": wake.wake_id,
+                "state": wake.state,
+                "revision": wake.revision,
+                "wait_id": wake.wait_id,
+                "wait_match_count": wake.wait_match_count,
+                "wait_match_sequence": wake.wait_match_sequence,
+            })),
+            "queued_delivery_count": bootstrap.inbox.queued_delivery_count,
+            "dispatch_observation": dispatch_observation,
+            "recovery": recovery_kind.map(|kind| json!({ "kind": kind })),
+        }
+    })
 }
 
 impl ToolRuntime {
@@ -229,9 +297,35 @@ impl ToolRuntime {
             &principal,
             agent_id.as_deref(),
             offset.unwrap_or(0),
-            limit.unwrap_or(DEFAULT_COMMUNICATION_LIST_LIMIT),
+            communication_list_limit(limit),
         ) {
-            Ok(result) => serialized_success(result),
+            Ok(result) => {
+                let agents = result
+                    .agents
+                    .into_iter()
+                    .map(|agent| {
+                        let production_auto_resume_available = agent.active_endpoint_count > 0
+                            && self.agent_continuations.as_ref().is_some_and(|controller| {
+                                controller.production_auto_resume_available(
+                                    &principal,
+                                    &agent.agent_id,
+                                    agent.current_controller_generation,
+                                )
+                            });
+                        AgentIdentityReadinessProjection {
+                            agent,
+                            production_auto_resume_available,
+                        }
+                    })
+                    .collect();
+                serialized_success(AgentIdentityReadinessPage {
+                    total_count: result.total_count,
+                    offset: result.offset,
+                    next_offset: result.next_offset,
+                    truncated: result.truncated,
+                    agents,
+                })
+            }
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
     }
@@ -401,6 +495,607 @@ impl ToolRuntime {
         }
     }
 
+    pub(crate) fn present_agent_continuation(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let bootstrap = match db.bootstrap_agent_conversation(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            None,
+            None,
+        ) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let binding = self
+            .agent_continuations
+            .as_ref()
+            .map(|controller| {
+                controller.binding_status(&agent_id, &endpoint_id, expected_controller_generation)
+            })
+            .unwrap_or(crate::agent_wake::AgentHostBindingStatus {
+                adapter_registered: false,
+                adapter_kind: None,
+                production_auto_resume_available: false,
+            });
+        let observation = self.agent_continuations.as_ref().and_then(|controller| {
+            controller.mcp_app_binding_observation(
+                &agent_id,
+                &endpoint_id,
+                expected_controller_generation,
+            )
+        });
+        ToolResult::ok(agent_continuation_projection(
+            bootstrap,
+            binding,
+            observation,
+            None,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_bind(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        self.agent_continuation_bind_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+        )
+    }
+
+    pub(crate) fn agent_continuation_bind_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let _endpoint = match controller.register_mcp_app_binding(
+            principal.clone(),
+            agent_id.clone(),
+            endpoint_id.clone(),
+            expected_controller_generation,
+            binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+        ) {
+            Ok(result) => result,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let bootstrap = match db.bootstrap_agent_conversation(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            None,
+            None,
+        ) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let binding =
+            controller.binding_status(&agent_id, &endpoint_id, expected_controller_generation);
+        let observation = controller.mcp_app_binding_observation(
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+        );
+        let mut output = agent_continuation_projection(bootstrap, binding, observation, None);
+        output["state_changed"] = json!(true);
+        ToolResult::ok(output)
+    }
+
+    pub(crate) fn agent_continuation_recover_endpoint_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let recovery = match controller.recover_expired_mcp_app_endpoint(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+        ) {
+            Ok(recovery) => recovery,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let (
+            current_endpoint_id,
+            current_generation,
+            replacement,
+            replayed,
+            state_changed,
+            successor_needs_recovery,
+        ) = match recovery {
+            crate::db::McpAppEndpointRecovery::Live { endpoint } => (
+                endpoint.endpoint_id,
+                endpoint.controller_generation,
+                json!({
+                    "kind": "controller_live",
+                    "replacement": null,
+                    "successor_needs_recovery": false,
+                }),
+                false,
+                false,
+                false,
+            ),
+            crate::db::McpAppEndpointRecovery::Replaced {
+                from_endpoint_id,
+                from_controller_generation,
+                endpoint,
+                replayed,
+                state_changed,
+                successor_needs_recovery,
+            } => {
+                let replacement_endpoint_id = endpoint.endpoint_id.clone();
+                let replacement_generation = endpoint.controller_generation;
+                (
+                    replacement_endpoint_id.clone(),
+                    replacement_generation,
+                    json!({
+                        "kind": "endpoint_replaced",
+                        "replacement": {
+                            "agent_id": agent_id,
+                            "from_endpoint_id": from_endpoint_id,
+                            "from_controller_generation": from_controller_generation,
+                            "endpoint_id": replacement_endpoint_id,
+                            "controller_generation": replacement_generation,
+                            "reason": "endpoint_expired",
+                        },
+                        "successor_needs_recovery": successor_needs_recovery,
+                    }),
+                    replayed,
+                    state_changed,
+                    successor_needs_recovery,
+                )
+            }
+        };
+        if successor_needs_recovery {
+            return ToolResult::ok(json!({
+                "agent_continuation": null,
+                "endpoint_recovery": replacement,
+                "replayed": replayed,
+                "state_changed": state_changed,
+            }));
+        }
+        let bootstrap = match db.bootstrap_agent_conversation(
+            &principal,
+            &agent_id,
+            &current_endpoint_id,
+            current_generation,
+            None,
+            None,
+        ) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let binding =
+            controller.binding_status(&agent_id, &current_endpoint_id, current_generation);
+        let observation = controller.mcp_app_binding_observation(
+            &agent_id,
+            &current_endpoint_id,
+            current_generation,
+        );
+        let mut output = agent_continuation_projection(bootstrap, binding, observation, None);
+        output["endpoint_recovery"] = replacement;
+        output["replayed"] = json!(replayed);
+        output["state_changed"] = json!(state_changed);
+        ToolResult::ok(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_state(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        self.agent_continuation_state_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+        )
+    }
+
+    pub(crate) fn agent_continuation_state_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        let state = match controller.mcp_app_binding_state(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+        ) {
+            Ok(result) => result,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let (observation, recovery_kind) = match state {
+            crate::agent_wake::McpAppBindingState::Bound(observation) => (Some(observation), None),
+            crate::agent_wake::McpAppBindingState::RestartRecovery => {
+                (None, Some("host_binding_missing_in_process"))
+            }
+        };
+        let bootstrap = match db.bootstrap_agent_conversation(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            None,
+            // Observe the current unresolved Wake after the previous one is
+            // consumed. Keep the old claim in the controller for a late ACK;
+            // acquire retires it when the View actually takes the next Wake.
+            None,
+        ) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return communication_error(error, RecoveryKind::Reconcile),
+        };
+        let binding =
+            controller.binding_status(&agent_id, &endpoint_id, expected_controller_generation);
+        ToolResult::ok(agent_continuation_projection(
+            bootstrap,
+            binding,
+            observation,
+            recovery_kind,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_wake_acquire(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        self.agent_continuation_wake_acquire_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+        )
+    }
+
+    pub(crate) fn agent_continuation_wake_acquire_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match controller.acquire_mcp_app_wake(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+        ) {
+            Ok(acquisition) => {
+                let state_changed = acquisition
+                    .as_ref()
+                    .is_some_and(|acquisition| !acquisition.replayed);
+                ToolResult::ok(json!({
+                    "agent_id": agent_id,
+                    "endpoint_id": endpoint_id,
+                    "controller_generation": expected_controller_generation,
+                    "adapter_kind": crate::agent_wake::MCP_APP_CONTINUATION_ADAPTER_KIND,
+                    "wake": acquisition.map(|acquisition| json!({
+                        "wake_id": acquisition.wake_id,
+                        "attempt_id": acquisition.attempt_id,
+                        "state": acquisition.wake_state,
+                        "revision": acquisition.wake_revision,
+                        "queued_delivery_count": acquisition.queued_delivery_count,
+                        "inbox_high_watermark": acquisition.inbox_high_watermark,
+                        "dispatch_observation": acquisition.dispatch_phase.map(|phase| phase.as_str()),
+                        "replayed": acquisition.replayed,
+                    })),
+                    "state_changed": state_changed,
+                }))
+            }
+            Err(error) => communication_error(error, RecoveryKind::Reconcile),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_wake_prepare(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+        wake_id: String,
+        attempt_id: String,
+    ) -> ToolResult {
+        self.agent_continuation_wake_prepare_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+            wake_id,
+            attempt_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn agent_continuation_wake_prepare_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+        wake_id: String,
+        attempt_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match controller.prepare_mcp_app_wake(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+            &wake_id,
+            &attempt_id,
+        ) {
+            Ok(prepared) => ToolResult::ok(json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "controller_generation": expected_controller_generation,
+                "wake_id": prepared.wake_id,
+                "attempt_id": prepared.attempt_id,
+                "wake_revision": prepared.wake_revision,
+                "dispatch_observation": crate::agent_wake::McpAppDispatchPhase::Prepared.as_str(),
+                "state_changed": true,
+                // Only the ModelHidden MCP Apps prepare response carries this bounded
+                // protocol payload. Standard structuredContent survives Host bridges;
+                // custom ToolResult _meta is not a correctness prerequisite. Typed
+                // audit/Session projections and name-based trace suppression omit it.
+                "app_protocol": {
+                    "automatic_message": prepared.automatic_message,
+                }
+            })),
+            Err(error) => communication_error(error, RecoveryKind::Reconcile),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_wake_finish(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+        wake_id: String,
+        attempt_id: String,
+        outcome: String,
+    ) -> ToolResult {
+        self.agent_continuation_wake_finish_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+            wake_id,
+            attempt_id,
+            outcome,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn agent_continuation_wake_finish_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+        wake_id: String,
+        attempt_id: String,
+        outcome: String,
+    ) -> ToolResult {
+        let dispatch_accepted = match outcome.as_str() {
+            "dispatch_accepted" => true,
+            "delivery_unknown" => false,
+            _ => {
+                return ToolResult::err_with_output(
+                    "outcome must be dispatch_accepted or delivery_unknown",
+                    json!({
+                        "error_kind": "invalid_dispatch_outcome",
+                        "state_changed": false,
+                    }),
+                )
+                .with_recovery(RecoveryKind::FixInput)
+            }
+        };
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match controller.finish_mcp_app_wake(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+            &wake_id,
+            &attempt_id,
+            dispatch_accepted,
+        ) {
+            Ok(finished) => ToolResult::ok(json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "controller_generation": expected_controller_generation,
+                "wake_id": finished.wake.wake_id,
+                "attempt_id": attempt_id,
+                "wake_state": finished.wake.state,
+                "wake_revision": finished.wake.revision,
+                "dispatch_observation": finished.dispatch_phase.as_str(),
+                "continuation_consumed": finished.wake.state == AgentWakeState::Consumed,
+                "state_changed": finished.state_changed,
+            })),
+            Err(error) => communication_error(error, RecoveryKind::Reconcile),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_continuation_unbind(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        self.agent_continuation_unbind_for_window(
+            auth,
+            None,
+            agent_id,
+            endpoint_id,
+            expected_controller_generation,
+            binding_id,
+        )
+    }
+
+    pub(crate) fn agent_continuation_unbind_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        binding_id: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(controller) = self.agent_continuations.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match controller.unregister_mcp_app_binding(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &binding_id,
+            window.map(crate::client_window::ClientWindow::key),
+        ) {
+            Ok(endpoint) => serialized_success(json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint.endpoint_id,
+                "controller_generation": endpoint.controller_generation,
+                "adapter_kind": crate::agent_wake::MCP_APP_CONTINUATION_ADAPTER_KIND,
+                "wake_capable": endpoint.wake_capable,
+                "state_changed": true,
+            })),
+            Err(error) => communication_error(error, RecoveryKind::Reconcile),
+        }
+    }
+
     pub(crate) fn detach_agent_endpoint(
         &self,
         auth: Option<&AuthContext>,
@@ -481,7 +1176,7 @@ impl ToolRuntime {
             &principal,
             &access,
             offset.unwrap_or(0),
-            limit.unwrap_or(DEFAULT_COMMUNICATION_LIST_LIMIT),
+            communication_list_limit(limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
@@ -516,7 +1211,7 @@ impl ToolRuntime {
             &access,
             &conversation_id,
             after_seq.unwrap_or(0),
-            limit.unwrap_or(DEFAULT_COMMUNICATION_LIST_LIMIT),
+            communication_list_limit(limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
@@ -604,7 +1299,7 @@ impl ToolRuntime {
             &endpoint_id,
             expected_controller_generation,
             after_delivery_order.unwrap_or(0),
-            limit.unwrap_or(DEFAULT_COMMUNICATION_LIST_LIMIT),
+            communication_list_limit(limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
@@ -894,7 +1589,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let missing_agent = format!("wc_dagent_{}", "9".repeat(32));
+        let missing_agent = "wc_dagent_mZmZmZmZmZmZmZmZ".to_string();
 
         let foreign_agent = runtime.update_agent_identity(
             Some(&alice),
@@ -932,7 +1627,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let missing_conversation = format!("wc_conv_{}", "8".repeat(32));
+        let missing_conversation = "wc_conv_iIiIiIiIiIiIiIiI".to_string();
         let foreign_conversation = runtime.read_conversation(
             Some(&alice),
             bob_conversation_id,

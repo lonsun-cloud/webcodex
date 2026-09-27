@@ -2,7 +2,7 @@
 
 [English](QUICK_START.md) | [简体中文](QUICK_START.zh-CN.md)
 
-This page does one thing: use `webcodex share` to temporarily expose one local repository so you can decide within a few minutes whether WebCodex fits your workflow. This is a **temporary, single-project, restricted experience** that ends when the command exits.
+This page does one thing: use `webcodex share` to temporarily expose one local repository so you can decide within a few minutes whether WebCodex fits your workflow. This is a **temporary, single-project, project-scoped ordinary WebCodex runtime** that ends when the command exits.
 
 For everyday WebCodex use and the full regular Server + Runner coding experience, go directly to the [Full Setup guide](PERSONAL_SETUP.md) instead of treating `share` as the default long-lived deployment.
 

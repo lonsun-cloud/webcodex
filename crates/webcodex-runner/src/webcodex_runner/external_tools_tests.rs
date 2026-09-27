@@ -42,6 +42,13 @@ fn serialize_fake_mcp_test() -> FakeMcpTestSerialGuard {
     FakeMcpTestSerialGuard
 }
 
+// Provider startup and eventual-state probes are synchronization aids, not
+// latency contracts. Leave enough wall-clock room for macOS/CI scheduling;
+// tests that assert actual timeout/shutdown latency keep their explicit short
+// request deadlines and elapsed-time bounds below.
+const TEST_MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct FakeBinary {
     _temp: TempDir,
     path: PathBuf,
@@ -193,6 +200,8 @@ fn process_ids(provider: &ClaudeCodeMcpProvider) -> Vec<u32> {
 
 fn runner_request(kind: &str, root: &Path, path: &str, content: Option<Value>) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: "request".to_string(),
         client_id: "client".to_string(),
         kind: kind.to_string(),
@@ -359,6 +368,48 @@ search_project_text = "project_search"
 }
 
 #[test]
+fn native_search_preflight_reports_only_proven_missing_paths() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    let router = ExternalToolRouter::new(&ToolProvidersConfig {
+        strategy: ToolProviderStrategy::Native,
+        claude_code: ClaudeCodeMcpConfig::default(),
+    });
+
+    let mut missing = runner_request("run_shell", root.path(), ".", None);
+    missing.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    let mut missing_payload = search_request();
+    missing_payload["path"] = json!("src/definitely-missing");
+    missing.stdin = Some(missing_payload.to_string());
+    let ExternalRoute::Handled(result) = router.route(&permissive_test_policy(), &missing) else {
+        panic!("proven missing search path was not handled by the Runner preflight");
+    };
+    assert_eq!(result.exit_code, Some(2));
+    let marker: Value = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
+    assert_eq!(marker["webcodex_search"]["path_status"], "not_found");
+    assert_eq!(marker["webcodex_search"]["backend"], "native");
+    assert!(result.stderr.as_deref().unwrap_or_default().is_empty());
+
+    let mut existing = runner_request("run_shell", root.path(), ".", None);
+    existing.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    existing.stdin = Some(search_request().to_string());
+    assert!(matches!(
+        router.route(&permissive_test_policy(), &existing),
+        ExternalRoute::Native
+    ));
+
+    let mut invalid = runner_request("run_shell", root.path(), ".", None);
+    invalid.command = EXTERNAL_SEARCH_REQUEST_PREFIX.to_string();
+    let mut invalid_payload = search_request();
+    invalid_payload["path"] = json!("../outside");
+    invalid.stdin = Some(invalid_payload.to_string());
+    assert!(matches!(
+        router.route(&permissive_test_policy(), &invalid),
+        ExternalRoute::Native
+    ));
+}
+
+#[test]
 fn status_reports_discovery_mapping_process_and_bounded_error() {
     let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("normal");
@@ -406,7 +457,7 @@ fn status_reports_discovery_mapping_process_and_bounded_error() {
         .insert("search_project_text".to_string(), "fake_edit".to_string());
     let mismatched = ClaudeCodeMcpProvider::new(mismatched);
     mismatched
-        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .project_client(&fixture.root, Instant::now() + TEST_MCP_STARTUP_TIMEOUT)
         .unwrap();
     let status = mismatched.status();
     assert_eq!(
@@ -615,7 +666,7 @@ fn process_exit_clears_pending_and_next_call_restarts_lazily() {
     let _serial = serialize_fake_mcp_test();
     let fixture = Fixture::new("restart_once");
     assert!(call_search(&fixture).is_err());
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || {
         pending_count(&fixture.provider) == 0
             && fixture.provider.status().process_state == "stopped"
     }));
@@ -666,7 +717,7 @@ fn provider_shutdown_reaps_a_normally_terminating_process_once() {
     let fixture = Fixture::new("normal");
     let client = fixture
         .provider
-        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .project_client(&fixture.root, Instant::now() + TEST_MCP_STARTUP_TIMEOUT)
         .unwrap();
     let pid = client.connection.child.lock().unwrap().id();
 
@@ -676,7 +727,7 @@ fn provider_shutdown_reaps_a_normally_terminating_process_once() {
     assert_eq!(outcome.connections, 1);
     assert_eq!(outcome.timed_out, 0);
     assert!(
-        wait_until(Duration::from_secs(1), || !process_exists(pid)),
+        wait_until(TEST_EVENTUALLY_TIMEOUT, || !process_exists(pid)),
         "provider process remained after shutdown"
     );
 
@@ -698,7 +749,7 @@ fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
     let fixture = Fixture::with_timeout("ignore_term", 5);
     let client = fixture
         .provider
-        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .project_client(&fixture.root, Instant::now() + TEST_MCP_STARTUP_TIMEOUT)
         .unwrap();
     let connection = Arc::clone(&client.connection);
     let pid = connection.child.lock().unwrap().id();
@@ -710,7 +761,7 @@ fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
             Duration::from_secs(5),
         )
     });
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || {
         lock_unpoison(&connection.pending).len() == 1
     }));
 
@@ -728,7 +779,7 @@ fn unresponsive_provider_is_killed_reaped_and_wakes_pending_request() {
     assert_eq!(error.code, "mcp_connection_closed");
     assert_eq!(lock_unpoison(&connection.pending).len(), 0);
     assert!(
-        wait_until(Duration::from_secs(1), || !process_exists(pid)),
+        wait_until(TEST_EVENTUALLY_TIMEOUT, || !process_exists(pid)),
         "SIGTERM-ignoring provider process survived SIGKILL"
     );
 }
@@ -740,7 +791,7 @@ fn provider_request_timeout_racing_shutdown_is_idempotent() {
     let fixture = Fixture::with_timeout("ignore_term", 1);
     let client = fixture
         .provider
-        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .project_client(&fixture.root, Instant::now() + TEST_MCP_STARTUP_TIMEOUT)
         .unwrap();
     let connection = Arc::clone(&client.connection);
     let pid = connection.child.lock().unwrap().id();
@@ -757,7 +808,7 @@ fn provider_request_timeout_racing_shutdown_is_idempotent() {
             Duration::from_millis(100),
         )
     });
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || {
         lock_unpoison(&connection.pending).len() == 1
     }));
     drop(stdin_guard);
@@ -774,7 +825,7 @@ fn provider_request_timeout_racing_shutdown_is_idempotent() {
         error.code
     );
     assert!(
-        wait_until(Duration::from_secs(1), || !process_exists(pid)),
+        wait_until(TEST_EVENTUALLY_TIMEOUT, || !process_exists(pid)),
         "provider process survived concurrent timeout and shutdown"
     );
     let repeated = Instant::now();
@@ -806,7 +857,7 @@ fn native_strategy_does_not_start_claude() {
 #[test]
 fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
     let _serial = serialize_fake_mcp_test();
-    let fixture = Fixture::with_timeout("delayed", 2);
+    let fixture = Fixture::new("delayed");
     let old = Arc::new(ExternalToolRouter::new(&ToolProvidersConfig {
         strategy: ToolProviderStrategy::ClaudeCode,
         claude_code: fixture.config.clone(),
@@ -822,7 +873,7 @@ fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
             ExternalRoute::Handled(_)
         ));
     });
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || {
         fs::read_to_string(&fixture.marker)
             .unwrap_or_default()
             .contains(r#""method":"tools/call""#)
@@ -845,10 +896,10 @@ fn retiring_router_keeps_inflight_search_alive_then_reaps_its_process() {
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
 
     worker.join().unwrap();
-    assert!(wait_until(Duration::from_secs(1), || weak
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || weak
         .upgrade()
         .is_none()));
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || {
         (unsafe { libc::kill(pid as i32, 0) }) == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }));
@@ -864,7 +915,7 @@ fn shutdown_reaps_descendant_and_stdout_closes_without_leaks() {
     let fixture = Fixture::new("spawn_descendant");
     let client = fixture
         .provider
-        .project_client(&fixture.root, Instant::now() + Duration::from_secs(1))
+        .project_client(&fixture.root, Instant::now() + TEST_MCP_STARTUP_TIMEOUT)
         .unwrap();
     let connection = Arc::clone(&client.connection);
 
@@ -889,7 +940,7 @@ fn shutdown_reaps_descendant_and_stdout_closes_without_leaks() {
 
     // The direct child exited on its own, but the tree (descendant) is alive
     // and still holds the stdout write end, so the reader must stay alive.
-    assert!(wait_until(Duration::from_secs(1), || process_exists(
+    assert!(wait_until(TEST_EVENTUALLY_TIMEOUT, || process_exists(
         descendant_pid
     )));
     assert!(
@@ -912,7 +963,7 @@ fn shutdown_reaps_descendant_and_stdout_closes_without_leaks() {
         "descendant {descendant_pid} survived MCP shutdown"
     );
     assert!(
-        wait_until(Duration::from_secs(1), || !process_exists(direct_pid)),
+        wait_until(TEST_EVENTUALLY_TIMEOUT, || !process_exists(direct_pid)),
         "direct child {direct_pid} survived MCP shutdown"
     );
 }

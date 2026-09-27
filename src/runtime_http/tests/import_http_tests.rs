@@ -194,6 +194,8 @@ async fn complete_import_artifact_uploads(
                             .to_string(),
                     ),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 })
@@ -229,6 +231,8 @@ async fn complete_import_artifact_uploads(
                     .to_string(),
                 ),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })
@@ -277,6 +281,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })
@@ -308,6 +314,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })
@@ -340,6 +348,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })
@@ -426,28 +436,28 @@ async fn import_http_accepts_office_mime_and_extension_policy() {
             salvo::http::StatusCode::BAD_REQUEST
         );
         let body: Value = mismatched.take_json().await.unwrap();
-        assert!(body["error"].as_str().unwrap().contains("unsupported MIME"));
+        assert!(body["error"].as_str().unwrap().contains("incompatible"));
     }
 
-    for path in ["payload.dat", "payload.artifact"] {
+    for path in ["payload.dat", "payload.artifact", "payload.customblob"] {
         let service = import_test_service_with_local_runtime().await;
-        let mut rejected = TestClient::post("http://localhost/api/artifacts/import")
+        let mut accepted_by_mime_policy = TestClient::post("http://localhost/api/artifacts/import")
             .bearer_auth("secret")
             .json(&import_body(
-                "https://files.oaiusercontent.com/file",
+                "https://example.com/file",
                 "application/octet-stream",
                 path,
             ))
             .send(&service)
             .await;
         assert_eq!(
-            super::effective_status(&rejected),
+            super::effective_status(&accepted_by_mime_policy),
             salvo::http::StatusCode::BAD_REQUEST
         );
-        let body: Value = rejected.take_json().await.unwrap();
+        let body: Value = accepted_by_mime_policy.take_json().await.unwrap();
         assert!(
-            body["error"].as_str().unwrap().contains("unsupported MIME"),
-            "artifact-only octet-stream suffix must remain rejected by conversation import: {path}: {body:?}"
+            body["error"].as_str().unwrap().contains("OpenAI file host"),
+            "generic binary should pass MIME policy before host validation: {path}: {body:?}"
         );
     }
 }
@@ -518,7 +528,7 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path_b
                 auth: Some(&auth),
                 window: None,
                 record_oauth_scope_denials: false,
-                host_file_import_trust: HostFileImportTrust::TrustedOAuthClient,
+                host_file_import_trust: HostFileImportTrust::TrustedMcpHostFile,
             },
         ),
     )
@@ -558,7 +568,7 @@ fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path() {
 }
 
 #[tokio::test]
-async fn runtime_conversation_import_rejects_non_mcp_transport() {
+async fn runtime_conversation_import_rejects_untrusted_api_transport() {
     use crate::auth::{AuthContext, AuthKind};
     use crate::runner_protocol::RunnerCapabilities;
     use crate::tool_runtime::ToolCall;
@@ -604,7 +614,7 @@ async fn runtime_conversation_import_rejects_non_mcp_transport() {
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.contains("MCP host file-reference mechanism")));
+        .is_some_and(|error| error.contains("trusted GPT Action/OpenAI host file provenance")));
 }
 
 #[tokio::test]
@@ -633,21 +643,24 @@ async fn import_http_existing_mime_policy_still_passes_before_host_validation() 
     }
 
     let service = import_test_service_with_local_runtime().await;
-    let mut unsupported = TestClient::post("http://localhost/api/artifacts/import")
+    let mut unknown_mime = TestClient::post("http://localhost/api/artifacts/import")
         .bearer_auth("secret")
         .json(&import_body(
-            "https://files.oaiusercontent.com/file",
+            "https://example.com/file",
             "application/x-msdownload",
             "payload.bin",
         ))
         .send(&service)
         .await;
     assert_eq!(
-        super::effective_status(&unsupported),
+        super::effective_status(&unknown_mime),
         salvo::http::StatusCode::BAD_REQUEST
     );
-    let body: Value = unsupported.take_json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("unsupported MIME"));
+    let body: Value = unknown_mime.take_json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("OpenAI file host"),
+        "unknown MIME should normalize to generic binary before host validation: {body:?}"
+    );
 }
 
 #[tokio::test]
@@ -779,6 +792,88 @@ async fn import_http_streams_download_in_bounded_upload_chunks() {
     assert_eq!(
         std::fs::read(tmp.path().join("docs/assets/streamed.zip")).unwrap(),
         bytes
+    );
+}
+
+#[tokio::test]
+async fn import_http_batch_failure_reports_prior_success_and_preserves_unicode_name() {
+    let _guard = lock_import_http_test().await;
+    let first_bytes = b"# imported markdown\n".to_vec();
+    let server = start_mock_http_server(vec![http_response(
+        "200 OK",
+        &[("Content-Length", first_bytes.len().to_string())],
+        &first_bytes,
+    )])
+    .await;
+    let _download_base = ImportDownloadBaseUrlGuard::set(server.base_url.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = super::register_import_agent_with_capabilities(
+        tmp.path(),
+        Some(crate::runner_protocol::RunnerCapabilities {
+            file_write: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let config = super::test_config(Some("secret"));
+    let (_db_tmp, db) = super::test_db();
+    let service = Service::new(super::build_projects_router(config, db, runtime));
+    let agent = tokio::spawn(complete_import_artifact_uploads(registry, 1));
+
+    let mut resp = TestClient::post("http://localhost/api/artifacts/import")
+        .bearer_auth("secret")
+        .json(&json!({
+            "project":"agent:importer:demo",
+            "output_dir":"docs/assets",
+            "targets":["毕业论文.md", "wrong.bin"],
+            "openaiFileIdRefs":[
+                {
+                    "name":"毕业论文.md",
+                    "id":"file_markdown",
+                    "mime_type":"text/markdown",
+                    "download_link":"https://files.oaiusercontent.com/markdown"
+                },
+                {
+                    "name":"source.docx",
+                    "id":"file_ooxml_mismatch",
+                    "mime_type":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "download_link":"https://files.oaiusercontent.com/not-read"
+                }
+            ]
+        }))
+        .send(&service)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), agent)
+        .await
+        .expect("partial-success upload fixture timed out")
+        .unwrap();
+
+    assert_eq!(
+        super::effective_status(&resp),
+        salvo::http::StatusCode::BAD_REQUEST
+    );
+    let body: Value = resp.take_json().await.unwrap();
+    assert_eq!(body["output"]["partial_success"], true);
+    assert_eq!(body["output"]["atomic"], false);
+    assert_eq!(body["output"]["count"], 1);
+    assert_eq!(body["output"]["succeeded_count"], 1);
+    assert_eq!(
+        body["output"]["imported"][0]["path"],
+        "docs/assets/毕业论文.md"
+    );
+    assert_eq!(
+        body["output"]["succeeded"][0]["path"],
+        "docs/assets/毕业论文.md"
+    );
+    assert_eq!(body["output"]["failed_item"]["index"], 1);
+    assert_eq!(body["output"]["failed_item"]["source_name"], "source.docx");
+    assert!(body["output"]["failure_reason"]
+        .as_str()
+        .unwrap()
+        .contains("incompatible"));
+    assert_eq!(
+        std::fs::read(tmp.path().join("docs/assets/毕业论文.md")).unwrap(),
+        first_bytes
     );
 }
 

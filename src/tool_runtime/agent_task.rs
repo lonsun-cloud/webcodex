@@ -34,7 +34,7 @@ fn agent_task_store_unavailable() -> ToolResult {
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn agent_task_recovery_kind(
@@ -101,7 +101,7 @@ fn agent_task_error(
             "state_changed": false,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
 fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
@@ -114,7 +114,7 @@ fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
     }
 }
 
@@ -174,7 +174,7 @@ fn coding_run_observation(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::Reconcile, None)
+        .with_recovery(RecoveryKind::Reconcile)
     })?;
     Ok(AgentTaskCodingRunObservation {
         run_id: run.run_id.clone(),
@@ -291,7 +291,7 @@ fn coding_run_failure_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(failure.recovery, None)
+    .with_recovery(failure.recovery)
 }
 
 fn coding_run_terminal_result(run: &CodingAgentRunSnapshot) -> String {
@@ -381,7 +381,7 @@ impl ToolRuntime {
         };
         let offset = offset.unwrap_or(0);
         let limit = limit.unwrap_or(DEFAULT_AGENT_TASK_LIST_LIMIT);
-        if limit == 0 || limit > MAX_AGENT_TASK_LIST_LIMIT {
+        if limit == 0 {
             return ToolResult::err_with_output(
                 format!("limit must be 1..={MAX_AGENT_TASK_LIST_LIMIT}"),
                 json!({
@@ -389,8 +389,9 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
+        let limit = limit.min(MAX_AGENT_TASK_LIST_LIMIT);
         match db.list_agent_tasks(&principal, assignee_agent_id.as_deref(), offset, limit) {
             Ok(result) => serialized_task_success(result),
             Err(error) => agent_task_error(error, RecoveryKind::Reobserve),
@@ -460,6 +461,41 @@ impl ToolRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_agent_task_endpoint_continuation(
+        &self,
+        auth: Option<&AuthContext>,
+        task_id: String,
+        attempt_id: String,
+        assignee_agent_id: String,
+        attempt_fence: String,
+        attempt_controller_generation: i64,
+    ) -> ToolResult {
+        let principal = match task_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return agent_task_store_unavailable();
+        };
+        match db.start_agent_task_endpoint_continuation(
+            &principal,
+            &task_id,
+            &attempt_id,
+            &assignee_agent_id,
+            &attempt_fence,
+            attempt_controller_generation,
+        ) {
+            Ok(result) => {
+                if let Some(controller) = self.agent_continuations.as_ref() {
+                    controller.schedule_agent(&assignee_agent_id);
+                }
+                serialized_task_success(result)
+            }
+            Err(error) => agent_task_error(error, RecoveryKind::RetrySame),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_agent_task_coding_run(
         &self,
         auth: Option<&AuthContext>,
@@ -518,7 +554,7 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
         let binding_intent_fingerprint =
             coding_run_binding_fingerprint(&task_id, &attempt_id, &prepared);
@@ -687,6 +723,20 @@ impl ToolRuntime {
             Some(&terminal_reason),
         ) {
             Ok(mutation) => {
+                if mutation.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &mutation.attention_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
+                if mutation.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &mutation.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
                 let mut output =
                     coding_run_binding_projection(&mutation.binding, mutation.state_changed, false);
                 if let Some(object) = output.as_object_mut() {
@@ -714,7 +764,19 @@ impl ToolRuntime {
         assignee_agent_id: String,
         attempt_fence: String,
         attempt_controller_generation: i64,
+        active_turn_wake_id: Option<String>,
+        active_turn_consume_token: Option<String>,
     ) -> ToolResult {
+        if active_turn_wake_id.is_some() != active_turn_consume_token.is_some() {
+            return ToolResult::err_with_output(
+                "active_turn_wake_id and active_turn_consume_token must be provided together",
+                json!({
+                    "error_kind": "invalid_agent_task_active_turn_proof",
+                    "state_changed": false,
+                }),
+            )
+            .with_recovery(RecoveryKind::FixInput);
+        }
         let principal = match task_principal(auth) {
             Ok(principal) => principal,
             Err(result) => return result,
@@ -722,13 +784,15 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return agent_task_store_unavailable();
         };
-        match db.heartbeat_agent_task_attempt(
+        match db.heartbeat_agent_task_attempt_with_active_turn_proof(
             &principal,
             &task_id,
             &attempt_id,
             &assignee_agent_id,
             &attempt_fence,
             attempt_controller_generation,
+            active_turn_wake_id.as_deref(),
+            active_turn_consume_token.as_deref(),
         ) {
             Ok(result) => serialized_task_success(result),
             Err(error) => agent_task_error(error, RecoveryKind::Reconcile),
@@ -764,7 +828,7 @@ impl ToolRuntime {
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::FixInput, None)
+                .with_recovery(RecoveryKind::FixInput)
             }
         };
         let Some(db) = self.communication_db.as_ref() else {
@@ -782,7 +846,23 @@ impl ToolRuntime {
             terminal_reason.as_deref(),
             &completion_key,
         ) {
-            Ok(result) => serialized_task_success(result),
+            Ok(result) => {
+                if result.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &result.attention_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
+                if result.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &result.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
+                serialized_task_success(result)
+            }
             Err(error) => agent_task_error(error, RecoveryKind::RetrySame),
         }
     }

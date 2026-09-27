@@ -5,12 +5,18 @@ fn validate_file_request_rejects_invalid_read_requests() {
     let cases: Vec<(&str, fn(&mut ShellFileOpRequest), &str)> = vec![
         (
             "only start_line",
-            |req| req.start_line = Some(10),
+            |req| {
+                req.start_line = Some(10);
+                req.end_line = None;
+            },
             "end_line is required when start_line is set for op=read",
         ),
         (
             "only end_line",
-            |req| req.end_line = Some(20),
+            |req| {
+                req.start_line = None;
+                req.end_line = Some(20);
+            },
             "start_line is required when end_line is set for op=read",
         ),
         (
@@ -60,10 +66,9 @@ fn validate_file_request_rejects_invalid_read_requests() {
 }
 
 #[test]
-fn generic_file_request_cannot_inject_runner_skill_store_operations() {
+fn generic_file_request_cannot_inject_runner_skill_operations() {
     for op in [
-        "skill_store",
-        "configured_skill_roots",
+        "skill",
         "skill_install",
         "skill_activate",
         "skill_versions",

@@ -250,13 +250,12 @@ async fn mcp_import_runtime(
     root: &std::path::Path,
     owner: Option<&str>,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
-    mcp_import_runtime_with_surface(root, owner, ModelSurface::FullOperatorRuntime).await
+    mcp_import_runtime_inner(root, owner).await
 }
 
-async fn mcp_import_runtime_with_surface(
+async fn mcp_import_runtime_inner(
     root: &std::path::Path,
     owner: Option<&str>,
-    model_surface: ModelSurface,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
     use crate::runner_protocol::{RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest};
     let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
@@ -300,6 +299,8 @@ async fn mcp_import_runtime_with_surface(
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -308,10 +309,9 @@ async fn mcp_import_runtime_with_surface(
         }],
     )
     .await;
-    let runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_runner_registry(registry.clone())
-            .with_model_surface(model_surface),
-    );
+    let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
+        registry.clone(),
+    ));
     (runtime, registry)
 }
 
@@ -376,6 +376,8 @@ async fn complete_mcp_import_save(
                 .to_string(),
             ),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -425,6 +427,8 @@ async fn complete_mcp_import_save(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -455,6 +459,8 @@ async fn complete_mcp_import_save(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -467,145 +473,8 @@ async fn complete_mcp_import_save(
     }
 }
 
-async fn complete_mcp_import_until_abort(
-    registry: Arc<crate::runner_http::RunnerRegistry>,
-) -> usize {
-    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
-    use base64::Engine as _;
-
-    async fn next_request(
-        registry: &crate::runner_http::RunnerRegistry,
-    ) -> crate::runner_protocol::RunnerRequest {
-        loop {
-            if let Some(request) = registry
-                .poll(RunnerPollRequest {
-                    client_id: "importer".to_string(),
-                    runner_instance_id: "inst-import".to_string(),
-                })
-                .await
-                .unwrap()
-            {
-                return request;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
-
-    let request = next_request(&registry).await;
-    assert_eq!(request.kind, "file_artifact_upload_begin");
-    let begin: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
-    assert!(begin["expected_bytes"].is_null());
-    let path = begin["path"].as_str().unwrap().to_string();
-    let mime_type = begin["mime_type"].as_str().unwrap().to_string();
-    let upload_id = "wc_upload_mcp_abort_fixture";
-    registry
-        .complete(RunnerResultRequest {
-            client_id: "importer".to_string(),
-            runner_instance_id: "inst-import".to_string(),
-            request_id: request.request_id,
-            exit_code: Some(0),
-            stdout: Some(
-                json!({
-                    "path": path,
-                    "upload_id": upload_id,
-                    "received_bytes": 0,
-                    "next_offset": 0,
-                    "expected_bytes": null,
-                    "expected_sha256": null,
-                    "max_bytes": crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
-                    "mime_type": mime_type,
-                    "committed": false
-                })
-                .to_string(),
-            ),
-            stderr: None,
-            duration_ms: Some(1),
-            error: None,
-        })
-        .await
-        .unwrap();
-
-    let mut received_bytes = 0usize;
-    let mut chunk_count = 0usize;
-    loop {
-        let request = next_request(&registry).await;
-        let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
-        assert_eq!(payload["path"], path);
-        assert_eq!(payload["upload_id"], upload_id);
-        match request.kind.as_str() {
-            "file_artifact_upload_chunk" => {
-                assert_eq!(payload["offset"], received_bytes);
-                let chunk = base64::engine::general_purpose::STANDARD
-                    .decode(payload["content_base64"].as_str().unwrap())
-                    .unwrap();
-                assert!(!chunk.is_empty());
-                assert!(
-                    chunk.len()
-                        <= crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES
-                );
-                received_bytes += chunk.len();
-                chunk_count += 1;
-                registry
-                    .complete(RunnerResultRequest {
-                        client_id: "importer".to_string(),
-                        runner_instance_id: "inst-import".to_string(),
-                        request_id: request.request_id,
-                        exit_code: Some(0),
-                        stdout: Some(
-                            json!({
-                                "path": path,
-                                "upload_id": upload_id,
-                                "received_bytes": received_bytes,
-                                "next_offset": received_bytes,
-                                "expected_bytes": null,
-                                "expected_sha256": null,
-                                "max_bytes": crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
-                                "mime_type": mime_type,
-                                "committed": false
-                            })
-                            .to_string(),
-                        ),
-                        stderr: None,
-                        duration_ms: Some(1),
-                        error: None,
-                    })
-                    .await
-                    .unwrap();
-            }
-            "file_artifact_upload_abort" => {
-                registry
-                    .complete(RunnerResultRequest {
-                        client_id: "importer".to_string(),
-                        runner_instance_id: "inst-import".to_string(),
-                        request_id: request.request_id,
-                        exit_code: Some(0),
-                        stdout: Some(
-                            json!({
-                                "path": path,
-                                "upload_id": upload_id,
-                                "received_bytes": received_bytes,
-                                "temp_file_removed": true,
-                                "sidecar_removed": true,
-                                "final_file_exists": false,
-                                "committed": false
-                            })
-                            .to_string(),
-                        ),
-                        stderr: None,
-                        duration_ms: Some(1),
-                        error: None,
-                    })
-                    .await
-                    .unwrap();
-                return chunk_count;
-            }
-            other => panic!("unexpected over-limit MCP import request: {other}"),
-        }
-    }
-}
-
 #[tokio::test]
-async fn pat_created_replacement_client_with_same_redirect_remains_untrusted() {
+async fn pat_created_replacement_client_gets_openai_host_only_tier() {
     let (_db_tmp, db) = test_db();
     let user = seed_user(&db, "alice");
     let trusted =
@@ -647,14 +516,13 @@ async fn pat_created_replacement_client_with_same_redirect_remains_untrusted() {
         MCP_IMPORT_TRUSTED_REDIRECT
     );
 
-    // Model the strongest downstream case: even if the PAT holder completes
-    // OAuth for the replacement and obtains a valid access token, its
-    // allowed_client_id is the new server-generated ID and cannot match the
-    // operator-controlled trust configuration for the revoked client.
+    // A reprovisioned active OAuth client no longer loses ordinary ChatGPT
+    // attachment import solely because the exact allowlist still has the old id.
+    // It receives only the OpenAI-host-restricted Tier 2 provenance.
     let replacement_auth = mcp_import_oauth_auth(replacement_client_id);
     assert_eq!(
         mcp_host_file_import_trust_from_state(&config, &db, Some(&replacement_auth)),
-        HostFileImportTrust::Untrusted
+        HostFileImportTrust::AuthenticatedMcpOpenAiHostFile
     );
 }
 
@@ -673,6 +541,114 @@ fn mcp_file_import_trust_decision_reports_exact_failure_stage() {
     let api_auth = crate::auth::AuthContext::new(crate::auth::AuthKind::ApiToken);
     let not_oauth = mcp_host_file_import_trust_decision_from_state(&config, &db, Some(&api_auth));
     assert_eq!(not_oauth.reason, HostFileImportTrustReason::NotOAuthToken);
+
+    let mut loopback_api_token_config = (*test_config(Some("secret"))).clone();
+    loopback_api_token_config
+        .oauth2
+        .trust_loopback_api_token_mcp_file_import = true;
+    let mut user_api_auth = crate::auth::AuthContext::new(crate::auth::AuthKind::ApiToken);
+    user_api_auth.token_kind = Some("user".to_string());
+    let trusted_loopback = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&user_api_auth),
+    );
+    assert_eq!(
+        trusted_loopback.reason,
+        HostFileImportTrustReason::TrustedLoopbackApiToken
+    );
+    assert_eq!(
+        trusted_loopback.trust,
+        HostFileImportTrust::TrustedMcpHostFile
+    );
+
+    let bootstrap_auth = crate::auth::AuthContext {
+        is_bootstrap: true,
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap)
+    };
+    let trusted_bootstrap = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&bootstrap_auth),
+    );
+    assert_eq!(
+        trusted_bootstrap.reason,
+        HostFileImportTrustReason::TrustedLoopbackBootstrap
+    );
+    assert_eq!(
+        trusted_bootstrap.trust,
+        HostFileImportTrust::TrustedMcpHostFile
+    );
+
+    let mut bootstrap_flag_disabled_config = loopback_api_token_config.clone();
+    bootstrap_flag_disabled_config
+        .oauth2
+        .trust_loopback_api_token_mcp_file_import = false;
+    let bootstrap_flag_disabled = mcp_host_file_import_trust_decision_from_state(
+        &bootstrap_flag_disabled_config,
+        &db,
+        Some(&bootstrap_auth),
+    );
+    assert_eq!(
+        bootstrap_flag_disabled.reason,
+        HostFileImportTrustReason::NotOAuthToken
+    );
+    assert_eq!(
+        bootstrap_flag_disabled.trust,
+        HostFileImportTrust::Untrusted
+    );
+
+    loopback_api_token_config.addr = "0.0.0.0:8080".to_string();
+    let non_loopback = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&user_api_auth),
+    );
+    assert_eq!(
+        non_loopback.reason,
+        HostFileImportTrustReason::LoopbackApiTokenTrustRequiresLoopback
+    );
+    assert_eq!(non_loopback.trust, HostFileImportTrust::Untrusted);
+
+    let bootstrap_non_loopback = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&bootstrap_auth),
+    );
+    assert_eq!(
+        bootstrap_non_loopback.reason,
+        HostFileImportTrustReason::LoopbackBootstrapTrustRequiresLoopback
+    );
+    assert_eq!(bootstrap_non_loopback.trust, HostFileImportTrust::Untrusted);
+
+    let mut loopback_rejection_config = (*test_config(Some("secret"))).clone();
+    loopback_rejection_config
+        .oauth2
+        .trust_loopback_api_token_mcp_file_import = true;
+    for kind in [
+        crate::auth::AuthKind::SharedKey,
+        crate::auth::AuthKind::AgentToken,
+        crate::auth::AuthKind::AccountCredential,
+        crate::auth::AuthKind::ProjectCredential,
+        crate::auth::AuthKind::OpenAnonymous,
+    ] {
+        let auth = crate::auth::AuthContext::new(kind);
+        let decision = mcp_host_file_import_trust_decision_from_state(
+            &loopback_rejection_config,
+            &db,
+            Some(&auth),
+        );
+        assert_eq!(
+            decision.trust,
+            HostFileImportTrust::Untrusted,
+            "kind: {kind:?}"
+        );
+        assert_eq!(
+            decision.reason,
+            HostFileImportTrustReason::NotOAuthToken,
+            "kind: {kind:?}"
+        );
+    }
 
     let mut missing_id = mcp_import_oauth_auth(&client.client_id);
     missing_id.allowed_client_id = None;
@@ -693,15 +669,37 @@ fn mcp_file_import_trust_decision_reports_exact_failure_stage() {
         HostFileImportTrustReason::OAuthDisabled
     );
 
-    let other_client_id = crate::auth::generate_oauth_client_id();
+    let tier2_client = seed_mcp_import_client(
+        &db,
+        &user,
+        "Reprovisioned ChatGPT WebCodex",
+        MCP_IMPORT_TRUSTED_REDIRECT,
+    );
+    let tier2 = mcp_host_file_import_trust_decision_from_state(
+        &config,
+        &db,
+        Some(&mcp_import_oauth_auth(&tier2_client.client_id)),
+    );
+    assert_eq!(
+        tier2.reason,
+        HostFileImportTrustReason::AuthenticatedOAuthOpenAiHostOnly
+    );
+    assert_eq!(
+        tier2.trust,
+        HostFileImportTrust::AuthenticatedMcpOpenAiHostFile
+    );
+    assert_eq!(tier2.client_id_configured, Some(false));
+    assert_eq!(tier2.active_client_registration_found, Some(true));
+
+    let missing_client_id = crate::auth::generate_oauth_client_id();
     assert_eq!(
         mcp_host_file_import_trust_decision_from_state(
             &config,
             &db,
-            Some(&mcp_import_oauth_auth(&other_client_id))
+            Some(&mcp_import_oauth_auth(&missing_client_id))
         )
         .reason,
-        HostFileImportTrustReason::ClientIdNotConfigured
+        HostFileImportTrustReason::ClientRegistrationMissingOrRevoked
     );
 
     let unknown_configured_id = crate::auth::generate_oauth_client_id();
@@ -723,7 +721,7 @@ fn mcp_file_import_trust_decision_reports_exact_failure_stage() {
         Some(&mcp_import_oauth_auth(&client.client_id)),
     );
     assert_eq!(trusted.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(trusted.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(trusted.trust, HostFileImportTrust::TrustedMcpHostFile);
     assert_eq!(trusted.client_id_configured, Some(true));
     assert_eq!(trusted.active_client_registration_found, Some(true));
 }
@@ -743,12 +741,7 @@ async fn adaptive_gateway_file_import_preserves_target_aware_host_trust_impl() {
         seed_mcp_import_client(&db, &user, "ChatGPT WebCodex", MCP_IMPORT_TRUSTED_REDIRECT);
     let token = seed_oauth_access_token(&db, &client, &user, "project:write");
     let project_tmp = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = mcp_import_runtime_with_surface(
-        project_tmp.path(),
-        Some("alice"),
-        ModelSurface::AdaptiveRuntime,
-    )
-    .await;
+    let (runtime, _registry) = mcp_import_runtime_inner(project_tmp.path(), Some("alice")).await;
     let service = Service::new(build_test_router(
         mcp_import_config(&[client.client_id.as_str()]),
         db,
@@ -775,7 +768,7 @@ async fn adaptive_gateway_file_import_preserves_target_aware_host_trust_impl() {
     let decision = take_last_mcp_host_file_import_trust_decision()
         .expect("gateway target must be recognized before host-file trust selection");
     assert_eq!(decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     assert_eq!(body["result"]["structuredContent"]["success"], false);
     assert!(body["result"]["structuredContent"]["error"]
@@ -837,13 +830,31 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
         Some(&verified),
     );
     assert_eq!(decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
 
     let project_tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
     let service = Service::new(build_test_router(config, db, runtime));
     let agent = tokio::spawn(complete_mcp_import_save(registry, pptx.clone()));
     let temporary_url = "https://download.example/temporary-secret-token/stateless-import.pptx";
+    let forged_provenance_error = crate::tool_runtime::ToolCall::from_tool_name(
+        "import_conversation_files_to_project",
+        json!({
+            "project": "agent:importer:demo",
+            "openaiFileIdRefs": [{
+                "download_url": temporary_url,
+                "file_id": "file_stateless_host_rewritten",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "file_name": "source.pptx"
+            }],
+            "host_file_import_provenance": "GptActionOpenAiHost"
+        }),
+    )
+    .expect_err("caller-controlled host provenance must fail closed at the canonical parser");
+    assert!(
+        forged_provenance_error.contains("unknown field `host_file_import_provenance`"),
+        "{forged_provenance_error}"
+    );
     let (status, body, _) = oauth_mcp_request(
         &service,
         &token,
@@ -860,8 +871,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
                 }],
                 "output_dir": "paper/export",
                 "targets": ["stateless-import.pptx"],
-                "overwrite": false,
-                "trusted_mcp_host_file_import": false
+                "overwrite": false
             }
         })),
     )
@@ -870,7 +880,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     let mcp_decision = take_last_mcp_host_file_import_trust_decision()
         .expect("mcp_post must evaluate host-file trust for the import tool");
     assert_eq!(mcp_decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(mcp_decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(mcp_decision.trust, HostFileImportTrust::TrustedMcpHostFile);
 
     // Stages D-E: the kernel injects the internal provenance bit after JSON
     // deserialization and dispatch crosses the pre-network provenance gate to
@@ -893,6 +903,260 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     let serialized = serde_json::to_string(&body).unwrap();
     assert!(!serialized.contains(temporary_url));
     assert!(!serialized.contains("file_stateless_host_rewritten"));
+}
+
+#[test]
+fn loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled() {
+    run_mcp_import_in_large_stack_test_thread(
+        loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled_impl,
+    );
+}
+
+async fn loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled_impl() {
+    use sha2::{Digest, Sha256};
+
+    let _lock = lock_mcp_import_test().await;
+    let pptx = b"trusted-loopback-api-token-pptx".to_vec();
+    let expected_sha256 = format!("{:x}", Sha256::digest(&pptx));
+    let server = start_mcp_import_mock_server(mcp_import_http_response(
+        "200 OK",
+        &[("Content-Length", pptx.len().to_string())],
+        &pptx,
+    ))
+    .await;
+    let _network = McpImportNetworkOverride::set(server.base_url.clone());
+
+    let (_db_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_mcp_import_pat(&db, &user);
+    let project_tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
+    let mut config = (*test_config(Some("secret"))).clone();
+    config.oauth2.trust_loopback_api_token_mcp_file_import = true;
+    let service = Service::new(build_test_router(Arc::new(config), db, runtime));
+    let agent = tokio::spawn(complete_mcp_import_save(registry, pptx.clone()));
+    let temporary_url = "https://download.example/temporary-secret-token/loopback-import.pptx";
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": "import_conversation_files_to_project",
+            "arguments": {
+                "project": "agent:importer:demo",
+                "openaiFileIdRefs": [{
+                    "download_url": temporary_url,
+                    "file_id": "file_loopback_host_rewritten",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "file_name": "source.pptx"
+                }],
+                "output_dir": "paper/export",
+                "targets": ["loopback-import.pptx"],
+                "overwrite": false
+            }
+        }),
+    )
+    .await;
+
+    let decision = take_last_mcp_host_file_import_trust_decision()
+        .expect("MCP import must evaluate host-file trust");
+    assert_eq!(
+        decision.reason,
+        HostFileImportTrustReason::TrustedLoopbackApiToken
+    );
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .expect("save_project_artifact fixture timed out")
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false, "body: {body:?}");
+    let imported = &body["result"]["structuredContent"]["output"]["imported"][0];
+    assert_eq!(imported["path"], "paper/export/loopback-import.pptx");
+    assert_eq!(imported["bytes_written"], pptx.len());
+    assert_eq!(imported["sha256"], expected_sha256);
+    assert_eq!(
+        crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
+        1
+    );
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains(temporary_url));
+    assert!(!serialized.contains("file_loopback_host_rewritten"));
+}
+
+#[test]
+fn loopback_bootstrap_mcp_file_import_saves_pptx_when_explicitly_enabled() {
+    run_mcp_import_in_large_stack_test_thread(
+        loopback_bootstrap_mcp_file_import_saves_pptx_when_explicitly_enabled_impl,
+    );
+}
+
+async fn loopback_bootstrap_mcp_file_import_saves_pptx_when_explicitly_enabled_impl() {
+    use sha2::{Digest, Sha256};
+
+    let _lock = lock_mcp_import_test().await;
+    let pptx = b"trusted-loopback-bootstrap-pptx".to_vec();
+    let expected_sha256 = format!("{:x}", Sha256::digest(&pptx));
+    let server = start_mcp_import_mock_server(mcp_import_http_response(
+        "200 OK",
+        &[("Content-Length", pptx.len().to_string())],
+        &pptx,
+    ))
+    .await;
+    let _network = McpImportNetworkOverride::set(server.base_url.clone());
+
+    let (_db_tmp, db) = test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_import_runtime(project_tmp.path(), None).await;
+    let mut config = (*test_config(Some("secret"))).clone();
+    config.oauth2.trust_loopback_api_token_mcp_file_import = true;
+    let service = Service::new(build_test_router(Arc::new(config), db, runtime));
+    let agent = tokio::spawn(complete_mcp_import_save(registry, pptx.clone()));
+    let temporary_url = "https://download.example/temporary-secret-token/bootstrap-import.pptx";
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        "secret",
+        "tools/call",
+        json!({
+            "name": "import_conversation_files_to_project",
+            "arguments": {
+                "project": "agent:importer:demo",
+                "openaiFileIdRefs": [{
+                    "download_url": temporary_url,
+                    "file_id": "file_loopback_bootstrap_host_rewritten",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "file_name": "source.pptx"
+                }],
+                "output_dir": "paper/export",
+                "targets": ["bootstrap-import.pptx"],
+                "overwrite": false
+            }
+        }),
+    )
+    .await;
+
+    let decision = take_last_mcp_host_file_import_trust_decision()
+        .expect("MCP import must evaluate bootstrap host-file trust after authentication");
+    assert_eq!(
+        decision.reason,
+        HostFileImportTrustReason::TrustedLoopbackBootstrap
+    );
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .expect("save_project_artifact fixture timed out")
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false, "body: {body:?}");
+    let imported = &body["result"]["structuredContent"]["output"]["imported"][0];
+    assert_eq!(imported["path"], "paper/export/bootstrap-import.pptx");
+    assert_eq!(imported["bytes_written"], pptx.len());
+    assert_eq!(imported["sha256"], expected_sha256);
+    assert_eq!(
+        crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
+        1
+    );
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains(temporary_url));
+    assert!(!serialized.contains("file_loopback_bootstrap_host_rewritten"));
+}
+
+#[test]
+fn oauth_mcp_file_import_unallowlisted_active_client_saves_openai_host_file() {
+    run_mcp_import_in_large_stack_test_thread(
+        oauth_mcp_file_import_unallowlisted_active_client_saves_openai_host_file_impl,
+    );
+}
+
+async fn oauth_mcp_file_import_unallowlisted_active_client_saves_openai_host_file_impl() {
+    use sha2::{Digest, Sha256};
+
+    let _lock = lock_mcp_import_test().await;
+    let bytes = b"tier2-chatgpt-pptx-attachment".to_vec();
+    let expected_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let server = start_mcp_import_mock_server(mcp_import_http_response(
+        "200 OK",
+        &[("Content-Length", bytes.len().to_string())],
+        &bytes,
+    ))
+    .await;
+    let _network = McpImportNetworkOverride::set(server.base_url.clone());
+
+    let (_db_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let client = seed_mcp_import_client(
+        &db,
+        &user,
+        "Reprovisioned ChatGPT WebCodex",
+        MCP_IMPORT_TRUSTED_REDIRECT,
+    );
+    let token = seed_oauth_access_token(&db, &client, &user, "project:write");
+    let project_tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
+    let unrelated_trusted_id = crate::auth::generate_oauth_client_id();
+    let service = Service::new(build_test_router(
+        mcp_import_config(&[unrelated_trusted_id.as_str()]),
+        db,
+        runtime,
+    ));
+    let agent = tokio::spawn(complete_mcp_import_save(registry, bytes.clone()));
+    let temporary_url = "https://files.oaiusercontent.com/temporary-secret-token/tier2-import.pptx";
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": "import_conversation_files_to_project",
+            "arguments": {
+                "project": "agent:importer:demo",
+                "openaiFileIdRefs": [{
+                    "download_url": temporary_url,
+                    "file_id": "file_tier2_reprovisioned",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "file_name": "source.pptx"
+                }],
+                "output_dir": "paper/export",
+                "targets": ["tier2-import.pptx"],
+                "overwrite": false
+            }
+        }),
+    )
+    .await;
+
+    let decision = take_last_mcp_host_file_import_trust_decision()
+        .expect("MCP import must evaluate host-file trust");
+    assert_eq!(
+        decision.reason,
+        HostFileImportTrustReason::AuthenticatedOAuthOpenAiHostOnly
+    );
+    assert_eq!(
+        decision.trust,
+        HostFileImportTrust::AuthenticatedMcpOpenAiHostFile
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .expect("Tier 2 import fixture timed out")
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false, "body: {body:?}");
+    let imported = &body["result"]["structuredContent"]["output"]["imported"][0];
+    assert_eq!(imported["path"], "paper/export/tier2-import.pptx");
+    assert_eq!(imported["bytes_written"], bytes.len());
+    assert_eq!(imported["sha256"], expected_sha256);
+    assert_eq!(
+        crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
+        1,
+        "Tier 2 OpenAI hostname must be resolved and pinned"
+    );
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains(temporary_url));
+    assert!(!serialized.contains("file_tier2_reprovisioned"));
 }
 
 #[test]
@@ -998,7 +1262,7 @@ async fn oauth_mcp_file_import_trusted_download_guards_remain_bounded_impl() {
         seed_mcp_import_client(&db, &user, "ChatGPT WebCodex", MCP_IMPORT_TRUSTED_REDIRECT);
     let token = seed_oauth_access_token(&db, &client, &user, "project:write");
     let project_tmp = tempfile::tempdir().unwrap();
-    let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
+    let (runtime, _registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
     let service = Service::new(build_test_router(
         mcp_import_config(&[client.client_id.as_str()]),
         db,
@@ -1042,31 +1306,13 @@ async fn oauth_mcp_file_import_trusted_download_guards_remain_bounded_impl() {
             "exceeds",
             false,
         ),
-        (
-            mcp_import_http_response(
-                "200 OK",
-                &[],
-                &vec![b'x'; crate::tool_runtime::conversation_import::MAX_IMPORT_FILE_BYTES + 1],
-            ),
-            "exceeds",
-            true,
-        ),
     ];
 
-    for (response, expected_error, requires_upload_cleanup) in cases {
+    for (response, expected_error, _) in cases {
         let server = start_mcp_import_mock_server(response).await;
         let network = McpImportNetworkOverride::set(server.base_url.clone());
-        let upload_fixture = requires_upload_cleanup
-            .then(|| tokio::spawn(complete_mcp_import_until_abort(registry.clone())));
         let (status, body, _) =
             oauth_mcp_request(&service, &token, "tools/call", params.clone()).await;
-        if let Some(upload_fixture) = upload_fixture {
-            tokio::time::timeout(std::time::Duration::from_secs(10), upload_fixture)
-                .await
-                .expect("over-limit import abort fixture timed out")
-                .unwrap();
-            assert!(!project_tmp.path().join("guard.pptx").exists());
-        }
         assert_eq!(status, StatusCode::OK, "body: {body:?}");
         assert_eq!(body["result"]["isError"], true, "body: {body:?}");
         let serialized = serde_json::to_string(&body).unwrap();
@@ -1082,13 +1328,13 @@ async fn oauth_mcp_file_import_trusted_download_guards_remain_bounded_impl() {
 }
 
 #[test]
-fn mcp_file_import_untrusted_callers_fail_before_dns() {
+fn mcp_file_import_unallowlisted_oauth_rejects_non_openai_host_before_dns() {
     run_mcp_import_in_large_stack_test_thread(
-        mcp_file_import_untrusted_callers_fail_before_dns_impl,
+        mcp_file_import_unallowlisted_oauth_rejects_non_openai_host_before_dns_impl,
     );
 }
 
-async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
+async fn mcp_file_import_unallowlisted_oauth_rejects_non_openai_host_before_dns_impl() {
     let _lock = lock_mcp_import_test().await;
     let _network = McpImportNetworkOverride::without_download();
     let (_db_tmp, db) = test_db();
@@ -1127,12 +1373,12 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     assert_eq!(body["result"]["isError"], true);
     let serialized = serde_json::to_string(&body).unwrap();
-    assert!(serialized.contains("explicitly trusted OAuth MCP client"));
+    assert!(serialized.contains("OpenAI file host"));
     assert!(!serialized.contains(temporary_url));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
         0,
-        "ordinary OAuth client must be rejected before DNS/network"
+        "Tier 2 non-OpenAI URL must be rejected before DNS/network"
     );
 
     crate::tool_runtime::conversation_import::reset_import_test_dns_resolution_count();
@@ -1141,11 +1387,11 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(body["result"]["isError"], true);
     assert!(serde_json::to_string(&body)
         .unwrap()
-        .contains("explicitly trusted OAuth MCP client"));
+        .contains("trusted MCP host-file provenance"));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
         0,
-        "raw/API-token MCP client must be rejected before DNS/network"
+        "bootstrap MCP client without the explicit local trust flag must be rejected before DNS/network"
     );
 }
 

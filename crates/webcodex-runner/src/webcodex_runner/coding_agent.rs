@@ -258,7 +258,7 @@ impl DurableRunStore {
             if self
                 .test_control
                 .fail_next_terminal_writes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()
@@ -592,6 +592,7 @@ pub(crate) struct CodingAgentWorkerDrain {
 pub(crate) struct CodingAgentManager {
     client_id: String,
     providers: BTreeMap<String, Arc<ProviderEntry>>,
+    forced_config: BTreeMap<String, CodingAgentConfigValue>,
     max_concurrent_runs: usize,
     permission_timeout: Duration,
     store: DurableRunStore,
@@ -633,6 +634,7 @@ impl CodingAgentManager {
         let manager = Arc::new(Self {
             client_id: client_id.to_string(),
             providers,
+            forced_config: config.forced_config.clone(),
             max_concurrent_runs: config.max_concurrent_runs,
             permission_timeout: Duration::from_secs(config.permission_timeout_secs),
             store: DurableRunStore::new(DurableRunStore::default_root(client_id, server_url)?),
@@ -673,6 +675,7 @@ impl CodingAgentManager {
         let manager = Arc::new(Self {
             client_id: "test".to_string(),
             providers,
+            forced_config: config.forced_config.clone(),
             max_concurrent_runs: config.max_concurrent_runs,
             permission_timeout: Duration::from_secs(config.permission_timeout_secs),
             store: DurableRunStore::new(root),
@@ -966,6 +969,174 @@ impl CodingAgentManager {
                 false
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_pre_prompt_config_option(
+        &self,
+        run_id: &str,
+        entry: &Arc<RunEntry>,
+        child: &mut ManagedChild,
+        outbound: &mut AcpOutboundWriter,
+        rx: &Receiver<ReaderEvent>,
+        run_deadline: Instant,
+        session_id: &str,
+        next_id: &mut u64,
+        advertised: &mut Vec<SessionConfigOption>,
+        key: &str,
+        value: &CodingAgentConfigValue,
+        forced: bool,
+    ) -> bool {
+        if self.pre_prompt_should_stop(run_id, entry, run_deadline) {
+            self.terminate_run_io(child, outbound);
+            return false;
+        }
+        if !advertised.iter().any(|option| option.id.to_string() == key) {
+            self.setup_failure(
+                run_id,
+                entry,
+                if forced {
+                    "coding_agent_forced_config_not_advertised"
+                } else {
+                    "coding_agent_config_invalid"
+                },
+                if forced {
+                    "Runner-enforced ACP config option is not advertised by provider"
+                } else {
+                    "ACP config override is not currently advertised/legal"
+                },
+            );
+            self.terminate_run_io(child, outbound);
+            return false;
+        }
+        if !config_override_is_valid(advertised, key, value) {
+            self.setup_failure(
+                run_id,
+                entry,
+                if forced {
+                    "coding_agent_forced_config_invalid"
+                } else {
+                    "coding_agent_config_invalid"
+                },
+                if forced {
+                    "Runner-enforced ACP config value is not currently legal for provider"
+                } else {
+                    "ACP config override is not currently advertised/legal"
+                },
+            );
+            self.terminate_run_io(child, outbound);
+            return false;
+        }
+
+        let config_id = *next_id;
+        *next_id += 1;
+        let params = match config_params(session_id, key, value) {
+            Some(params) => params,
+            None => {
+                self.setup_failure(
+                    run_id,
+                    entry,
+                    if forced {
+                        "coding_agent_forced_config_invalid"
+                    } else {
+                        "coding_agent_config_invalid"
+                    },
+                    if forced {
+                        "Runner-enforced ACP config value type is unsupported by stable v1"
+                    } else {
+                        "ACP config value type is unsupported by stable v1"
+                    },
+                );
+                self.terminate_run_io(child, outbound);
+                return false;
+            }
+        };
+        if !self.write_pre_prompt_frame(
+            run_id,
+            entry,
+            child,
+            outbound,
+            request_frame(config_id, "session/set_config_option", params),
+            run_deadline,
+            if forced {
+                "coding_agent_forced_config_write_failed"
+            } else {
+                "coding_agent_config_write_failed"
+            },
+            if forced {
+                "failed to write Runner-enforced session/set_config_option"
+            } else {
+                "failed to write session/set_config_option"
+            },
+        ) {
+            return false;
+        }
+        let Some(config_wait) = bounded_setup_wait(run_deadline) else {
+            self.setup_timeout(run_id, entry);
+            self.terminate_run_io(child, outbound);
+            return false;
+        };
+        let result = match wait_response(rx, config_id, config_wait, Some(&entry.cancel_requested))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if !self.pre_prompt_should_stop(run_id, entry, run_deadline) {
+                    self.setup_failure(
+                        run_id,
+                        entry,
+                        if forced {
+                            "coding_agent_forced_config_failed"
+                        } else {
+                            "coding_agent_config_failed"
+                        },
+                        &error,
+                    );
+                }
+                self.terminate_run_io(child, outbound);
+                return false;
+            }
+        };
+        if self.pre_prompt_should_stop(run_id, entry, run_deadline) {
+            self.terminate_run_io(child, outbound);
+            return false;
+        }
+        let refreshed: SetSessionConfigOptionResponse = match serde_json::from_value(result) {
+            Ok(result) => result,
+            Err(_) => {
+                self.setup_failure(
+                    run_id,
+                    entry,
+                    if forced {
+                        "coding_agent_forced_config_invalid_response"
+                    } else {
+                        "coding_agent_config_invalid_response"
+                    },
+                    "invalid refreshed ACP config options",
+                );
+                self.terminate_run_io(child, outbound);
+                return false;
+            }
+        };
+        *advertised = refreshed.config_options;
+        if !config_override_is_current(advertised, key, value) {
+            self.setup_failure(
+                run_id,
+                entry,
+                if forced {
+                    "coding_agent_forced_config_not_applied"
+                } else {
+                    "coding_agent_config_not_applied"
+                },
+                if forced {
+                    "Runner-enforced ACP config was not reflected by provider"
+                } else {
+                    "ACP config override was not reflected by provider"
+                },
+            );
+            self.terminate_run_io(child, outbound);
+            return false;
+        }
+        true
     }
 
     fn terminate_run_io(&self, child: &mut ManagedChild, outbound: &mut AcpOutboundWriter) {
@@ -1535,10 +1706,47 @@ impl CodingAgentManager {
         let session_id = new_session.session_id.to_string();
         let mut advertised = new_session.config_options.unwrap_or_default();
 
+        // Runner-owned global forced config is admission policy, not a
+        // best-effort preference. Conflicting caller input fails before prompt.
         for (key, value) in &request.config {
-            if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-                self.terminate_run_io(&mut child, &mut outbound);
+            if let Some(forced_value) = self.forced_config.get(key) {
+                if value != forced_value {
+                    self.setup_failure(
+                        &request.run_id,
+                        &entry,
+                        "coding_agent_forced_config_conflict",
+                        "caller ACP config conflicts with Runner-enforced policy",
+                    );
+                    self.terminate_run_io(&mut child, &mut outbound);
+                    return;
+                }
+            }
+        }
+
+        for (key, value) in &self.forced_config {
+            if !self.apply_pre_prompt_config_option(
+                &request.run_id,
+                &entry,
+                &mut child,
+                &mut outbound,
+                &rx,
+                run_deadline,
+                &session_id,
+                &mut next_id,
+                &mut advertised,
+                key,
+                value,
+                true,
+            ) {
                 return;
+            }
+        }
+
+        for (key, value) in &request.config {
+            // Exact repetition of globally forced policy is accepted but is not
+            // a caller override and is already active.
+            if self.forced_config.contains_key(key) {
+                continue;
             }
             if !provider
                 .config
@@ -1555,92 +1763,63 @@ impl CodingAgentManager {
                 self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
-            if !config_override_is_valid(&advertised, key, value) {
-                self.setup_failure(
-                    &request.run_id,
-                    &entry,
-                    "coding_agent_config_invalid",
-                    "ACP config override is not currently advertised/legal",
-                );
-                self.terminate_run_io(&mut child, &mut outbound);
-                return;
-            }
-            let config_id = next_id;
-            next_id += 1;
-            let params = match config_params(&session_id, key, value) {
-                Some(params) => params,
-                None => {
-                    self.setup_failure(
-                        &request.run_id,
-                        &entry,
-                        "coding_agent_config_invalid",
-                        "ACP config value type is unsupported by stable v1",
-                    );
-                    self.terminate_run_io(&mut child, &mut outbound);
-                    return;
-                }
-            };
-            if !self.write_pre_prompt_frame(
+            if !self.apply_pre_prompt_config_option(
                 &request.run_id,
                 &entry,
                 &mut child,
                 &mut outbound,
-                request_frame(config_id, "session/set_config_option", params),
+                &rx,
                 run_deadline,
-                "coding_agent_config_write_failed",
-                "failed to write session/set_config_option",
+                &session_id,
+                &mut next_id,
+                &mut advertised,
+                key,
+                value,
+                false,
             ) {
                 return;
             }
-            let Some(config_wait) = bounded_setup_wait(run_deadline) else {
-                self.setup_timeout(&request.run_id, &entry);
-                self.terminate_run_io(&mut child, &mut outbound);
-                return;
-            };
-            let result =
-                match wait_response(&rx, config_id, config_wait, Some(&entry.cancel_requested)) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        if !self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-                            self.setup_failure(
-                                &request.run_id,
-                                &entry,
-                                "coding_agent_config_failed",
-                                &error,
-                            );
-                        }
-                        self.terminate_run_io(&mut child, &mut outbound);
-                        return;
-                    }
-                };
-            if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-                self.terminate_run_io(&mut child, &mut outbound);
+        }
+
+        // Caller-allowed changes may have provider-side effects on another
+        // option. Re-assert any forced value that drifted.
+        for (key, value) in &self.forced_config {
+            if config_override_is_valid(&advertised, key, value)
+                && config_override_is_current(&advertised, key, value)
+            {
+                continue;
+            }
+            if !self.apply_pre_prompt_config_option(
+                &request.run_id,
+                &entry,
+                &mut child,
+                &mut outbound,
+                &rx,
+                run_deadline,
+                &session_id,
+                &mut next_id,
+                &mut advertised,
+                key,
+                value,
+                true,
+            ) {
                 return;
             }
-            let refreshed: SetSessionConfigOptionResponse = match serde_json::from_value(result) {
-                Ok(result) => result,
-                Err(_) => {
-                    self.setup_failure(
-                        &request.run_id,
-                        &entry,
-                        "coding_agent_config_invalid_response",
-                        "invalid refreshed ACP config options",
-                    );
-                    self.terminate_run_io(&mut child, &mut outbound);
-                    return;
-                }
-            };
-            advertised = refreshed.config_options;
-            if !config_override_is_current(&advertised, key, value) {
-                self.setup_failure(
-                    &request.run_id,
-                    &entry,
-                    "coding_agent_config_not_applied",
-                    "ACP config override was not reflected by provider",
-                );
-                self.terminate_run_io(&mut child, &mut outbound);
-                return;
-            }
+        }
+
+        // Final fail-closed check immediately before the prompt-dispatch path.
+        if self.forced_config.iter().any(|(key, value)| {
+            !config_override_is_valid(&advertised, key, value)
+                || !config_override_is_current(&advertised, key, value)
+        }) {
+            self.setup_failure(
+                &request.run_id,
+                &entry,
+                "coding_agent_forced_config_not_applied",
+                "Runner-enforced ACP config was not active before prompt dispatch",
+            );
+            self.terminate_run_io(&mut child, &mut outbound);
+            return;
         }
 
         #[cfg(test)]
@@ -2674,12 +2853,21 @@ fn resolve_environment(
     Ok(result)
 }
 
+fn unique_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    key: &str,
+) -> Option<&'a SessionConfigOption> {
+    let mut matches = options.iter().filter(|option| option.id.to_string() == key);
+    let option = matches.next()?;
+    matches.next().is_none().then_some(option)
+}
+
 fn config_override_is_valid(
     options: &[SessionConfigOption],
     key: &str,
     value: &CodingAgentConfigValue,
 ) -> bool {
-    let Some(option) = options.iter().find(|option| option.id.to_string() == key) else {
+    let Some(option) = unique_config_option(options, key) else {
         return false;
     };
     match (&option.kind, value) {
@@ -2705,7 +2893,7 @@ fn config_override_is_current(
     key: &str,
     value: &CodingAgentConfigValue,
 ) -> bool {
-    let Some(option) = options.iter().find(|option| option.id.to_string() == key) else {
+    let Some(option) = unique_config_option(options, key) else {
         return false;
     };
     match (&option.kind, value) {
@@ -2925,6 +3113,7 @@ mod tests {
         AcpConfig {
             max_concurrent_runs: 1,
             permission_timeout_secs: 1,
+            forced_config: BTreeMap::new(),
             agents: vec![AcpAgentConfig {
                 id: "codex".to_string(),
                 name: "Codex".to_string(),
@@ -2942,7 +3131,7 @@ mod tests {
         let script = r#"#!/usr/bin/env python3
 import json,os,sys,time,subprocess
 scenario=sys.argv[1]
-config_values={'one':'a','two':'a','three':'a','four':'a'}
+config_values={'one':'a','two':'a','three':'a','four':'a','mode':'agent','model':'default-model','reasoning_effort':'medium','feature_flag':False}
 log_path=os.path.join(os.path.dirname(__file__),'fake-acp.log')
 def log(x):
  with open(log_path,'a',encoding='utf-8') as f: f.write(json.dumps(x,separators=(',',':'))+'\n')
@@ -2963,7 +3152,16 @@ for line in sys.stdin:
   send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentCapabilities':{}}})
  elif method=='session/new':
   if scenario=='slow_configs':
-   opts=[{'id':k,'name':k.title(),'type':'select','currentValue':config_values[k],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for k in config_values]
+   opts=[{'id':k,'name':k.title(),'type':'select','currentValue':config_values[k],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for k in ('one','two','three','four')]
+  elif scenario in ('forced_configs','forced_not_applied','forced_reset_by_caller','forced_duplicate'):
+   opts=[
+    {'id':'mode','name':'Mode','type':'select','currentValue':config_values['mode'],'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]},
+    {'id':'model','name':'Model','type':'select','currentValue':config_values['model'],'options':[{'value':'default-model','name':'Default'},{'value':'policy-model','name':'Policy'}]},
+    {'id':'reasoning_effort','name':'Reasoning Effort','type':'select','currentValue':config_values['reasoning_effort'],'options':[{'value':'medium','name':'Medium'},{'value':'high','name':'High'}]},
+    {'id':'feature_flag','name':'Feature Flag','type':'boolean','currentValue':config_values['feature_flag']}
+   ]
+   if scenario=='forced_duplicate':
+    opts.append({'id':'feature_flag','name':'Duplicate Feature Flag','type':'boolean','currentValue':False})
   else:
    opts=[{'id':'mode','name':'Mode','type':'select','currentValue':'agent','options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   session_id='s'*70000 if scenario=='block_cancel_write' else 's1'
@@ -2977,7 +3175,19 @@ for line in sys.stdin:
   if scenario=='slow_configs':
    time.sleep(0.6)
    k=m['params']['configId']; v=m['params']['value']; config_values[k]=v
-   opts=[{'id':key,'name':key.title(),'type':'select','currentValue':config_values[key],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for key in config_values]
+   opts=[{'id':key,'name':key.title(),'type':'select','currentValue':config_values[key],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for key in ('one','two','three','four')]
+  elif scenario in ('forced_configs','forced_not_applied','forced_reset_by_caller'):
+   k=m['params']['configId']; v=m['params']['value']
+   if not (scenario=='forced_not_applied' and k=='model'):
+    config_values[k]=v
+   if scenario=='forced_reset_by_caller' and k=='mode':
+    config_values['model']='default-model'; config_values['reasoning_effort']='medium'
+   opts=[
+    {'id':'mode','name':'Mode','type':'select','currentValue':config_values['mode'],'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]},
+    {'id':'model','name':'Model','type':'select','currentValue':config_values['model'],'options':[{'value':'default-model','name':'Default'},{'value':'policy-model','name':'Policy'}]},
+    {'id':'reasoning_effort','name':'Reasoning Effort','type':'select','currentValue':config_values['reasoning_effort'],'options':[{'value':'medium','name':'Medium'},{'value':'high','name':'High'}]},
+    {'id':'feature_flag','name':'Feature Flag','type':'boolean','currentValue':config_values['feature_flag']}
+   ]
   else:
    v=m['params']['value']; opts=[{'id':'mode','name':'Mode','type':'select','currentValue':v,'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   send({'jsonrpc':'2.0','id':rid,'result':{'configOptions':opts}})
@@ -3158,6 +3368,62 @@ for line in sys.stdin:
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    fn received_config_ids(log: &[Value]) -> Vec<String> {
+        log.iter()
+            .filter_map(|entry| {
+                let recv = entry.get("recv")?;
+                if recv.get("method").and_then(Value::as_str) != Some("session/set_config_option") {
+                    return None;
+                }
+                recv.pointer("/params/configId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn force_policy(cfg: &mut AcpConfig) {
+        cfg.forced_config = BTreeMap::from([
+            (
+                "model".to_string(),
+                CodingAgentConfigValue::String("policy-model".to_string()),
+            ),
+            (
+                "reasoning_effort".to_string(),
+                CodingAgentConfigValue::String("high".to_string()),
+            ),
+        ]);
+    }
+
+    #[cfg(unix)]
+    fn start_request_for_provider(
+        manager: &CodingAgentManager,
+        root: &Path,
+        run: &str,
+        provider_id: &str,
+        config: BTreeMap<String, CodingAgentConfigValue>,
+    ) -> CodingAgentRequest {
+        let provider = manager
+            .providers()
+            .into_iter()
+            .find(|provider| provider.provider_id == provider_id)
+            .unwrap();
+        CodingAgentRequest::Start(webcodex_core::coding_agent::CodingAgentStartRequest {
+            run_id: run.to_string(),
+            intent_fingerprint: format!("fingerprint-{provider_id}"),
+            authority_fingerprint: "auth_test".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            project_root: root.to_string_lossy().to_string(),
+            provider_id: provider_id.to_string(),
+            provider_instance_id: provider.provider_instance_id,
+            instruction: "inspect".to_string(),
+            config,
+            timeout_secs: 10,
+        })
     }
 
     #[cfg(unix)]
@@ -4252,6 +4518,450 @@ for line in sys.stdin:
             received_methods(&wire_log(&temp))
                 .iter()
                 .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn forced_config_is_applied_before_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe, args);
+        force_policy(&mut cfg);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedapply01";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Completed);
+        assert_eq!(
+            received_config_ids(&wire_log(&temp)),
+            vec!["model".to_string(), "reasoning_effort".to_string()]
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp)),
+            vec![
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_forced_config_fails_without_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "end");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedmissing01";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_not_advertised")
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn forced_config_must_be_reflected_by_provider() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_not_applied");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedreflect01";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_not_applied")
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn caller_may_repeat_but_not_override_forced_config() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let same_run = "wc_agent_run_forcedsame0001";
+        assert!(manager
+            .handle(
+                start_request(
+                    &manager,
+                    &root,
+                    same_run,
+                    BTreeMap::from([(
+                        "model".to_string(),
+                        CodingAgentConfigValue::String("policy-model".to_string()),
+                    )]),
+                ),
+                &projects,
+            )
+            .error
+            .is_none());
+        assert_eq!(
+            wait_for_snapshot(&manager, same_run, |snapshot| snapshot.state.terminal()).state,
+            CodingAgentRunState::Completed
+        );
+
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let conflict_run = "wc_agent_run_forcedconflict01";
+        assert!(manager
+            .handle(
+                start_request(
+                    &manager,
+                    &root,
+                    conflict_run,
+                    BTreeMap::from([(
+                        "model".to_string(),
+                        CodingAgentConfigValue::String("default-model".to_string()),
+                    )]),
+                ),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal =
+            wait_for_snapshot(&manager, conflict_run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_conflict")
+        );
+        assert!(received_config_ids(&wire_log(&temp)).is_empty());
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn forced_config_is_reasserted_after_caller_side_effects() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_reset_by_caller");
+        let mut cfg = fake_config(exe, args);
+        force_policy(&mut cfg);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedreassert01";
+        assert!(manager
+            .handle(
+                start_request(
+                    &manager,
+                    &root,
+                    run,
+                    BTreeMap::from([(
+                        "mode".to_string(),
+                        CodingAgentConfigValue::String("read-only".to_string()),
+                    )]),
+                ),
+                &projects,
+            )
+            .error
+            .is_none());
+        assert_eq!(
+            wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal()).state,
+            CodingAgentRunState::Completed
+        );
+        assert_eq!(
+            received_config_ids(&wire_log(&temp)),
+            vec![
+                "model".to_string(),
+                "reasoning_effort".to_string(),
+                "mode".to_string(),
+                "model".to_string(),
+                "reasoning_effort".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn global_forced_config_is_multi_provider_admission_policy() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe.clone(), args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        cfg.agents.push(AcpAgentConfig {
+            id: "limited".to_string(),
+            name: "Limited".to_string(),
+            executable: exe,
+            args: vec!["end".to_string()],
+            env_from_env: BTreeMap::new(),
+            allowed_config_options: vec!["mode".to_string()],
+        });
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+
+        let supported_run = "wc_agent_run_forcedmultiok";
+        assert!(manager
+            .handle(
+                start_request_for_provider(
+                    &manager,
+                    &root,
+                    supported_run,
+                    "codex",
+                    BTreeMap::new(),
+                ),
+                &projects,
+            )
+            .error
+            .is_none());
+        assert_eq!(
+            wait_for_snapshot(&manager, supported_run, |snapshot| snapshot
+                .state
+                .terminal())
+            .state,
+            CodingAgentRunState::Completed
+        );
+        let prompts_after_supported = received_methods(&wire_log(&temp))
+            .iter()
+            .filter(|method| method.as_str() == "session/prompt")
+            .count();
+        assert_eq!(prompts_after_supported, 1);
+
+        let limited_run = "wc_agent_run_forcedmultifail";
+        assert!(manager
+            .handle(
+                start_request_for_provider(
+                    &manager,
+                    &root,
+                    limited_run,
+                    "limited",
+                    BTreeMap::new(),
+                ),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal =
+            wait_for_snapshot(&manager, limited_run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_not_advertised")
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            1,
+            "unsupported provider must fail before prompt dispatch"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn forced_boolean_config_is_applied_before_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "feature_flag".to_string(),
+            CodingAgentConfigValue::Bool(true),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedbool0001";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Completed);
+        assert_eq!(
+            received_config_ids(&wire_log(&temp)),
+            vec!["feature_flag".to_string()]
+        );
+        let log = wire_log(&temp);
+        let set = log
+            .iter()
+            .filter_map(|entry| entry.get("recv"))
+            .find(|recv| {
+                recv.get("method").and_then(Value::as_str) == Some("session/set_config_option")
+            })
+            .unwrap();
+        assert_eq!(
+            set.pointer("/params/type").and_then(Value::as_str),
+            Some("boolean")
+        );
+        assert_eq!(
+            set.pointer("/params/value").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn duplicate_forced_config_id_fails_closed_without_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_duplicate");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "feature_flag".to_string(),
+            CodingAgentConfigValue::Bool(true),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedduplicate01";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_invalid")
+        );
+        assert!(received_config_ids(&wire_log(&temp)).is_empty());
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn illegal_forced_select_value_fails_without_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "forced_configs");
+        let mut cfg = fake_config(exe, args);
+        cfg.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("not-advertised-model".to_string()),
+        );
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_forcedinvalid01";
+        assert!(manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects,
+            )
+            .error
+            .is_none());
+        let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(terminal.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            terminal
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_forced_config_invalid")
+        );
+        assert!(received_config_ids(&wire_log(&temp)).is_empty());
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
                 .count(),
             0
         );
@@ -5394,6 +6104,7 @@ for line in sys.stdin:
         let cfg = AcpConfig {
             max_concurrent_runs: 1,
             permission_timeout_secs: 3,
+            forced_config: BTreeMap::new(),
             agents: vec![AcpAgentConfig {
                 id: "codex".to_string(),
                 name: "Codex ACP dogfood".to_string(),
@@ -5561,6 +6272,7 @@ for line in sys.stdin:
         let cfg = AcpConfig {
             max_concurrent_runs: manager.max_concurrent_runs,
             permission_timeout_secs: 1,
+            forced_config: manager.forced_config.clone(),
             agents: manager
                 .providers
                 .values()

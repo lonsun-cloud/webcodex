@@ -1,5 +1,5 @@
 use crate::activity::ActivityLog;
-use crate::process::{ProcessKind, ProcessSupervisor};
+use crate::process::{ProcessKey, ProcessSupervisor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,11 +119,11 @@ async fn desktop_owned_group_kills_descendant_without_touching_unrelated_process
     let activity = ActivityLog::default();
     let mut supervisor = ProcessSupervisor::new(activity);
     supervisor
-        .spawn_owned(ProcessKind::LocalServer, owned, false)
+        .spawn_owned(ProcessKey::LocalServer, owned, false)
         .await
         .expect("spawn Desktop-owned process group");
     let root_pid = supervisor
-        .snapshot(ProcessKind::LocalServer)
+        .snapshot(ProcessKey::LocalServer)
         .and_then(|snapshot| snapshot.pid)
         .expect("owned root pid");
 
@@ -138,7 +138,7 @@ async fn desktop_owned_group_kills_descendant_without_touching_unrelated_process
     assert!(process_exists(descendant_pid));
     assert!(process_exists(control_pid));
 
-    supervisor.stop(ProcessKind::LocalServer).await;
+    supervisor.stop(ProcessKey::LocalServer).await;
 
     wait_for_process_exit(root_pid).await;
     wait_for_process_exit(descendant_pid).await;
@@ -165,7 +165,7 @@ async fn respawn_reclaims_descendants_from_a_terminal_previous_generation() {
     let activity = ActivityLog::default();
     let mut supervisor = ProcessSupervisor::new(activity);
     supervisor
-        .spawn_owned(ProcessKind::LocalServer, previous, false)
+        .spawn_owned(ProcessKey::LocalServer, previous, false)
         .await
         .expect("spawn previous Desktop-owned generation");
     let descendant_pid = wait_for_pid(&marker).await;
@@ -174,7 +174,7 @@ async fn respawn_reclaims_descendants_from_a_terminal_previous_generation() {
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
         let terminal = supervisor
-            .snapshot(ProcessKind::LocalServer)
+            .snapshot(ProcessKey::LocalServer)
             .is_some_and(|snapshot| {
                 matches!(
                     snapshot.phase,
@@ -194,12 +194,12 @@ async fn respawn_reclaims_descendants_from_a_terminal_previous_generation() {
     let mut replacement = Command::new("/bin/sleep");
     replacement.arg("60");
     supervisor
-        .spawn_owned(ProcessKind::LocalServer, replacement, false)
+        .spawn_owned(ProcessKey::LocalServer, replacement, false)
         .await
         .expect("spawn replacement Desktop-owned generation");
 
     wait_for_process_exit(descendant_pid).await;
-    supervisor.stop(ProcessKind::LocalServer).await;
+    supervisor.stop(ProcessKey::LocalServer).await;
     let _ = std::fs::remove_file(marker);
 }
 
@@ -216,10 +216,18 @@ async fn regular_tunnel_stop_observes_stdin_eof_before_group_termination() {
     let activity = ActivityLog::default();
     let mut supervisor = ProcessSupervisor::new(activity);
     supervisor
-        .spawn_owned(ProcessKind::RegularTunnel, command, false)
+        .spawn_owned(
+            ProcessKey::RegularTunnel(crate::connection_id::TunnelProfileId::DEFAULT),
+            command,
+            false,
+        )
         .await
         .expect("start EOF fixture");
-    supervisor.stop(ProcessKind::RegularTunnel).await;
+    supervisor
+        .stop(ProcessKey::RegularTunnel(
+            crate::connection_id::TunnelProfileId::DEFAULT,
+        ))
+        .await;
 
     assert!(
         marker.is_file(),

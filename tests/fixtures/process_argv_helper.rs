@@ -159,6 +159,16 @@ fn main() {
                 println!("{}:{value}", value.len());
             }
         }
+        // Canonical validation argv for the isolated Job stdin fixture. Tests
+        // copy this executable to cargo[.exe]; no real Cargo command runs here.
+        Some("fmt" | "check") => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            if !input.is_empty() {
+                std::process::exit(9);
+            }
+            println!("JOB_STDIN_EOF");
+        }
         Some("stdin") => {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).unwrap();

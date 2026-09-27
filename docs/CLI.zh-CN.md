@@ -135,23 +135,9 @@ Runner 配置术语中，`project_registry_dir` 是 Project registry TOML 文件
 `--json` 与 `--strict`。优先使用 `--token-file`；`--token` 容易泄露到 shell
 历史或进程列表。`--strict` 会让 FAIL 报告以状态码 2 退出。
 
-### 审查（本地决策）
+### 审查与 runtime activity
 
-| 命令 | 用途 |
-| --- | --- |
-| `webcodex task list` | 列出当前项目的近期任务 |
-| `webcodex task show <id>` | 显示任务的结果、审批与时间线 |
-| `webcodex task accept <id>` | 把已审查的结果应用到 checkout |
-| `webcodex task reject <id> [reason]` | 拒绝稳定结果；reason 会到达模型 |
-| `webcodex task resume <id>` | runtime 重启后恢复保留的运行 |
-| `webcodex task guide <id> <message>` | 向运行中的任务发送纠偏指引 |
-| `webcodex task approve <id> <approval> [reason]` | 批准某条原始命令使用一次 |
-| `webcodex task deny <id> <approval> [reason]` | 拒绝；reason 会显示给模型 |
-| `webcodex task activity` | 显示近期变更性工具执行（workspace ledger） |
-
-`task` 命令默认作用于当前项目；可用 `--root PATH`、`--profile NAME` 或
-`--state-dir PATH` 指向其他项目。Accept 与 Reject 是人工在本地应用或丢弃 coding
-结果的两种方式——在线模型永远不能接受自己的工作。
+旧 `webcodex task` namespace 已随独立 Connector Task/Result/Approval lifecycle 删除。`webcodex run` 会输出 Runtime Console 地址（`/runtime`）。现在的 review 使用 canonical Workflow Session、Job、Git/diff、`show_changes` 与 `finish_coding_task`，不再有 host-side result accept/reject queue。
 
 ### 凭据与账号
 
@@ -190,7 +176,6 @@ credential；admin token management 也使用相同的 plural namespace。
 - **Server** —— 认证调用方、保存共享 runtime 状态并路由工作。
 - **Runner** —— 在持有代码的机器上执行仓库工作。
 - **Project** —— 由 Runner 注册的一个仓库/工作区。
-- **Task** —— 一个可审查的有界 project-first 工作单元。
 - **Job** —— 发起调用返回后仍继续运行的命令或 validation。
 - **Workflow Session** —— runtime 用于 coding evidence/continuity 的有界状态。普通用户通常不需要管理其内部协议字段。
 
@@ -206,7 +191,7 @@ WebCodex 把 bootstrap 管理、账号接入、runtime API 访问与 Runner 连�
 | --- | --- | --- | --- | --- |
 | Server bootstrap token | （env `WEBCODEX_TOKEN`） | `webcodex server init` | server/admin 设置、建用户、pairing | GPT Actions、MCP、Runner、日常使用 |
 | 共享 key | `wck_...` | `webcodex connect`（一次性生成） | hosted shared-key 的 MCP + Runner | 生产 IAM |
-| Project Credential | （私有文件） | `webcodex setup` | 单个项目的 Connector + Runner | 其他项目、admin |
+| Project Credential | （私有文件） | `webcodex setup` | 一个 ProjectGrant 的普通 runtime API/MCP 访问 | 其它 ProjectGrant、admin、Runner transport |
 | Account credential | `wc_acct_...` | `webcodex users create --issue-credential` | 本地创建令牌 | GPT Actions、MCP、Runner |
 | 个人 API 令牌（PAT） | `wc_pat_...` | `webcodex tokens create-local` | GPT Actions、MCP、REST API | Runner 连接 |
 | Runner 令牌 | `wc_agent_...` | `webcodex runner-tokens create-local` | 仅 `webcodex-runner` 传输 | MCP、REST、GPT Actions |
@@ -246,11 +231,8 @@ Local/manual project-bound 工作流（高级/诊断）：
 ```bash
 webcodex setup
 webcodex doctor
-webcodex run          # 保持该终端打开
+webcodex run          # 保持该终端打开；输出会指向 /runtime
 webcodex status       # 在另一个终端
-webcodex task list
-webcodex task show <task-id>
-webcodex task accept <task-id>
 ```
 
 已有 hosted Server：

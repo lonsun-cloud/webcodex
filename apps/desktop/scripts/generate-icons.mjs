@@ -4,13 +4,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const source = resolve(root, "..", "..", "frontend", "src", "ui", "brand-mark.svg");
 const cache = join(root, "node_modules", ".cache");
 mkdirSync(cache, { recursive: true });
 const output = mkdtempSync(join(cache, "desktop-icons-"));
 try {
   execFileSync(process.execPath, [
     join(root, "node_modules", "@tauri-apps", "cli", "tauri.js"),
-    "icon", join(root, "src", "assets", "app-icon.png"), "--output", output,
+    "icon", source, "--output", output,
   ], { cwd: root, stdio: "inherit" });
   for (const name of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico"]) {
     copyFileSync(join(output, name), join(root, "src-tauri", "icons", name));
@@ -31,6 +32,7 @@ try {
   }
 
   copyFileSync(join(output, "128x128.png"), join(root, "src", "assets", "brand.png"));
+  copyFileSync(join(output, "ios", "AppIcon-512@2x.png"), join(root, "src", "assets", "app-icon.png"));
 } finally {
   rmSync(output, { recursive: true, force: true });
 }

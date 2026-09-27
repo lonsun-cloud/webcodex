@@ -9,7 +9,7 @@ use super::state::{
 };
 use super::{
     clamp_grace, job_recovery_grace_secs, now_ts, RunnerRegistry, RUNNER_ONLINE_WINDOW_SECS,
-    JOB_RECOVERY_GRACE_SECS, LIVE_JOB_STREAM_RETENTION_BYTES,
+    JOB_RECOVERY_GRACE_MAX_SECS, JOB_RECOVERY_GRACE_SECS, LIVE_JOB_STREAM_RETENTION_BYTES,
 };
 use webcodex_core::runner_operation::{
     RunnerInvocationMetadata, RunnerJobOperation, RunnerOperation,
@@ -19,17 +19,19 @@ use crate::runner_protocol::{
     RunnerProjectSummary, RunnerRequest, RunnerCapabilities,
     RunnerRegisterRequest, ShellCommandExecutionState, ShellJobContext, ShellJobInventory,
     ShellJobLogSnapshot, ShellJobOpRequest, ShellJobSnapshot, ShellJobStreamSnapshot,
-    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    ShellJobTestCountEvidence, ShellJobValidationMetadata, ShellJobValidationProgress,
+    ShellJobValidationStep,
     ShellProcessArgv, ShellScriptLanguage, ShellScriptPayload, JOB_INVENTORY_MAX_TERMINAL_JOBS,
-    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
+    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, PROCESS_TIMEOUT_MAX_SECS,
 };
+use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
 const CLIENT_ID: &str = "oe";
 const INSTANCE_A: &str = "instance-reconcile-a";
 const INSTANCE_B: &str = "instance-reconcile-b";
 const PROJECT_ID: &str = "demo";
 const RUNTIME_PROJECT_ID: &str = "agent:oe:demo";
-const SESSION_ID: &str = "wc_sess_job_reconciliation";
+const SESSION_ID: &str = "wc_sess_QGd6iAa67eC56FwA";
 
 fn reconciliation_capabilities() -> RunnerCapabilities {
     RunnerCapabilities {
@@ -42,6 +44,8 @@ fn reconciliation_capabilities() -> RunnerCapabilities {
         structured_validation_argv: true,
         structured_cargo_test_count_assertion: true,
         structured_cargo_test_execution_policy: true,
+        structured_cargo_test_lib: true,
+        structured_cargo_check_packages: true,
         job_state_reconciliation: true,
         coding_agent_runs: false,
         ..Default::default()
@@ -60,6 +64,8 @@ fn project_summary() -> RunnerProjectSummary {
         hooks: Vec::new(),
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: Some("main".to_string()),
         git_head: None,
         git_dirty: None,
@@ -104,6 +110,7 @@ async fn register(registry: &RunnerRegistry, instance: &str, inventory: ShellJob
 
 fn start_request(command: &str) -> ShellJobOpRequest {
     ShellJobOpRequest {
+        login: false,
         op: "start".to_string(),
         client_id: Some(CLIENT_ID.to_string()),
         cwd: Some("/srv/demo".to_string()),
@@ -137,6 +144,7 @@ fn cargo_validation_start_metadata(
         shell: Some("direct_argv".to_string()),
         validation_steps: vec![step.clone()],
         validation: Some(ShellJobValidationMetadata {
+            source_fence: None,
             tool: "cargo_test".to_string(),
             kind: "test".to_string(),
             steps: vec![step],
@@ -147,6 +155,58 @@ fn cargo_validation_start_metadata(
             minimum_tests,
             require_tests,
             no_run,
+        }),
+        visibility: ShellJobVisibility::Public,
+        ..Default::default()
+    }
+}
+
+fn cargo_lib_validation_start_metadata() -> ShellJobStartMetadata {
+    let mut metadata = cargo_validation_start_metadata(None, None, None);
+    for step in &mut metadata.validation_steps {
+        step.args.push("--lib".to_string());
+    }
+    if let Some(validation) = metadata.validation.as_mut() {
+        for step in &mut validation.steps {
+            step.args.push("--lib".to_string());
+        }
+    }
+    metadata
+}
+
+fn multi_package_cargo_check_start_metadata() -> ShellJobStartMetadata {
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec![
+            "check".to_string(),
+            "--all-targets".to_string(),
+            "-p".to_string(),
+            "package-a".to_string(),
+            "-p".to_string(),
+            "package-b".to_string(),
+        ],
+        env: Vec::new(),
+    };
+    ShellJobStartMetadata {
+        project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+        session_id: Some(SESSION_ID.to_string()),
+        project_cwd: Some("/srv/demo".to_string()),
+        purpose: Some("validation".to_string()),
+        shell: Some("direct_argv".to_string()),
+        validation_steps: vec![step.clone()],
+        validation: Some(ShellJobValidationMetadata {
+            source_fence: None,
+            tool: "cargo_check".to_string(),
+            kind: "check".to_string(),
+            steps: vec![step],
+            effective_timeout_secs: 600,
+            sync_wait_secs: 1,
+            adapter: "cargo_check".to_string(),
+            validation_target_id: Some("target:1123456789abcdef01234567".to_string()),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
         }),
         visibility: ShellJobVisibility::Public,
         ..Default::default()
@@ -232,6 +292,7 @@ fn snapshot_from_request(
         stdout,
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
     }
 }
@@ -253,14 +314,13 @@ fn update(
         status: status.to_string(),
         stdout_chunk: stdout_chunk.map(str::to_string),
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: finished.then_some(0),
         duration_ms: finished.then_some(2_000),
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished,
     }
@@ -411,8 +471,6 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
             status: status.to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: finished.then_some(0),
             duration_ms: finished.then_some(2_000),
@@ -423,6 +481,7 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
                 current_step: current_step.map(str::to_string),
                 failed_step: None,
             }),
+            test_count_evidence: None,
             activity,
             finished,
         }
@@ -539,6 +598,52 @@ async fn old_count_capable_runner_fails_closed_on_explicit_cargo_execution_polic
 }
 
 #[tokio::test]
+async fn old_structured_runner_fails_closed_on_cargo_test_lib_selector() {
+    let registry = RunnerRegistry::default();
+    let mut registration = register_request(INSTANCE_A, empty_inventory());
+    registration.capabilities.structured_cargo_test_lib = false;
+    assert!(registration.capabilities.structured_validation_argv);
+    registry.register(registration).await.unwrap();
+
+    let error = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            cargo_lib_validation_start_metadata(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("structured_cargo_test_lib_unavailable"),
+        "error={error}"
+    );
+    assert!(registry.list_jobs(Some(100)).await.is_empty());
+}
+
+#[tokio::test]
+async fn old_structured_runner_fails_closed_on_multi_package_cargo_check() {
+    let registry = RunnerRegistry::default();
+    let mut registration = register_request(INSTANCE_A, empty_inventory());
+    registration.capabilities.structured_cargo_check_packages = false;
+    assert!(registration.capabilities.structured_validation_argv);
+    registry.register(registration).await.unwrap();
+
+    let error = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            multi_package_cargo_check_start_metadata(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("structured_cargo_check_packages_unavailable"),
+        "error={error}"
+    );
+    assert!(registry.list_jobs(Some(100)).await.is_empty());
+}
+
+#[tokio::test]
 async fn cargo_execution_policy_survives_inventory_roundtrip_and_server_restart() {
     let registry_a = RunnerRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
@@ -612,6 +717,7 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
                 shell: Some("direct_argv".to_string()),
                 validation_steps: vec![step.clone()],
                 validation: Some(ShellJobValidationMetadata {
+                    source_fence: None,
                     tool: "cargo_test".to_string(),
                     kind: "test".to_string(),
                     steps: vec![step],
@@ -650,21 +756,21 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
     let mut snapshot = snapshot_from_request(
         &job,
         &request,
-        "running",
+        "completed",
         2,
-        stream("running 4 tests\n", 1, false),
+        stream("retained tail after truncation\n", 42, true),
     );
     snapshot.validation_progress = Some(ShellJobValidationProgress {
-        completed: 0,
-        current_step: Some("test".to_string()),
+        completed: 1,
+        current_step: None,
         failed_step: None,
     });
-    snapshot.activity = Some(crate::runner_protocol::ShellJobActivity {
-        state: crate::runner_protocol::ShellJobActivityState::Working,
-        phase: crate::runner_protocol::ShellJobActivityPhase::ValidationTest,
-        source: crate::runner_protocol::ShellJobActivitySource::ValidationPlan,
+    snapshot.test_count_evidence = Some(ShellJobTestCountEvidence {
+        tests_detected: true,
+        tests_run_count: Some(6),
+        status: CargoTestCountEvidenceStatus::CompleteSummary,
     });
-    let expected_activity = snapshot.activity;
+    let expected_evidence = snapshot.test_count_evidence.clone();
     let inventory: ShellJobInventory = serde_json::from_value(
         serde_json::to_value(ShellJobInventory {
             active_complete: true,
@@ -682,8 +788,10 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
         restored_validation.validation_target_id.as_deref(),
         Some(target)
     );
-    assert_eq!(restored.status, "running");
-    assert_eq!(restored.activity, expected_activity);
+    assert_eq!(restored.status, "completed");
+    assert!(restored.stdout_log_truncated);
+    assert_eq!(restored.stdout_retained_from_line, Some(42));
+    assert_eq!(restored.test_count_evidence, expected_evidence);
     assert!(restored.recovered_after_server_restart);
 }
 
@@ -702,6 +810,7 @@ async fn reconciliation_rejects_cross_product_first_class_go_test_metadata() {
     snapshot.context.purpose = Some("validation".to_string());
     snapshot.context.validation_steps = vec!["test".to_string()];
     snapshot.context.validation = Some(ShellJobValidationMetadata {
+        source_fence: None,
         tool: "go_test".to_string(),
         kind: "test".to_string(),
         steps: vec![cargo_step],
@@ -777,13 +886,56 @@ async fn job_reconciliation_server_restart_restores_running_job_and_completion()
 }
 
 #[tokio::test]
+async fn long_process_terminal_wait_horizon_covers_execution_recovery_and_retention() {
+    let registry = RunnerRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let mut request = start_request("");
+    request.timeout_secs = Some(PROCESS_TIMEOUT_MAX_SECS);
+    let job = registry
+        .start_job_with_metadata(
+            request,
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("operation".to_string()),
+                shell: Some("direct_argv".to_string()),
+                visibility: ShellJobVisibility::Public,
+                structured_execution: Some(StructuredJobExecution::Process(ShellProcessArgv {
+                    executable: "/bin/echo".to_string(),
+                    args: vec!["long".to_string()],
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let before = now_ts();
+    let snapshot = registry
+        .job_terminal_registration_snapshot_for_auth(None, &job.job_id)
+        .await
+        .unwrap();
+    let after = now_ts();
+    let expected_horizon = PROCESS_TIMEOUT_MAX_SECS as i64
+        + JOB_RECOVERY_GRACE_MAX_SECS
+        + JOB_TERMINAL_RETENTION_SECS;
+    assert!(snapshot.wait_expires_at >= before + expected_horizon);
+    assert!(snapshot.wait_expires_at <= after + expected_horizon);
+    assert_eq!(expected_horizon, 694_800);
+}
+
+#[tokio::test]
 async fn structured_process_reconciliation_restores_active_and_terminal_evidence_without_redispatch(
 ) {
     let registry_a = RunnerRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
+    let mut long_request = start_request("");
+    long_request.timeout_secs = Some(21_600);
     let job = registry_a
         .start_job_with_metadata(
-            start_request(""),
+            long_request,
             "tester".to_string(),
             ShellJobStartMetadata {
                 project_id: Some(RUNTIME_PROJECT_ID.to_string()),
@@ -814,6 +966,7 @@ async fn structured_process_reconciliation_restores_active_and_terminal_evidence
         .unwrap()
         .expect("typed process Job request");
     assert_eq!(request.kind, "start_process_job");
+    assert_eq!(request.timeout_secs, 21_600);
     assert_eq!(request.command, "");
     assert!(request.process.is_some());
     assert!(request.script.is_none());
@@ -1079,6 +1232,41 @@ async fn typescript_structured_job_start_requires_additive_runner_capability() {
         request.script.as_ref().map(|script| script.language),
         Some(ShellScriptLanguage::Typescript)
     );
+}
+
+#[tokio::test]
+async fn python_script_job_requires_additive_runner_capability() {
+    let registry = RunnerRegistry::default();
+    let mut old_runner = register_request(INSTANCE_A, empty_inventory());
+    old_runner.capabilities.structured_script_payload = true;
+    old_runner.capabilities.structured_execution_jobs = true;
+    old_runner.capabilities.structured_script_python = false;
+    registry.register(old_runner).await.unwrap();
+    let metadata = || ShellJobStartMetadata {
+        project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+        session_id: Some(SESSION_ID.to_string()),
+        project_cwd: Some("/srv/demo".to_string()),
+        purpose: Some("operation".to_string()),
+        shell: Some("python".to_string()),
+        visibility: ShellJobVisibility::HiddenUntilHandoff,
+        structured_execution: Some(StructuredJobExecution::Script(ShellScriptPayload {
+            language: ShellScriptLanguage::Python,
+            script: "print('雪')\n".to_string(),
+            args: vec!["two words".to_string()],
+        })),
+        ..Default::default()
+    };
+    let error = registry.start_job_with_metadata(start_request(""), "tester".to_string(), metadata()).await.unwrap_err();
+    assert!(error.contains("structured_script_python"), "{error}");
+    assert!(registry.poll(RunnerPollRequest {client_id: CLIENT_ID.to_string(), runner_instance_id: INSTANCE_A.to_string()}).await.unwrap().is_none());
+
+    let mut upgraded = register_request(INSTANCE_A, empty_inventory());
+    upgraded.capabilities.structured_script_python = true;
+    registry.register(upgraded).await.unwrap();
+    let job = registry.start_job_with_metadata(start_request(""), "tester".to_string(), metadata()).await.unwrap();
+    let request = registry.poll(RunnerPollRequest {client_id: CLIENT_ID.to_string(), runner_instance_id: INSTANCE_A.to_string()}).await.unwrap().unwrap();
+    assert_eq!(request.job_id.as_deref(), Some(job.job_id.as_str()));
+    assert_eq!(request.script.unwrap().language, ShellScriptLanguage::Python);
 }
 
 #[tokio::test]
@@ -1791,10 +1979,14 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_runner_owner: None,
                 expected_project_id: None,
                 expected_project_cwd: None,
+                expected_project_runner_instance_id: None,
                 expected_mcp_gateway_runner_instance_id: None,
                 expected_ssh_resource_runner_instance_id: None,
                 expected_runner_config_runner_instance_id: None,
-                skill_store_fence: None,
+                expected_instruction_runner_instance_id: None,
+                skill_fence: None,
+                enqueued_at: std::time::Instant::now(),
+                dispatched_transport: Some(crate::RunnerTransport::Polling),
                 dispatched: true,
                 expected_mcp_gateway_provider_id: None,
                 expected_mcp_gateway_provider_instance_id: None,
@@ -1813,10 +2005,14 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_runner_owner: None,
                 expected_project_id: None,
                 expected_project_cwd: None,
+                expected_project_runner_instance_id: None,
                 expected_mcp_gateway_runner_instance_id: None,
                 expected_ssh_resource_runner_instance_id: None,
                 expected_runner_config_runner_instance_id: None,
-                skill_store_fence: None,
+                expected_instruction_runner_instance_id: None,
+                skill_fence: None,
+                enqueued_at: std::time::Instant::now(),
+                dispatched_transport: None,
                 dispatched: false,
                 expected_mcp_gateway_provider_id: None,
                 expected_mcp_gateway_provider_instance_id: None,
@@ -2513,6 +2709,7 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
     }
 }
@@ -2653,6 +2850,8 @@ async fn reconciliation_summary_counts_inventory_effects_without_payload_data() 
             INSTANCE_A,
             None,
             registry.observation_epoch.clone(),
+            None,
+            None,
             &first_inventory,
             now_ts(),
         );
@@ -2680,6 +2879,8 @@ async fn reconciliation_summary_counts_inventory_effects_without_payload_data() 
         INSTANCE_A,
         None,
         registry.observation_epoch.clone(),
+        None,
+        None,
         &second_inventory,
         now_ts(),
     );
@@ -3501,3 +3702,6 @@ async fn sweep_only_transitions_expired_jobs_and_leaves_recent_recovering() {
         "non-expired recovering job is left alone by the sweep"
     );
 }
+
+#[path = "job_receipts.rs"]
+mod job_receipts;

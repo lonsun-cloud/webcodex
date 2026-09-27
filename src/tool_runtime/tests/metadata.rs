@@ -4,17 +4,17 @@ use super::super::*;
 use super::support::*;
 use crate::runner_http::RunnerRegistry;
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerRegisterRequest, RunnerResultRequest, ShellProjectInventoryPage,
-    RUNNER_PROTOCOL_GENERATION_V2,
+    RunnerCapabilities, RunnerProjectLineage, RunnerRegisterRequest, RunnerResultRequest,
+    ShellProjectInventoryPage, RUNNER_PROTOCOL_GENERATION_V2,
 };
 use crate::tool_runtime::kernel::{
     HostFileImportTrust, ToolCallContext, ToolCallErrorStatus, ToolCallRequest,
     ToolProtocolCapabilities, ToolTransport,
 };
-use crate::tool_runtime::sessions::{
-    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+use crate::tool_runtime::project_resolution::{
+    ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
-use crate::tool_runtime::TOOL_CALL_WRAPPER_FIELDS;
+use crate::tool_runtime::tool_call::ComputerObserveToolCall;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -282,6 +282,32 @@ async fn register_pointer_target_for_auth(
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn computer_gateway_rejects_missing_exact_action_capability_before_dispatch() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("computer-capability-fence");
+    register_pointer_target_for_auth(&runtime, "pointer-only", "Pointer Only", &auth).await;
+
+    let result = runtime
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+                client_id: "pointer-only".to_string(),
+                display_id: "display_iavN7wEjRWeJq83v".to_string(),
+                max_width: None,
+                max_height: None,
+            }),
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("computer_display_observe"));
+}
+
 async fn register_clipboard_target_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -348,6 +374,8 @@ async fn register_agent_projects_for_auth(
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
                         shell: true,
+                        explicit_shell_selection: false,
+                        bash_login_shell: false,
                         file_read: true,
                         file_write: true,
                         artifact_export_chunk_read: false,
@@ -355,10 +383,11 @@ async fn register_agent_projects_for_auth(
                         structured_file_delete: false,
                         apply_text_edit_occurrence: false,
                         apply_text_edit_line_scope: false,
+                        apply_text_edit_expected_match_count: false,
+                        apply_text_edit_local_guard_without_sha: false,
                         apply_patch: false,
                         apply_patch_match_metadata: false,
                         apply_patch_matching_mode: false,
-                        apply_patch_strict_matching: false,
                         git: true,
                         jobs: true,
                         async_jobs: true,
@@ -369,6 +398,8 @@ async fn register_agent_projects_for_auth(
                         structured_validation_argv: true,
                         structured_cargo_test_count_assertion: true,
                         structured_cargo_test_execution_policy: true,
+                        structured_cargo_test_lib: true,
+                        structured_cargo_check_packages: true,
                         structured_go_test_json: true,
                         structured_go_test_tool: true,
                         structured_go_test_packages: true,
@@ -376,6 +407,7 @@ async fn register_agent_projects_for_auth(
                         structured_script_payload: false,
                         structured_script_javascript: false,
                         structured_script_typescript: false,
+                        structured_script_python: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -384,9 +416,12 @@ async fn register_agent_projects_for_auth(
                         project_lifecycle: false,
                         project_path_registration: false,
                         managed_worktree: false,
-                        configured_skill_roots_read: false,
-                        skill_store_read: false,
-                        skill_store_manage: false,
+                        skill_runtime: false,
+                        skill_resource_execution: false,
+                        skill_management: false,
+                        browser_observe: false,
+                        browser_control: false,
+                        browser_launch: false,
                         computer_observe: false,
                         computer_application_discovery: false,
                         computer_application_launch: false,
@@ -407,6 +442,7 @@ async fn register_agent_projects_for_auth(
                         native_tool_plugins: false,
                         managed_ssh_resources: false,
                         runner_config_control: false,
+                        instruction_runtime: false,
                     },
                 ),
                 policy: None,
@@ -703,13 +739,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "agent:client-a:proj-a".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bridge_a),
                 )
@@ -732,13 +772,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&bridge_a),
         )
@@ -762,13 +806,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&bridge_b),
         )
@@ -795,13 +843,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "agent:client-open:proj-open".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&open),
                 )
@@ -855,13 +907,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&open),
         )
@@ -891,13 +947,17 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&shared_a),
         )
@@ -907,19 +967,274 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-open:proj-open".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&shared_a),
         )
         .await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "unknown_project");
+}
+
+#[tokio::test]
+async fn repository_knowledge_association_revalidates_identity_availability_and_authority() {
+    let runtime = test_runtime();
+    let auth = bootstrap_auth();
+    let client_id = "repo-association";
+    let instance_id = format!("inst-{client_id}");
+    let target_path = "/tmp/repo-association-target";
+    let source_path = "/tmp/repo-association-source";
+    let source_fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let target_fingerprint = format!("wc_projroot_{}", "2".repeat(64));
+    let base_sha = "a".repeat(40);
+    let caps = RunnerCapabilities {
+        shell: true,
+        file_read: true,
+        file_write: true,
+        ..Default::default()
+    };
+
+    let mut source = registered_project("source", source_path);
+    source.root_fingerprint = Some(source_fingerprint.clone());
+    source.allow_patch = true;
+    let mut target = registered_project("target", target_path);
+    target.root_fingerprint = Some(target_fingerprint);
+    target.allow_patch = false;
+    target.lineage = Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id: "source".to_string(),
+        source_root_fingerprint: source_fingerprint.clone(),
+        base_sha: base_sha.clone(),
+    });
+    register_agent_projects(
+        &runtime,
+        client_id,
+        None,
+        caps.clone(),
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+
+    let target_id = crate::tool_runtime::runner_project_runtime_id(client_id, "target");
+    let resolved_target = runtime
+        .resolve_project_input_for_auth(&target_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(resolved_target.config.path, target_path);
+    assert!(
+        !resolved_target.config.allow_patch,
+        "source allow_patch must not elevate target"
+    );
+    let available = runtime
+        .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+        .await;
+    let ProjectKnowledgeSourceResolution::Available(available) = available else {
+        panic!("expected available knowledge source");
+    };
+    assert_eq!(
+        available.source.resolved_id,
+        "agent:repo-association:source"
+    );
+    assert_eq!(available.source.config.path, source_path);
+    assert_eq!(
+        available.source.root_fingerprint.as_deref(),
+        Some(source_fingerprint.as_str())
+    );
+    assert_eq!(available.base_sha, base_sha);
+    let diagnostic = runtime
+        .project_knowledge_association_diagnostic(&resolved_target, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(diagnostic["kind"], "managed_worktree_source");
+    assert_eq!(diagnostic["status"], "available");
+    assert_eq!(
+        diagnostic["source_project"],
+        "agent:repo-association:source"
+    );
+    assert_eq!(diagnostic["base_sha"], base_sha);
+    assert_eq!(diagnostic["read_through"], false);
+    let diagnostic_text = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!diagnostic_text.contains(source_path));
+    assert!(!diagnostic_text.contains(&source_fingerprint));
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&available.source, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::NotAssociated
+    ));
+    assert!(runtime
+        .project_knowledge_association_diagnostic(&available.source, Some(&auth))
+        .await
+        .is_none());
+
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::SourceUnavailable
+        )
+    ));
+    let unavailable_diagnostic = runtime
+        .project_knowledge_association_diagnostic(&resolved_target, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(unavailable_diagnostic["status"], "unavailable");
+    assert!(unavailable_diagnostic.get("source_project").is_none());
+    assert!(unavailable_diagnostic.get("base_sha").is_none());
+    let target_still_resolves = runtime
+        .resolve_project_input_for_auth(&target_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(target_still_resolves.config.path, target_path);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let target_id = target_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        login: false,
+                        project: target_id,
+                        command: "pwd".to_string(),
+                        session_id: None,
+                        timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = wait_for_runner_request_for_instance(&runtime, client_id, &instance_id).await;
+    assert_eq!(request.cwd.as_deref(), Some(target_path));
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        client_id,
+        &instance_id,
+        &request.request_id,
+        0,
+        "ok\n",
+        "",
+    )
+    .await;
+    assert!(
+        task.await.unwrap().success,
+        "association failure must not block target execution"
+    );
+
+    source.disabled = true;
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::SourceUnavailable
+        )
+    ));
+
+    source.disabled = false;
+    source.root_fingerprint = Some(format!("wc_projroot_{}", "3".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Stale
+    ));
+
+    source.root_fingerprint = Some(source_fingerprint);
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source, target],
+    )
+    .await;
+    let foreign_auth = shared_key_auth("foreign-repo-association-key");
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&foreign_auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::Unauthorized
+        )
+    ));
+
+    runtime
+        .runner_registry
+        .reconcile_disconnect(client_id, &instance_id)
+        .await;
+    let replacement_instance = "repo-association-replacement";
+    let replacement = runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            client_id: client_id.to_string(),
+            runner_instance_id: replacement_instance.to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: crate::test_support::current_runner_capabilities(caps),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement
+            .project_inventory
+            .as_ref()
+            .map(|status| status.sync_state.as_str()),
+        Some("pending")
+    );
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::InventoryIncomplete
+        )
+    ));
 }
 
 #[tokio::test]
@@ -995,21 +1310,27 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
 
     let pending_calls = vec![
         ToolCall::RunShell {
+            login: false,
             project: project_id.clone(),
             command: "pwd".to_string(),
             session_id: None,
             timeout_secs: Some(30),
+            sync_wait_secs: None,
             cwd: None,
             purpose: None,
             shell: None,
         },
-        ToolCall::ReadFile {
+        ToolCall::ReadFiles {
             project: project_id.clone(),
-            path: "README.md".to_string(),
+            items: vec![crate::tool_runtime::ReadFilesItem {
+                path: "README.md".to_string(),
+                start_line: None,
+                limit: None,
+                expected_read_revision: None,
+            }],
             session_id: None,
-            start_line: None,
-            limit: None,
             with_line_numbers: None,
+            max_result_bytes: None,
         },
         ToolCall::WriteProjectFile {
             project: project_id.clone(),
@@ -1017,7 +1338,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             content: "must not dispatch".to_string(),
             session_id: None,
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         },
         ToolCall::RunJob {
             project: project_id.clone(),
@@ -1075,10 +1396,12 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: project_id,
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1158,10 +1481,12 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
         let result = runtime
             .dispatch_with_auth(
                 ToolCall::RunShell {
+                    login: false,
                     project: project_id.clone(),
                     command: "pwd".to_string(),
                     session_id: None,
                     timeout_secs: Some(30),
+                    sync_wait_secs: None,
                     cwd: None,
                     purpose: None,
                     shell: None,
@@ -1416,10 +1741,12 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: "agent-proj".to_string(),
                         command: "echo hi".to_string(),
                         session_id: None,
                         timeout_secs: Some(1),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1440,6 +1767,8 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
             exit_code: Some(0),
             stdout: Some("hi\n".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -1484,10 +1813,12 @@ async fn runner_capability_rejection_matrix_names_required_capability() {
         let project = agent_test_project_id(client_id);
         let call = match case {
             CapabilityCase::RunShell => ToolCall::RunShell {
+                login: false,
                 project,
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1520,10 +1851,12 @@ async fn runner_tool_unknown_client_returns_unknown_project_error() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: agent_test_project_id("ghost"),
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1641,22 +1974,9 @@ fn runtime_status_input_schema_exposes_compact_flags() {
         .expect("runtime_status agents output description");
     assert!(agents_description.contains("stale_count"));
     assert!(!agents_description.contains("offline_count"));
-    let runtime_exposure_description = output_schema["properties"]["output"]["properties"]
-        ["runtime_exposure"]["description"]
-        .as_str()
-        .expect("runtime_status runtime_exposure output description");
-    for exposure in [
-        crate::model_surface::MODEL_SURFACE_LOCAL_CODING,
-        crate::model_surface::MODEL_SURFACE_ADAPTIVE_RUNTIME,
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR,
-    ] {
-        assert!(
-            runtime_exposure_description.contains(exposure),
-            "runtime_status runtime_exposure output description missing {exposure}"
-        );
-    }
-    assert!(!runtime_exposure_description.contains("canonical_connector"));
+    assert!(output_schema["properties"]["output"]["properties"]
+        .get("runtime_exposure")
+        .is_none());
     let compact_schemas =
         &output_schema["properties"]["output"]["properties"]["mcp_compact_schemas"];
     assert_eq!(compact_schemas["type"], "boolean");
@@ -1676,13 +1996,16 @@ fn runtime_status_input_schema_exposes_compact_flags() {
     );
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
+    let action = &openapi["paths"]["/api/actions/runtime_status"]["post"];
+    assert_eq!(action["operationId"], "runtime_status");
+    let action_properties = action["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]
         .as_object()
-        .expect("ToolCallRequest properties");
+        .unwrap();
     for field in ["compact", "summary_only"] {
         assert!(
-            tool_call_properties.contains_key(field),
-            "ToolCallRequest.properties should expose flattened runtime_status {field}"
+            action_properties.contains_key(field),
+            "runtime_status Action missing {field}"
         );
     }
 }
@@ -1704,7 +2027,7 @@ fn session_handoff_validation_exposure_keeps_read_only_metadata() {
 }
 
 #[test]
-fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
+fn project_overview_metadata_schema_is_read_only() {
     let metadata = crate::tool_runtime::metadata::lookup_tool_metadata("project_overview")
         .expect("project_overview metadata");
     assert_eq!(metadata.provider_id, "agent");
@@ -1733,28 +2056,10 @@ fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
         );
     }
     assert_eq!(spec.input_schema["additionalProperties"], false);
-    let accepted = accepted_flattened_args_for_spec(&spec);
-    for field in ["project", "path", "max_depth", "limit", "session_id"] {
-        assert!(
-            accepted.contains(&field.to_string()),
-            "missing {field}: {accepted:?}"
-        );
-    }
     assert_eq!(spec.annotations["readOnlyHint"], true);
     assert_eq!(spec.annotations["destructiveHint"], false);
     assert_eq!(spec.annotations["idempotentHint"], true);
     assert_eq!(spec.annotations["openWorldHint"], false);
-
-    let openapi = crate::openapi::build_openapi_spec();
-    let action_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .unwrap();
-    for field in ["max_depth", "limit", "path", "project"] {
-        assert!(
-            action_properties.contains_key(field),
-            "missing flattened {field}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -1783,41 +2088,8 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
             tool.get("inputSchema").is_none() && tool.get("outputSchema").is_none(),
             "tool_manifest must stay compact: {tool:?}"
         );
-        assert!(
-            tool["accepted_flattened_args"].is_array(),
-            "tool_manifest entry must expose accepted_flattened_args: {tool:?}"
-        );
         assert_eq!(tool["deprecated_or_unsupported_args"], json!([]));
-        let accepted = tool["accepted_flattened_args"].as_array().unwrap();
-        let tool_name = tool["name"].as_str().unwrap_or("unknown");
-        for &field in TOOL_CALL_EXPECTATION_METADATA_FIELDS {
-            let advertised = accepted.iter().any(|value| value.as_str() == Some(field));
-            let expected = match field {
-                "assertion_name" => {
-                    matches!(
-                        tool_name,
-                        "run_process" | "run_script" | "run_shell" | "run_job"
-                    )
-                }
-                "result_expectation" => matches!(
-                    tool_name,
-                    "run_process"
-                        | "run_script"
-                        | "run_shell"
-                        | "session_shell_exec"
-                        | "cargo_fmt"
-                        | "cargo_check"
-                        | "cargo_test"
-                        | "go_test"
-                ),
-                "accepted_exit_codes" => tool_name == "run_process",
-                _ => false,
-            };
-            assert_eq!(
-                advertised, expected,
-                "{tool_name} manifest expectation-field exposure mismatch for {field}"
-            );
-        }
+        assert!(tool.get("accepted_flattened_args").is_none());
     }
 
     let exact = runtime
@@ -1833,202 +2105,61 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
     assert_eq!(exact.output["contract"]["name"], "run_script");
     assert_eq!(exact.output["contract"]["input_schema"]["type"], "object");
     assert!(exact.output["contract"].get("output_schema").is_none());
-
-    let accepted = |name: &str| -> Vec<String> {
-        tools
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap_or_else(|| panic!("missing manifest tool {name}"))["accepted_flattened_args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap().to_string())
-            .collect()
-    };
-
-    for field in [
-        "category",
-        "intent",
-        "include_recommended_flows",
-        "include_risk_summary",
-        TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    ] {
-        assert!(accepted("tool_manifest").contains(&field.to_string()));
-    }
-    for field in ["summary_only", "category", "features", "limit"] {
-        assert!(accepted("list_tools").contains(&field.to_string()));
-    }
-    for field in ["compact", "summary_only"] {
-        assert!(accepted("runtime_status").contains(&field.to_string()));
-    }
-    for field in [
-        "project",
-        "client_id",
-        "path",
-        "instruction",
-        "include_project_instructions",
-        "include_workflow_guidance",
-        "session_id",
-        TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    ] {
-        assert!(accepted("work_on_project").contains(&field.to_string()));
-    }
-    for field in [
-        "session_id",
-        "include_validation",
-        "include_workspace",
-        "include_checkpoints",
-        "summary_only",
-        "limit",
-    ] {
-        assert!(accepted("session_handoff_summary").contains(&field.to_string()));
-    }
-    for field in [
-        "project",
-        "session_id",
-        "include_diff",
-        "include_hygiene",
-        "include_handoff",
-        "include_workspace",
-        "include_validation_summary",
-        "summary_only",
-    ] {
-        assert!(accepted("finish_coding_task").contains(&field.to_string()));
-    }
-    for field in ["project", "path", "allow_missing", "session_id"] {
-        assert!(accepted("read_project_artifact_metadata").contains(&field.to_string()));
-    }
-    assert!(!accepted("read_project_artifact_metadata")
-        .contains(&"allow_cross_project_session".to_string()));
-    for (tool, fields) in [
-        (
-            "artifact_upload_begin",
-            vec![
-                "project",
-                "path",
-                "expected_bytes",
-                "expected_sha256",
-                "mime_type",
-                "overwrite",
-                "session_id",
-            ],
-        ),
-        (
-            "artifact_upload_chunk",
-            vec![
-                "project",
-                "path",
-                "upload_id",
-                "offset",
-                "content_base64",
-                "session_id",
-            ],
-        ),
-        (
-            "artifact_upload_finish",
-            vec!["project", "path", "upload_id", "session_id"],
-        ),
-        (
-            "artifact_upload_abort",
-            vec!["project", "path", "upload_id", "session_id"],
-        ),
-        ("job_status", vec!["job_id", "include_command_preview"]),
-    ] {
-        let accepted = accepted(tool);
-        for field in fields {
-            assert!(
-                accepted.contains(&field.to_string()),
-                "{tool} missing accepted flattened arg {field}: {accepted:?}"
-            );
-        }
-    }
 }
 
 #[tokio::test]
-async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate() {
+async fn tool_manifest_exact_route_is_parser_ready_for_direct_and_gateway_tools() {
     let runtime = test_runtime();
-    let result = runtime
+
+    let direct = runtime
         .dispatch(ToolCall::ToolManifest {
-            tool_name: None,
+            tool_name: Some("run_shell".to_string()),
             category: None,
             intent: None,
             include_recommended_flows: false,
             include_risk_summary: false,
         })
         .await;
-    assert!(result.success, "{:?}", result.error);
+    assert!(direct.success, "{:?}", direct.error);
+    assert_eq!(direct.output["route"]["primary"]["mode"], "direct");
+    assert_eq!(direct.output["route"]["primary"]["tool"], "run_shell");
+    assert_eq!(direct.output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(
+        direct.output["route"]["fallback"]["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(direct.output["route"]["fallback"]["target"], "run_shell");
+    assert_eq!(
+        direct.output["route"]["fallback"]["when"],
+        "direct_callable_unavailable"
+    );
+    assert_eq!(
+        direct.output["route"]["fallback"]["blocked_when_mcp_apps_enabled"],
+        false
+    );
+    assert_eq!(
+        direct.output["route"]["tool_manifest_registers_host_tool"],
+        false
+    );
+    assert_eq!(direct.output["route"]["discovery_effect"], "none");
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .expect("ToolCallRequest properties");
-    let tools = result.output["tools"]
-        .as_array()
-        .expect("tool_manifest tools");
-    let mut accepted_fields = BTreeSet::new();
-
-    for tool in tools {
-        let tool_name = tool["name"].as_str().expect("tool name");
-        let accepted = tool["accepted_flattened_args"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{tool_name} accepted_flattened_args"));
-        for field in accepted {
-            let field = field
-                .as_str()
-                .unwrap_or_else(|| panic!("{tool_name} accepted field"));
-            accepted_fields.insert(field.to_string());
-            if TOOL_CALL_EXPECTATION_METADATA_FIELDS.contains(&field) {
-                assert!(
-                    !properties.contains_key(field),
-                    "{tool_name} recorder metadata arg {field} must stay out of generic ToolCallRequest.properties"
-                );
-                continue;
-            }
-            assert!(
-                properties.contains_key(field),
-                "{tool_name} advertises flattened arg {field}, but ToolCallRequest.properties does not declare it"
-            );
-        }
-    }
-
-    for field in [
-        "temporary_project_name",
-        "deny_write_tools",
-        "deny_shell_tools",
-        "detail",
-        "resume_session_id",
-        "bind_current",
-        "new_session",
-    ] {
-        assert!(
-            !accepted_fields.contains(field),
-            "retired start-only field {field} must not be owned by the model-visible manifest"
-        );
-        assert!(
-            !properties.contains_key(field),
-            "retired start-only flattened arg {field} must not remain in ToolCallRequest"
-        );
-    }
-    for field in ["mode", "base_ref", "execution_context"] {
-        assert!(
-            accepted_fields.contains(field),
-            "current model-visible flattened field {field} must be owned by the manifest"
-        );
-        assert!(
-            properties.contains_key(field),
-            "current model-visible flattened field {field} must be declared by ToolCallRequest"
-        );
-    }
-
-    for field in properties.keys() {
-        if TOOL_CALL_WRAPPER_FIELDS.contains(&field.as_str()) {
-            continue;
-        }
-        assert!(
-            accepted_fields.contains(field),
-            "ToolCallRequest.properties declares flattened field {field}, but no model-visible manifest entry accepts it"
-        );
-    }
+    let gateway = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("apply_patch".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(gateway.success, "{:?}", gateway.error);
+    assert_eq!(gateway.output["route"]["primary"]["mode"], "gateway");
+    assert_eq!(
+        gateway.output["route"]["primary"]["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(gateway.output["route"]["primary"]["target"], "apply_patch");
+    assert!(gateway.output["route"]["fallback"].is_null());
 }
 
 #[tokio::test]
@@ -2144,7 +2275,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
@@ -2186,10 +2317,11 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         );
     }
     assert!(
-        serialized.contains("run_shell")
-            && serialized.contains("shell semantics or one tightly related observation goal")
-            && serialized.contains("do not combine validation, commit, push, deploy, restart"),
-        "recommended_flows should keep run_shell selection and effect-boundary guidance: {serialized}"
+        serialized.contains("runner-owned sync-first")
+            && serialized.contains("run_job is runner-owned immediate async")
+            && serialized.contains("run_detached_process is supervisor-owned immediate async")
+            && serialized.contains("session_shell_exec continues an existing persistent session shell"),
+        "recommended_flows should expose the canonical execution selection vocabulary: {serialized}"
     );
 }
 
@@ -2255,17 +2387,15 @@ async fn runtime_status_uses_agent_projects_as_effective() {
 
 #[tokio::test]
 async fn runtime_status_includes_build_metadata() {
-    let runtime =
-        test_runtime().with_model_surface(crate::model_surface::ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["runtime_exposure"],
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
-    );
+    assert!(result.output.get("runtime_exposure").is_none());
     assert_eq!(
         result.output["mcp_compact_schemas"],
-        crate::config::mcp_compact_schemas_enabled()
+        crate::model_surface::effective_mcp_compact_schemas(
+            crate::config::mcp_compact_schemas_override(),
+        )
     );
     let build = &result.output["build"];
     assert!(build.is_object());
@@ -2348,73 +2478,27 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
     }
 }
 
-#[tokio::test]
-async fn runtime_status_defaults_to_local_coding_surface() {
-    // ToolRuntime::new_for_tests defaults to local_coding; keep this as a real
-    // default-constructor check rather than overriding the value under test.
-    let runtime = test_runtime();
-    let result = runtime.dispatch(runtime_status_call()).await;
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["runtime_exposure"],
-        crate::model_surface::MODEL_SURFACE_LOCAL_CODING
-    );
-}
-
-#[tokio::test]
-async fn runtime_status_reports_project_connector_exposure_when_configured() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_SHARED_KEY_ENABLED", "true");
-    env.set("WEBCODEX_ALLOW_ANONYMOUS", "true");
-    let runtime = runtime_with_info(RuntimeInfo {
-        auth_enabled: true,
-        oauth2_enabled: true,
-        oauth2_shared_key_bridge_enabled: true,
-        ..RuntimeInfo::default()
-    })
-    .with_runtime_exposure(crate::model_surface::RuntimeExposure::ProjectConnector);
-    let full = runtime.dispatch(runtime_status_call()).await;
-    assert_eq!(
-        full.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["shared_key_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["anonymous_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_enabled"],
-        true
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-    let compact = runtime
-        .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
-        .await;
-    assert_eq!(
-        compact.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        compact.output["mcp_compact_schemas"],
-        crate::config::mcp_compact_schemas_enabled()
-    );
-    assert_eq!(
-        compact.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-}
-
-// runtime_status reads the process-global compact-schema switch on each call.
-// Serialize this async assertion with tests that mutate that switch so the
-// value cannot change between dispatch and the matching expectation.
 #[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn runtime_status_reports_effective_mcp_compact_schema_policy() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    let runtime = test_runtime();
+
+    let default = runtime.dispatch(runtime_status_call()).await;
+    assert!(default.success, "{:?}", default.error);
+    assert_eq!(default.output["mcp_compact_schemas"], true);
+    assert!(default.output.get("runtime_exposure").is_none());
+
+    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+    let full = runtime.dispatch(runtime_status_call()).await;
+    assert_eq!(full.output["mcp_compact_schemas"], false);
+
+    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
+    let compact = runtime.dispatch(runtime_status_call()).await;
+    assert_eq!(compact.output["mcp_compact_schemas"], true);
+}
+
 #[tokio::test]
 async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
     use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
@@ -2452,7 +2536,9 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
         assert_eq!(summary["compact"], true, "arguments: {arguments}");
         assert_eq!(
             summary["mcp_compact_schemas"],
-            crate::config::mcp_compact_schemas_enabled(),
+            crate::model_surface::effective_mcp_compact_schemas(
+                crate::config::mcp_compact_schemas_override(),
+            ),
             "arguments: {arguments}"
         );
         assert!(summary["effective_config"].is_object());
@@ -2477,7 +2563,6 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
             "/connection_layers/server_transport/status",
             "/connection_layers/server_registration/status",
             "/connection_layers/project_registry/status",
-            "/connection_layers/connector_endpoint/status",
             "/connection_layers/last_successful_tool_call/status",
         ] {
             assert!(
@@ -2888,6 +2973,13 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
+    let openapi_before = crate::openapi::build_openapi_spec();
+    let operation_ids_before = openapi_before["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|path| path["post"]["operationId"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
     // Snapshot a model-visible tool's schema as the baseline that external
     // provider discovery must not perturb.
     let write_schema_before = before
@@ -2949,14 +3041,18 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
             .input_schema,
         write_schema_before
     );
-    let openapi = crate::openapi::build_openapi_spec();
-    let operation_count: usize = openapi["paths"]
+    let openapi_after = crate::openapi::build_openapi_spec();
+    let operation_ids_after = openapi_after["paths"]
         .as_object()
         .unwrap()
         .values()
-        .map(|path| path.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 22);
+        .map(|path| path["post"]["operationId"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(operation_ids_after, operation_ids_before);
+    let serialized = serde_json::to_string(&openapi_after).unwrap();
+    for internal in ["Edit", "Read", "Bash", "Write", "FutureTool"] {
+        assert!(!serialized.contains(&format!("\"{internal}\"")));
+    }
 }
 
 #[tokio::test]
@@ -3076,7 +3172,10 @@ async fn computer_list_targets_is_minimal_capability_filtered_and_auth_scoped() 
     .await;
 
     let result = runtime
-        .dispatch_with_auth(ToolCall::ComputerListTargets, Some(&shared_a))
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Targets),
+            Some(&shared_a),
+        )
         .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["count"], 8);
@@ -3314,11 +3413,6 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
         "registration_instance_disconnected"
     );
     assert_eq!(layers["project_registry"]["status"], "not_configured");
-    assert_eq!(layers["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        layers["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
     assert!(layers.get("session_binding").is_none());
 }
 
@@ -3360,6 +3454,11 @@ async fn runtime_status_tools_summary_lists_names() {
     assert!(result.success);
     let tools = &result.output["tools"];
     let names = tools["names"].as_array().unwrap();
+    let expected_names = registered_tool_specs()
+        .into_iter()
+        .map(|spec| Value::String(spec.name))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected_names.as_slice());
     assert!(!names.is_empty());
     assert!(
         names.iter().any(|n| n == "runtime_status"),

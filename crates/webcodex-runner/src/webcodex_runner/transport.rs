@@ -1,53 +1,85 @@
 use super::config::{
-    max_concurrent_jobs, project_registry_dir, validate_quic_config, HotRunnerConfig,
-    QuicClientConfig, ReloadableRunnerConfig, RunnerConfig,
+    max_concurrent_jobs, project_registry_dir, validate_quic_config, QuicClientConfig,
+    ReloadableRunnerConfig, RunnerConfig,
 };
+use super::contains_any;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use super::detached_job::DetachedJobStore;
 #[cfg(windows)]
 use super::exit_diagnostics::RunnerExitDiagnostics;
+use super::job_manager::JobManager;
 use super::lsp::LspSupervisor;
 use super::projects::RunnerProjectCache;
 use super::shutdown::{
     ActivityTracker, BackgroundThreads, ShutdownCoordinator, ShutdownDeadline, ShutdownPhaseResult,
-    ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
-    LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
+    ShutdownReport, BACKGROUND_JOIN_BUDGET, BROWSER_SHUTDOWN_BUDGET, DEFAULT_SHUTDOWN_BUDGET,
+    JOB_DRAIN_BUDGET, LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
 };
-use super::util::contains_any;
-use super::{PersistentShellManager, ShellCommandResult};
+use super::PersistentShellManager;
 use crate::runner_config::{
     TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
 };
 use crate::runner_protocol::{
     read_quic_frame, write_quic_frame, write_quic_register_frame, QuicFrameError,
-    QuicRegisterFrame, RunnerEnvelope, RunnerJobUpdateRequest, RunnerJobUpdateResponse,
-    RunnerOfflineRequest, RunnerPersistentShellResultRequest, RunnerPersistentShellResultResponse,
-    RunnerProjectSummary, RunnerResultPayload, RunnerResultRequest, RunnerResultResponse,
-    ShellJobInventory, ShellProjectInventoryPage, ShellProjectInventoryStatus,
+    QuicRegisterFrame, RunnerEnvelope, RunnerOfflineRequest, RunnerProjectSummary,
+    ShellJobInventory, ShellProjectInventoryStatus,
+};
+#[cfg(test)]
+use crate::runner_protocol::{
     PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
 };
+use webcodex_browser::BrowserSupervisor;
+
+mod project_inventory;
+mod result_submission;
+mod websocket_connect;
+
 use crate::{
     build_register_request_with_provider_status, dispatch_request_with_outcome, handle_one_poll,
-    register, CommandResult, JobManager, PollingDispatchSupervisor, PollingRecoveryAction,
-    RegisterRecoveryAction, RunnerHttpError, RunnerHttpErrorKind,
+    register, PollingDispatchSupervisor, PollingRecoveryAction, RegisterRecoveryAction,
+};
+#[cfg(test)]
+use crate::{CommandResult, RunnerHttpError, RunnerHttpErrorKind};
+#[cfg(test)]
+use project_inventory::{
+    handle_project_inventory_status, ProjectInventoryStatusAction,
+    POLLING_PROJECT_REFRESH_INTERVAL, PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS,
+};
+use project_inventory::{
+    log_project_inventory_degraded, paged_sync_after_registration, polling_projects_for_poll,
+    try_queue_project_inventory_page, PollingProjectRefresh, ProjectInventorySync,
+    StreamingProjectInventoryCoordinator,
 };
 use reqwest::blocking::Client;
+#[cfg(test)]
+use result_submission::{
+    dropped_result_log_line, permanent_result_rejection_log_line, result_http_error_disposition,
+    ResultHttpErrorDisposition, RESULT_SUBMIT_RETRY_BACKOFF, RUNNER_RESULT_PATH,
+};
+pub(crate) use result_submission::{
+    HttpSendConfig, ResultSubmission, RunnerSink, SubmitResultError,
+};
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
+use websocket_connect::connect_websocket_request;
+pub(crate) use websocket_connect::{build_ws_request, server_url_to_ws};
+#[cfg(test)]
+use websocket_connect::{
+    connect_websocket_request_with_proxy, http_proxy_connect_tunnel, parse_http_proxy_endpoint,
+    target_authority, websocket_proxy_from_env_with, websocket_target_endpoint, HttpProxyEndpoint,
+    WS_PROXY_CONNECT_HEADER_MAX_BYTES,
+};
 
 /// WebSocket outgoing envelope channel capacity.
 pub(crate) const WS_OUTGOING_CAPACITY: usize = 64;
 /// WebSocket ping interval.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
-/// HTTP CONNECT response headers are read one byte at a time so no tunneled
-/// WebSocket bytes can be over-read or lost before tungstenite takes ownership.
-const WS_PROXY_CONNECT_HEADER_MAX_BYTES: usize = 16 * 1024;
 /// Bounded reconnect backoff after a transport disconnect or transient error.
 const RECONNECT_BACKOFF_STEPS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -56,16 +88,7 @@ const RECONNECT_BACKOFF_STEPS: [Duration; 5] = [
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
-/// Retry only transient Server-side project-inventory staging pressure on an
-/// otherwise healthy streaming connection. Permanent/malformed inventory
-/// failures never enter this backoff.
-const PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-];
+
 /// Reset reconnect backoff after a connection stayed up long enough to prove
 /// the endpoint is healthy. Immediate flapping still escalates.
 const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -113,50 +136,45 @@ const POLLING_IDLE_BACKOFF_STEPS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
 ];
-/// Polling periodically refreshes the Server's project projection so external
-/// project-registry and Git metadata changes remain discoverable without attaching
-/// the full inventory to every poll.
-const POLLING_PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Older Servers may keep an active polling instance leased for 60 seconds.
 /// Preserve a bounded compatibility wait when such a Server returns the legacy
 /// exact lease-conflict error; current Servers use explicit registration takeover.
 const POLLING_LEASE_CONFLICT_MAX_WAIT: Duration = Duration::from_secs(75);
 const RUNNER_OFFLINE_PATH: &str = "/api/shell/agent/offline";
-/// Result submission endpoint used by the polling transport sink.
-const RUNNER_RESULT_PATH: &str = "/api/shell/agent/result";
-const RUNNER_PERSISTENT_SHELL_RESULT_PATH: &str = "/api/shell/agent/persistent_shell_result";
-/// Bounded same-payload retry backoff for transient result submission
-/// failures over the polling transport. After the last step the payload is
-/// released with an explicit dropped outcome, so a single result can never
-/// monopolize the polling loop or trigger outer re-registration recovery.
-const RESULT_SUBMIT_RETRY_BACKOFF: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
-
 fn send_provider_metadata(
+    transport: StreamTransport,
     tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
     runtime: &ReloadableRunnerConfig,
     expected_generation: Option<u64>,
 ) {
     runtime.with_active(|config| {
         if expected_generation.is_some_and(|expected| expected != config.generation) {
-            return;
+            // An accepted result may belong to the generation that performed a
+            // successful config reload. Treat that result only as a delivery
+            // trigger: metadata is always read from the current active
+            // generation below, so stale work can never publish stale routing.
+            tracing::debug!(
+                expected_generation,
+                active_generation = config.generation,
+                "publishing current Runner metadata after config generation changed"
+            );
         }
         let Some((mut status, revision)) = config.external_tools.claim_status_update() else {
             return;
         };
         status.config_reload = config.reload_status();
-        if tx
-            .try_send(RunnerEnvelope::RuntimeMetadata {
+        if try_send_runner_stream_control(
+            transport,
+            tx,
+            RunnerEnvelope::RuntimeMetadata {
                 tool_providers: status,
-            })
-            .is_err()
-        {
-            config.external_tools.release_status_update(revision);
-        } else {
+                mcp_gateway_providers: Some(runtime.mcp_gateway().provider_inventory()),
+            },
+        ) {
             config.external_tools.mark_status_reported(revision);
+        } else {
+            config.external_tools.release_status_update(revision);
         }
     });
 }
@@ -164,6 +182,7 @@ fn send_provider_metadata(
 #[derive(Clone)]
 pub(crate) struct RunnerRuntimeState {
     lsp: LspSupervisor,
+    browser: BrowserSupervisor,
     config: Arc<ReloadableRunnerConfig>,
     jobs: JobManager,
     persistent_shells: PersistentShellManager,
@@ -186,9 +205,10 @@ impl RunnerRuntimeState {
         // Persistent shells reuse the same authenticated OpenSSH multiplex pool
         // as async jobs: one transport per (session, resource, generation),
         // never a second SSH configuration or connection pool.
-        let persistent_shells = PersistentShellManager::new(&cfg.shell, jobs.ssh_pool.clone());
+        let persistent_shells = PersistentShellManager::new(&cfg.shell, jobs.ssh_pool().clone());
         Self {
             lsp: LspSupervisor::default(),
+            browser: BrowserSupervisor::new(),
             config: Arc::new(ReloadableRunnerConfig::new(cfg.clone(), path)),
             jobs,
             persistent_shells,
@@ -215,6 +235,7 @@ impl RunnerRuntimeState {
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
         self.persistent_shells.close_all("runner_shutdown");
+        self.browser.begin_shutdown();
         self.lsp.begin_shutdown_until(deadline);
     }
 
@@ -266,7 +287,7 @@ impl RunnerRuntimeState {
     }
 
     fn cleanup(&self, deadline: ShutdownDeadline) -> Vec<ShutdownPhaseResult> {
-        let mut phases = Vec::with_capacity(10);
+        let mut phases = Vec::with_capacity(11);
 
         let started = Instant::now();
         phases.push(if self.coordinator.signal_received() {
@@ -279,6 +300,7 @@ impl RunnerRuntimeState {
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
         self.persistent_shells.close_all("runner_shutdown");
+        self.browser.begin_shutdown();
         self.lsp.begin_shutdown_until(deadline.instant());
         phases.push(ShutdownPhaseResult::completed(
             "stop_accepting_work",
@@ -310,8 +332,8 @@ impl RunnerRuntimeState {
 
         let started = Instant::now();
         let job_batch = self.jobs.signal_all_for_shutdown();
-        let active_jobs = job_batch.running;
-        let signal_failures = job_batch.failures;
+        let active_jobs = job_batch.running();
+        let signal_failures = job_batch.failures();
         phases.push(shutdown_phase(
             "active_jobs_signal",
             started,
@@ -328,9 +350,9 @@ impl RunnerRuntimeState {
         phases.push(shutdown_phase(
             "active_jobs_drain",
             started,
-            jobs.resources,
-            jobs.timed_out,
-            jobs.failures.saturating_sub(signal_failures),
+            jobs.resources(),
+            jobs.timed_out(),
+            jobs.failures().saturating_sub(signal_failures),
             "job_reap_failed",
         ));
 
@@ -352,6 +374,19 @@ impl RunnerRuntimeState {
             provider_timeouts,
             provider_failures,
             "provider_shutdown_failed",
+        ));
+
+        let started = Instant::now();
+        let browser = self
+            .browser
+            .shutdown_until(deadline.phase_deadline(BROWSER_SHUTDOWN_BUDGET));
+        phases.push(shutdown_phase(
+            "browser_runtimes_stop",
+            started,
+            browser.browsers,
+            browser.timed_out,
+            browser.failures,
+            "browser_shutdown_failed",
         ));
 
         let started = Instant::now();
@@ -475,7 +510,34 @@ fn install_shutdown_listener(
         .map_err(|_| "failed to start process shutdown signal listener".to_string())
 }
 
+#[cfg(windows)]
+const PARENT_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(windows)]
 fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+
+    let stdin = std::io::stdin();
+    let handle = stdin.as_raw_handle() as usize;
+    if unsafe { GetFileType(handle as _) } == FILE_TYPE_PIPE {
+        let listener = spawn_windows_pipe_parent_liveness_listener(handle, runtime)?;
+        // The process owns stdin for its whole lifetime. The listener stops on
+        // pipe EOF/error or an already-requested Runner shutdown, so detaching
+        // the JoinHandle does not transfer ownership of any external resource.
+        drop(listener);
+        return Ok(());
+    }
+
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+#[cfg(not(windows))]
+fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+fn install_blocking_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
     use std::io::Read;
 
     let listener = std::thread::Builder::new()
@@ -494,12 +556,74 @@ fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), S
             }
         })
         .map_err(|_| "failed to start parent-liveness listener".to_string())?;
-    // This reader is intentionally detached. A blocking stdin read cannot be
-    // cancelled portably; joining it during an ordinary signal-driven shutdown
-    // would hang until the parent closed the lease. Process exit reclaims the
-    // detached thread, while EOF still triggers exact-generation shutdown.
+    // Non-pipe stdin may require a genuinely blocking read. Keep the legacy
+    // detached behavior for consoles and Unix streams; process exit reclaims
+    // the listener while EOF still triggers exact-generation shutdown.
     drop(listener);
     Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_pipe_parent_liveness_listener(
+    pipe_handle: usize,
+    runtime: RunnerRuntimeState,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    std::thread::Builder::new()
+        .name("webcodex-runner-parent-lease".to_string())
+        .spawn(move || {
+            let pipe = pipe_handle as windows_sys::Win32::Foundation::HANDLE;
+            let mut discard = [0_u8; 64];
+            loop {
+                if runtime.shutdown_requested() {
+                    return;
+                }
+
+                let mut available = 0_u32;
+                let peeked = unsafe {
+                    PeekNamedPipe(
+                        pipe,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if peeked == 0 {
+                    // Preserve the historical lease contract: any stdin read
+                    // failure is equivalent to parent EOF and requests Runner
+                    // shutdown. Broken anonymous pipes land here without a
+                    // blocking ReadFile on the Windows startup path.
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+
+                if available == 0 {
+                    std::thread::sleep(PARENT_PIPE_POLL_INTERVAL);
+                    continue;
+                }
+
+                let to_read = available.min(discard.len() as u32);
+                let mut bytes_read = 0_u32;
+                let read = unsafe {
+                    ReadFile(
+                        pipe,
+                        discard.as_mut_ptr(),
+                        to_read,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if read == 0 || bytes_read == 0 {
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+            }
+        })
+        .map_err(|_| "failed to start parent-liveness listener".to_string())
 }
 
 fn send_polling_offline_best_effort(client: &Client, cfg: &RunnerConfig, runner_instance_id: &str) {
@@ -803,655 +927,6 @@ pub(crate) fn install_reload_listener(
         .map_err(|_| "failed to start config reload signal listener".to_string())
 }
 
-/// Minimal HTTP send configuration used by the polling `RunnerSink`. We do not
-/// store the whole `RunnerConfig` here: policy and concurrency limits stay
-/// with the Runner config and are passed alongside the sink.
-#[derive(Debug, Clone)]
-pub(crate) struct HttpSendConfig {
-    pub(crate) client: Client,
-    pub(crate) server_url: String,
-    pub(crate) token: String,
-    pub(crate) client_id: String,
-    pub(crate) runner_instance_id: String,
-    pub(crate) shutdown: Arc<AtomicBool>,
-}
-
-/// Transport-neutral outgoing channel for a Runner. Both the polling loop and
-/// the WebSocket loop build a `RunnerSink` and hand it to the shared
-/// `dispatch_request` / `JobManager` execution path. This shared boundary lets
-/// the Runner speak either transport without duplicating execution logic.
-#[derive(Debug, Clone)]
-pub(crate) enum RunnerSink {
-    /// Polling transport: POST results/job_updates to the HTTP endpoints.
-    Http(HttpSendConfig),
-    /// WebSocket transport: push envelopes through an mpsc that a writer task
-    /// drains onto the socket.
-    WebSocket {
-        tx: tokio::sync::mpsc::Sender<RunnerEnvelope>,
-        client_id: String,
-        runner_instance_id: String,
-    },
-    /// QUIC transport: push envelopes through an mpsc that a single writer
-    /// task drains onto the bidirectional stream.
-    Quic {
-        tx: tokio::sync::mpsc::Sender<RunnerEnvelope>,
-        client_id: String,
-        runner_instance_id: String,
-    },
-}
-
-/// Outcome of a result submission that no longer needs the payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResultSubmission {
-    /// The server accepted the result.
-    Accepted,
-    /// The server permanently rejected this exact payload (e.g. the request
-    /// expired, was cancelled, or this instance lost the lease). The payload
-    /// has been logged once (bounded, redacted) and released; the caller must
-    /// keep polling instead of retrying it.
-    RejectedPermanent,
-    /// A transient HTTP failure persisted through every bounded retry. The
-    /// payload has been logged once (bounded, redacted) and released so the
-    /// polling runner remains live without retrying forever or entering the
-    /// unrelated re-registration recovery path.
-    DroppedAfterRetryExhaustion,
-}
-
-/// Structured result failures that require the current agent/session to stop.
-/// Polling HTTP transients never reach this type: they are retried in place
-/// and become `DroppedAfterRetryExhaustion` if the bounded budget is exhausted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SubmitResultError {
-    /// 401/403: credentials are wrong or revoked. Never retried.
-    FatalAuth(String),
-    /// 404: endpoint missing or incompatible server. Never retried.
-    FatalProtocol(String),
-    /// Invalid HTTP URL or non-recoverable TLS configuration. Never retried.
-    FatalConfig(String),
-    /// A WebSocket/QUIC outgoing channel closed before the result could be
-    /// queued. This is a transport-session failure, not an HTTP retry outcome.
-    TransportClosed(String),
-    /// Process shutdown interrupted an HTTP retry backoff. The polling loop
-    /// handles this as a clean shutdown rather than an operational failure.
-    Shutdown(String),
-}
-
-impl fmt::Display for SubmitResultError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FatalAuth(message)
-            | Self::FatalProtocol(message)
-            | Self::FatalConfig(message)
-            | Self::TransportClosed(message)
-            | Self::Shutdown(message) => f.write_str(message),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResultHttpErrorDisposition {
-    RetryTransient,
-    RejectPermanent,
-    FatalAuth,
-    FatalProtocol,
-    FatalConfig,
-}
-
-fn result_http_error_disposition(kind: &RunnerHttpErrorKind) -> ResultHttpErrorDisposition {
-    match kind {
-        RunnerHttpErrorKind::ServerUnavailable
-        | RunnerHttpErrorKind::Status
-        | RunnerHttpErrorKind::RequestTimeout
-        | RunnerHttpErrorKind::Request
-        | RunnerHttpErrorKind::DecodeTransient => ResultHttpErrorDisposition::RetryTransient,
-        RunnerHttpErrorKind::ClientRejected => ResultHttpErrorDisposition::RejectPermanent,
-        RunnerHttpErrorKind::Auth => ResultHttpErrorDisposition::FatalAuth,
-        RunnerHttpErrorKind::NotFound | RunnerHttpErrorKind::ProtocolDecode => {
-            ResultHttpErrorDisposition::FatalProtocol
-        }
-        RunnerHttpErrorKind::Config => ResultHttpErrorDisposition::FatalConfig,
-    }
-}
-
-/// One bounded, redacted diagnostic line for a permanently rejected result.
-/// Emitted exactly once per payload: permanent rejections are never retried,
-/// so this cannot repeat for the same result.
-fn permanent_result_rejection_log_line(request_id: &str, error: &str, token: &str) -> String {
-    format!(
-        "webcodex-runner result permanently rejected request_id={} error={}; dropping this result and continuing to poll",
-        concise_log_error(request_id, token),
-        concise_log_error(error, token)
-    )
-}
-
-/// One bounded, redacted warning after all transient submission attempts have
-/// failed. It makes the possible result loss explicit without exposing raw
-/// response bodies, credentials, or multiline request errors.
-fn dropped_result_log_line(request_id: &str, attempts: usize, error: &str, token: &str) -> String {
-    format!(
-        "webcodex-runner result submission retries exhausted request_id={} attempts={} error={}; dropping this result and continuing to poll",
-        concise_log_error(request_id, token),
-        attempts,
-        concise_log_error(error, token)
-    )
-}
-
-/// Submit one result over the polling HTTP transport. Transient failures are
-/// retried in place with bounded backoff; permanent rejections release the
-/// payload after a single bounded log line; exhausted transient failures also
-/// release it with an explicit dropped outcome; only auth/protocol failures
-/// surface as errors that terminate the polling agent.
-fn submit_result_http(
-    h: &HttpSendConfig,
-    body: &RunnerResultPayload,
-) -> Result<ResultSubmission, SubmitResultError> {
-    let mut attempt = 0usize;
-    loop {
-        let error = match post_json_raw::<_, RunnerResultResponse>(
-            &h.client,
-            &h.server_url,
-            &h.token,
-            RUNNER_RESULT_PATH,
-            body,
-        ) {
-            Ok(resp) if resp.success => return Ok(ResultSubmission::Accepted),
-            Ok(resp) => {
-                // A structured `success: false` answer is an explicit server
-                // decision about this payload; resending it cannot succeed.
-                let reason = resp
-                    .error
-                    .unwrap_or_else(|| "result submission failed without error".to_string());
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(&body.result.request_id, &reason, &h.token,)
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            Err(error) => error,
-        };
-        match result_http_error_disposition(&error.kind) {
-            ResultHttpErrorDisposition::RejectPermanent => {
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(
-                        &body.result.request_id,
-                        &error.to_string(),
-                        &h.token
-                    )
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            ResultHttpErrorDisposition::FatalAuth => {
-                return Err(SubmitResultError::FatalAuth(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalProtocol => {
-                return Err(SubmitResultError::FatalProtocol(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalConfig => {
-                return Err(SubmitResultError::FatalConfig(error.to_string()));
-            }
-            ResultHttpErrorDisposition::RetryTransient => {
-                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
-                    eprintln!(
-                        "{}",
-                        dropped_result_log_line(
-                            &body.result.request_id,
-                            attempt + 1,
-                            &error.to_string(),
-                            &h.token
-                        )
-                    );
-                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
-                };
-                attempt += 1;
-                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
-                    return Err(SubmitResultError::Shutdown(
-                        "result submission retry interrupted by process shutdown".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl RunnerSink {
-    pub(crate) fn client_id(&self) -> &str {
-        match self {
-            RunnerSink::Http(h) => &h.client_id,
-            RunnerSink::WebSocket { client_id, .. } => client_id,
-            RunnerSink::Quic { client_id, .. } => client_id,
-        }
-    }
-
-    /// Active Runner process identity carried by this sink so every result /
-    /// job_update submission includes it.
-    pub(crate) fn runner_instance_id(&self) -> &str {
-        match self {
-            RunnerSink::Http(h) => &h.runner_instance_id,
-            RunnerSink::WebSocket {
-                runner_instance_id, ..
-            } => runner_instance_id,
-            RunnerSink::Quic {
-                runner_instance_id, ..
-            } => runner_instance_id,
-        }
-    }
-
-    /// Submit the result of a synchronous shell/file request. Mirrors the old
-    /// `submit_result` free function but routes over the active transport.
-    pub(crate) fn submit_result(
-        &self,
-        request_id: String,
-        result: CommandResult,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: self.client_id().to_string(),
-                runner_instance_id: self.runner_instance_id().to_string(),
-                request_id,
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_ms: result.duration_ms,
-                error: result.error,
-            },
-            command_execution_state: None,
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: None,
-        })
-    }
-
-    /// Submit one closed MCP gateway response. The response is typed separately
-    /// from stdout/stderr so provider data cannot become a shell-result tunnel.
-    pub(crate) fn submit_mcp_gateway_result(
-        &self,
-        request_id: String,
-        response: crate::mcp_gateway::McpGatewayResponse,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: self.client_id().to_string(),
-                runner_instance_id: self.runner_instance_id().to_string(),
-                request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
-            command_execution_state: None,
-            mcp_gateway: Some(response),
-            plugin_gateway: None,
-            coding_agent: None,
-        })
-    }
-
-    /// Submit one closed native Tool Plugin response. Plugin protocol traffic
-    /// remains Runner-local; only the bounded typed WebCodex response crosses
-    /// the Server transport.
-    pub(crate) fn submit_plugin_gateway_result(
-        &self,
-        request_id: String,
-        response: webcodex_core::plugin::PluginGatewayResponse,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: self.client_id().to_string(),
-                runner_instance_id: self.runner_instance_id().to_string(),
-                request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
-            command_execution_state: None,
-            mcp_gateway: None,
-            plugin_gateway: Some(response),
-            coding_agent: None,
-        })
-    }
-
-    /// Submit one closed CodingAgentRun response. ACP JSON-RPC remains local to
-    /// the Runner and never crosses this typed transport result boundary.
-    pub(crate) fn submit_coding_agent_result(
-        &self,
-        request_id: String,
-        response: webcodex_core::coding_agent::CodingAgentResponse,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: self.client_id().to_string(),
-                runner_instance_id: self.runner_instance_id().to_string(),
-                request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
-            command_execution_state: None,
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: Some(response),
-        })
-    }
-
-    fn submit_result_payload(
-        &self,
-        body: RunnerResultPayload,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let request_id = body.result.request_id.clone();
-        if super::dispatch::runner_tool_trace_enabled() {
-            tracing::info!(
-                event = "runner_tool_result_submit_started",
-                runner_request_id = %request_id,
-                runner_client_id = self.client_id(),
-                runner_agent_instance_id = self.runner_instance_id(),
-                "runner_tool_result_submit_started"
-            );
-        }
-        let submitted = match self {
-            RunnerSink::Http(h) => submit_result_http(h, &body),
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = RunnerEnvelope::Result { payload: body };
-                tx.blocking_send(env).map_err(|_| {
-                    SubmitResultError::TransportClosed(
-                        "agent transport result channel closed".to_string(),
-                    )
-                })?;
-                Ok(ResultSubmission::Accepted)
-            }
-        };
-        if super::dispatch::runner_tool_trace_enabled() {
-            match &submitted {
-                Ok(outcome) => tracing::info!(
-                    event = "runner_tool_result_submit_finished",
-                    runner_request_id = %request_id,
-                    outcome = ?outcome,
-                    "runner_tool_result_submit_finished"
-                ),
-                Err(error) => tracing::warn!(
-                    event = "runner_tool_result_submit_finished",
-                    runner_request_id = %request_id,
-                    error = %error,
-                    "runner_tool_result_submit_finished"
-                ),
-            }
-        }
-        submitted
-    }
-
-    pub(crate) fn submit_shell_result_with_metadata(
-        &self,
-        request_id: String,
-        shell_result: ShellCommandResult,
-        config: &HotRunnerConfig,
-        runtime: &ReloadableRunnerConfig,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let ShellCommandResult {
-            result,
-            execution_state,
-        } = shell_result;
-        let body = RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: self.client_id().to_string(),
-                runner_instance_id: self.runner_instance_id().to_string(),
-                request_id,
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_ms: result.duration_ms,
-                error: result.error,
-            },
-            command_execution_state: Some(execution_state),
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: None,
-        };
-        let submitted = self.submit_result_payload(body);
-        if matches!(&submitted, Ok(ResultSubmission::Accepted)) {
-            self.send_provider_metadata_best_effort(config.generation, runtime);
-        }
-        submitted
-    }
-
-    pub(crate) fn submit_result_with_metadata(
-        &self,
-        request_id: String,
-        result: CommandResult,
-        config: &HotRunnerConfig,
-        runtime: &ReloadableRunnerConfig,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let submitted = self.submit_result(request_id, result);
-        // Provider metadata is a best-effort follow-up on push transports, not
-        // proof that a rejected or dropped result was accepted. Send it only
-        // after the result reached the transport successfully.
-        if matches!(&submitted, Ok(ResultSubmission::Accepted)) {
-            self.send_provider_metadata_best_effort(config.generation, runtime);
-        }
-        submitted
-    }
-
-    /// Submit one Runner-authoritative persistent-shell lifecycle result. It
-    /// has its own envelope and HTTP endpoint because PersistentShell is not a
-    /// synchronous one-shot shell result and is never represented as a Job.
-    pub(crate) fn submit_persistent_shell_result(
-        &self,
-        request_id: String,
-        result: crate::runner_protocol::PersistentShellResult,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let body = RunnerPersistentShellResultRequest {
-            client_id: self.client_id().to_string(),
-            runner_instance_id: self.runner_instance_id().to_string(),
-            request_id,
-            result,
-        };
-        match self {
-            RunnerSink::Http(h) => submit_persistent_shell_result_http(h, &body),
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                tx.blocking_send(RunnerEnvelope::PersistentShellResult { payload: body })
-                    .map_err(|_| {
-                        SubmitResultError::TransportClosed(
-                            "agent transport persistent shell result channel closed".to_string(),
-                        )
-                    })?;
-                Ok(ResultSubmission::Accepted)
-            }
-        }
-    }
-
-    fn send_provider_metadata_best_effort(
-        &self,
-        generation: u64,
-        runtime: &ReloadableRunnerConfig,
-    ) {
-        let (RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. }) = self else {
-            return;
-        };
-        send_provider_metadata(tx, runtime, Some(generation));
-    }
-
-    pub(crate) fn same_job_update_target(&self, other: &Self) -> bool {
-        match (self, other) {
-            (RunnerSink::Http(left), RunnerSink::Http(right)) => {
-                left.server_url == right.server_url
-                    && left.client_id == right.client_id
-                    && left.runner_instance_id == right.runner_instance_id
-            }
-            (RunnerSink::WebSocket { tx: left, .. }, RunnerSink::WebSocket { tx: right, .. })
-            | (RunnerSink::Quic { tx: left, .. }, RunnerSink::Quic { tx: right, .. }) => {
-                left.same_channel(right)
-            }
-            _ => false,
-        }
-    }
-
-    /// Non-blocking stream enqueue used by the JobManager's single bounded
-    /// delivery worker. HTTP remains a bounded synchronous request, but only
-    /// that delivery worker waits for it; child output capture never does.
-    /// `Ok(false)` means the live WS/QUIC queue is full and the caller must
-    /// retain the update for a later retry rather than drop it.
-    pub(crate) fn try_send_job_update(
-        &self,
-        body: &RunnerJobUpdateRequest,
-    ) -> Result<bool, String> {
-        match self {
-            RunnerSink::Http(h) => {
-                let resp: RunnerJobUpdateResponse = post_json_raw(
-                    &h.client,
-                    &h.server_url,
-                    &h.token,
-                    "/api/shell/agent/job_update",
-                    body,
-                )
-                .map_err(|e| e.to_string())?;
-                if resp.success {
-                    Ok(true)
-                } else {
-                    Err(resp
-                        .error
-                        .unwrap_or_else(|| "job_update failed without error".to_string()))
-                }
-            }
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = RunnerEnvelope::JobUpdate {
-                    payload: body.clone(),
-                };
-                match tx.try_send(env) {
-                    Ok(()) => Ok(true),
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err("agent transport send failed".to_string())
-                    }
-                }
-            }
-        }
-    }
-
-    /// Push an incremental/final job update. Mirrors the old `send_job_update`
-    /// free function. Job updates stay best-effort: callers ignore failures
-    /// and the terminal state is still resolved by the final result path.
-    pub(crate) fn send_job_update(&self, body: &RunnerJobUpdateRequest) -> Result<(), String> {
-        match self {
-            RunnerSink::Http(h) => {
-                let resp: RunnerJobUpdateResponse = post_json_raw(
-                    &h.client,
-                    &h.server_url,
-                    &h.token,
-                    "/api/shell/agent/job_update",
-                    body,
-                )
-                .map_err(|e| e.to_string())?;
-                if resp.success {
-                    Ok(())
-                } else {
-                    Err(resp
-                        .error
-                        .unwrap_or_else(|| "job_update failed without error".to_string()))
-                }
-            }
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = RunnerEnvelope::JobUpdate {
-                    payload: body.clone(),
-                };
-                tx.blocking_send(env)
-                    .map_err(|_| "agent transport send failed".to_string())
-            }
-        }
-    }
-}
-
-fn submit_persistent_shell_result_http(
-    h: &HttpSendConfig,
-    body: &RunnerPersistentShellResultRequest,
-) -> Result<ResultSubmission, SubmitResultError> {
-    let mut attempt = 0usize;
-    loop {
-        let error = match post_json_raw::<_, RunnerPersistentShellResultResponse>(
-            &h.client,
-            &h.server_url,
-            &h.token,
-            RUNNER_PERSISTENT_SHELL_RESULT_PATH,
-            body,
-        ) {
-            Ok(response) if response.success => return Ok(ResultSubmission::Accepted),
-            Ok(response) => {
-                let reason = response.error.unwrap_or_else(|| {
-                    "persistent shell result submission failed without error".to_string()
-                });
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(&body.request_id, &reason, &h.token)
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            Err(error) => error,
-        };
-        match result_http_error_disposition(&error.kind) {
-            ResultHttpErrorDisposition::RejectPermanent => {
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(
-                        &body.request_id,
-                        &error.to_string(),
-                        &h.token,
-                    )
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            ResultHttpErrorDisposition::FatalAuth => {
-                return Err(SubmitResultError::FatalAuth(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalProtocol => {
-                return Err(SubmitResultError::FatalProtocol(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalConfig => {
-                return Err(SubmitResultError::FatalConfig(error.to_string()));
-            }
-            ResultHttpErrorDisposition::RetryTransient => {
-                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
-                    eprintln!(
-                        "{}",
-                        dropped_result_log_line(
-                            &body.request_id,
-                            attempt + 1,
-                            &error.to_string(),
-                            &h.token,
-                        )
-                    );
-                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
-                };
-                attempt += 1;
-                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
-                    return Err(SubmitResultError::Shutdown(
-                        "persistent shell result retry interrupted by process shutdown".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-/// Send a JSON POST to the server and decode the response. Same wire behavior
-/// as `post_json` but takes the raw connection bits so it can be used from
-/// `RunnerSink::Http` without an `RunnerConfig`. Preserves the structured
-/// `RunnerHttpError` classification for callers that must act on it.
-fn post_json_raw<T, R>(
-    client: &Client,
-    server_url: &str,
-    token: &str,
-    path: &str,
-    body: &T,
-) -> Result<R, RunnerHttpError>
-where
-    T: serde::Serialize + ?Sized,
-    R: serde::de::DeserializeOwned,
-{
-    crate::post_json_with_auth(client, server_url, token, path, body)
-}
-
 pub(crate) fn non_empty_token(token: &str) -> Option<String> {
     let token = token.trim();
     if token.is_empty() {
@@ -1658,204 +1133,6 @@ fn polling_idle_delay(backoff: &mut PollingIdleBackoff, ran_request: bool) -> Op
     }
 }
 
-static NEXT_PROJECT_INVENTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn next_project_inventory_sequence() -> u64 {
-    NEXT_PROJECT_INVENTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-#[derive(Debug, Clone)]
-struct PendingProjectInventoryPage {
-    page: ShellProjectInventoryPage,
-    next_cursor: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ProjectInventorySync {
-    generation: String,
-    snapshot_sequence: u64,
-    projects: Vec<RunnerProjectSummary>,
-    cursor: usize,
-    page_index: u32,
-    pending: Option<PendingProjectInventoryPage>,
-}
-
-impl ProjectInventorySync {
-    fn new(projects: Vec<RunnerProjectSummary>) -> Self {
-        Self {
-            generation: uuid::Uuid::new_v4().simple().to_string(),
-            snapshot_sequence: next_project_inventory_sequence(),
-            projects,
-            cursor: 0,
-            page_index: 0,
-            pending: None,
-        }
-    }
-
-    fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    fn total_reported(&self) -> usize {
-        self.projects.len()
-    }
-
-    fn current_page(&mut self) -> Result<Option<ShellProjectInventoryPage>, &'static str> {
-        if let Some(pending) = &self.pending {
-            return Ok(Some(pending.page.clone()));
-        }
-        if self.cursor >= self.projects.len() && !(self.projects.is_empty() && self.page_index == 0)
-        {
-            return Ok(None);
-        }
-        if self.projects.is_empty() {
-            let page = ShellProjectInventoryPage {
-                generation: self.generation.clone(),
-                snapshot_sequence: self.snapshot_sequence,
-                page_index: 0,
-                total_reported: 0,
-                complete: true,
-                projects: Vec::new(),
-            };
-            self.pending = Some(PendingProjectInventoryPage {
-                page: page.clone(),
-                next_cursor: 0,
-            });
-            return Ok(Some(page));
-        }
-
-        let mut summaries = Vec::new();
-        for project in self.projects[self.cursor..].iter() {
-            if summaries.len() == PROJECT_INVENTORY_PAGE_MAX_SUMMARIES {
-                break;
-            }
-            summaries.push(project.clone());
-            let next_cursor = self.cursor + summaries.len();
-            let candidate = ShellProjectInventoryPage {
-                generation: self.generation.clone(),
-                snapshot_sequence: self.snapshot_sequence,
-                page_index: self.page_index,
-                total_reported: self.projects.len(),
-                complete: next_cursor == self.projects.len(),
-                projects: summaries.clone(),
-            };
-            let bytes = serde_json::to_vec(&candidate)
-                .map_err(|_| "project_inventory_serialization_failed")?;
-            if bytes.len() > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES {
-                summaries.pop();
-                if summaries.is_empty() {
-                    return Err("project_inventory_summary_too_large");
-                }
-                break;
-            }
-        }
-        if summaries.is_empty() {
-            return Err("project_inventory_empty_page");
-        }
-        let next_cursor = self.cursor + summaries.len();
-        let page = ShellProjectInventoryPage {
-            generation: self.generation.clone(),
-            snapshot_sequence: self.snapshot_sequence,
-            page_index: self.page_index,
-            total_reported: self.projects.len(),
-            complete: next_cursor == self.projects.len(),
-            projects: summaries,
-        };
-        if serde_json::to_vec(&page)
-            .map_err(|_| "project_inventory_serialization_failed")?
-            .len()
-            > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES
-        {
-            return Err("project_inventory_page_too_large");
-        }
-        self.pending = Some(PendingProjectInventoryPage {
-            page: page.clone(),
-            next_cursor,
-        });
-        Ok(Some(page))
-    }
-
-    fn acknowledge(&mut self, status: &ShellProjectInventoryStatus) -> Result<bool, String> {
-        // Explicit Server failure status owns error classification before any
-        // local pending-state or success-ack correlation. In particular,
-        // staging-capacity rejection can legitimately carry the previous
-        // authoritative generation because page 0 was not admitted.
-        if status.sync_state == "degraded" || status.sync_state == "failed" {
-            return Err(status
-                .last_error_code
-                .clone()
-                .unwrap_or_else(|| "project_inventory_sync_degraded".to_string()));
-        }
-        let Some(pending) = self.pending.as_ref() else {
-            return Ok(self.cursor >= self.projects.len());
-        };
-        // Successful in-progress/complete acknowledgements remain strictly
-        // fenced by generation, total, and exact cursor progress below.
-        if status.generation.as_deref() != Some(self.generation()) {
-            return Err("project_inventory_ack_generation_mismatch".to_string());
-        }
-        if status.total_reported != Some(self.projects.len()) {
-            return Err("project_inventory_ack_total_mismatch".to_string());
-        }
-        if status.total_synced != pending.next_cursor {
-            return Err("project_inventory_ack_progress_mismatch".to_string());
-        }
-        let final_page = pending.page.complete;
-        let valid_ack = (final_page && status.sync_state == "complete")
-            || (!final_page && status.sync_state == "in_progress");
-        if !valid_ack {
-            return Err("project_inventory_ack_state_mismatch".to_string());
-        }
-        self.cursor = pending.next_cursor;
-        self.page_index = self.page_index.saturating_add(1);
-        self.pending = None;
-        Ok(final_page)
-    }
-}
-
-fn log_project_inventory_degraded(transport: &str, projects: usize, reason_code: &str) {
-    eprintln!(
-        "webcodex-runner project inventory sync degraded transport={} projects={} reason_code={}; runner remains online",
-        transport, projects, reason_code
-    );
-}
-
-fn paged_sync_after_registration(projects: Vec<RunnerProjectSummary>) -> ProjectInventorySync {
-    ProjectInventorySync::new(projects)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PollingProjectRefresh {
-    last_sent_at: Instant,
-}
-
-impl PollingProjectRefresh {
-    fn new(now: Instant) -> Self {
-        Self { last_sent_at: now }
-    }
-
-    fn mark_sent(&mut self, now: Instant) {
-        self.last_sent_at = now;
-    }
-
-    fn should_refresh(&self, project_cache: &RunnerProjectCache, now: Instant) -> bool {
-        project_cache.needs_refresh()
-            || now.saturating_duration_since(self.last_sent_at) >= POLLING_PROJECT_REFRESH_INTERVAL
-    }
-}
-
-fn polling_projects_for_poll(
-    refresh: &PollingProjectRefresh,
-    project_cache: &mut RunnerProjectCache,
-    cfg: &RunnerConfig,
-    shutdown: &AtomicBool,
-    now: Instant,
-) -> Option<Vec<RunnerProjectSummary>> {
-    refresh
-        .should_refresh(project_cache, now)
-        .then(|| project_cache.get_with_shutdown(cfg, Some(shutdown)))
-}
-
 #[derive(Debug, Clone)]
 struct RetryBackoff {
     attempts: usize,
@@ -1942,6 +1219,205 @@ impl StreamTransport {
             Self::Quic => QUIC_PING_INTERVAL,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerStreamMetricOutcome {
+    Success,
+    Closed,
+    Backpressure,
+    TransportError,
+    Timeout,
+}
+
+impl RunnerStreamMetricOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Closed => "closed",
+            Self::Backpressure => "backpressure",
+            Self::TransportError => "transport_error",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+fn observe_runtime_metric_fail_open(observe: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe));
+}
+
+macro_rules! runtime_metric_info {
+    ($($fields:tt)*) => {
+        observe_runtime_metric_fail_open(|| tracing::info!($($fields)*))
+    };
+}
+
+fn bounded_stream_envelope_kind(kind: &str) -> &'static str {
+    match kind {
+        "request" => "request",
+        "result" => "result",
+        "job_update" => "job_update",
+        "persistent_shell_result" => "persistent_shell_result",
+        "ping" => "ping",
+        "pong" => "pong",
+        "project_inventory_page" | "project_inventory_status" => "project_inventory",
+        "runtime_metadata" => "provider_metadata",
+        "goodbye" => "goodbye",
+        _ => "control",
+    }
+}
+
+fn successful_stream_duration(
+    outcome: RunnerStreamMetricOutcome,
+    duration: Option<Duration>,
+) -> Option<Duration> {
+    (outcome == RunnerStreamMetricOutcome::Success)
+        .then_some(duration)
+        .flatten()
+}
+
+fn observe_runner_stream_incoming_envelope(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    runtime_metric_info!(
+        metric = "runner_stream_incoming_envelopes_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_stream_request_dispatch_wait(transport: StreamTransport, duration: Duration) {
+    runtime_metric_info!(
+        metric = "runner_stream_request_dispatch_wait_seconds",
+        value = duration.as_secs_f64(),
+        transport = transport.name(),
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_request_duration(transport: &'static str, duration_ms: u64) {
+    runtime_metric_info!(
+        metric = "runner_request_duration_seconds",
+        value = duration_ms as f64 / 1000.0,
+        transport,
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_stream_outgoing_channel(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+    wait: Option<Duration>,
+    backpressured: bool,
+    outcome: RunnerStreamMetricOutcome,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    let successful_wait = successful_stream_duration(outcome, wait);
+    runtime_metric_info!(
+        metric = "runner_stream_outgoing_channel_events_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        outcome = outcome.as_str(),
+        "runtime_metric"
+    );
+    if backpressured {
+        runtime_metric_info!(
+            metric = "runner_stream_outgoing_backpressure_total",
+            value = 1_u64,
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+    if let Some(wait) = successful_wait {
+        runtime_metric_info!(
+            metric = "runner_stream_outgoing_channel_wait_seconds",
+            value = wait.as_secs_f64(),
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+}
+fn try_send_runner_stream_control(
+    transport: StreamTransport,
+    tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
+    envelope: RunnerEnvelope,
+) -> bool {
+    let envelope_kind = envelope.kind();
+    match tx.try_send(envelope) {
+        Ok(()) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                false,
+                RunnerStreamMetricOutcome::Success,
+            );
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                true,
+                RunnerStreamMetricOutcome::Backpressure,
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                false,
+                RunnerStreamMetricOutcome::Closed,
+            );
+            false
+        }
+    }
+}
+
+fn observe_runner_stream_writer_send(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+    duration: Option<Duration>,
+    outcome: RunnerStreamMetricOutcome,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    let successful_duration = successful_stream_duration(outcome, duration);
+    runtime_metric_info!(
+        metric = "runner_stream_outgoing_envelopes_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        outcome = outcome.as_str(),
+        "runtime_metric"
+    );
+    if let Some(duration) = successful_duration {
+        runtime_metric_info!(
+            metric = "runner_stream_writer_send_seconds",
+            value = duration.as_secs_f64(),
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+}
+
+fn observe_runner_stream_disconnect(transport: StreamTransport) {
+    runtime_metric_info!(
+        metric = "runner_stream_session_disconnects_total",
+        value = 1_u64,
+        transport = transport.name(),
+        "runtime_metric"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2334,7 +1810,7 @@ fn run_polling_runner_with_shutdown(
                 &mut project_cache,
                 Some(shutdown.as_ref()),
                 runner_instance_id,
-                jobs.prepared_profiles.len(),
+                jobs.prepared_profiles().len(),
                 &jobs,
             ) {
                 Ok((projects_count, registered_jobs, registered_projects, _inventory_status)) => {
@@ -2507,6 +1983,7 @@ fn run_polling_runner_with_shutdown(
             project_inventory_page,
             runner_instance_id,
             &runtime.lsp,
+            &runtime.browser,
             &shutdown,
             &runtime.dispatches,
             &mut polling_dispatches,
@@ -2889,239 +2366,6 @@ fn registered_ack(ack: RunnerEnvelope) -> Result<ShellProjectInventoryStatus, St
     }
 }
 
-fn try_queue_project_inventory_page(
-    transport: StreamTransport,
-    sync: &mut Option<ProjectInventorySync>,
-    out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-) {
-    let next = sync
-        .as_mut()
-        .map(|state| (state.total_reported(), state.current_page()));
-    match next {
-        Some((_, Ok(Some(page)))) => {
-            let _ = out_tx.try_send(RunnerEnvelope::ProjectInventoryPage { page });
-        }
-        Some((_, Ok(None))) => {
-            *sync = None;
-        }
-        Some((projects, Err(reason_code))) => {
-            log_project_inventory_degraded(transport.name(), projects, reason_code);
-            *sync = None;
-        }
-        None => {}
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectInventoryStatusAction {
-    None,
-    IgnoreDelayedAck,
-    RetryExactAfter(Duration),
-    FreshResnapshot,
-}
-
-fn project_inventory_status_requests_fresh_resnapshot(
-    status: &ShellProjectInventoryStatus,
-) -> bool {
-    matches!(
-        status.last_error_code.as_deref(),
-        Some(
-            "project_inventory_stale_generation" | "project_inventory_missing_or_stale_generation"
-        )
-    )
-}
-
-fn project_inventory_status_is_delayed_success_ack(
-    state: &ProjectInventorySync,
-    status: &ShellProjectInventoryStatus,
-) -> bool {
-    if status.last_error_code.is_some()
-        || !matches!(status.sync_state.as_str(), "in_progress" | "complete")
-    {
-        return false;
-    }
-    if status.generation.as_deref() != Some(state.generation()) {
-        return true;
-    }
-    state.pending.as_ref().is_some_and(|pending| {
-        status.total_reported == Some(state.total_reported())
-            && status.total_synced < pending.next_cursor
-    })
-}
-
-fn handle_project_inventory_status(
-    transport: StreamTransport,
-    status: ShellProjectInventoryStatus,
-    sync: &mut Option<ProjectInventorySync>,
-    out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-    retry_backoff: &mut RetryBackoff,
-) -> ProjectInventoryStatusAction {
-    // Stale-generation statuses can retain the last authoritative sync state
-    // and generation while carrying the actual recovery reason only in
-    // `last_error_code`. Those explicit reasons invalidate the current logical
-    // snapshot before ordinary success-ack correlation is attempted.
-    if project_inventory_status_requests_fresh_resnapshot(&status) {
-        if let Some(state) = sync.as_ref() {
-            log_project_inventory_degraded(
-                transport.name(),
-                state.total_reported(),
-                status
-                    .last_error_code
-                    .as_deref()
-                    .unwrap_or("project_inventory_stale_generation"),
-            );
-        }
-        *sync = None;
-        retry_backoff.reset();
-        return ProjectInventoryStatusAction::FreshResnapshot;
-    }
-
-    let Some(state) = sync.as_mut() else {
-        retry_backoff.reset();
-        return ProjectInventoryStatusAction::None;
-    };
-    if project_inventory_status_is_delayed_success_ack(state, &status) {
-        tracing::debug!(
-            transport = transport.name(),
-            current_generation = state.generation(),
-            ack_generation = status.generation.as_deref(),
-            ack_total_synced = status.total_synced,
-            "ignoring delayed project inventory success acknowledgement"
-        );
-        return ProjectInventoryStatusAction::IgnoreDelayedAck;
-    }
-    let projects = state.total_reported();
-    match state.acknowledge(&status) {
-        Ok(true) => {
-            *sync = None;
-            retry_backoff.reset();
-            ProjectInventoryStatusAction::None
-        }
-        Ok(false) => {
-            retry_backoff.reset();
-            try_queue_project_inventory_page(transport, sync, out_tx);
-            ProjectInventoryStatusAction::None
-        }
-        Err(reason_code) if reason_code == "project_inventory_staging_capacity" => {
-            let delay = retry_backoff.next_delay();
-            log_project_inventory_degraded(transport.name(), projects, &reason_code);
-            eprintln!(
-                "webcodex-runner project inventory retry scheduled transport={} reason_code={} delay={}",
-                transport.name(),
-                reason_code,
-                format_delay(delay)
-            );
-            // Keep the exact pending page/generation/snapshot_sequence. The
-            // Server rejected page 0 before advancing its high-water fence, so
-            // replaying this exact page after bounded delay is safe.
-            ProjectInventoryStatusAction::RetryExactAfter(delay)
-        }
-        Err(reason_code) => {
-            log_project_inventory_degraded(transport.name(), projects, &reason_code);
-            *sync = None;
-            retry_backoff.reset();
-            ProjectInventoryStatusAction::None
-        }
-    }
-}
-
-struct StreamingProjectInventoryCoordinator {
-    supported: bool,
-    sync: Option<ProjectInventorySync>,
-    project_cache: RunnerProjectCache,
-    retry_backoff: RetryBackoff,
-    retry_at: Option<tokio::time::Instant>,
-}
-
-impl StreamingProjectInventoryCoordinator {
-    fn new(sync: Option<ProjectInventorySync>) -> Self {
-        Self {
-            supported: sync.is_some(),
-            sync,
-            project_cache: RunnerProjectCache::default(),
-            retry_backoff: RetryBackoff::new(&PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS),
-            retry_at: None,
-        }
-    }
-
-    fn retry_at(&self) -> Option<tokio::time::Instant> {
-        self.retry_at
-    }
-
-    fn queue_pending(
-        &mut self,
-        transport: StreamTransport,
-        out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-    ) {
-        try_queue_project_inventory_page(transport, &mut self.sync, out_tx);
-    }
-
-    fn retry_pending_now(
-        &mut self,
-        transport: StreamTransport,
-        out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-    ) {
-        self.retry_at = None;
-        self.queue_pending(transport, out_tx);
-    }
-
-    fn refresh_from_current_projects(
-        &mut self,
-        transport: StreamTransport,
-        cfg: &RunnerConfig,
-        runtime: &RunnerRuntimeState,
-        out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-        reason_code: &str,
-    ) {
-        if !self.supported {
-            return;
-        }
-        self.project_cache.invalidate();
-        let projects = runtime.project_summaries(&mut self.project_cache, cfg);
-        let projects_count = projects.len();
-        self.sync = Some(ProjectInventorySync::new(projects));
-        self.retry_backoff.reset();
-        self.retry_at = None;
-        eprintln!(
-            "webcodex-runner project inventory resnapshot transport={} projects={} reason_code={}",
-            transport.name(),
-            projects_count,
-            reason_code
-        );
-        self.queue_pending(transport, out_tx);
-    }
-
-    fn handle_status(
-        &mut self,
-        transport: StreamTransport,
-        status: ShellProjectInventoryStatus,
-        cfg: &RunnerConfig,
-        runtime: &RunnerRuntimeState,
-        out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
-    ) {
-        match handle_project_inventory_status(
-            transport,
-            status,
-            &mut self.sync,
-            out_tx,
-            &mut self.retry_backoff,
-        ) {
-            ProjectInventoryStatusAction::None => self.retry_at = None,
-            ProjectInventoryStatusAction::IgnoreDelayedAck => {}
-            ProjectInventoryStatusAction::RetryExactAfter(delay) => {
-                self.retry_at = Some(tokio::time::Instant::now() + delay);
-            }
-            ProjectInventoryStatusAction::FreshResnapshot => self.refresh_from_current_projects(
-                transport,
-                cfg,
-                runtime,
-                out_tx,
-                "project_inventory_server_invalidated_snapshot",
-            ),
-        }
-    }
-}
-
 fn handle_stream_envelope(
     transport: StreamTransport,
     envelope: RunnerEnvelope,
@@ -3132,8 +2376,11 @@ fn handle_stream_envelope(
     project_inventory_refresh_tx: &tokio::sync::mpsc::Sender<()>,
     runtime: &RunnerRuntimeState,
 ) -> Option<String> {
+    let envelope_kind = envelope.kind();
+    observe_runner_stream_incoming_envelope(transport, envelope_kind);
     match envelope {
         RunnerEnvelope::Request { request } => {
+            let received_at = Instant::now();
             let sink = sink.clone();
             let config = Arc::clone(&runtime.config);
             let hot = config.snapshot();
@@ -3144,10 +2391,12 @@ fn handle_stream_envelope(
                 Err(error) => return Some(error),
             };
             let lsp = runtime.lsp.clone();
+            let browser = runtime.browser.clone();
             let dispatch_guard = runtime.dispatches.enter();
             let project_inventory_refresh_tx = project_inventory_refresh_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let _dispatch_guard = dispatch_guard;
+                observe_runner_stream_request_dispatch_wait(transport, received_at.elapsed());
                 let dispatch_result = dispatch_request_with_outcome(
                     &sink,
                     &hot,
@@ -3156,6 +2405,7 @@ fn handle_stream_envelope(
                     &persistent_shells,
                     &project_registry_dir,
                     &lsp,
+                    &browser,
                     request,
                 );
                 if dispatch_result
@@ -3172,7 +2422,7 @@ fn handle_stream_envelope(
             None
         }
         RunnerEnvelope::Ping { ts } => {
-            let _ = out_tx.try_send(RunnerEnvelope::Pong { ts });
+            let _ = try_send_runner_stream_control(transport, out_tx, RunnerEnvelope::Pong { ts });
             None
         }
         RunnerEnvelope::Pong { .. } => None,
@@ -3304,7 +2554,7 @@ where
                     transport = transport.name(),
                     "webcodex-runner stream keepalive ping"
                 );
-                send_provider_metadata(&out_tx, &runtime.config, None);
+                send_provider_metadata(transport, &out_tx, &runtime.config, None);
                 // An acknowledgement can be dropped if the Server's outbound
                 // channel is saturated. Re-sending the exact pending page is
                 // idempotent and gives the sync a bounded periodic recovery path.
@@ -3314,21 +2564,49 @@ where
                 if project_inventory.retry_at().is_none() {
                     project_inventory.queue_pending(transport, &out_tx);
                 }
-                let _ = out_tx.try_send(RunnerEnvelope::Ping {
-                    ts: chrono::Utc::now().timestamp(),
-                });
+                let _ = try_send_runner_stream_control(
+                    transport,
+                    &out_tx,
+                    RunnerEnvelope::Ping {
+                        ts: chrono::Utc::now().timestamp(),
+                    },
+                );
             }
         }
     }
 
     if shutdown_requested {
-        let _ = tokio::time::timeout(
+        let queue_started = Instant::now();
+        match tokio::time::timeout(
             TRANSPORT_CONTROL_SEND_TIMEOUT,
             out_tx.send(RunnerEnvelope::Goodbye {
                 reason: Some("process shutdown".to_string()),
             }),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(())) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                Some(queue_started.elapsed()),
+                false,
+                RunnerStreamMetricOutcome::Success,
+            ),
+            Ok(Err(_)) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                None,
+                false,
+                RunnerStreamMetricOutcome::Closed,
+            ),
+            Err(_) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                None,
+                false,
+                RunnerStreamMetricOutcome::Timeout,
+            ),
+        }
     } else if jobs.has_work() {
         tracing::warn!(
             transport = transport.name(),
@@ -3348,6 +2626,9 @@ where
         runtime
             .persistent_shells
             .close_all("runner_transport_disconnected");
+    }
+    if !shutdown_requested {
+        observe_runner_stream_disconnect(transport);
     }
     if let Some(error) = session_error {
         return Err(error);
@@ -3689,10 +2970,24 @@ async fn quic_session(
     try_queue_project_inventory_page(StreamTransport::Quic, &mut project_inventory_sync, &out_tx);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
             let graceful = matches!(env, RunnerEnvelope::Goodbye { .. });
+            let send_started = Instant::now();
             if write_quic_frame(&mut send, &env).await.is_err() {
+                observe_runner_stream_writer_send(
+                    StreamTransport::Quic,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             }
+            observe_runner_stream_writer_send(
+                StreamTransport::Quic,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                RunnerStreamMetricOutcome::Success,
+            );
             if graceful {
                 return if send.finish().is_ok() {
                     StreamWriterExit::GracefulClose
@@ -3734,377 +3029,6 @@ async fn quic_session(
 // pushes `Request` envelopes; the Runner executes them via the same
 // `dispatch_request` path the polling loop uses, and sends `Result` /
 // `JobUpdate` envelopes back. Polling is unchanged and remains the fallback.
-
-/// Convert an `http(s)://` server URL into a `ws(s)://` URL plus path.
-pub(crate) fn server_url_to_ws(server_url: &str, path: &str) -> Result<String, String> {
-    let base = server_url.trim_end_matches('/');
-    let ws = if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{}{}", rest, path)
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{}{}", rest, path)
-    } else if base.starts_with("ws://") || base.starts_with("wss://") {
-        format!("{}{}", base, path)
-    } else {
-        return Err(format!(
-            "server_url must be http(s)://... for websocket transport; got {}",
-            server_log_label(server_url)
-        ));
-    };
-    Ok(ws)
-}
-
-/// Build a WebSocket handshake request, carrying a Bearer token only when the
-/// configured token is non-empty. Open-mode agents intentionally send no
-/// credential so the server must have explicit anonymous mode enabled.
-pub(crate) fn build_ws_request(
-    ws_url: &str,
-    token: &str,
-) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = ws_url.into_client_request().map_err(|e| {
-        format!(
-            "invalid websocket url for {}: {}",
-            server_log_label(ws_url),
-            e
-        )
-    })?;
-    if let Some(token) = non_empty_token(token) {
-        let value = format!("Bearer {}", token);
-        let header_value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&value)
-            .map_err(|e| format!("invalid token header value: {}", e))?;
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-            header_value,
-        );
-    }
-    Ok(request)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpProxyEndpoint {
-    host: String,
-    port: u16,
-}
-
-fn first_nonempty_env_value_with<F>(names: &[&str], get_env: &mut F) -> Option<std::ffi::OsString>
-where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    names
-        .iter()
-        .find_map(|name| get_env(name).filter(|value| !value.as_os_str().is_empty()))
-}
-
-fn split_no_proxy_host_port(entry: &str) -> (&str, Option<u16>) {
-    if let Some(rest) = entry.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = &rest[..end];
-            let suffix = &rest[end + 1..];
-            if suffix.is_empty() {
-                return (host, None);
-            }
-            if let Some(port) = suffix
-                .strip_prefix(':')
-                .and_then(|value| value.parse().ok())
-            {
-                return (host, Some(port));
-            }
-            return (entry, None);
-        }
-    }
-    if entry.bytes().filter(|byte| *byte == b':').count() == 1 {
-        if let Some((host, port)) = entry.rsplit_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                return (host, Some(port));
-            }
-        }
-    }
-    (entry, None)
-}
-
-fn no_proxy_entry_matches(entry: &str, target_host: &str, target_port: u16) -> bool {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return false;
-    }
-    if entry == "*" {
-        return true;
-    }
-    let (pattern, port) = split_no_proxy_host_port(entry);
-    if port.is_some_and(|port| port != target_port) {
-        return false;
-    }
-    let pattern = pattern
-        .trim()
-        .trim_end_matches('.')
-        .strip_prefix("*.")
-        .unwrap_or(pattern.trim().trim_end_matches('.'))
-        .trim_start_matches('.');
-    if pattern.is_empty() {
-        return false;
-    }
-    let target_host = target_host.trim_end_matches('.');
-    if let Ok(pattern_ip) = pattern.parse::<std::net::IpAddr>() {
-        return target_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|target_ip| target_ip == pattern_ip);
-    }
-    if pattern.eq_ignore_ascii_case("localhost") {
-        return target_host.eq_ignore_ascii_case("localhost");
-    }
-    let target = target_host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    target == pattern
-        || target
-            .strip_suffix(&pattern)
-            .is_some_and(|prefix| prefix.ends_with('.'))
-}
-
-fn no_proxy_matches(no_proxy: &str, target_host: &str, target_port: u16) -> bool {
-    no_proxy
-        .split(',')
-        .any(|entry| no_proxy_entry_matches(entry, target_host, target_port))
-}
-
-fn canonical_url_host(parsed: &url::Url) -> Option<String> {
-    match parsed.host()? {
-        url::Host::Domain(host) => (!host.is_empty()).then(|| host.to_string()),
-        url::Host::Ipv4(host) => Some(host.to_string()),
-        url::Host::Ipv6(host) => Some(host.to_string()),
-    }
-}
-
-fn parse_http_proxy_endpoint(raw: &str) -> Result<HttpProxyEndpoint, RunnerTransportError> {
-    let parsed = url::Url::parse(raw.trim()).map_err(|_| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    if parsed.scheme() != "http" {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy scheme is unsupported",
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy authentication is unsupported",
-        ));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() || !matches!(parsed.path(), "" | "/")
-    {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy URL options are unsupported",
-        ));
-    }
-    let host = canonical_url_host(&parsed).ok_or_else(|| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    Ok(HttpProxyEndpoint { host, port })
-}
-
-fn websocket_proxy_from_env_with<F>(
-    ws_url: &str,
-    mut get_env: F,
-) -> Result<Option<HttpProxyEndpoint>, RunnerTransportError>
-where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    let target = url::Url::parse(ws_url).map_err(|_| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let proxy_names: &[&str] = match target.scheme() {
-        "wss" => &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
-        "ws" => &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
-        _ => {
-            return Err(RunnerTransportError::fatal(
-                "websocket connect failed: websocket target scheme is invalid",
-            ));
-        }
-    };
-    let Some(proxy_raw) = first_nonempty_env_value_with(proxy_names, &mut get_env) else {
-        return Ok(None);
-    };
-    let target_host = canonical_url_host(&target).ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let target_port = target.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    if let Some(no_proxy_raw) =
-        first_nonempty_env_value_with(&["NO_PROXY", "no_proxy"], &mut get_env)
-    {
-        let no_proxy = no_proxy_raw.into_string().map_err(|_| {
-            RunnerTransportError::proxy_configuration(
-                "websocket connect failed: NO_PROXY configuration is invalid",
-            )
-        })?;
-        if no_proxy_matches(&no_proxy, &target_host, target_port) {
-            return Ok(None);
-        }
-    }
-    let proxy = proxy_raw.into_string().map_err(|_| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    parse_http_proxy_endpoint(&proxy).map(Some)
-}
-
-fn websocket_proxy_from_env(
-    ws_url: &str,
-) -> Result<Option<HttpProxyEndpoint>, RunnerTransportError> {
-    websocket_proxy_from_env_with(ws_url, |name| std::env::var_os(name))
-}
-
-fn target_authority(host: &str, port: u16) -> String {
-    if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-fn websocket_target_endpoint(ws_url: &str) -> Result<(String, u16), RunnerTransportError> {
-    let target = url::Url::parse(ws_url).map_err(|_| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let host = canonical_url_host(&target).ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let port = target.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    Ok((host, port))
-}
-
-async fn http_proxy_connect_tunnel(
-    proxy: &HttpProxyEndpoint,
-    target_host: &str,
-    target_port: u16,
-) -> Result<tokio::net::TcpStream, RunnerTransportError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
-        .await
-        .map_err(|_| {
-            RunnerTransportError::transient("websocket connect failed: proxy TCP connect failed")
-        })?;
-    let authority = target_authority(target_host, target_port);
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).await.map_err(|_| {
-        RunnerTransportError::transient("websocket connect failed: proxy CONNECT write failed")
-    })?;
-
-    let mut headers = Vec::with_capacity(1024);
-    loop {
-        if headers.len() >= WS_PROXY_CONNECT_HEADER_MAX_BYTES {
-            return Err(RunnerTransportError::transient(format!(
-                "websocket connect failed: proxy CONNECT response headers exceeded {} bytes",
-                WS_PROXY_CONNECT_HEADER_MAX_BYTES
-            )));
-        }
-        let mut byte = [0u8; 1];
-        let read = stream.read(&mut byte).await.map_err(|_| {
-            RunnerTransportError::transient("websocket connect failed: proxy CONNECT read failed")
-        })?;
-        if read == 0 {
-            return Err(RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            ));
-        }
-        headers.push(byte[0]);
-        if headers.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    let headers = std::str::from_utf8(&headers).map_err(|_| {
-        RunnerTransportError::transient(
-            "websocket connect failed: proxy CONNECT response was malformed",
-        )
-    })?;
-    let status_line = headers.split("\r\n").next().ok_or_else(|| {
-        RunnerTransportError::transient(
-            "websocket connect failed: proxy CONNECT response was malformed",
-        )
-    })?;
-    let mut parts = status_line.split_whitespace();
-    let version = parts
-        .next()
-        .filter(|version| version.starts_with("HTTP/"))
-        .ok_or_else(|| {
-            RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            )
-        })?;
-    let _ = version;
-    let status = parts
-        .next()
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| {
-            RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            )
-        })?;
-    if status == 407 {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy CONNECT returned HTTP 407",
-        ));
-    }
-    if !(200..300).contains(&status) {
-        return Err(RunnerTransportError::transient(format!(
-            "websocket connect failed: proxy CONNECT returned HTTP {status}"
-        )));
-    }
-    Ok(stream)
-}
-
-async fn connect_websocket_request_with_proxy(
-    request: tokio_tungstenite::tungstenite::http::Request<()>,
-    ws_url: &str,
-    proxy: Option<&HttpProxyEndpoint>,
-    token: &str,
-) -> Result<RunnerWebSocket, RunnerTransportError> {
-    let Some(proxy) = proxy else {
-        return tokio_tungstenite::connect_async(request)
-            .await
-            .map(|(stream, _)| stream)
-            .map_err(|error| {
-                classify_session_error(format!(
-                    "websocket connect failed: {}",
-                    concise_log_error(&error.to_string(), token)
-                ))
-            });
-    };
-    let (target_host, target_port) = websocket_target_endpoint(ws_url)?;
-    let stream = http_proxy_connect_tunnel(proxy, &target_host, target_port).await?;
-    tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
-        .await
-        .map(|(stream, _)| stream)
-        .map_err(|error| {
-            classify_session_error(format!(
-                "websocket connect failed: {}",
-                concise_log_error(&error.to_string(), token)
-            ))
-        })
-}
-
-async fn connect_websocket_request(
-    request: tokio_tungstenite::tungstenite::http::Request<()>,
-    ws_url: &str,
-    token: &str,
-) -> Result<RunnerWebSocket, RunnerTransportError> {
-    let proxy = websocket_proxy_from_env(ws_url)?;
-    connect_websocket_request_with_proxy(request, ws_url, proxy.as_ref(), token).await
-}
 
 fn run_websocket_runner(
     cfg: RunnerConfig,
@@ -4247,13 +3171,33 @@ where
     );
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
             let is_goodbye = matches!(env, RunnerEnvelope::Goodbye { .. });
+            let send_started = Instant::now();
             let Ok(json) = serde_json::to_string(&env) else {
+                observe_runner_stream_writer_send(
+                    StreamTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             };
             if sink.send(WsMessage::Text(json.into())).await.is_err() {
+                observe_runner_stream_writer_send(
+                    StreamTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             }
+            observe_runner_stream_writer_send(
+                StreamTransport::WebSocket,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                RunnerStreamMetricOutcome::Success,
+            );
             if is_goodbye {
                 // The session loop continues polling the split read half while
                 // awaiting this task, allowing tungstenite's close handshake to

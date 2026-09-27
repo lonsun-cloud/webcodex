@@ -37,7 +37,7 @@ async fn api_model_ergonomics_success_is_exact_and_queryable() {
     let mut response = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .add_header("x-action-session-id", "ergonomics-success", true)
-        .json(&json!({"tool": "tool_manifest", "intent": "audit"}))
+        .json(&json!({"tool": "tool_manifest", "params": {"intent": "audit"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&response), StatusCode::OK);
@@ -45,7 +45,7 @@ async fn api_model_ergonomics_success_is_exact_and_queryable() {
     assert_eq!(body["success"], true);
 
     let telemetry = single_model_ergonomics(&db, "ergonomics-success", "tool_manifest");
-    assert_eq!(telemetry["schema_version"], 3);
+    assert_eq!(telemetry["schema_version"], 9);
     assert_eq!(telemetry["tool_name"], "tool_manifest");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
@@ -76,7 +76,7 @@ async fn api_model_ergonomics_failure_uses_structured_kinds_without_private_text
     let mut response = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .add_header("x-action-session-id", "ergonomics-failure", true)
-        .json(&json!({"tool": "project_overview", "project": private_project}))
+        .json(&json!({"tool": "project_overview", "params": {"project": private_project}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&response), StatusCode::BAD_REQUEST);
@@ -117,14 +117,14 @@ async fn api_pre_result_invalid_arguments_still_counts_without_fabricated_bytes(
     let mut response = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .add_header("x-action-session-id", "ergonomics-invalid", true)
-        .json(&json!({"tool": "read_file"}))
+        .json(&json!({"tool": "read_files"}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&response), StatusCode::BAD_REQUEST);
     let body: Value = response.take_json().await.unwrap();
     assert!(body["error"].is_string());
 
-    let telemetry = single_model_ergonomics(&db, "ergonomics-invalid", "read_file");
+    let telemetry = single_model_ergonomics(&db, "ergonomics-invalid", "read_files");
     assert_eq!(telemetry["success"], false);
     assert_eq!(telemetry["error_kind"], "invalid_arguments");
     assert!(telemetry["serialized_result_bytes"].is_null());
@@ -154,11 +154,13 @@ async fn api_batch_call_records_one_generic_outer_invocation() {
         .add_header("x-action-session-id", "ergonomics-batch", true)
         .json(&json!({
             "tool": "read_files",
-            "project": "agent:importer:demo",
-            "items": [
-                {"path": "missing-a.rs"},
-                {"path": "missing-b.rs"}
-            ]
+            "params": {
+                "project": "agent:importer:demo",
+                "items": [
+                    {"path": "missing-a.rs"},
+                    {"path": "missing-b.rs"}
+                ]
+            }
         }))
         .send(&service)
         .await;
@@ -180,6 +182,58 @@ async fn api_batch_call_records_one_generic_outer_invocation() {
 }
 
 #[tokio::test]
+async fn api_work_on_project_preferences_persist_as_privacy_bounded_action_audit_facts() {
+    let config = super::test_config(Some("secret"));
+    let (_db_tmp, db) = super::test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = super::register_import_agent(project_tmp.path()).await;
+    let executor = super::spawn_startup_agent_executor(registry);
+    let service = Service::new(super::build_projects_router(config, db.clone(), runtime));
+    let private_instruction = "PRIVATE_API_WORK_ON_PROJECT_INSTRUCTION";
+    let project = "agent:importer:demo";
+
+    let mut response = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .add_header("x-action-session-id", "ergonomics-work-on-project", true)
+        .json(&json!({
+            "tool": "work_on_project",
+            "params": {
+                "project": project,
+                "instruction": private_instruction,
+                "guidance_profile": "host_code_mode",
+                "include_extension_catalog": false
+            }
+        }))
+        .send(&service)
+        .await;
+    let status = super::effective_status(&response);
+    let body: Value = response.take_json().await.unwrap();
+    executor.abort();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+
+    let telemetry = single_model_ergonomics(&db, "ergonomics-work-on-project", "work_on_project");
+    assert_eq!(telemetry["schema_version"], 9);
+    let facts = &telemetry["work_on_project"];
+    assert_eq!(facts["resume_requested"], false);
+    assert_eq!(facts["source"], "project");
+    assert_eq!(facts["mode"], "checkout");
+    assert_eq!(facts["mode_explicit"], false);
+    assert_eq!(facts["base_ref_present"], false);
+    assert_eq!(facts["guidance_profile"], "host_code_mode");
+    assert_eq!(facts["guidance_profile_explicit"], true);
+    assert_eq!(facts["include_extension_catalog"], false);
+    assert_eq!(facts["include_extension_catalog_explicit"], true);
+    let serialized = serde_json::to_string(&telemetry).unwrap();
+    for forbidden in [private_instruction, project] {
+        assert!(
+            !serialized.contains(forbidden),
+            "persisted API model ergonomics leaked {forbidden}: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn action_audit_sink_failure_never_changes_success_or_failure_tool_result() {
     let config = super::test_config(Some("secret"));
     let (_db_tmp, db) = super::test_db();
@@ -195,7 +249,7 @@ async fn action_audit_sink_failure_never_changes_success_or_failure_tool_result(
 
     let mut success = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "tool_manifest", "intent": "audit"}))
+        .json(&json!({"tool": "tool_manifest", "params": {"intent": "audit"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&success), StatusCode::OK);
@@ -205,7 +259,7 @@ async fn action_audit_sink_failure_never_changes_success_or_failure_tool_result(
 
     let mut failure = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "project_overview", "project": "missing-project"}))
+        .json(&json!({"tool": "project_overview", "params": {"project": "missing-project"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&failure), StatusCode::BAD_REQUEST);

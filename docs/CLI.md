@@ -147,24 +147,9 @@ For Runner config terminology, `project_registry_dir` is the directory of Projec
 operator use; `--token` can leak into shell history or process lists. `--strict`
 makes a FAIL report exit with status 2.
 
-### Review (host-local decisions)
+### Review and runtime activity
 
-| Command | Purpose |
-| --- | --- |
-| `webcodex task list` | List recent tasks for this project |
-| `webcodex task show <id>` | Show a task's result, approvals, and timeline |
-| `webcodex task accept <id>` | Apply a reviewed result to the checkout |
-| `webcodex task reject <id> [reason]` | Reject the stable result; the reason reaches the model |
-| `webcodex task resume <id>` | Resume a preserved run after a runtime restart |
-| `webcodex task guide <id> <message>` | Send course-correcting guidance to a running task |
-| `webcodex task approve <id> <approval> [reason]` | Approve one exact raw command for one use |
-| `webcodex task deny <id> <approval> [reason]` | Deny it; the reason is shown to the model |
-| `webcodex task activity` | Show recent mutating tool executions (workspace ledger) |
-
-`task` commands operate on the current project by default; use `--root PATH`,
-`--profile NAME`, or `--state-dir PATH` to point at another project. Accept and
-Reject are the two ways a human applies or discards a coding result locally —
-the online model can never accept its own work.
+The legacy `webcodex task` namespace has been removed with the separate Connector Task/Result/Approval lifecycle. Local `webcodex run` prints the Runtime Console URL (`/runtime`). Runtime review uses the canonical Workflow Session, Job, Git/diff, `show_changes`, and `finish_coding_task` paths rather than a host-side result accept/reject queue.
 
 ### Credentials and accounts
 
@@ -205,7 +190,6 @@ normal entry points.
 - **Server** — authenticates callers, stores shared runtime state, and routes work.
 - **Runner** — runs repository work on the machine that owns the code.
 - **Project** — one repository/workspace registered by a Runner.
-- **Task** — one bounded project-first unit of work that can be reviewed.
 - **Job** — a command or validation that continues after the initiating call returns.
 - **Workflow Session** — bounded coding evidence/continuity used by the runtime. Ordinary users normally do not manage its internal protocol fields.
 
@@ -222,7 +206,7 @@ quick answer.
 | --- | --- | --- | --- | --- |
 | Server bootstrap token | (env `WEBCODEX_TOKEN`) | `webcodex server init` | server/admin setup, user creation, pairing | GPT Actions, MCP, Runner, daily use |
 | Shared key | `wck_...` | `webcodex connect` (generated once) | hosted shared-key MCP + Runner | production IAM |
-| Project Credential | (private file) | `webcodex setup` | the one project's Connector + Runner | other projects, admin |
+| Project Credential | (private file) | `webcodex setup` | one ProjectGrant's ordinary runtime API/MCP access | other ProjectGrants, admin, Runner transport |
 | Account credential | `wc_acct_...` | `webcodex users create --issue-credential` | local token creation | GPT Actions, MCP, Runner |
 | Personal API token (PAT) | `wc_pat_...` | `webcodex tokens create-local` | GPT Actions, MCP, REST API | Runner connectivity |
 | Runner token | `wc_agent_...` | `webcodex runner-tokens create-local` | `webcodex-runner` transport only | MCP, REST, GPT Actions |
@@ -262,11 +246,8 @@ Local/manual project-bound workflow (advanced/diagnostic):
 ```bash
 webcodex setup
 webcodex doctor
-webcodex run          # keep this terminal open
+webcodex run          # keep this terminal open; output points to /runtime
 webcodex status       # in another terminal
-webcodex task list
-webcodex task show <task-id>
-webcodex task accept <task-id>
 ```
 
 Existing hosted Server:

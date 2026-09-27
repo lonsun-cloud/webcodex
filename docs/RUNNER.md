@@ -37,9 +37,9 @@ shell state.
 
 Some compatibility-facing values still use the historical word `agent`, including the `wc_agent_*` Runner-token prefix and `agent:<client_id>:<project_id>` runtime Project address. They do not refer to WebCodex's separate Durable Agent domain, and ordinary users do not need the process-level lease identifiers behind Runner recovery.
 
-### Runner config filename compatibility
+### Runner config filename migration
 
-`runner.toml` is the canonical config filename. A legacy directory containing only `agent.toml` remains readable for compatibility; if both names exist in the same config directory WebCodex fails closed and asks the operator to resolve the ambiguity. `WEBCODEX_RUNNER_CONFIG` is the current path override; the old `WEBCODEX_AGENT_CONFIG` remains a compatibility alias.
+`runner.toml` is the canonical config filename. During the WebCodex 0.4.x migration window, automatic/default/profile discovery still accepts a legacy-only `agent.toml`, and `WEBCODEX_AGENT_CONFIG` remains a deprecated fallback when `WEBCODEX_RUNNER_CONFIG` is unset. Likewise, a legacy-only `projects_dir` config field is normalized to `project_registry_dir` at load time. These compatibility inputs emit migration warnings and are planned for removal in WebCodex 0.5.0. Ambiguous dual state remains fail-closed: `runner.toml` plus `agent.toml`, both config-path environment variables, or both registry fields must be resolved by the operator. New/generated configurations always use `runner.toml`, `project_registry_dir`, and `WEBCODEX_RUNNER_CONFIG`.
 
 ## Connecting to the Server
 
@@ -66,6 +66,13 @@ When upgrading an older installation across the 0.4 boundary, upgrade the first-
 
 The exact protocol-generation field names, baseline capability list, registration grammar, and compatibility-test matrix are maintainer/wire-contract details and are intentionally omitted from this operations guide.
 
+A ChatGPT Host message that the current conversation does not support developer
+MCPs is not a Runner heartbeat or reconnect result. If ChatGPT cannot dispatch
+`runtime_status`, first run `webcodex runner status` locally (and inspect bounded
+Runner logs) before restarting or changing Runner configuration. See
+[Troubleshooting](TROUBLESHOOTING.md) for the Host-vs-Server-vs-Runner decision
+tree.
+
 If you use QUIC, keep Server and Runner QUIC settings compatible. `[quic].keepalive_interval_secs` defaults to 20 seconds and accepts `1..=25`; invalid values are rejected rather than silently clamped.
 
 ## Registering projects
@@ -88,15 +95,16 @@ allow_patch = true
 `id` and `path` are the important fields; `kind` is optional descriptive metadata.
 The registry directory is storage for Project records, not a workspace root.
 
-New configurations use `project-registry/` and `project_registry_dir`. A legacy
-installation that has only `projects.d/` / `projects_dir` remains readable. If
-both old and new locations/fields are configured, WebCodex fails closed instead
-of merging or guessing precedence. Use `--project-registry-dir` in new CLI
-commands.
+New configurations use `project-registry/` and `project_registry_dir`. An
+existing installation whose only physical registry directory is `projects.d/`
+continues to use that directory in place. During 0.4.x, a legacy-only
+`projects_dir` config field is also accepted with a deprecation warning and is
+normalized to `project_registry_dir`; the old `--projects-dir` CLI flag remains
+retired. If both physical registry directories or both config fields exist,
+WebCodex fails closed instead of merging or guessing precedence. Use
+`--project-registry-dir` for explicit CLI selection.
 
-Runtime project ids take the shape `agent:<client_id>:<project_id>`, for
-example `agent:workstation:my-repo`. A project-bound Connector resolves this
-internally; ordinary users do not type it.
+Runtime Project ids take the canonical shape `agent:<client_id>:<project_id>`, for example `agent:workstation:my-repo`. That canonical identity remains the authorization, persistence, audit, Runner-routing, diagnostic, API and CLI address. Model-facing bootstrap/discovery may additionally return a short Server-issued `project_ref` such as `~p1`. Models should normally reuse that selector on later Project-scoped tool calls instead of copying the canonical id. The mapping is durable and scoped to the authenticated caller, is pinned to the canonical id plus Runner-reported Project root identity, and grants no authority: every use re-runs current Project visibility/authorization. It never depends on Workflow Session, ClientWindow, MCP session, transport connection, recent activity or hidden Host state, and a stale ref is never silently rebound to another Project.
 
 ### Allowed roots
 
@@ -124,11 +132,15 @@ Runner's `allowed_roots` policy.
 `skill_list` presents one catalog while preserving three distinct ownership and
 lifecycle models:
 
+**Available since v0.4.2:** configured live Runner Skill roots and the Managed Runner Skill Store participate in this unified catalog. WebCodex v0.4.1 `skill_list` did not implicitly scan `~/.codex/skills`; configure `[skills].roots` explicitly on v0.4.2+ when that directory should participate.
+
 | Source | Location / owner | Trust | Version semantics |
 | --- | --- | --- | --- |
 | Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Live project content; no package revision. |
-| Configured live Runner Skill roots | Operator-selected absolute directories on the Runner host | `operator_configured_guidance` | Live read-only filesystem content; no install, activation, rollback, or package revision. |
+| Configured live Runner Skill roots | Operator-selected absolute directories on the Runner host | `operator_configured_guidance` | Live filesystem content that WebCodex does not modify; supported scripts may execute through `run_skill_resource`; no install, activation, rollback, or package revision. |
 | Managed Runner Skill Store | Runner state under `runner-skills-v1` | `operator_installed_guidance` | Immutable package revisions with install, activation, removal, and rollback-oriented Store semantics. |
+
+`skill_list.sources` always reports these three logical sources with bounded `status`, counts, truncation, and safe reason codes. An available source with `skill_count=0` means discovery succeeded and found no Skills; it is not an index failure. Only the Project source exposes the logical root hint `.agents/skills`; native configured Runner paths remain private.
 
 Configured live roots are optional and have no implicit defaults. Each configured
 root contains normal Agent Skill packages directly:
@@ -154,23 +166,133 @@ roots = [
 ```
 
 A root has the form `<root>/<package>/SKILL.md`, with optional package resources
-such as `references/`. These directories are read directly by the Runner. WebCodex
-does not copy them into the managed Store, and `skill_install`, `skill_activate`,
-and `skill_remove_revision` continue to mutate only that Store.
+such as `references/` and `scripts/`. These directories are read directly by the
+Runner. WebCodex does not modify files in configured roots or copy them into the
+managed Store; `skill_install`, `skill_activate`, and `skill_remove_revision`
+continue to mutate only that Store. This non-mutating behavior does not make the
+source non-executable: `run_skill_resource` may execute supported `scripts/*.py`
+or `scripts/*.sh` from an operator-configured trusted Skill.
 
 The configured paths belong to the **Runner host**, even when the Server is on a
-different machine. They are not added to `[policy].allowed_roots`, do not grant
-ordinary Project file/shell/process tools access to those directories, and native
-root paths are not projected through the model-facing Skill catalog. Skill reads
-accept only an opaque `skill_id` plus a package-relative resource path; the Runner
-resolves the root from its trusted configuration and rejects traversal or link
-escapes.
+different machine, and selecting them is an explicit operator trust decision for
+the narrow Skill runtime. They are not added to `[policy].allowed_roots`, do not
+grant ordinary Project file/shell/process tools access to those directories, and
+native root paths are not projected through the model-facing Skill catalog. Skill
+reads and `run_skill_resource` accept only an opaque `skill_id` plus a
+package-relative resource path; the Runner resolves the root from its trusted
+configuration and rejects traversal or link escapes.
 
 Skill files remain live: editing `SKILL.md` or a resource is visible to the next
-discovery/read without any reload. Changing the configured `roots` list is a
-hot-reloadable Runner configuration change: edit `runner.toml`, run
+discovery/read without any reload. For configured Skills,
+`expected_definition_revision` fences the `SKILL.md` definition, not the resource
+bytes: `run_skill_resource` re-reads the selected script at execution and returns
+`skill_sha256` for the actual bytes executed. Managed installed Skills additionally
+use `expected_package_revision` to fence the immutable package. Changing the
+configured `roots` list is a hot-reloadable Runner configuration change: edit
+`runner.toml`, run `runner_config_check`, then `runner_config_reload` with the
+current generation. No Runner process restart is required.
+
+## Runner build identity
+
+A connected Runner reports bounded, non-secret binary identity through `runtime_status(client_id=...)` and `list_runners`: package version, Git commit/dirty state, build timestamp, Cargo target triple, and architecture. Older Runners may omit any of these optional fields. This is intended for deployment/source-alignment diagnostics; executable paths, environment, tokens, and credentials are not included. `webcodex-runner --version` remains the local pre-connection identity check.
+
+## Runner-level configured instructions
+
+A Runner can project the same coding guidance into every Project bootstrap on that
+Runner. v1 is configured manually in the Runner's `runner.toml`; Desktop file
+selection/upload UI is intentionally deferred.
+
+```toml
+[instructions]
+files = [
+    "/home/alice/.codex/AGENTS.md",
+]
+```
+
+On macOS use the equivalent Runner-local absolute path such as
+`/Users/alice/.codex/AGENTS.md`. On Windows, TOML literal strings avoid escaping
+backslashes:
+
+```toml
+[instructions]
+files = [
+    'C:\Users\alice\.codex\AGENTS.md',
+]
+```
+
+There is no implicit `~/.codex/AGENTS.md` discovery. Each configured path is
+absolute and Runner-local. At coding startup, Runner-configured sources are
+projected first in deterministic config order, followed by the existing
+project-local candidates (`AGENTS.md`, `agents.md`, `CLAUDE.md`,
+`.codex/AGENTS.md`, `.github/copilot-instructions.md`). Both classes are model
+guidance only; neither changes execution authority.
+
+Configured instruction files are read by a narrow Runner-owned instruction
+runtime. Their parent directories are **not** added to `[policy].allowed_roots`,
+ordinary Project file/shell/process tools do not gain access to them, and native
+absolute paths are not projected to the model. Model-facing sources use sanitized
+logical identities instead.
+
+Configured sources must be ordinary UTF-8 files, at most 1 MiB each. The file and
+its parent components must not be symbolic links or Windows reparse points
+(including directory junctions); configure the resolved physical path instead.
+Parent traversal is handle-relative on Unix and preserves search-only directory
+semantics where the platform exposes them. On Windows, the parent path is
+acquired with a native no-reparse open and the leaf is opened relative to that
+pinned parent handle; the parent identity is rechecked before accepting the
+observation, so a concurrent parent replacement cannot retarget the configured
+read. Non-Unix/non-Windows targets fail closed instead of falling back to a
+path-based open. Windows verbatim disk/UNC paths remain accepted, but remote filesystems
+depend on their server-side reparse and handle semantics and should not be
+treated as providing stronger guarantees than the remote server implements.
+The reader checks the opened file handle and enforces the byte bound during
+reading, not only through a prior metadata check. Unreadable, redirected, oversized, or invalid-UTF-8
+sources make the instruction scan incomplete without exposing their native paths
+or failing the entire Project bootstrap.
+
+Changing `[instructions].files` is hot-reloadable: edit `runner.toml`, run
 `runner_config_check`, then `runner_config_reload` with the current generation.
-No Runner process restart is required.
+No Runner restart is required. The files themselves remain live: editing a
+configured `AGENTS.md` is visible to the next `work_on_project`/new Project
+bootstrap without any config reload. Each Project bootstrap observes the current
+Runner-global instructions independently; v1 does not retain or suppress them
+across Projects. Truncated Runner-global sources stay bounded and do not create a
+generic arbitrary-file `read_more` authority.
+
+
+An empty configured file or a missing leaf beneath verified ordinary parent
+directories confirms removal. A missing, redirected, or unreadable parent leaves
+the Runner scope unavailable, as do other read failures. Removing an entry from
+`instructions.files` remains an explicit revocation after config reload.
+An explicit Session resume refreshes Runner and
+Project scopes independently, retaining an unavailable scope's last-known rules
+only in memory. A newly observed Runner instance or config generation cannot
+inherit the previous global rules. Within one instance, a higher known config
+generation wins regardless of request start order; an unknown generation cannot
+replace a known generation. Instance replacement uses live-instance verification
+order, so a late retired-instance observation cannot restore old guidance.
+Within one instance/generation, request observation order breaks ties. Project
+reads have their own start-order fence, independent of Runner availability;
+late Project observations retain newer local rules and report an incomplete
+scan. Retention is scope-wide, not per-file within an incomplete scope.
+Instruction bodies and observation fences are not persisted.
+
+Project-local text reserves its share of the 32 Ki-character snapshot before
+global text is shortened; presentation remains global-before-project. Session
+retention selects scopes before applying this shared budget. An independently
+bounded global source copy (at most 32 Ki characters) stays only in Session
+memory, so retaining a short Project scope or later shrinking it can recover
+global text hidden by an earlier aggregate budget. This source copy and all
+observation fences are omitted from public snapshots and summaries. Runner
+sources never receive a Project `read_file` continuation, including during final
+startup byte-budget reduction. `work_on_project` always re-observes instructions
+and change metadata while keeping instruction bodies out of its primary output.
+An explicit `context_request=["project.instructions"]` observes current Runner
+and Project sources together and projects their bounded bodies without reusing
+Session-retained bodies. The instruction
+projection fits the remaining 20 KiB shared sidecar envelope by dropping derived
+headings before shortening text, preserving source identities and Project rules
+instead of discarding the entire material solely because global sources were added.
 
 ## Local MCP providers
 
@@ -190,13 +312,13 @@ env_from_env = { GITHUB_TOKEN = "GITHUB_TOKEN", PATH = "PATH", HOME = "HOME" }
 timeout_secs = 30
 ```
 
-`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` is restart-required configuration; changing a provider does not hot-reload it.
+`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` participates in the normal generation-fenced Runner config reload transaction: unchanged providers keep their exact provider identity and live connection, changed providers receive a fresh provider identity, and added/removed providers update routing without restarting the Runner. Old exact provider identities fail closed and are never retargeted.
 
-Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start.
+Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start. On Windows, the Runner additionally supplies only the non-secret `SYSTEMROOT` OS bootstrap after clearing the environment, unless that destination is explicitly mapped; `PATH`, user-profile state, proxies, and credentials are still not inherited.
 
 Mapping a credential delegates that credential to the configured provider process. The provider can use it according to its own implementation and can choose to return derived or raw values through normal tool results; WebCodex does not attempt to redact arbitrary provider output. Treat configured providers as credential recipients, use least-privilege provider credentials, and remember that any caller authorized for `mcp:local` can exercise the provider capabilities that those credentials enable.
 
-A provider starts on first real interaction and is then reused. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports whether a provider id can be routed; `list(server=...)` and `describe` interact with the provider.
+A provider connection starts on first real interaction and is reused while healthy. A fatal stdio/protocol failure retires only that connection; WebCodex never replays the failed request. A later explicit request may start a fresh connection under the same logical provider identity, and an effectful `tools/call` re-lists and checks the bound tool schema before dispatch. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports only routing resolvability. `mcp_tool(action=status, server=...)` is a passive Runner-side lifecycle observation that never starts, initializes, or pings a provider; it reports only `never_started`, `healthy`, `connection_retired`, or `busy`. Here `healthy` means the retained connection's child process is still running, not that an end-to-end MCP health probe was performed. `list(server=...)` and `describe` interact with the provider.
 
 ### Provider-side gateway V1 compatibility
 
@@ -204,10 +326,12 @@ The built-in Runner-to-provider gateway is intentionally a bounded stdio tool su
 
 - provider-side tool behavior is based on MCP `2025-06-18`;
 - `tools/list` and `tools/call` are supported;
-- callbacks, list pagination, media/resources, and end-to-end progress forwarding are not supported;
-- text tool results and bounded `structuredContent` are supported.
+- callbacks, list pagination, and end-to-end progress forwarding are not supported;
+- tool results support text plus standard bounded image content blocks, preserving provider content order; image data must be standard Base64 with MIME `image/png`, `image/jpeg`, or `image/webp`, and all image blocks in one result share a 4 MiB decoded-data cap;
+- bounded `structuredContent` is preserved independently of image content;
+- audio, resource, `resource_link`, and unknown content block types remain unsupported.
 
-Unsupported protocol/content shapes fail closed instead of being silently translated.
+Unsupported protocol/content shapes fail closed instead of being silently translated. This remains a bounded MCP tool subset, not a transparent media/resource bridge.
 
 ## Shell profiles
 
@@ -421,6 +545,21 @@ the same logical detached Job and route observation or stop through its durable
 control state. This does not make ordinary process execution detachable, and it
 does not promise survival across a machine reboot.
 
+Completed caller-visible ordinary Jobs have a separate Server-owned SQLite
+receipt. Within the original 15-minute terminal retention window, up to 64
+receipts per logical Runner survive a coordinated Server/Runner restart and
+remain available through `list_jobs`, `observe_jobs`, and bounded log reads.
+Receipts preserve the Job id, terminal result, retained log cursors and tails,
+and original authorization partition/owner; Runner registration is not required
+to observe them. Restarts and receipt replay do not renew their deadlines.
+Storage failure degrades restart observability without changing execution success.
+
+These receipts are read-only evidence. They contain no command input, stdin,
+environment, validation argv, replay intent, process handle, or execution lease.
+Active ordinary Jobs remain process-owned; only `run_detached_process` has an
+explicit durable execution ownership handoff. Hidden synchronous results and
+detached ownership state are excluded from ordinary receipt persistence.
+
 The Server distinguishes the stable Runner `client_id` from the current live process lease. A stale or replacement process cannot keep submitting results under the old lease, and ordinary child-process Jobs are not adopted by a replacement Runner. The exact lease identifier is an internal wire detail.
 
 Reconnect happens automatically with a short delay. Authentication failure and
@@ -580,8 +719,9 @@ of finding its PID or sending signals manually:
 4. Inspect `runtime_status(client_id=...)` (or `list_runners`) after reload.
 
 `runner_config_reload` never writes `runner.toml`; it only activates the candidate
-already on disk. Hot-reloadable policy, shell, configured Skill roots, Native Plugin, and static SSH-resource changes can
-become active immediately, while fields reported in `restart_required_fields`
+already on disk. Hot-reloadable policy, shell, configured Skill roots, configured
+instruction files, Native Plugin, and static SSH-resource changes can become active
+immediately, while fields reported in `restart_required_fields`
 remain startup-only until the Runner restarts. Invalid candidates leave the active
 snapshot and generation unchanged. Managed `ssh_resource` mutations are different:
 they use a frozen startup snapshot and require a Runner restart exactly when the

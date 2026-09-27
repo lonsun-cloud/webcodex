@@ -44,6 +44,19 @@ fn agent_schema() -> Value {
     })
 }
 
+fn listed_agent_schema() -> Value {
+    let mut schema = agent_schema();
+    schema["properties"]["production_auto_resume_available"] = schema_type(
+        "boolean",
+        "True only when this listed Agent snapshot has a current unexpired generation-matching wake-capable Endpoint and the current Server process has a production Host carrier for that exact generation. This is continuation readiness only: it does not mean idle, reserve capacity, grant execution authority, or guarantee immediate Host scheduling.",
+    );
+    schema["required"]
+        .as_array_mut()
+        .expect("agent schema required fields")
+        .push(json!("production_auto_resume_available"));
+    schema
+}
+
 fn endpoint_schema() -> Value {
     json!({
         "type": "object",
@@ -70,12 +83,122 @@ fn endpoint_schema() -> Value {
     })
 }
 
+pub(super) fn agent_continuation_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "agent_id": schema_type("string", "Exact durable Agent identity."),
+            "display_name": schema_type("string", "Safe Agent display name only; private description and specialty labels are omitted."),
+            "endpoint_id": schema_type("string", "Exact current Endpoint identity."),
+            "controller_generation": schema_type("integer", "Exact Endpoint controller generation."),
+            "endpoint_lease_expires_at_unix_ms": schema_type("integer", "Current bounded Endpoint lease expiry."),
+            "host_binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "bound": schema_type("boolean", "Whether this exact Endpoint generation has a current process-local Host carrier."),
+                    "adapter_kind": nullable_string("Safe Host carrier kind, if present."),
+                    "production_auto_resume_available": schema_type("boolean", "Whether the current Host carrier has a demonstrated production new-turn primitive.")
+                },
+                "required": ["bound", "adapter_kind", "production_auto_resume_available"]
+            },
+            "wake": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "wake_id": schema_type("string", "Exact unresolved durable Wake identity."),
+                            "state": {"type": "string", "enum": ["pending", "claimed", "prepared", "delivered", "delivery_unknown"]},
+                            "revision": schema_type("integer", "Current durable Wake revision."),
+                            "wait_id": nullable_string("Exact AgentWait source for an agent_wait_events Wake; null for other Wake kinds."),
+                            "wait_match_count": nullable_integer("Frozen/coalescing Wait match-count snapshot for agent_wait_events; null for other Wake kinds."),
+                            "wait_match_sequence": nullable_integer("Frozen/coalescing Wait match high-watermark for agent_wait_events; null for other Wake kinds.")
+                        },
+                        "required": ["wake_id", "state", "revision", "wait_id", "wait_match_count", "wait_match_sequence"]
+                    },
+                    {"type": "null"}
+                ]
+            },
+            "queued_delivery_count": schema_type("integer", "Current authoritative queued Inbox count; no Message bodies are included."),
+            "dispatch_observation": {
+                "anyOf": [
+                    {"type": "string", "enum": ["dispatch_prepared", "dispatch_accepted", "dispatch_unknown", "continuation_consumed"]},
+                    {"type": "null"}
+                ],
+                "description": "Process-local Host observation only; only continuation_consumed proves a later turn exact-consumed the durable Wake."
+            },
+            "recovery": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "kind": {"type": "string", "const": "host_binding_missing_in_process"}
+                        },
+                        "required": ["kind"]
+                    },
+                    {"type": "null"}
+                ],
+                "description": "Null during ordinary state. The sole object variant is emitted only for fingerprint-proven Server-restart loss of this exact process-local MCP App binding."
+            }
+        },
+        "required": [
+            "version", "agent_id", "display_name", "endpoint_id", "controller_generation",
+            "endpoint_lease_expires_at_unix_ms", "host_binding", "wake",
+            "queued_delivery_count", "dispatch_observation", "recovery"
+        ]
+    })
+}
+
+fn agent_continuation_endpoint_recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"type": "string", "enum": ["controller_live", "endpoint_replaced"]},
+            "replacement": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "agent_id": schema_type("string", "Durable Agent identity, unchanged by replacement."),
+                            "from_endpoint_id": schema_type("string", "Exact stale Endpoint authorized for replacement."),
+                            "from_controller_generation": schema_type("integer", "Exact stale controller generation authorized for replacement."),
+                            "endpoint_id": schema_type("string", "Server-created replacement Endpoint identity."),
+                            "controller_generation": schema_type("integer", "Monotonically increased replacement generation."),
+                            "reason": {"type": "string", "const": "endpoint_expired"}
+                        },
+                        "required": [
+                            "agent_id", "from_endpoint_id", "from_controller_generation",
+                            "endpoint_id", "controller_generation", "reason"
+                        ]
+                    },
+                    {"type": "null"}
+                ]
+            },
+            "successor_needs_recovery": schema_type(
+                "boolean",
+                "True only when the exact one-hop successor is itself naturally expired and must be supplied as the predecessor of another recovery call."
+            )
+        },
+        "required": ["kind", "replacement", "successor_needs_recovery"]
+    })
+}
+
 fn participant_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "participant_id": schema_type("string", "Canonical Conversation participant record id."),
+            "participant_id": {
+                "type": "string",
+                "pattern": "^wc_participant_[A-Za-z0-9_-]{16}$",
+                "description": "Canonical Conversation participant record id."
+            },
             "participant_kind": {"type": "string", "enum": ["human", "agent"]},
             "agent_id": nullable_string("Canonical Agent id for Agent participants."),
             "handle": nullable_string("Current Agent handle projection."),
@@ -226,25 +349,41 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "agents",
-                array_schema(agent_schema(), "Bounded Agent Card page."),
+                array_schema(
+                    listed_agent_schema(),
+                    "Bounded Agent Card page with current continuation readiness.",
+                ),
             ),
         ]),
-        "attach_agent_endpoint" | "detach_agent_endpoint" => wrapped_output_schema(vec![
+        "present_agent_continuation" => wrapped_output_schema(vec![(
+            "agent_continuation",
+            agent_continuation_projection_schema(),
+        )]),
+        "agent_continuation_recover_endpoint" => wrapped_output_schema(vec![
+            ("agent_continuation", json!({
+                "anyOf": [agent_continuation_projection_schema(), {"type": "null"}],
+                "description": "Live continuation projection for the returned selector, or null when the exact one-hop successor is itself expired and requires another bounded recovery step."
+            })),
+            ("endpoint_recovery", agent_continuation_endpoint_recovery_schema()),
+            ("replayed", schema_type("boolean", "True when the exact expired-endpoint replacement was replayed.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the replacement Endpoint.")),
+        ]),
+        "rotate_agent_continuation_endpoint" | "attach_agent_endpoint" | "detach_agent_endpoint" => wrapped_output_schema(vec![
             ("endpoint", endpoint_schema()),
             (
                 "created",
                 schema_type(
                     "boolean",
-                    "True only for first attachment; false for detach.",
+                    "True only when this call created a new Endpoint; false for detach or exact replay.",
                 ),
             ),
             (
                 "replayed",
-                schema_type("boolean", "True for exact idempotent attach replay."),
+                schema_type("boolean", "True when an exact idempotent Endpoint creation or rotation request replayed the original result."),
             ),
             (
                 "state_changed",
-                schema_type("boolean", "Whether attachment state changed."),
+                schema_type("boolean", "Whether Endpoint/controller lifecycle state changed."),
             ),
         ]),
         "bootstrap_agent_conversation" => wrapped_output_schema(vec![
@@ -280,14 +419,22 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                                 "wake_id": schema_type("string", "Exact unresolved durable Wake identity."),
                                 "state": {"type": "string", "enum": ["pending", "claimed", "prepared", "delivered", "delivery_unknown"]},
                                 "revision": schema_type("integer", "Current Wake revision."),
-                                "conversation_id": schema_type("string", "Latest Conversation represented by the Wake."),
-                                "latest_message_id": schema_type("string", "Latest Message id represented by the Wake; no Message body is included."),
-                                "queued_delivery_count": schema_type("integer", "Bounded queued count snapshot represented by the Wake."),
-                                "inbox_high_watermark": schema_type("integer", "Durable delivery high-watermark represented by the Wake.")
+                                "trigger_kind": {"type": "string", "enum": ["inbox_changed", "agent_task_attempt", "attention_event"]},
+                                "conversation_id": nullable_string("Latest Conversation represented by an inbox_changed Wake; null for task and attention sources."),
+                                "latest_message_id": nullable_string("Latest Message id represented by an inbox_changed Wake; null for task and attention sources and no Message body is included."),
+                                "queued_delivery_count": nullable_integer("Bounded queued count snapshot for an inbox_changed Wake; null for task and attention sources."),
+                                "inbox_high_watermark": nullable_integer("Durable delivery high-watermark for an inbox_changed Wake; null for task and attention sources."),
+                                "task_id": nullable_string("Exact AgentTask id for Task-attempt or Task-terminal attention; null for Goal workflow stall attention and non-Task sources."),
+                                "task_attempt_id": nullable_string("Exact AgentTaskAttempt id for Task sources; null for Goal workflow stall attention and non-Task sources."),
+                                "event_id": nullable_string("Exact durable semantic attention Event id for attention_event; null for other Wake sources."),
+                                "goal_id": nullable_string("Exact correlated Goal id for attention_event; null for other Wake sources. Identity grants no Goal authority."),
+                                "attention_kind": {"anyOf": [{"type": "string", "enum": ["agent_task_terminal", "goal_workflow_stalled"]}, {"type": "null"}]},
+                                "workflow_session_id": nullable_string("Exact explicitly correlated Workflow Session for a Goal workflow stall. Identity grants no Session authority.")
                             },
                             "required": [
-                                "wake_id", "state", "revision", "conversation_id",
-                                "latest_message_id", "queued_delivery_count", "inbox_high_watermark"
+                                "wake_id", "state", "revision", "trigger_kind", "conversation_id",
+                                "latest_message_id", "queued_delivery_count", "inbox_high_watermark",
+                                "task_id", "task_attempt_id", "event_id", "goal_id", "attention_kind", "workflow_session_id"
                             ]
                         },
                         {"type": "null"}

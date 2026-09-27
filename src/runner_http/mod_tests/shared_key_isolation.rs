@@ -356,8 +356,8 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
 
 #[tokio::test]
 async fn same_client_id_in_different_project_grants_is_isolated() {
-    // Expected pre-fix failure: reusing the same instance id currently
-    // lets a second auth group replace the first group's global lease.
+    // A matching client/instance identity in another ProjectGrant must not replace
+    // or reveal the original grant's Runner lease.
     let registry = RunnerRegistry::default();
     let grant_a = crate::auth::shared_key::project_credential_context("wc_pgrant_aaaaaaaaaaaaaaaa");
     let grant_b = crate::auth::shared_key::project_credential_context("wc_pgrant_bbbbbbbbbbbbbbbb");

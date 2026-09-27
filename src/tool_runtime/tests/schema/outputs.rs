@@ -1,13 +1,12 @@
 use super::*;
 
 #[test]
-fn computer_launch_application_output_schema_has_closed_native_platforms() {
-    let schema =
-        crate::tool_runtime::registry::output_schema_for_tool("computer_launch_application");
+fn computer_control_output_schema_has_closed_native_platforms() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("computer_control");
     let validate = |value: &Value| {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
     };
-    let application_id = "application_0123456789abcdef0123456789abcdef";
+    let application_id = "application_iavN7wEjRWeJq83v";
     for platform in ["windows", "macos"] {
         let output =
             serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
@@ -28,19 +27,33 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
                 "application_id": application_id,
                 "state_changed": false,
                 "execution_state": "not_started",
-                "recovery_kind": "reobserve",
-                "recovery_tool": "computer_list_applications"
+                "suggested_call": {
+                    "tool": "computer_observe",
+                    "arguments": {"action": "applications", "client_id": "msi"}
+                }
             }),
         ),
     )
     .unwrap();
     validate(&stale).unwrap();
-    let mut invalid_recovery = stale.clone();
-    invalid_recovery["output"]["recovery_kind"] = json!("blind_retry");
-    assert!(validate(&invalid_recovery).is_err());
-    let mut invalid_tool_class = stale.clone();
-    invalid_tool_class["output"]["recovery_kind"] = json!("fix_input");
-    assert!(validate(&invalid_tool_class).is_err());
+    let mut legacy_recovery_tool = stale.clone();
+    legacy_recovery_tool["output"]["recovery_tool"] = json!("computer_observe");
+    assert!(validate(&legacy_recovery_tool).is_err());
+    assert!(schema["properties"]["output"]["properties"]
+        .get("recovery_tool")
+        .is_none());
+    let serialized_schema = serde_json::to_string(&schema).unwrap();
+    assert!(serialized_schema.contains("suggested_call"));
+    assert!(serialized_schema.contains("reconcile_with"));
+    assert!(serialized_schema.contains("recovery_tool"));
+    assert!(serialized_schema.contains("not"));
+    let mut inferred_argument = stale.clone();
+    inferred_argument["output"]["suggested_call"]["arguments"]["surface_id"] =
+        json!("surface_should_not_be_inferred");
+    assert!(validate(&inferred_argument).is_err());
+    let mut duplicate_kind = stale.clone();
+    duplicate_kind["output"]["recovery_kind"] = json!("reobserve");
+    assert!(validate(&duplicate_kind).is_err());
 
     let mut recovery_on_success =
         serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
@@ -72,62 +85,134 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
 }
 
 #[test]
-fn read_file_output_schema_matches_real_results_and_strict_tool_payloads() {
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
-    let validate = |value: &Value| {
-        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
+fn browser_output_schemas_accept_canonical_results_and_reject_leaked_fields() {
+    let observe_schema = crate::tool_runtime::registry::output_schema_for_tool("browser_observe");
+    let act_schema = crate::tool_runtime::registry::output_schema_for_tool("browser_act");
+    let validate_observe = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            value,
+            &observe_schema,
+        )
     };
-    let success = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
-        "text": "hello",
-        "format": "plain",
-        "path": "src/lib.rs",
-        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "start_line": 1,
-        "limit": 2,
-        "total_lines": 3,
-        "returned_lines": 1,
-        "end_line": 1,
-        "has_more": true,
-        "next_start_line": 2
+    let validate_act = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &act_schema)
+    };
+
+    let snapshot = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_id": "page_abcdefghijklmnop",
+        "snapshot_generation": 1,
+        "node_count": 1,
+        "truncated": false,
+        "nodes": [{
+            "role": "button",
+            "name": "Continue",
+            "value": null,
+            "element_id": "element_abcdefghijklmnop",
+            "actionable": true
+        }]
     })))
     .unwrap();
-    assert!(
-        success.get("error").is_none(),
-        "successful ToolResult omits error"
-    );
-    validate(&success).unwrap();
-    assert!(
-        success["output"]["returned_lines"].as_u64().unwrap()
-            <= success["output"]["limit"].as_u64().unwrap()
-    );
+    validate_observe(&snapshot).unwrap();
 
-    let sparse = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
-        "text": "hello",
-        "path": "src/lib.rs",
-        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "total_lines": 1
+    let screenshot =
+        serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+            "execution_state": "completed",
+            "state_changed": false,
+            "browser_id": "browser_abcdefghijklmnop",
+            "page_id": "page_abcdefghijklmnop",
+            "content_base64": "iVBORw0KGgo=",
+            "mime_type": "image/png",
+            "width": 1024,
+            "height": 768,
+            "file_bytes": 8,
+            "sha256": "a".repeat(64)
+        })))
+        .unwrap();
+    validate_observe(&screenshot).unwrap();
+
+    let console = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "retained_count": 200,
+        "count": 2,
+        "truncated": true,
+        "entries": [
+            {"level":"warning","text":"warn","source":null,"timestamp":1.0},
+            {"level":"error","text":"boom","source":"https://example.test/app.js","timestamp":2.0}
+        ]
     })))
     .unwrap();
-    validate(&sparse).unwrap();
-    let mut sparse_numbered = sparse.clone();
-    sparse_numbered["output"]["format"] = json!("numbered");
-    validate(&sparse_numbered).unwrap();
+    validate_observe(&console).unwrap();
 
-    let mut sparse_plain = sparse.clone();
-    sparse_plain["output"]["format"] = json!("plain");
-    assert!(
-        validate(&sparse_plain).is_err(),
-        "complete sparse plain output must omit redundant format"
-    );
+    let diagnostics = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "console_retained": 200,
+        "console_count": 1,
+        "console_truncated": true,
+        "console": [
+            {"level":"exception","text":"boom","source":null,"timestamp":3.0}
+        ],
+        "network_retained": 300,
+        "network_count": 1,
+        "network_truncated": false,
+        "network": [
+            {"method":"GET","url":"https://example.test/api","resource_type":"Fetch","status":500,"failed_reason":null,"timestamp":4.0}
+        ]
+    })))
+    .unwrap();
+    validate_observe(&diagnostics).unwrap();
+
+    let launch = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": true,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_count": 1
+    })))
+    .unwrap();
+    validate_act(&launch).unwrap();
+
+    let stale = serde_json::to_value(
+        crate::tool_runtime::tool_result::ToolResult::err_with_output(
+            "stale element",
+            json!({
+                "execution_state": "not_started",
+                "state_changed": false,
+                "error_kind": "stale_element",
+                "message": "element identity is stale",
+                "recovery": {
+                    "reason": "re-observe before acting",
+                    "suggested_call": {
+                        "tool": "browser_observe",
+                        "arguments": {
+                            "action": "snapshot",
+                            "client_id": "msi",
+                            "browser_id": "browser_abcdefghijklmnop",
+                            "page_id": "page_abcdefghijklmnop"
+                        }
+                    }
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    validate_act(&stale).unwrap();
+
+    let mut leaked = snapshot;
+    leaked["output"]["target_id"] = json!("private-cdp-target");
+    assert!(validate_observe(&leaked).is_err());
+    let mut leaked = launch;
+    leaked["output"]["debug_endpoint"] = json!("private-endpoint");
+    assert!(validate_act(&leaked).is_err());
+}
+
+#[test]
+fn read_files_output_schema_rejects_sparse_item_over_default_limit() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let default_limit = webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
-    let mut sparse_over_default_limit = sparse.clone();
-    sparse_over_default_limit["output"]["total_lines"] = json!(default_limit + 1);
-    assert!(
-        validate(&sparse_over_default_limit).is_err(),
-        "complete sparse read_file output cannot claim more lines than the default range can return"
-    );
-
-    let read_files_schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let sparse_batch_over_default_limit = json!({
         "success": true,
         "output": {
@@ -148,102 +233,9 @@ fn read_file_output_schema_matches_real_results_and_strict_tool_payloads() {
     assert!(
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
             &sparse_batch_over_default_limit,
-            &read_files_schema,
+            &schema,
         )
         .is_err(),
         "complete sparse read_files item cannot claim more lines than the default range can return"
     );
-    let mut sparse_missing_sha = sparse.clone();
-    sparse_missing_sha["output"]
-        .as_object_mut()
-        .unwrap()
-        .remove("sha256");
-    assert!(validate(&sparse_missing_sha).is_err());
-    let mut sparse_fake_continuation = sparse.clone();
-    sparse_fake_continuation["output"]["has_more"] = json!(true);
-    assert!(
-        validate(&sparse_fake_continuation).is_err(),
-        "sparse complete form must not admit partial-read continuation fields"
-    );
-
-    let failure = serde_json::to_value(
-        crate::tool_runtime::tool_result::ToolResult::err_with_output(
-            "read_file failed: not_found",
-            json!({
-                "error_kind": "read_file_failed",
-                "reason_code": "not_found",
-                "path": "missing.rs",
-                "state_changed": false
-            }),
-        ),
-    )
-    .unwrap();
-    validate(&failure).unwrap();
-
-    // Failures produced before the read implementation runs retain the runtime's
-    // generic null/object payloads and must still match the advertised envelope.
-    let generic_null = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::err(
-        "unknown project",
-    ))
-    .unwrap();
-    validate(&generic_null).unwrap();
-    let generic_object = serde_json::to_value(
-        crate::tool_runtime::tool_result::ToolResult::err_with_output(
-            "session guard denied",
-            json!({"error_kind": "session_guard_denied", "state_changed": false}),
-        ),
-    )
-    .unwrap();
-    validate(&generic_object).unwrap();
-
-    for recorder_only in ["session_recorded", "session_event_id", "session_id"] {
-        let mut telemetry = success.clone();
-        telemetry["output"][recorder_only] = match recorder_only {
-            "session_recorded" => json!(true),
-            "session_event_id" => json!("evt_test"),
-            "session_id" => json!("wc_sess_test"),
-            _ => unreachable!(),
-        };
-        assert!(
-            validate(&telemetry).is_err(),
-            "read_file schema admitted recorder-only field {recorder_only}"
-        );
-    }
-
-    for missing in ["next_start_line", "sha256"] {
-        let mut value = success.clone();
-        value["output"].as_object_mut().unwrap().remove(missing);
-        assert!(validate(&value).is_err(), "missing {missing} was accepted");
-    }
-
-    let mut bad_sha = success.clone();
-    bad_sha["output"]["sha256"] = json!("ABC");
-    assert!(validate(&bad_sha).is_err());
-
-    let mut zero_limit = success.clone();
-    zero_limit["output"]["limit"] = json!(0);
-    assert!(validate(&zero_limit).is_err());
-
-    let mut impossible_count = success.clone();
-    impossible_count["output"]["returned_lines"] = json!(2001);
-    assert!(validate(&impossible_count).is_err());
-
-    let mut missing_reason = failure.clone();
-    missing_reason["output"]
-        .as_object_mut()
-        .unwrap()
-        .remove("reason_code");
-    assert!(validate(&missing_reason).is_err());
-
-    let mut unknown_failure = failure.clone();
-    unknown_failure["output"]["runner_secret"] = json!("hidden");
-    assert!(validate(&unknown_failure).is_err());
-
-    let mut unknown_output = success.clone();
-    unknown_output["output"]["runner_secret"] = json!("hidden");
-    assert!(validate(&unknown_output).is_err());
-
-    let mut unknown_top = success;
-    unknown_top["runner_secret"] = json!("hidden");
-    assert!(validate(&unknown_top).is_err());
 }

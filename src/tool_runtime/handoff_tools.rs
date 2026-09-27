@@ -1,4 +1,4 @@
-//! Runtime dispatch adapter for handoff tool calls.
+//! Runtime dispatch adapter for explicit handoff recovery.
 
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
@@ -16,7 +16,7 @@ impl ToolRuntime {
                 include_workspace,
                 include_checkpoints,
                 include_validation,
-                summary_only,
+                diagnostic,
                 limit,
             } => {
                 self.session_handoff_summary(
@@ -25,8 +25,24 @@ impl ToolRuntime {
                     include_workspace,
                     include_checkpoints,
                     include_validation,
-                    summary_only,
+                    diagnostic,
                     limit,
+                    auth,
+                )
+                .await
+            }
+            ToolCall::SessionHandoffState {
+                project,
+                session_id,
+            } => {
+                self.session_handoff_summary(
+                    session_id,
+                    Some(project),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
                     auth,
                 )
                 .await

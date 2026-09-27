@@ -161,7 +161,7 @@ impl Database {
         refresh_token_mode: OAuthRefreshTokenMode,
     ) -> anyhow::Result<()> {
         validate_oauth_client_owner(record)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "INSERT INTO oauth_clients (
                 id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
@@ -207,7 +207,7 @@ impl Database {
         &self,
         client_id: &str,
     ) -> anyhow::Result<Option<OAuthClientRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
                     owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
@@ -226,7 +226,7 @@ impl Database {
         &self,
         client_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare("SELECT name FROM oauth_clients WHERE client_id = ?1")?;
         let mut rows = stmt.query_map(params![client_id], |row| row.get(0))?;
         match rows.next() {
@@ -236,7 +236,7 @@ impl Database {
     }
 
     pub fn get_oauth_client_by_id(&self, id: &str) -> anyhow::Result<Option<OAuthClientRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
                     owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
@@ -250,7 +250,7 @@ impl Database {
     }
 
     pub fn revoke_oauth_client(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_clients SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
@@ -261,7 +261,7 @@ impl Database {
     /// List all OAuth clients (including revoked ones), ordered by creation
     /// time descending. Used by the first-party client management API.
     pub fn list_oauth_clients(&self) -> anyhow::Result<Vec<OAuthClientRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
                     owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
@@ -269,6 +269,24 @@ impl Database {
         )?;
         let rows = stmt.query_map([], row_to_oauth_client)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Replace the redirect URI set for one active OAuth client without touching
+    /// client secrets, access tokens, refresh tokens, or authorization codes.
+    /// The expected value is a compare-and-swap guard for concurrent management.
+    pub fn update_oauth_client_redirect_uris(
+        &self,
+        client_id: &str,
+        expected_redirect_uris: &str,
+        redirect_uris: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
+        let updated = conn.execute(
+            "UPDATE oauth_clients SET redirect_uris = ?3
+             WHERE client_id = ?1 AND redirect_uris = ?2 AND revoked_at IS NULL",
+            params![client_id, expected_redirect_uris, redirect_uris],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Replace one active OAuth client's explicit permission allow-list and
@@ -289,7 +307,7 @@ impl Database {
         ts: i64,
     ) -> anyhow::Result<Option<(bool, usize, usize, usize)>> {
         let changed = expected_allowed_scopes != allowed_scopes;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
         let tx = conn.transaction()?;
         let updated = tx.execute(
             "UPDATE oauth_clients SET allowed_scopes = ?3
@@ -336,7 +354,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_clients SET revoked_at = COALESCE(revoked_at, ?2) \
              WHERE client_id = ?1",
@@ -353,7 +371,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_access_tokens SET revoked_at = COALESCE(revoked_at, ?2) \
              WHERE client_id = ?1",
@@ -369,7 +387,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?2) \
              WHERE client_id = ?1",
@@ -385,7 +403,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_authorization_codes SET revoked_at = COALESCE(revoked_at, ?2) \
              WHERE client_id = ?1",
@@ -402,7 +420,7 @@ impl Database {
         code_hash: &str,
     ) -> anyhow::Result<()> {
         validate_oauth_authorization_code_subject(record)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "INSERT INTO oauth_authorization_codes (
                 id, code_hash, client_id, subject_kind, subject_id, user_id,
@@ -435,7 +453,7 @@ impl Database {
         &self,
         code_hash: &str,
     ) -> anyhow::Result<Option<OAuthAuthorizationCodeRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, code_hash, client_id, subject_kind, subject_id, user_id,
                     redirect_uri, scopes, code_challenge, code_challenge_method,
@@ -469,7 +487,7 @@ impl Database {
         code_hash: &str,
         now: i64,
     ) -> anyhow::Result<Option<OAuthAuthorizationCodeRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let changed = conn.execute(
             "UPDATE oauth_authorization_codes
              SET used_at = ?2
@@ -494,7 +512,7 @@ impl Database {
         &self,
         code_hash: &str,
     ) -> anyhow::Result<Option<OAuthAuthorizationCodeRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, code_hash, client_id, subject_kind, subject_id, user_id,
                     redirect_uri, scopes, code_challenge, code_challenge_method,
@@ -510,7 +528,7 @@ impl Database {
     }
 
     pub fn revoke_oauth_authorization_code(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_authorization_codes SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
@@ -554,7 +572,7 @@ impl Database {
         // allowing get_oauth_authorization_code_by_hash_for_consume to
         // re-acquire the lock.
         {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
             let tx = conn.transaction()?;
 
             // 1. Consume the authorization code atomically.
@@ -655,7 +673,7 @@ impl Database {
 
     pub fn insert_oauth_access_token(&self, record: &OAuthAccessTokenRecord) -> anyhow::Result<()> {
         validate_oauth_access_token_subject(record)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "INSERT INTO oauth_access_tokens (
                 id, token_hash, client_id, subject_kind, subject_id, user_id,
@@ -685,7 +703,7 @@ impl Database {
         &self,
         token_hash: &str,
     ) -> anyhow::Result<Option<OAuthAccessTokenRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, token_hash, client_id, subject_kind, subject_id, user_id,
                     scopes, resource, shared_key_hash, created_at, expires_at,
@@ -701,7 +719,7 @@ impl Database {
     }
 
     pub fn update_oauth_access_token_last_used(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_access_tokens SET last_used_at = ?2 WHERE id = ?1",
             params![id, ts],
@@ -710,7 +728,7 @@ impl Database {
     }
 
     pub fn revoke_oauth_access_token(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_access_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
@@ -729,7 +747,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_access_tokens SET revoked_at = COALESCE(revoked_at, ?3) \
              WHERE token_hash = ?1 AND client_id = ?2",
@@ -745,7 +763,7 @@ impl Database {
         record: &OAuthRefreshTokenRecord,
     ) -> anyhow::Result<()> {
         validate_oauth_refresh_token_subject(record)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "INSERT INTO oauth_refresh_tokens (
                 id, token_hash, client_id, subject_kind, subject_id, user_id,
@@ -776,7 +794,7 @@ impl Database {
         &self,
         token_hash: &str,
     ) -> anyhow::Result<Option<OAuthRefreshTokenRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, token_hash, client_id, subject_kind, subject_id, user_id,
                     scopes, resource, shared_key_hash, created_at, expires_at,
@@ -792,7 +810,7 @@ impl Database {
     }
 
     pub fn update_oauth_refresh_token_last_used(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_refresh_tokens SET last_used_at = ?2 WHERE id = ?1",
             params![id, ts],
@@ -801,7 +819,7 @@ impl Database {
     }
 
     pub fn revoke_oauth_refresh_token(&self, id: &str, ts: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         conn.execute(
             "UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, ts],
@@ -820,7 +838,7 @@ impl Database {
         client_id: &str,
         ts: i64,
     ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let updated = conn.execute(
             "UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?3) \
              WHERE token_hash = ?1 AND client_id = ?2",
@@ -837,7 +855,7 @@ impl Database {
         &self,
         token_hash: &str,
     ) -> anyhow::Result<Option<OAuthRefreshTokenRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, token_hash, client_id, subject_kind, subject_id, user_id,
                     scopes, resource, shared_key_hash, created_at, expires_at,
@@ -888,7 +906,7 @@ impl Database {
         )?;
         // Scope the transaction so the MutexGuard is dropped after commit.
         {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
             let tx = conn.transaction()?;
 
             // 1. Look up old refresh token (including revoked/expired).

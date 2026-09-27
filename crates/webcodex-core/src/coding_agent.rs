@@ -5,6 +5,7 @@
 //! and protocol callbacks; the Server sees only the bounded typed structures in
 //! this module.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -43,6 +44,36 @@ pub struct CodingAgentProvider {
     pub provider_id: String,
     pub provider_instance_id: String,
     pub name: String,
+}
+
+/// Safe discovery metadata, not a provider replacement fence or execution authority.
+/// Keep this separate from the Runner wire inventory: serializing the latter into
+/// a model/product response would disclose the private provider instance identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentProviderSummary {
+    pub provider_id: String,
+    pub name: String,
+}
+
+pub fn safe_provider_inventory(
+    providers: Option<&[CodingAgentProvider]>,
+) -> Vec<CodingAgentProviderSummary> {
+    providers
+        .unwrap_or_default()
+        .iter()
+        .take(CODING_AGENT_MAX_PROVIDERS)
+        .filter(|provider| {
+            validate_provider_id(&provider.provider_id).is_ok()
+                && !provider.name.is_empty()
+                && provider.name.len() <= CODING_AGENT_MAX_PROVIDER_NAME_BYTES
+                && !provider.name.chars().any(char::is_control)
+        })
+        .map(|provider| CodingAgentProviderSummary {
+            provider_id: provider.provider_id.clone(),
+            name: provider.name.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,7 +160,7 @@ pub enum CodingAgentDispatchState {
     Completed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum CodingAgentConfigValue {
     String(String),

@@ -12,12 +12,12 @@ async fn activation_stops_if_connection_identity_changes_during_config_retry() {
             std::fs::create_dir(&project).unwrap();
             let config_path = tmp.path().join("runner.toml");
             let mut responses = vec![(
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":1,"restart_required":false}}),
             )];
             if generation_conflict {
                 responses.push((
-                    "/api/runners/config/reload",
+                    "tool:runner_config_reload",
                     json!({"success":false,"output":{"error_code":"config_generation_conflict"}}),
                 ));
             }

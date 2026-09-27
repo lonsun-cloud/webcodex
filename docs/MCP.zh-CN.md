@@ -10,6 +10,18 @@ WebCodex 通过 MCP endpoint，让 ChatGPT、Claude 与其他 MCP client 使用�
 
 如果只是临时试用一个仓库，再使用下面的 `share` 路径。
 
+## ChatGPT Host 侧的 Developer MCP 错误
+
+如果 ChatGPT 返回：
+
+```text
+FORBIDDEN: This conversation does not support developer MCPs
+```
+
+该拒绝来自 ChatGPT Host 或会话级 Developer MCP 准入与路由层。它本身并不表示 WebCodex 永久关闭了开发者访问权限，也不能证明 Runner 已离线或项目注册已失效。
+
+请独立检查 Runner 与项目状态。如果两者仍然可用，而且请求没有到达 WebCodex，请在 ChatGPT 允许 Developer MCP 的会话中重试。不要仅因出现这个 Host 侧错误就修改 WebCodex 配置。
+
 ## ChatGPT：临时 `share`
 
 显式 `share` 支持 Linux、macOS 与 Windows，并由当前前台进程持有临时单项目环境。Windows x64 可直接使用 managed 默认 Cloudflare Quick Tunnel；固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此 ARM64 需要受信任的显式/`PATH` `cloudflared`。managed OpenAI `tunnel-client` 支持 Windows x64/arm64。
@@ -37,6 +49,12 @@ UI 文案可能随 rollout 变化；URL 与认证以 CLI 输出为准。Develope
 和 write/modify action 是否可用，还分别受 ChatGPT 套餐、workspace 与管理员设置控制；
 WebCodex scope 不会扩大这些客户端侧权限。
 
+如果 ChatGPT 自身返回 `FORBIDDEN: This conversation does not support developer MCPs`
+（或提示当前会话已禁用 developer MCP server），在有相反证据之前应先按 Host/conversation
+admission 问题处理。如果 Host 根本没有 dispatch `runtime_status`，这段文本并不是
+WebCodex tool result。修改 credential 或 Runner 配置前，先从独立路径确认 Server/Runner；
+完整流程见[故障排查](TROUBLESHOOTING.zh-CN.md)。
+
 ## Claude 与其他 MCP client
 
 使用同一份输出的 `/mcp` URL 与认证值。Claude 中添加 custom connector 并粘贴 MCP URL；
@@ -53,6 +71,15 @@ share 的 Project Credential，并不是 PAT/OAuth/shared-key 的通用 query au
 `CONTROL_PLANE_API_KEY`，然后运行 `webcodex share --tunnel openai`。ChatGPT 使用
 Connection: Tunnel + No authentication；临时 WebCodex Bearer 留在本机，由固定且经过校验的
 OpenAI `tunnel-client` 注入。
+
+对于通过 OpenAI Secure Tunnel 访问的长期 **loopback-only** Server，可以设置
+`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true`，从而信任由明确允许的本地 tunnel
+credential 认证的 ChatGPT host-file rewrite。WebCodex Desktop 自 v0.4.2 起会为它自己管理的
+本机 loopback Server 默认写入该值；已有显式配置不会被覆盖。该例外仅在 `WEBCODEX_ADDR`
+解析为 loopback，且当前 credential 是普通 user API token，或 Desktop regular Tunnel 使用的
+已配置 Server bootstrap credential 时生效。regular Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生
+该 credential，并只把它注入私有 tunnel-client authorization；用户不应复制或暴露该
+credential。独立/network-accessible Server 仍默认关闭，不应使用它替代 OAuth。
 
 如果在 Windows 上使用普通独立 Server + Runner 并通过 OpenAI Tunnel 接入，或排查“本地 `/readyz` 正常但 ChatGPT Connector 创建失败”的情况，见 [Windows + OpenAI Secure MCP Tunnel 深入实操](WINDOWS_OPENAI_TUNNEL.zh-CN.md)。它是深入配置/排障文档，不是普通用户第一次必须阅读的教程。
 
@@ -76,13 +103,17 @@ OAuth 仍是独立的高级身份路径。
 
 ## Advanced / reference
 
-### Runtime surface selection
+### Adaptive Runtime routing
 
-Server 启动时会选择 model-facing MCP surface。普通用户不需要选择或理解内部 routing 名称，直接使用当前 Server 展示的工具即可。需要调整该 surface 的 maintainer 应查看内部 architecture/configuration contract；routing 不会改变目标工具原有的 authentication、project 或 safety checks。
+WebCodex 只有一个 model-facing MCP runtime contract：**Adaptive Runtime**。Canonical `ToolDefinition` rank 决定 direct tools；普通 model-visible long-tail tools 通过 `call_runtime_tool` 调用；server-owned protocol capability 与 MCP App admission 可以为对应请求加入 hidden extension。启动时不再选择 model surface。`tool_manifest(tool_name=...)` 只负责 discovery，不会动态向 Host 注册一个新 tool。exact manifest 的 `route.primary` 给出首选 callable；普通 direct tool 还会给出经 `call_runtime_tool` 的 `route.fallback`，用于 Host 当前没有该 direct callable 的情况；显式 MCP App presentation tool 会标明 Apps enabled 时该 fallback 被禁止。direct/gateway 只改变 presentation，不会绕过目标工具的 authentication、Project authority、permission、Runner capability、Session 或 safety checks。
 
 ### Tool result framing
 
 MCP tool 的 machine-readable 结果位于 `structuredContent`；`content` 只保留简短的人类可读或 protocol-native fallback。需要结构化字段的 client 应读取 `structuredContent`，不要解析文本。
+
+普通 client 保持标准 MCP `isError` 语义。对于 `_meta["io.modelcontextprotocol/clientInfo"].name` 精确等于 `openai-mcp`（不限版本）的请求，MCP adapter 会对 WebCodex-owned canonical `ToolResult` failure 应用 **OpenAI structured-failure compatibility projection**：presentation 使用 `isError=false`，但 `structuredContent.success=false` 仍是业务结果的 authoritative truth，完整 output/error 也继续保留。当前 OpenAI Host 会把 `isError=true` 提升成异常而不暴露 `structuredContent`；该兼容层用于保留 machine-actionable failure/recovery data，Host 行为修复后即可移除。JSON-RPC/protocol error 仍然是真错误，第三方 MCP/Plugin passthrough result 也继续保留 provider 自己的语义。
+
+部分 MCP host 不会把 `structuredContent` 暴露给模型；Claude Custom Connector 已观察到这种情况，即使 WebCodex 已成功执行工具并返回完整结构化结果。为这类 host 提供服务的 operator 可以显式设置 `WEBCODEX_MCP_TEXT_JSON_COMPAT=true`。开启后，普通 runtime tool result 仍以 `structuredContent` 为 canonical，同时把同一 JSON 值序列化到 `content[0].text`。该选项默认关闭，因为重复表示会增加 response/model-context 大小；protocol-native image/resource framing 与现有 App-only compatibility path 不受影响。
 
 Result 中的 recovery 字段只描述下一次**显式**调用的安全建议，不授予 authority，也不会触发 hidden retry。尤其是 uncertain outcome，必须先 reconcile，再决定是否重复 effect。
 
@@ -215,119 +246,58 @@ OAuth access token 会绑定到该用户，同时继续受 client 注册权限�
 Grok Custom MCP UI 与可用范围以 xAI 的
 [Connector 文档](https://docs.x.ai/grok/connectors)为准。
 
-## Project-bound Connector workflow
+## Project-scoped ordinary runtime
 
-`webcodex run` 与 `webcodex share` 会绑定一个已经配置好的仓库，并暴露一组较小的 task-oriented MCP 工具：
+`webcodex run` 与 `webcodex share` 绑定一个已配置仓库，启动本地 Server + Runner，并暴露普通 Adaptive Runtime。临时或持久的 Project Credential 是 authentication / ProjectGrant 边界，不会选择第二套 capability surface。
 
-```text
-task_start
-task_list
-task_resume
-files_list
-files_read
-files_search
-code_navigate
-edits_apply
-checks_run
-commands_run
-task_review
-task_cancel
-task_finish
-code_impact
-```
-
-从 `task_start` 开始。Connector 已经知道当前 Project，因此 prompt 不需要 runtime project id 或 project discovery。返回的 `task_id` 是该 Connector task 的 durable handle；明确继续旧工作时使用 `task_resume(task_id)`。不要假设同一个 chat、HTTP/MCP connection 或 credential 会自动 resume 之前的任务。
-
-精确的 MCP Tasks-extension materialization/polling 协议属于 implementation compatibility detail，有意不放在这份 user-facing guide 中。
-
-## 黄金 coding 循环
+典型 coding 流程是：
 
 ```text
-task_start
-→ files_list
-→ files_read / files_search / code_navigate / code_impact
-→ edits_apply
-→ checks_run
-→ task_finish
-→ task_review
+work_on_project
+→ read_files / search_project_texts / 按需语义导航
+→ apply_text_edits 或其它 canonical edit 工具
+→ substantial work 进入真实状态后调用一次 present_work_result
+→ 按需 run_process / run_shell / focused validation
+→ show_changes
+→ finish_coding_task
 ```
 
-`task_start` 只有两种 execution mode：
+`work_on_project` 在普通 registered Project 上启动或精确恢复 Workflow Session。用户要求隔离时，`work_on_project(mode=worktree)` 才让 Runner 创建 canonical managed worktree，并把该 worktree 注册为另一个普通 Project；没有隔离要求时，本地 `share` / `run` 直接使用 setup 已注册的那一个 Project。
 
-- `normal`（默认）用于可写 coding。WebCodex 在 target checkout 外准备受管理的隔离
-  Git worktree，所有 edit/command/check 都在那里执行，`task_finish` 捕获稳定结果。
-  只有项目 owner 在本地接受结果后 target checkout 才会变化。隔离 worktree 无法安全
-  创建或验证时，`normal` 会 fail closed，绝不会回退成直接写 target checkout。
-- `read_only` 只用于分析。read/search/LSP/impact analysis 仍可使用；structured write、
-  command 与 check 均会被拒绝。
+`present_work_result` 是 substantial coding 的一次性可视化层，不是 correctness primitive。挂载后，卡片通过 App-only state read 持续显示 Progress、Workspace、Validation 与 Review，无需模型轮询。`finish_coding_task` 在 non-blocking closeout 时把 eligible final changes seal 到 presentation cache，同一张卡随后发现这份 immutable snapshot，并按文件 lazy 展开 diff。tiny/read-only 工作应跳过这张卡，同一 Session 不应重复 presentation。
 
-同一 task 可以保持当前 mode，也可以在写权限和隔离 workspace 准备成功后从
-`read_only` 升级到 `normal`。已经进入 writable `normal` 的 task 不能降级为
-`read_only`；应先 finish 或 reject 当前 writable task，再新建 `read_only` task。
-任何 isolated writable result 在 `task_finish` 前都必须有 structured checks，不能依赖
-持久化 mode 字符串绕过。
+Adaptive Runtime 可以把常用工具直接暴露，把 long-tail 工具通过 `call_runtime_tool` 暴露。direct/gateway 只影响 model exposure，不改变 schema validation、OAuth scope、Project authority、permission policy、Runner capability、Session fence 或 tool effects。
 
-- `files_list` 从 Git index 回答"项目里有什么"，因此被忽略的目录不会出现。猜测
-  路径前先调用它。
-- `code_navigate` 提供只读的语言服务器状态、document/workspace symbols、
-  definition、references、diagnostics 与 hover。它只接受项目相对路径和从 1 开始的
-  Unicode scalar 位置；Connector 负责选择已绑定的 executor project。参数按
-  operation 严格区分：`status` 不带额外字段；document symbols 与 diagnostics
-  使用 `path`；workspace symbols 使用 `query`；definition、references 与 hover
-  使用 `path` + `line` + `column`。无意义的字段会被拒绝。normal 与 read-only
-  task 均可调用。
-- `code_impact` 从项目相对源码位置执行一次有界 call hierarchy 操作。它支持
-  `incoming`、`outgoing`、`both`，广度优先深度为 1 或 2，全局 edge 上限为
-  1..100；只返回规范化的项目内 root、edge 和有界 call-site range。语言服务器
-  不支持时会显式失败，不回退到 grep 或 AST。normal 与 read-only task 均可调用。
-- `edits_apply` 是受保护的编辑工具；`commands_run` 是需要 shell 的命令的有界
-  逃生口。
-- `checks_run` 做 structured validation。按照它返回的 retry/status guidance 继续，不需要手工重建内部 operation identity。
-- `task_finish` 生成稳定结果；由人工在本地用 `webcodex task accept <id>` /
-  `webcodex task reject <id>` 接受或拒绝。模型永远不能接受自己的工作。
+已删除的 ProjectConnector capability 名称（`task_start`、`files_read`、`edits_apply`、`task_finish` 等）不会作为 runtime 工具的 compatibility alias 保留。请使用当前 `tools/list` / `tool_manifest` 返回的 ToolRuntime 名称。
 
-### 校验 recipe
+### 长任务使用 Job lifecycle
 
-`checks_run` 支持 `format`、`check`、`test` 与可选 `recipe` 枚举（`rust`、
-`node`、`python`、`go`）。省略 `recipe` 时，从任务 `cwd` 相对位置最近的
-`Cargo.toml`、`package.json`、`pyproject.toml` 或 `go.mod` 自动解析。Recipe 不
-安装依赖、不修改 lockfile、不使用网络。缺少工具是 executor 失败；已启动的
-validator 返回非零是断言失败。
+长时间 command 与 validation 使用 canonical WebCodex Job。发起调用返回 exact Job 后，用 `observe_jobs` 观察同一个 Job；只有 Job identity 确实丢失时才用 `list_jobs` 恢复，不要重复启动。Jobs 不再包装成 MCP Tasks，WebCodex 也不再 advertise 原 Connector-specific MCP Tasks extension。
 
-| Recipe | 标记 | `format` | `check` | `test` |
-| --- | --- | --- | --- | --- |
-| Rust | `Cargo.toml` | `cargo fmt -- --check` | `cargo check --all-targets` | `cargo test` |
-| Node | `package.json` | `format:check`/`format-check`/`check:format` 第一个 | `check`/`typecheck`/`lint` 第一个 | 精确 `test` |
-| Python | `pyproject.toml` | 配置的 Ruff/Black | 配置的 Ruff/Mypy | 配置的 pytest |
-| Go | `go.mod` | 不可用 | `go vet ./...` | `go test -json ./...` |
-
-### 长校验会持久继续
-
-`checks_run` 与 `commands_run` 使用 durable execution；工作仍在继续时，调用大约
-8 秒后可能 quick-yield。在十四工具 Connector surface 上，用 `task_review` 的
-`after_cursor` / `wait_ms`（需要输出时再加 `include_output_tail=true`）观察进度，
-直到 execution 进入 terminal；需要停止时调用 `task_cancel`。不要为了轮询而重新
-执行同一个操作。
-
-在普通 runtime surface 上，长时间工作也可能作为 WebCodex Job 暴露。使用当前 Server 返回的 Job observation/recovery guidance，不要再启动一个副本。Opaque observation token 原样回传即可；它只是 read cursor，不是 credential 或 execution authority。
+ChatGPT/model turn 与一次 MCP observation request 都不拥有 Job 的生命周期。因此 Host 侧
+出现 `Thinking stopped` / `Thinking failed`、request timeout 或 observation 中断，
+本身不能证明 Job 已经停止。优先在原会话继续并重新观察已有 Job；identity 丢失时先恢复
+Job inventory，再考虑 retry。不要仅仅因为 model turn 结束就重复 dispatch。符合条件的
+terminal wait 可以提供 best-effort Host continuation，但 Host 接受 continuation 并不保证
+新的 model turn 已经实际运行。详见
+[Troubleshooting](TROUBLESHOOTING.zh-CN.md#长任务期间-chatgpt-显示-thinking-stopped--thinking-failed)。
 
 ## 第一个安全 prompt
 
 ```text
-Use the configured WebCodex project. Start a read-only task, read README.md,
-summarize the project, review the result, and finish. Do not edit files.
+Use the configured WebCodex project. Inspect README.md and summarize the
+project structure. Do not edit files or run commands.
 ```
 
 这个 prompt 里不需要项目发现或 runtime 标识符。
 
 ## 读取与搜索边界
 
-- `read_file` 是有界流式范围读取：`start_line`（默认 1）、`limit`（默认 2000，
-  最大 2000），返回范围加上完整文件 SHA-256 与行元数据，以及用于继续的
-  `next_start_line`。
-- `read_files` 批量执行最多 8 次单文件读取，条目结果相互独立。
-- `search_project_text` 是默认搜索工具（优先 ripgrep，工作量与字节均有界）；
-  `search_project_texts` 批量执行最多 8 个查询。
+- `read_files` 是 canonical 有界范围读取工具，一次支持 1 到 8 个文件；单条目 batch
+  就是单范围读取路径。每个成功条目返回完整文件 SHA-256 与有界行元数据；partial
+  条目返回可直接执行的单条目 `read_files` continuation，且读取并非 snapshot-stable。
+- `search_project_texts` 是 canonical 有界搜索面，一次支持 1 到 8 个独立查询（优先
+  ripgrep，并保留现有有界 fallback）；单查询直接使用 one-query batch。
 
 只有已识别的 backend 明确报告搜索正常完成且无匹配时，空搜索结果才是肯定的
 “无匹配”证据。backend 标识缺失或畸形、完成状态缺失、状态与输出不一致、
@@ -350,41 +320,38 @@ stderr、provider stderr 或任意 provider prose。
 | `workspace_unavailable` | 配置的 Git 工作区不可用 | 恢复工作区，再运行 doctor |
 | `server_unreachable` / `agent_offline` | 项目 Runner/runtime 不可用 | 运行 `webcodex run` / `webcodex doctor` |
 | `required_capability_unavailable` | 当前 Runner/runtime 缺少所需 coding capability | 升级所有二进制 |
-| `task_not_active` | 任务无法再变更或执行 | 开始新任务 |
-| `execution_not_terminal` | Finish 被活跃/未知工作阻塞 | 审查/等待/取消 |
-| `checks_required` | 普通任务尚未运行检查 | 调用 `checks_run` |
-| `checks_stale` | 上次检查后工作区已变化 | 运行一次新检查 |
+| `project_registry_scope_denied` | Project-scoped credential 尝试扩张或修改其授权可见范围之外的 Project registry | 使用已可见的 Project，或使用 `work_on_project(mode=worktree)` |
 
-## 高级 runtime surface
+## Adaptive Runtime extensions
 
-在 project-bound Connector 之外，WebCodex 还可以作为多项目管理 ToolRuntime 运行，
-提供 discovery、session、LSP、raw job 与 artifact 工具。那是面向运维者的高级
-surface，不是 canonical project Connector，也不是普通 coding 的前提。
+同一个 ToolRuntime 通过一套 Adaptive Runtime contract 服务单项目、project-scoped 的本地 `share` / `run` 和多项目 hosted Server。project-scoped credential 改变可见性与 authority，不改变 model-facing runtime shape。特定 protocol capability 与 MCP App 可以 admission 额外的 hidden presentation/resource operation，但不会形成第二套 runtime surface。
 
 ### ChatGPT 文件桥接
 
-在暴露 artifact 工具的更宽 MCP operator surface 上，WebCodex 支持双向的
-host-native 文件传输，不需要把完整二进制经由模型文本搬运：
+当当前 MCP protocol/host admission 允许 artifact capability 时，WebCodex 支持双向的 host-native 文件传输，不需要把完整二进制经由模型文本搬运：
 
 - `import_conversation_files_to_project` 通过 ChatGPT host 的
   `openai/fileParams` 导入 1..10 个文件。它既适用于用户选择的当前会话附件，也
   适用于 host 能绑定为 file parameter 的本轮新生成文件。Control 端负责下载原始
   bytes，并通过现有有界 artifact write 路径提交；调用方不应自行构造下载 URL，
   也不应手工 Base64 转运这些文件。
-- `export_project_artifact` 为一个有界 project artifact 创建短期、受认证的 MCP
+- `project_artifact` 是首选的 Project → Model / Host 读取入口：
+  `action=metadata` 用于 existence/size/MIME/digest/image/archive metadata；
+  `action=inspect` 只读取一个有 snapshot fence 的有界 Base64 segment；
+  `action=image` 通过 MCP native image delivery 给模型查看图片；
+  `action=export` 用于把完整 artifact 交付给 host/user。不要循环 `inspect` chunk
+  来完成整文件传输。
+- `action=export` 继续复用现有 artifact export authority，创建短期、受认证的 MCP
   `ResourceLink` 并返回 metadata。`tools/call` 不包含完整二进制；host 通过
   `resources/read` 取得 binary resource。读取时会再次检查认证与当前
-  project-read authority，并在返回 bytes 前重新验证 artifact metadata。
-- resource URI 本身不是独立 bearer authority。Export handle 只是短期、
-  process-local 的 presentation state；现有 project artifact 的大小、MIME、路径与
-  authorization 边界继续生效。
+  project-read authority，并在返回 bytes 前重新验证 artifact metadata。Resource
+  URI 本身不是独立 bearer authority；export handle 只是短期、process-local 的
+  presentation state，现有大小、MIME、路径与 authorization 边界继续生效。
 
-`read_project_artifact` 仍然只是有界 chunk inspection API，不承担大文件下载。
-DOCX/PPTX/XLSX 等 Office artifact 与 PDF 复用同一 artifact transport，因此在
-支持这些 host 能力的 ChatGPT 中，可以在 project 与 host 之间直接传递，而不需要
-模型手工搬运 Base64。
+底层 `read_project_artifact_metadata` 与 `read_project_artifact` 继续作为
+operator/gateway primitive 保留。旧的 `export_project_artifact` compatibility tool 已
+删除；完整 host 交付统一通过 `project_artifact(action=export)` 暴露。DOCX/PPTX/XLSX
+等 Office artifact 与 PDF 仍复用同一底层 artifact transport，因此在支持这些 host
+能力的 ChatGPT 中，可以在 project 与 host 之间直接传递，而不需要模型手工搬运 Base64。
 
-更宽的 model coding surface 暴露 `work_on_project` 时，请阅读
-[Coding 工作流](CODING_WORKFLOW.zh-CN.md)，使用 canonical bootstrap / behavioral role
-心智模型，并遵循其中的 validation/closeout guidance。运维工具见
-[架构](ARCHITECTURE.md)与 `webcodex` CLI。
+请阅读 [Coding 工作流](CODING_WORKFLOW.zh-CN.md)，使用 canonical `work_on_project` bootstrap / behavioral role 心智模型，并遵循其中的 validation/closeout guidance。运维工具见 [架构](ARCHITECTURE.md) 与 `webcodex` CLI。

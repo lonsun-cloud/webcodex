@@ -1,0 +1,1182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WebCodex</title>
+<style>
+:root {
+  color-scheme: light dark;
+  font: 13px/1.45 var(--font-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  --card-border: color-mix(in srgb, CanvasText 16%, transparent);
+  --card-header: color-mix(in srgb, Canvas 94%, CanvasText 6%);
+  --card-body: color-mix(in srgb, Canvas 98%, CanvasText 2%);
+  --surface: color-mix(in srgb, Canvas 93%, CanvasText 7%);
+  --surface-hover: color-mix(in srgb, Canvas 87%, CanvasText 13%);
+  --divider: color-mix(in srgb, CanvasText 12%, transparent);
+  --muted: color-mix(in srgb, CanvasText 60%, transparent);
+  --faint: color-mix(in srgb, CanvasText 42%, transparent);
+  --accent: light-dark(#2563eb, #60a5fa);
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --success: light-dark(#16803a, #6fda83);
+  --success-soft: color-mix(in srgb, var(--success) 12%, transparent);
+  --danger: light-dark(#c93636, #ee7676);
+  --danger-soft: color-mix(in srgb, var(--danger) 12%, transparent);
+  --warning: light-dark(#a15c08, #e6b566);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: transparent; }
+body { padding: 2px; color: CanvasText; }
+button { font: inherit; }
+.card {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  background: var(--card-body);
+  box-shadow: 0 1px 2px color-mix(in srgb, CanvasText 5%, transparent), 0 8px 28px color-mix(in srgb, CanvasText 4%, transparent);
+}
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 66px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--card-header);
+}
+.brand { display: flex; min-width: 0; align-items: center; gap: 11px; }
+.brand-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 11px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.brand-icon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.brand-copy { display: grid; min-width: 0; gap: 2px; }
+h1 { margin: 0; font-size: 14px; font-weight: 650; line-height: 1.25; letter-spacing: -.01em; }
+.brand-subtitle { overflow: hidden; color: var(--muted); font: 11px/1.35 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
+.badge, .status-value {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: color-mix(in srgb, CanvasText 5%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge.tone-clean, .status-value.tone-passed { border-color: color-mix(in srgb, var(--success) 28%, transparent); background: var(--success-soft); color: var(--success); }
+.badge.tone-changed, .status-value.tone-active { border-color: color-mix(in srgb, var(--accent) 28%, transparent); background: var(--accent-soft); color: var(--accent); }
+.badge.tone-unavailable, .status-value.tone-failed { border-color: color-mix(in srgb, var(--danger) 28%, transparent); background: var(--danger-soft); color: var(--danger); }
+.status-value.tone-warning { border-color: color-mix(in srgb, var(--warning) 28%, transparent); color: var(--warning); }
+.refresh {
+  appearance: none;
+  min-height: 30px;
+  border: 1px solid var(--card-border);
+  border-radius: 9px;
+  padding: 5px 10px;
+  color: CanvasText;
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 550;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.refresh:hover:not(:disabled) { background: var(--surface-hover); border-color: color-mix(in srgb, var(--accent) 28%, var(--card-border)); }
+.refresh:active:not(:disabled) { transform: translateY(1px); }
+.refresh:focus-visible, .file-toggle:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 2px; }
+.refresh:disabled { opacity: .48; cursor: default; }
+.content { display: grid; gap: 10px; padding: 11px; }
+.section {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--card-body) 88%, transparent);
+}
+.section-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
+h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color: var(--muted); text-transform: uppercase; }
+.primary { min-width: 0; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.secondary, .status { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.progress-section { background: linear-gradient(135deg, var(--accent-soft), transparent 58%); }
+.status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.stats-inline { display: inline-flex; align-items: center; gap: 7px; font: 11px/1.3 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.add { color: var(--success); }
+.remove { color: var(--danger); }
+.files {
+  margin: 0;
+  max-height: 13em;
+  overflow: auto;
+  padding: 9px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 9px;
+  background: color-mix(in srgb, Canvas 90%, CanvasText 10%);
+  color: color-mix(in srgb, CanvasText 84%, transparent);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.6 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+.frozen-file { overflow: hidden; border: 1px solid var(--divider); border-radius: 9px; background: color-mix(in srgb, Canvas 94%, CanvasText 6%); }
+.frozen-file + .frozen-file { margin-top: 6px; }
+.file-toggle {
+  display: block;
+  width: 100%;
+  min-height: 38px;
+  border: 0;
+  padding: 8px 10px;
+  color: CanvasText;
+  background: transparent;
+  text-align: left;
+  font: 11px/1.5 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.file-toggle:hover { background: var(--surface-hover); }
+.diff { max-height: 24em; overflow: auto; margin: 0; padding: 8px 0; border-top: 1px solid var(--divider); background: color-mix(in srgb, Canvas 88%, CanvasText 12%); font: 11px/1.5 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); }
+.diff-line { display: block; min-height: 1.5em; padding: 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-line.added { background: color-mix(in srgb, var(--success) 13%, transparent); }
+.diff-line.deleted { background: color-mix(in srgb, var(--danger) 13%, transparent); }
+.diff-line.hunk { color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.app-footer { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 8px 13px; border-top: 1px solid var(--divider); background: var(--card-header); }
+.activity-line { display: grid; gap: 3px; }
+.activity-current { font-size: 15px; font-weight: 650; }
+.activity-age { font-size: 12px; color: var(--muted); }
+.conversation { display: grid; gap: 7px; }
+.message { display: grid; gap: 4px; max-width: 92%; padding: 8px 10px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface); }
+.message.user { justify-self: end; background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, var(--divider)); }
+.message.agent { justify-self: start; }
+.message-copy { white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-meta { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }
+.message-state.acknowledged, .message-state.handled { color: var(--success); }
+.message-resolution { padding-top: 4px; border-top: 1px solid var(--divider); color: var(--muted); font-size: 11px; }
+.composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: end; }
+.composer textarea { width: 100%; min-height: 58px; max-height: 140px; resize: vertical; border: 1px solid var(--card-border); border-radius: 9px; padding: 8px 9px; color: CanvasText; background: var(--surface); font: inherit; }
+.composer textarea:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 1px; }
+.details { border: 1px solid var(--divider); border-radius: 10px; overflow: hidden; }
+.details > summary { padding: 9px 11px; cursor: pointer; color: var(--muted); font-weight: 600; }
+.detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 0 11px 11px; }
+.detail-item { display: grid; gap: 3px; min-width: 0; padding: 8px; border-radius: 8px; background: var(--surface); }
+.detail-item span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.detail-item strong { overflow-wrap: anywhere; font-size: 11px; }
+
+.live-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 999px; background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+@media (max-width: 620px) {
+  .app-header { align-items: flex-start; }
+  .actions { flex-direction: column-reverse; align-items: flex-end; }
+  .status-grid { grid-template-columns: 1fr; }
+  .brand-icon { width: 36px; height: 36px; }
+}
+[hidden] { display: none !important; }
+[hidden] { display: none !important; }
+.task-context { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 9px 13px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.card-tabs { display: flex; padding: 0 11px; border-bottom: 1px solid var(--divider); }
+.card-tabs button { flex: 1; min-width: 0; min-height: 40px; padding: 7px 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); cursor: pointer; }
+.card-tabs button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 650; }
+.card-tabs button:focus-visible, .workflow-stages button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.card-panel { display: grid; min-width: 0; gap: 10px; }
+.workflow-stages { display: flex; flex-wrap: wrap; gap: 6px; }
+.workflow-stages button { padding: 6px 9px; border: 1px solid var(--divider); border-radius: 9px; color: CanvasText; background: var(--surface); cursor: pointer; }
+.workflow-stages button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.workflow-activity { display: grid; max-height: 320px; overflow: auto; }
+.workflow-row { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--divider); }
+.workflow-row header { display: flex; gap: 8px; justify-content: space-between; }
+.workflow-row strong { overflow-wrap: anywhere; }
+.workflow-row time { color: var(--muted); font-size: 11px; }
+.section p { margin: 0; }
+</style>
+</head>
+<body>
+<main class="card" aria-live="polite">
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"></circle><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="18" r="3"></circle><path d="M8.6 7.5 15.4 16.5M15.4 7.5 8.6 16.5"></path></svg></span>
+      <div class="brand-copy"><h1 id="taskTitle">WebCodex</h1><span id="branch" class="brand-subtitle">Task</span></div>
+    </div>
+    <div class="actions"><button id="refresh" class="refresh" type="button" disabled>Refresh</button><span id="badge" class="badge">Loading</span></div>
+  </header>
+  <div class="task-context"><span id="projectIdentity"></span><span id="sessionIdentity"></span></div>
+  <nav class="card-tabs" role="tablist" aria-label="Task views">
+    <button id="tabWorkflow" type="button" role="tab" aria-selected="true" aria-controls="panelWorkflow">Workflow</button>
+    <button id="tabChecks" type="button" role="tab" aria-selected="false" aria-controls="panelChecks" tabindex="-1">Checks</button>
+    <button id="tabMessages" type="button" role="tab" aria-selected="false" aria-controls="panelMessages" tabindex="-1">Messages</button>
+    <button id="tabResult" type="button" role="tab" aria-selected="false" aria-controls="panelResult" tabindex="-1">Result</button>
+  </nav>
+  <div class="content">
+    <div id="panelWorkflow" class="card-panel" role="tabpanel" aria-labelledby="tabWorkflow">
+    <section class="section progress-section">
+      <div class="section-head"><h2>Current activity</h2><span id="activityAge" class="secondary"></span></div>
+      <div class="activity-line">
+        <div id="activityStatus" class="activity-current">Waiting for activity…</div>
+        <div id="activityDetail" class="activity-age"></div>
+      </div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>Task workflow</h2><span id="workflowCoverage" class="secondary"></span></div>
+      <p class="secondary">Recorded steps for this Session, newest first. Stages are filters, not a prescribed plan.</p>
+      <div id="workflowStages" class="workflow-stages" role="group" aria-label="Filter workflow stages"></div>
+      <div id="workflowActivity" class="workflow-activity"></div>
+      <button id="askWorkflow" class="refresh" type="button">Send an instruction</button>
+    </section>
+    </div>
+    <div id="panelMessages" class="card-panel" role="tabpanel" aria-labelledby="tabMessages" hidden>
+    <section class="section">
+      <div class="section-head"><h2>Messages</h2><span id="collaborationMeta" class="secondary"></span></div>
+      <div id="messages" class="conversation"></div>
+      <form id="composer" class="composer">
+        <textarea id="messageInput" maxlength="8000" placeholder="Send an instruction or follow-up…" aria-label="Message WebCodex"></textarea>
+        <button id="sendMessage" class="refresh" type="submit">Send</button>
+      </form>
+      <div id="composerState" class="secondary"></div>
+    </section>
+    </div>
+    <div id="panelResult" class="card-panel" role="tabpanel" aria-labelledby="tabResult" hidden>
+    <p id="resultPending" class="secondary">Final changes appear here after the task is closed out. Live workspace changes are not a final result.</p>
+    <section id="finalChanges" class="section" hidden>
+      <div class="section-head"><h2>What changed</h2><span id="frozenStats" class="stats-inline"></span></div>
+      <div id="frozenSummary" class="primary"></div>
+      <div id="frozenFiles"></div>
+      <button id="frozenMore" class="refresh" type="button" hidden></button>
+      <div id="frozenFooter" class="secondary"></div>
+    </section>
+    </div>
+    <section id="panelChecks" class="section card-panel" role="tabpanel" aria-labelledby="tabChecks" hidden>
+      <div class="section-head"><h2>Checks and review</h2></div>
+      <div class="detail-grid">
+        <div class="detail-item"><span>Checks</span><strong id="validationStatus">Waiting</strong><small id="validationMeta" class="secondary"></small></div>
+        <div class="detail-item"><span>Review</span><strong id="reviewStatus">Waiting</strong><small id="reviewMeta" class="secondary"></small></div>
+        <div class="detail-item"><span>Changes</span><strong id="workspaceStatus">Waiting</strong><small id="workspaceMeta" class="secondary"></small></div>
+      </div>
+      <button id="askChecks" class="refresh" type="button">Ask about checks</button>
+    </section>
+  </div>
+  <footer class="app-footer"><span class="live-dot" aria-hidden="true"></span><div id="status" class="status">Connecting…</div></footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const APP_PROTOCOL = "2026-01-26";
+  const WORK_RESULT_META_KEY = "webcodex/workResult";
+  const SESSION_ID = /^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$/;
+  const STATE_VERSION = /^wr2_[0-9a-f]{64}$/;
+  const MESSAGE_ID = /^wc_msg_[A-Za-z0-9_-]+$/;
+  const CALL_TIMEOUT_MS = 10000;
+  const VISIBLE_REFRESH_MS = 2500;
+  const HIDDEN_REFRESH_MS = 12000;
+  const VISIBLE_IDLE_REFRESH_MS = 10000;
+  const HIDDEN_IDLE_REFRESH_MS = 30000;
+  const IDLE_BACKOFF_AFTER_MS = 60000;
+  const ACTIVITY_IDLE_AFTER_MS = 60000;
+  const AUTO_REFRESH_IDLE_PAUSE_MS = 30 * 60 * 1000;
+  const MAX_PROJECT = 512;
+  const MAX_PATH = 512;
+  const MAX_FILES = 8;
+  const MAX_TOOLS = 12;
+  const SNAPSHOT_ID = /^wc_changes_snapshot_[0-9a-f]{32}$/;
+  const MAX_FROZEN_FILES = 24;
+  const INITIAL_FROZEN_FILES = 5;
+  let snapshot = null;
+  let acceptedFrozenKey = null;
+  let visibleCount = 0;
+  let hasRefreshed = false;
+  const diffCache = new Map();
+  const diffInFlight = new Set();
+  const VALIDATION = new Set(["not_run", "unproven", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown"]);
+  let nextId = 1;
+  let identity = null;
+  let lastStateVersion = null;
+  let hostInitialized = false;
+  let refreshInFlight = false;
+  let refreshTimer = null;
+  let sessionLifecycle = null;
+  let lastStateChangeAt = null;
+  let lastRenderedState = null;
+  let sendInFlight = false;
+  let pendingSend = null;
+  let tornDown = false;
+  let initialResultTransportMissing = false;
+  let selectedPane = "Workflow";
+  let selectedStage = "all";
+  const pending = new Map();
+  const el = id => document.getElementById(id);
+
+  function send(method, params) {
+    if (tornDown) return Promise.reject(new Error("App torn down"));
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("Host request timed out"));
+      }, CALL_TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
+      parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+    });
+  }
+
+  function notify(method, params) {
+    if (!tornDown) parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+  }
+
+  function validProject(value) {
+    return typeof value === "string" && value.length > 0 && Array.from(value).length <= MAX_PROJECT && !/[\u0000-\u001f\u007f]/.test(value);
+  }
+
+  function validSession(value) {
+    return typeof value === "string" && SESSION_ID.test(value);
+  }
+
+  function pair(project, session_id) {
+    return validProject(project) && validSession(session_id) ? { project, session_id } : null;
+  }
+
+  function failClosed(_message) {
+    teardown();
+    el("badge").textContent = "Unavailable";
+    el("status").textContent = "This task card is unavailable";
+    el("finalChanges").hidden = true;
+    el("frozenFiles").replaceChildren();
+    diffCache.clear();
+  }
+
+  function acceptIdentity(candidate) {
+    if (tornDown) return false;
+    if (!candidate || (identity && (identity.project !== candidate.project || identity.session_id !== candidate.session_id))) {
+      failClosed("Invalid or conflicting Work identity");
+      return false;
+    }
+    identity = candidate;
+    updateRefreshControl();
+    if (hostInitialized && lastStateVersion === null) el("status").textContent = "Waiting for Work snapshot · Refresh available";
+    return true;
+  }
+
+  function safeCount(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 1000000000;
+  }
+
+  function validPath(value, maxPath = MAX_PATH) {
+    if (typeof value !== "string" || value.length < 1 || Array.from(value).length > maxPath || /[\u0000-\u001f\u007f]/.test(value)) return false;
+    if (value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:/.test(value)) return false;
+    return !value.split(/[\\/]/).includes("..");
+  }
+
+  function validFile(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !validPath(value.path)) return false;
+    if (value.old_path !== undefined && !validPath(value.old_path)) return false;
+    for (const key of ["additions", "deletions"]) if (value[key] !== undefined && !safeCount(value[key])) return false;
+    for (const key of ["staged", "unstaged"]) if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
+    for (const key of ["status", "kind"]) if (value[key] !== undefined && (typeof value[key] !== "string" || value[key].length > 32)) return false;
+    return true;
+  }
+
+  function validWorkspace(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.git_available !== "boolean") return false;
+    if (value.clean !== undefined && typeof value.clean !== "boolean") return false;
+    if (!safeCount(value.files_total) || !Array.isArray(value.files) || value.files.length > MAX_FILES || !value.files.every(validFile)) return false;
+    if (typeof value.truncated !== "boolean") return false;
+    if (!value.counts || typeof value.counts !== "object" || Array.isArray(value.counts)) return false;
+    for (const key of ["modified", "added", "deleted", "renamed", "copied", "untracked", "conflicted", "staged", "unstaged"]) if (!safeCount(value.counts[key])) return false;
+    for (const key of ["additions", "deletions"]) if (value[key] !== undefined && !safeCount(value[key])) return false;
+    if (value.line_stats_partial !== undefined && typeof value.line_stats_partial !== "boolean") return false;
+    return true;
+  }
+
+  function validValidation(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value)
+      && VALIDATION.has(value.status) && VALIDATION.has(value.latest_status) && VALIDATION.has(value.current_status)
+      && typeof value.history_partial === "boolean"
+      && (value.successes === undefined || safeCount(value.successes))
+      && (value.failures === undefined || safeCount(value.failures))
+      && safeCount(value.unresolved_failures) && safeCount(value.evidence_gaps);
+  }
+
+  function validReview(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.available !== "boolean" || typeof value.history_partial !== "boolean" || !Array.isArray(value.tools) || value.tools.length > MAX_TOOLS) return false;
+    for (const key of ["total", "read_only_inspection_count", "search_count", "diff_review_count", "workspace_review_count", "hygiene_review_count"]) if (!safeCount(value[key])) return false;
+    return value.tools.every(tool => typeof tool === "string" && tool.length > 0 && tool.length <= 64);
+  }
+
+  function validSessionState(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (!["active", "closed"].includes(value.lifecycle)) return false;
+    if (!safeCount(value.events_total) || !safeCount(value.events_returned) || typeof value.history_partial !== "boolean") return false;
+    if (!Number.isSafeInteger(value.updated_at)) return false;
+    if (value.title !== undefined && (typeof value.title !== "string" || value.title.length > 160)) return false;
+    const latest = value.latest_activity;
+    if (latest === undefined) return true;
+    if (!latest || typeof latest !== "object" || Array.isArray(latest)) return false;
+    if (typeof latest.tool !== "string" || latest.tool.length < 1 || latest.tool.length > 64) return false;
+    if (typeof latest.kind !== "string" || latest.kind.length < 1 || latest.kind.length > 64) return false;
+    if (!Number.isSafeInteger(latest.timestamp)) return false;
+    if (latest.status !== undefined && (typeof latest.status !== "string" || latest.status.length > 32)) return false;
+    return latest.duration_ms === undefined || safeCount(latest.duration_ms);
+  }
+  function validActivityItem(value, timestampKey) {
+    if (value === null) return true;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.label !== "string" || value.label.length < 1 || value.label.length > 120) return false;
+    if (!(value.kind === null || value.kind === undefined || ["read", "search", "navigate", "edit", "run", "test", "review"].includes(value.kind))) return false;
+    const timestamp = value[timestampKey];
+    return timestamp === null || timestamp === undefined || (Number.isSafeInteger(timestamp) && timestamp >= 0);
+  }
+
+  function validActivity(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.available !== "boolean" || !["window", "session"].includes(value.scope) || typeof value.active !== "boolean") return false;
+    if (typeof value.coverage_partial !== "boolean") return false;
+    if (!validActivityItem(value.current, "started_at_ms") || !validActivityItem(value.last, "at_ms")) return false;
+    return value.last_meaningful_activity_at_ms === null
+      || (Number.isSafeInteger(value.last_meaningful_activity_at_ms) && value.last_meaningful_activity_at_ms >= 0);
+  }
+
+  function validCollaborationMessage(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !MESSAGE_ID.test(value.message_id)) return false;
+    if (!Number.isSafeInteger(value.created_at) || typeof value.message !== "string" || Array.from(value.message).length > 801) return false;
+    if (!["user", "agent"].includes(value.author) || !["sent", "acknowledged", "handled"].includes(value.state)) return false;
+    if (typeof value.kind !== "string" || value.kind.length < 1 || value.kind.length > 32 || typeof value.requires_ack !== "boolean") return false;
+    for (const key of ["first_seen_at", "handled_at"]) if (!(value[key] === null || (Number.isSafeInteger(value[key]) && value[key] >= 0))) return false;
+    return value.resolution === null || (typeof value.resolution === "string" && Array.from(value.resolution).length <= 801);
+  }
+
+  function validCollaboration(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.available !== "boolean" || typeof value.can_send !== "boolean") return false;
+    if (!Array.isArray(value.messages) || value.messages.length > 6 || !value.messages.every(validCollaborationMessage)) return false;
+    return value.available || (!value.can_send && value.messages.length === 0);
+  }
+
+  function validWorkflow(value) {
+    if (value === undefined) return true; // Cached pre-workflow presentations remain readable.
+    return value && typeof value.history_partial === "boolean" && Array.isArray(value.activity)
+      && value.activity.length <= 24 && value.activity.every(row => row
+        && typeof row.label === "string" && row.label.length <= 120
+        && ["explore", "edit", "run", "check", "review", "other"].includes(row.stage)
+        && typeof row.state === "string" && row.state.length <= 64
+        && Number.isSafeInteger(row.started_at) && row.started_at >= 0
+        && (row.finished_at === null || (Number.isSafeInteger(row.finished_at) && row.finished_at >= 0))
+        && (row.duration_ms === null || safeCount(row.duration_ms)) && safeCount(row.count) && row.count > 0);
+  }
+
+  function validState(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 2) return null;
+    const candidate = pair(value.project, value.session_id);
+    if (!candidate || typeof value.state_version !== "string" || !STATE_VERSION.test(value.state_version)) return null;
+    if (!validWorkspace(value.workspace) || !validValidation(value.validation) || !validReview(value.review)
+      || !validSessionState(value.session) || !validActivity(value.activity) || !validCollaboration(value.collaboration) || !validWorkflow(value.workflow)) return null;
+    if (value.final_changes !== undefined && !validFrozen(value.final_changes)) return null;
+    return value;
+  }
+
+  function callToolResultOf(result) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const nested = result.result;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)
+      && (nested.structuredContent || nested.structured_content || Array.isArray(nested.content)
+        || nested._meta || typeof nested.success === "boolean")) return nested;
+    return result;
+  }
+
+  function canonicalStructuredEnvelope(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.success === "boolean"
+      && (Object.prototype.hasOwnProperty.call(value, "output")
+        || Object.prototype.hasOwnProperty.call(value, "error")));
+  }
+
+  function standardContentEnvelopeOf(callResult) {
+    const blocks = Array.isArray(callResult && callResult.content) ? callResult.content : [];
+    for (const block of blocks) {
+      if (!block || block.type !== "text" || typeof block.text !== "string") continue;
+      try {
+        const parsed = JSON.parse(block.text);
+        if (canonicalStructuredEnvelope(parsed)) return parsed;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function structuredOf(result) {
+    const callResult = callToolResultOf(result);
+    if (!callResult || typeof callResult !== "object" || Array.isArray(callResult)) return null;
+    if (canonicalStructuredEnvelope(callResult)) return callResult;
+    const meta = callResult._meta && typeof callResult._meta === "object" && !Array.isArray(callResult._meta)
+      ? callResult._meta[WORK_RESULT_META_KEY]
+      : null;
+    if (canonicalStructuredEnvelope(meta)) return meta;
+    const standard = standardContentEnvelopeOf(callResult);
+    if (standard) return standard;
+    const direct = callResult.structuredContent || callResult.structured_content;
+    return canonicalStructuredEnvelope(direct) ? direct : null;
+  }
+
+  function toolSuccess(result) {
+    return structuredOf(result)?.success ?? null;
+  }
+
+  function extractState(result) {
+    const structured = structuredOf(result);
+    const output = structured && structured.output;
+    return validState(output && output.work_result);
+  }
+
+  function validFrozenFile(file) {
+    if (!file || typeof file !== "object" || Array.isArray(file) || !validPath(file.path, 1024) || file.path === ".") return false;
+    if (!["added", "modified", "deleted", "renamed"].includes(file.kind)) return false;
+    if (file.kind === "renamed") {
+      if (!validPath(file.previous_path, 1024) || file.previous_path === "." || file.previous_path === file.path) return false;
+    } else if (file.previous_path != null) return false;
+    if (![file.additions, file.deletions].every(value => value === null || safeCount(value))) return false;
+    return (file.binary === undefined || typeof file.binary === "boolean")
+      && (file.binary !== true || (file.additions === null && file.deletions === null));
+  }
+
+  function validFrozen(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.snapshot_id !== "string" || !SNAPSHOT_ID.test(value.snapshot_id)) return false;
+    // Work Result, not its frozen domain, owns the Project/Session identity.
+    if (value.project !== undefined || value.session_id !== undefined || value.version !== undefined) return false;
+    for (const key of ["files_changed", "files_total", "files_returned", "additions", "deletions"]) if (!safeCount(value[key])) return false;
+    if (!Array.isArray(value.files) || value.files.length > MAX_FROZEN_FILES || !value.files.every(validFrozenFile)) return false;
+    return value.files_changed > 0 && value.files_changed === value.files_total
+      && value.files_returned === value.files.length && value.files_returned <= value.files_total
+      && typeof value.files_truncated === "boolean" && (value.files_returned === value.files_total || value.files_truncated)
+      && new Set(value.files.map(file => file.path)).size === value.files.length;
+  }
+
+  function frozenKey(value) {
+    return JSON.stringify([value.snapshot_id, value.files_changed, value.files_total, value.files_returned,
+      value.additions, value.deletions, value.files_truncated,
+      value.files.map(file => [file.path, file.previous_path ?? null, file.kind, file.additions, file.deletions, file.binary ?? null])]);
+  }
+
+  function renderLineStats(target, additions, deletions, suffix = "") {
+    target.replaceChildren();
+    const add = document.createElement("span"); add.className = "add"; add.textContent = `+${additions}`;
+    const remove = document.createElement("span"); remove.className = "remove"; remove.textContent = `−${deletions}`;
+    target.append(add, remove);
+    if (suffix) { const meta = document.createElement("span"); meta.className = "secondary"; meta.textContent = suffix; target.append(meta); }
+  }
+
+  function acceptFrozen(value) {
+    if (value === undefined) return true;
+    const key = frozenKey(value);
+    if (acceptedFrozenKey !== null) {
+      if (key !== acceptedFrozenKey) { failClosed("Conflicting sealed Work identity"); return false; }
+      return true;
+    }
+    acceptedFrozenKey = key;
+    snapshot = {
+      snapshot_id: value.snapshot_id, files_total: value.files_total, files_truncated: value.files_truncated,
+      files: value.files.map(file => ({ path: file.path, previous_path: file.previous_path, kind: file.kind,
+        additions: file.additions, deletions: file.deletions, binary: file.binary })),
+    };
+    el("finalChanges").hidden = false;
+    el("frozenSummary").textContent = `Changed ${value.files_changed} ${value.files_changed === 1 ? "file" : "files"}`;
+    renderLineStats(el("frozenStats"), value.additions, value.deletions);
+    appendFrozenFiles(INITIAL_FROZEN_FILES);
+    return true;
+  }
+
+  function extractFrozenDiff(result, file) {
+    const structured = structuredOf(result);
+    const value = structured && structured.output && structured.output.changes_file_diff;
+    if (!value || value.version !== 1 || value.project !== identity.project || value.session_id !== identity.session_id
+      || value.snapshot_id !== snapshot.snapshot_id || value.path !== file.path || value.kind !== file.kind
+      || (value.previous_path ?? null) !== (file.previous_path ?? null)) return null;
+    if (value.binary !== null && typeof value.binary !== "boolean") return null;
+    if (file.binary !== undefined && value.binary !== file.binary) return null;
+    if (typeof value.diff !== "string" || typeof value.truncated !== "boolean") return null;
+    for (const key of ["bytes_total", "bytes_returned", "lines_total", "lines_returned"]) if (!safeCount(value[key])) return null;
+    const bytes = new TextEncoder().encode(value.diff).length;
+    const lines = value.diff === "" ? 0 : value.diff.split("\n").length - Number(value.diff.endsWith("\n"));
+    if (bytes > 48 * 1024 || lines > 1200 || value.bytes_returned !== bytes || value.lines_returned !== lines
+      || value.bytes_total < bytes || value.lines_total < lines) return null;
+    if (!value.truncated && (value.bytes_total !== bytes || value.lines_total !== lines)) return null;
+    return value;
+  }
+
+  function renderFrozenDiff(state, pre, diff) {
+    state.textContent = `${diff.binary ? "Binary file" : "File changes"}${diff.truncated
+      ? ` · partial (${diff.lines_returned}/${diff.lines_total} lines)` : ""}`;
+    pre.replaceChildren();
+    for (const text of diff.diff.split("\n")) {
+      const line = document.createElement("span");
+      const kind = text.startsWith("@@") ? "hunk" : text.startsWith("+") && !text.startsWith("+++") ? "added"
+        : text.startsWith("-") && !text.startsWith("---") ? "deleted" : "";
+      line.className = `diff-line ${kind}`;
+      line.textContent = text;
+      pre.appendChild(line);
+    }
+  }
+
+  async function loadFrozenDiff(file, state, pre) {
+    if (tornDown || !hostInitialized || !snapshot) return;
+    if (diffCache.has(file.path)) { renderFrozenDiff(state, pre, diffCache.get(file.path)); return; }
+    if (diffInFlight.has(file.path)) return;
+    diffInFlight.add(file.path);
+    state.textContent = "Loading changes…";
+    try {
+      const response = await send("tools/call", { name: "changes_file_diff", arguments: {
+        project: identity.project, session_id: identity.session_id, snapshot_id: snapshot.snapshot_id, path: file.path,
+      } });
+      if (tornDown) return;
+      const structured = structuredOf(response);
+      if (!structured) { state.textContent = "Changes unavailable · collapse and expand to retry"; return; }
+      if (structured.success === false) { state.textContent = "Changes unavailable · refresh the card"; return; }
+      const diff = extractFrozenDiff(structured, file);
+      if (!diff) { failClosed("Invalid file changes"); return; }
+      diffCache.set(file.path, diff);
+      renderFrozenDiff(state, pre, diff);
+    } catch (_) {
+      if (!tornDown) state.textContent = "Changes unavailable · collapse and expand to retry";
+    } finally {
+      diffInFlight.delete(file.path);
+    }
+  }
+
+  function frozenFileNode(file) {
+    const root = document.createElement("div"); root.className = "frozen-file";
+    const button = document.createElement("button"); button.className = "file-toggle"; button.type = "button";
+    const path = file.previous_path ? `${file.previous_path} → ${file.path}` : file.path;
+    const stats = file.binary ? "binary" : file.additions === null || file.deletions === null ? "line stats unavailable" : `+${file.additions} −${file.deletions}`;
+    button.textContent = `${({added: "A", modified: "M", deleted: "D", renamed: "R"})[file.kind]} ${path} · ${stats}`;
+    button.setAttribute("aria-expanded", "false");
+    const wrap = document.createElement("div"); wrap.hidden = true;
+    const state = document.createElement("div"); state.className = "secondary";
+    const pre = document.createElement("pre"); pre.className = "diff";
+    wrap.append(state, pre); root.append(button, wrap);
+    button.onclick = () => {
+      if (tornDown || !hostInitialized) return;
+      wrap.hidden = !wrap.hidden;
+      button.setAttribute("aria-expanded", String(!wrap.hidden));
+      if (!wrap.hidden) void loadFrozenDiff(file, state, pre);
+    };
+    return root;
+  }
+
+  function appendFrozenFiles(limit) {
+    if (tornDown || !snapshot) return;
+    // Append only: refresh/Show more cannot detach an in-flight diff's nodes.
+    const end = Math.min(limit, snapshot.files.length);
+    while (visibleCount < end) el("frozenFiles").appendChild(frozenFileNode(snapshot.files[visibleCount++]));
+    el("frozenMore").hidden = visibleCount >= snapshot.files.length;
+    el("frozenMore").textContent = `Show ${snapshot.files.length - visibleCount} more files`;
+    el("frozenFooter").textContent = `Final result · select a file to inspect its changes${snapshot.files_truncated
+      ? ` · showing ${snapshot.files.length} of ${snapshot.files_total} files` : ""}`;
+  }
+
+  function changeCode(file) {
+    const status = file.status;
+    if (status === "added") return "A";
+    if (status === "deleted") return "D";
+    if (status === "renamed") return "R";
+    if (status === "copied") return "C";
+    if (status === "untracked") return "?";
+    if (status === "conflicted") return "!";
+    if (status === "modified") return "M";
+    return "?";
+  }
+
+  function formatAge(timestampMs) {
+    if (!Number.isSafeInteger(timestampMs) || timestampMs < 0) return "";
+    const elapsed = Math.max(0, Date.now() - timestampMs);
+    if (elapsed < 5000) return "now";
+    if (elapsed < 60000) return `${Math.floor(elapsed / 1000)}s ago`;
+    const minutes = Math.floor(elapsed / 60000);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  }
+
+  function activityIdleElapsed(activity) {
+    if (activity.active || activity.last_meaningful_activity_at_ms === null) return null;
+    return Math.max(0, Date.now() - activity.last_meaningful_activity_at_ms);
+  }
+
+  function formatDuration(elapsedMs) {
+    const minutes = Math.floor(Math.max(0, elapsedMs) / 60000);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h`;
+  }
+
+  function renderWorkspace(workspace, hasFinalChanges) {
+    el("branch").textContent = workspace.branch || "Task";
+    if (!workspace.git_available) {
+      el("workspaceStatus").textContent = "Change status unavailable";
+      el("workspaceMeta").textContent = "";
+      return;
+    }
+    if (hasFinalChanges) {
+      el("workspaceStatus").textContent = "Final result available";
+      el("workspaceMeta").textContent = "Open What changed above";
+      return;
+    }
+    if (workspace.clean) {
+      el("workspaceStatus").textContent = "No pending changes";
+      el("workspaceMeta").textContent = "";
+      return;
+    }
+    el("workspaceStatus").textContent = "Changes in progress";
+    el("workspaceMeta").textContent = workspace.files_total > 0
+      ? `${workspace.files_total} ${workspace.files_total === 1 ? "file" : "files"} currently touched`
+      : "";
+  }
+
+  function validationLabel(validation) {
+    if (validation.unresolved_failures > 0 || validation.current_status === "failed") return "Checks need attention";
+    if (validation.current_status === "passed") return "Checks passed";
+    if (validation.current_status === "stale") return "Checks are out of date";
+    if (validation.current_status === "not_run" || validation.current_status === "unproven") return "Checks not run";
+    if (validation.current_status === "expected") return "Expected result recorded";
+    if (validation.current_status === "inconclusive") return "Checks inconclusive";
+    return "Check status unavailable";
+  }
+
+  function renderValidation(validation) {
+    el("validationStatus").textContent = validationLabel(validation);
+    const pieces = [];
+    if (safeCount(validation.successes) && validation.successes > 0) pieces.push(`${validation.successes} passed`);
+    if (validation.unresolved_failures > 0) pieces.push(`${validation.unresolved_failures} unresolved`);
+    if (validation.history_partial) pieces.push("limited history");
+    el("validationMeta").textContent = pieces.join(" · ");
+  }
+
+  function renderReview(review) {
+    if (review.total > 0) {
+      el("reviewStatus").textContent = "Review recorded";
+      el("reviewMeta").textContent = review.history_partial ? "Recent review activity available" : "";
+    } else if (review.history_partial) {
+      el("reviewStatus").textContent = "Review status incomplete";
+      el("reviewMeta").textContent = "Earlier activity is outside the retained history";
+    } else {
+      el("reviewStatus").textContent = "Review not recorded";
+      el("reviewMeta").textContent = "";
+    }
+  }
+
+  function renderActivity(activity, session, hasFinalChanges) {
+    if (hasFinalChanges || session.lifecycle === "closed") {
+      el("activityStatus").textContent = "Work completed";
+      el("activityDetail").textContent = activity.last?.label || "";
+      el("activityAge").textContent = activity.last_meaningful_activity_at_ms === null ? "" : `Finished ${formatAge(activity.last_meaningful_activity_at_ms)}`;
+      return;
+    }
+    if (activity.active && activity.current) {
+      el("activityStatus").textContent = activity.current.label;
+      el("activityDetail").textContent = activity.scope === "window" ? "This chat is active" : "WebCodex is working on this task";
+      el("activityAge").textContent = activity.scope === "window" ? "This chat · Active now" : "Active now";
+      return;
+    }
+    const idleElapsed = activityIdleElapsed(activity);
+    if (idleElapsed !== null && idleElapsed >= ACTIVITY_IDLE_AFTER_MS) {
+      el("activityStatus").textContent = "No WebCodex activity";
+      el("activityDetail").textContent = activity.last ? `Last work: ${activity.last.label}`
+        : activity.coverage_partial ? "Earlier activity is not fully observable" : "";
+      el("activityAge").textContent = `Idle for ${formatDuration(idleElapsed)}`;
+      return;
+    }
+    if (activity.last_meaningful_activity_at_ms === null) {
+      el("activityStatus").textContent = "Waiting for WebCodex activity";
+      el("activityDetail").textContent = activity.last?.label || (activity.coverage_partial ? "Current activity is not fully observable" : "");
+      el("activityAge").textContent = "";
+      return;
+    }
+    if (activity.last) {
+      el("activityStatus").textContent = activity.last.label;
+      el("activityDetail").textContent = activity.scope === "window" ? "Waiting for the next activity in this chat" : "Waiting for the next task activity";
+      const prefix = activity.scope === "window" ? "This chat · Last active " : "Task · Last active ";
+      el("activityAge").textContent = prefix + formatAge(activity.last_meaningful_activity_at_ms);
+      return;
+    }
+    el("activityStatus").textContent = "Waiting for WebCodex activity";
+    el("activityDetail").textContent = activity.coverage_partial ? "Current activity is not fully observable" : "";
+    el("activityAge").textContent = "";
+  }
+
+  function renderMessages(collaboration) {
+    const root = el("messages");
+    root.replaceChildren();
+    el("collaborationMeta").textContent = collaboration.available ? "Shared with WebUI" : "Unavailable";
+    const rows = [...collaboration.messages].reverse();
+    for (const message of rows) {
+      const article = document.createElement("article");
+      article.className = `message ${message.author}`;
+      const copy = document.createElement("div"); copy.className = "message-copy"; copy.textContent = message.message;
+      const meta = document.createElement("div"); meta.className = "message-meta";
+      const author = document.createElement("strong"); author.textContent = message.author === "user" ? "You" : "WebCodex";
+      const time = document.createElement("span"); time.textContent = formatAge(message.created_at * 1000);
+      meta.append(author, time);
+      if (message.author === "user") {
+        const state = document.createElement("span"); state.className = `message-state ${message.state}`;
+        state.textContent = message.state === "handled" ? "Handled" : message.state === "acknowledged" ? "Acknowledged" : "Sent";
+        meta.append(state);
+      }
+      article.append(copy, meta);
+      if (message.resolution) {
+        const resolution = document.createElement("div"); resolution.className = "message-resolution";
+        resolution.textContent = message.resolution;
+        article.append(resolution);
+      }
+      root.append(article);
+    }
+    if (!rows.length) {
+      const empty = document.createElement("div"); empty.className = "secondary";
+      empty.textContent = collaboration.available ? "No messages yet." : "Messaging is not available with this access.";
+      root.append(empty);
+    }
+    updateComposerControl(collaboration);
+  }
+
+  function updateComposerControl(collaboration = lastRenderedState?.collaboration) {
+    const enabled = !!collaboration?.available && !!collaboration?.can_send && hostInitialized && !tornDown && !sendInFlight;
+    el("messageInput").disabled = !enabled;
+    el("sendMessage").disabled = !enabled || !String(el("messageInput").value || "").trim();
+    el("sendMessage").textContent = sendInFlight ? "Sending…" : "Send";
+    if (collaboration && !collaboration.can_send) el("composerState").textContent = collaboration.available ? "This task is closed for new messages." : "";
+  }
+
+  const panes = ["Workflow", "Checks", "Messages", "Result"];
+  function selectPane(name, focus = false) {
+    if (!panes.includes(name)) return;
+    selectedPane = name;
+    for (const pane of panes) {
+      el("panel" + pane).hidden = pane !== name;
+      el("tab" + pane).setAttribute("aria-selected", String(pane === name));
+      el("tab" + pane).setAttribute("tabindex", pane === name ? "0" : "-1");
+    }
+    if (focus) el("tab" + name).focus?.();
+  }
+
+  function renderWorkflow(workflow) {
+    const rows = workflow?.activity || [];
+    const stages = [["all", "All"], ["explore", "Explore"], ["edit", "Edit"], ["run", "Run"], ["check", "Checks"], ["review", "Review"], ["other", "Other"]];
+    el("workflowCoverage").textContent = !workflow ? "Unavailable" : workflow.history_partial ? "Recent retained activity" : "Retained activity";
+    const filters = el("workflowStages");
+    // Keep focused filter buttons mounted while polling refreshes their counts.
+    if (!filters.children.length) for (const [stage, label] of stages) {
+      const button = document.createElement("button"); button.type = "button";
+      button.onclick = () => { selectedStage = stage; renderWorkflow(lastRenderedState?.workflow); };
+      button.setAttribute("aria-label", label); filters.append(button);
+    }
+    stages.forEach(([stage, label], index) => {
+      const count = rows.filter(row => stage === "all" || row.stage === stage).reduce((total, row) => total + row.count, 0);
+      filters.children[index].textContent = `${label} · ${count}`;
+      filters.children[index].setAttribute("aria-pressed", String(stage === selectedStage));
+    });
+    const root = el("workflowActivity"); root.replaceChildren();
+    for (const row of [...rows].reverse().filter(row => selectedStage === "all" || row.stage === selectedStage)) {
+      const article = document.createElement("article"); article.className = "workflow-row";
+      const header = document.createElement("header");
+      const label = document.createElement("strong"); label.textContent = row.label + (row.count > 1 ? ` · ${row.count}` : "");
+      const status = document.createElement("span"); status.className = "secondary";
+      status.textContent = ({ started: "Started · outcome not recorded", running: "Started · completion not recorded", queued: "Queued", outcome_unknown: "Outcome unknown", timed_out: "Timed out", cancelled: "Cancelled", not_started: "Not started", success: "Succeeded", succeeded: "Succeeded", completed: "Completed", failed: "Failed", info: "Reported progress" })[row.state] || row.state;
+      header.append(label, status);
+      const time = document.createElement("time");
+      time.textContent = new Date(row.started_at * 1000).toLocaleString() + (row.duration_ms === null ? "" : ` · ${row.duration_ms < 1000 ? row.duration_ms + "ms" : (row.duration_ms / 1000).toFixed(1) + "s"}`);
+      article.append(header, time); root.append(article);
+    }
+    if (!root.children.length) {
+      const empty = document.createElement("p"); empty.className = "secondary";
+      empty.textContent = workflow ? "No recorded activity in this stage." : "Workflow history is unavailable in this snapshot. Refresh to check.";
+      root.append(empty);
+    }
+  }
+
+  function render(state) {
+    if (tornDown) return;
+    lastRenderedState = state;
+    el("projectIdentity").textContent = state.project;
+    el("sessionIdentity").textContent = state.session_id;
+    renderWorkflow(state.workflow);
+    const hasFinalChanges = snapshot !== null || state.final_changes !== undefined;
+    el("taskTitle").textContent = state.session.title || "WebCodex";
+    renderActivity(state.activity, state.session, hasFinalChanges);
+    renderMessages(state.collaboration);
+    renderWorkspace(state.workspace, hasFinalChanges);
+    renderValidation(state.validation);
+    renderReview(state.review);
+    el("resultPending").hidden = hasFinalChanges;
+    el("tabResult").textContent = hasFinalChanges ? "Result · Ready" : "Result";
+    el("tabChecks").textContent = state.validation.unresolved_failures > 0 ? "Checks · !" : "Checks";
+
+    if (hasFinalChanges || state.session.lifecycle === "closed") {
+      el("badge").className = "badge tone-clean";
+      el("badge").textContent = "Completed";
+    } else if (state.activity.active) {
+      el("badge").className = "badge tone-changed";
+      el("badge").textContent = "Working";
+    } else if (state.validation.unresolved_failures > 0 || state.validation.current_status === "failed") {
+      el("badge").className = "badge tone-unavailable";
+      el("badge").textContent = "Needs attention";
+    } else if ((activityIdleElapsed(state.activity) ?? -1) >= ACTIVITY_IDLE_AFTER_MS) {
+      el("badge").className = "badge";
+      el("badge").textContent = "Idle";
+    } else {
+      el("badge").className = "badge";
+      el("badge").textContent = "Waiting";
+    }
+  }
+
+  function newDeliveryKey() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return "wrc_" + Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function sendMessageFromCard() {
+    if (tornDown || !hostInitialized || !identity || sendInFlight || !lastRenderedState?.collaboration?.can_send) return;
+    const text = String(el("messageInput").value || "").trim();
+    if (!text) return;
+    if (!pendingSend || pendingSend.message !== text) pendingSend = { message: text, delivery_key: newDeliveryKey() };
+    sendInFlight = true;
+    el("composerState").textContent = "Sending…";
+    updateComposerControl();
+    try {
+      const response = await send("tools/call", { name: "work_result_send_message", arguments: {
+        project: identity.project,
+        session_id: identity.session_id,
+        message: pendingSend.message,
+        delivery_key: pendingSend.delivery_key,
+      } });
+      if (tornDown) return;
+      if (toolSuccess(response) !== true) {
+        el("composerState").textContent = "Send failed · retry";
+        return;
+      }
+      el("messageInput").value = "";
+      pendingSend = null;
+      el("composerState").textContent = "Sent";
+      await refresh(false);
+    } catch (_) {
+      if (!tornDown) el("composerState").textContent = "Send status unknown · retry";
+    } finally {
+      sendInFlight = false;
+      updateComposerControl();
+    }
+  }
+
+  function updateRefreshControl() {
+    const button = el("refresh");
+    button.disabled = tornDown || !hostInitialized || !identity || refreshInFlight;
+    button.textContent = refreshInFlight ? "Refreshing…" : "Refresh";
+  }
+
+  function automaticRefreshDelay() {
+    const idleMs = lastStateChangeAt === null ? 0 : Math.max(0, Date.now() - lastStateChangeAt);
+    if (idleMs < IDLE_BACKOFF_AFTER_MS) return document.hidden ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
+    return document.hidden ? HIDDEN_IDLE_REFRESH_MS : VISIBLE_IDLE_REFRESH_MS;
+  }
+
+  function scheduleRefresh(delay) {
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    if (tornDown || !hostInitialized || !identity || lastStateVersion === null || sessionLifecycle === "closed") return;
+    if (lastStateChangeAt !== null && Date.now() - lastStateChangeAt >= AUTO_REFRESH_IDLE_PAUSE_MS) {
+      if (!refreshInFlight) el("status").textContent = "Updates paused · Refresh to check";
+      return;
+    }
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      void refresh(true);
+    }, delay ?? automaticRefreshDelay());
+  }
+
+  async function refresh(automatic = false) {
+    if (tornDown || !hostInitialized || !identity || refreshInFlight) return;
+    const hadSnapshot = lastStateVersion !== null;
+    refreshInFlight = true;
+    updateRefreshControl();
+    if (!automatic) el("status").textContent = "Refreshing…";
+    try {
+      const response = await send("tools/call", { name: "work_result_state", arguments: { project: identity.project, session_id: identity.session_id } });
+      if (tornDown) return;
+      const structured = structuredOf(response);
+      if (!structured) {
+        if (!automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+        return;
+      }
+      if (structured.success === false) {
+        if (!automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+        return;
+      }
+      const state = extractState(structured);
+      if (!state || !acceptIdentity(pair(state.project, state.session_id))) {
+        if (!tornDown) failClosed("Task state unavailable");
+        return;
+      }
+      const hadFrozen = snapshot !== null;
+      if (!acceptFrozen(state.final_changes)) return;
+      const completedNow = !hadFrozen && snapshot !== null;
+      hasRefreshed = true;
+      initialResultTransportMissing = false;
+      sessionLifecycle = state.session.lifecycle;
+      const changed = state.state_version !== lastStateVersion;
+      if (changed) {
+        lastStateVersion = state.state_version;
+        lastStateChangeAt = Date.now();
+      }
+      // Re-render even when authoritative state is unchanged so the View can
+      // update human-friendly "last active" time from the stable timestamp.
+      render(state);
+      if (!changed && !automatic) lastStateChangeAt = Date.now();
+      el("status").textContent = completedNow ? "Completed · final result ready"
+        : sessionLifecycle === "closed" ? "Completed"
+        : changed ? (automatic ? "Live · updated" : "Updated")
+        : (automatic ? "Live" : "Up to date");
+    } catch (_) {
+      if (!tornDown && !automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+    } finally {
+      refreshInFlight = false;
+      updateRefreshControl();
+      scheduleRefresh();
+    }
+  }
+
+  function acceptToolInput(params) {
+    const args = params && params.arguments;
+    if (!acceptIdentity(pair(args && !Array.isArray(args) && args.project, args && !Array.isArray(args) && args.session_id))) return;
+    if (initialResultTransportMissing && hostInitialized && lastStateVersion === null) void refresh(false);
+  }
+
+  function acceptToolResult(result) {
+    if (tornDown) return;
+    const structured = structuredOf(result);
+    if (!structured) {
+      // Production Hosts may omit structuredContent from a ToolResult delivered
+      // to the View. Preserve exact identity from tool-input and recover once
+      // through the app-only state read instead of permanently disabling the card.
+      initialResultTransportMissing = true;
+      if (identity && hostInitialized && lastStateVersion === null) void refresh(false);
+      return;
+    }
+    const state = extractState(structured);
+    if (structured.success === false || !state || !acceptIdentity(pair(state.project, state.session_id))) {
+      if (!tornDown) failClosed("Task state unavailable");
+      return;
+    }
+    initialResultTransportMissing = false;
+    const hadFrozen = snapshot !== null;
+    if (!acceptFrozen(state.final_changes)) return;
+    const adoptedFinal = !hadFrozen && snapshot !== null;
+    sessionLifecycle = state.session.lifecycle;
+    if (!hasRefreshed && state.state_version !== lastStateVersion) {
+      lastStateVersion = state.state_version;
+      lastStateChangeAt = Date.now();
+      render(state);
+    } else if (adoptedFinal && lastRenderedState) {
+      // A delayed initial ToolResult may carry the immutable closeout snapshot
+      // after a fresher live refresh. Adopt only that frozen domain and re-render
+      // the fresher live state as completed; never roll workspace/activity back.
+      render(lastRenderedState);
+    }
+    el("status").textContent = adoptedFinal ? "Completed · final result ready"
+      : sessionLifecycle === "closed" ? "Completed" : "Live";
+    updateRefreshControl();
+    scheduleRefresh(500);
+  }
+
+  function teardown() {
+    if (tornDown) return;
+    tornDown = true;
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    refreshInFlight = false;
+    updateRefreshControl();
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error("App torn down"));
+    }
+    pending.clear();
+  }
+
+  addEventListener("message", event => {
+    if (event.source !== parent) return;
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0") return;
+    if (Object.prototype.hasOwnProperty.call(msg, "id") && pending.has(msg.id)) {
+      const entry = pending.get(msg.id);
+      pending.delete(msg.id);
+      clearTimeout(entry.timer);
+      if (msg.error) entry.reject(new Error(String(msg.error.message || "Host error")));
+      else entry.resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-input") {
+      acceptToolInput(msg.params);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result") {
+      acceptToolResult(msg.params);
+      return;
+    }
+    if (msg.method === "ui/resource-teardown") {
+      teardown();
+      if (Object.prototype.hasOwnProperty.call(msg, "id")) parent.postMessage({ jsonrpc: "2.0", id: msg.id, result: {} }, "*");
+    }
+  });
+
+  for (const pane of panes) {
+    el("tab" + pane).onclick = () => selectPane(pane);
+    el("tab" + pane).onkeydown = event => {
+      const index = panes.indexOf(selectedPane);
+      const next = event.key === "ArrowRight" ? panes[(index + 1) % panes.length]
+        : event.key === "ArrowLeft" ? panes[(index + panes.length - 1) % panes.length]
+        : event.key === "Home" ? panes[0] : event.key === "End" ? panes.at(-1) : null;
+      if (next) { event.preventDefault(); selectPane(next, true); }
+    };
+  }
+  el("askWorkflow").onclick = () => { selectPane("Messages"); el("messageInput").focus?.(); };
+  el("askChecks").onclick = () => {
+    if (!el("messageInput").value) el("messageInput").value = "Please explain the current checks and any remaining issues.";
+    selectPane("Messages"); updateComposerControl(); el("messageInput").focus?.();
+  };
+  selectPane("Workflow");
+  el("refresh").onclick = () => { void refresh(false); };
+  el("frozenMore").onclick = () => { if (snapshot) appendFrozenFiles(snapshot.files.length); };
+  el("composer").onsubmit = event => { event.preventDefault(); void sendMessageFromCard(); };
+  el("messageInput").oninput = () => {
+    if (pendingSend && pendingSend.message !== String(el("messageInput").value || "").trim()) pendingSend = null;
+    if (el("composerState").textContent !== "Sending…") el("composerState").textContent = "";
+    updateComposerControl();
+  };
+  addEventListener("visibilitychange", () => {
+    if (!tornDown && hostInitialized && identity && lastStateVersion !== null) {
+      scheduleRefresh(document.hidden ? HIDDEN_REFRESH_MS : 250);
+    }
+  });
+  updateRefreshControl();
+  addEventListener("pagehide", teardown, { once: true });
+  addEventListener("beforeunload", teardown, { once: true });
+
+  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-work-result-app", title: "WebCodex", version: "2.0.0" }, appCapabilities: {} })
+    .then(() => {
+      if (tornDown) return;
+      hostInitialized = true;
+      el("status").textContent = lastStateVersion !== null
+        ? (sessionLifecycle === "closed" ? "Completed" : "Live")
+        : identity ? "Waiting for task status" : "Ready";
+      notify("ui/notifications/initialized", {});
+      updateRefreshControl();
+      updateComposerControl();
+      if (initialResultTransportMissing && identity && lastStateVersion === null) void refresh(false);
+      else scheduleRefresh();
+    })
+    .catch(() => { if (!tornDown) el("status").textContent = "Task card unavailable"; });
+})();
+</script>
+</body>
+</html>

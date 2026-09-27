@@ -19,6 +19,7 @@ const MEMORY_REVISION_PREFIX: &str = "wc_memrev_";
 const MEMORY_CATALOG_REVISION_PREFIX: &str = "wc_memcat_";
 const MEMORY_ROOT_FINGERPRINT_PREFIX: &str = "wc_memroot_";
 const MEMORY_PRINCIPAL_DIGEST_PREFIX: &str = "wc_memprincipal_";
+const COMPACT_SHA256_SUFFIX_LEN: usize = 43;
 const MAX_MEMORY_TAGS_JSON_BYTES: usize = 4 * 1024;
 const MEMORY_PROVENANCE_KINDS: &[&str] = &[
     "dev",
@@ -224,12 +225,7 @@ impl MemoryStoreError {
 }
 
 fn validate_scope(scope_id: &str) -> Result<(), MemoryStoreError> {
-    if scope_id.len() == "wc_memscope_".len() + 64
-        && scope_id.starts_with("wc_memscope_")
-        && scope_id["wc_memscope_".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if valid_compact_sha256_prefixed(scope_id, "wc_memscope_") {
         Ok(())
     } else {
         Err(MemoryStoreError::InvalidScope)
@@ -310,12 +306,19 @@ fn valid_lower_hex_prefixed(value: &str, prefix: &str, hex_len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_compact_sha256_prefixed(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .and_then(webcodex_core::compact::decode::<32>)
+        .is_some()
+}
+
 pub fn validate_memory_scope_id(value: &str) -> Result<(), MemoryStoreError> {
     validate_scope(value)
 }
 
 pub(crate) fn valid_memory_root_fingerprint(value: &str) -> bool {
-    valid_lower_hex_prefixed(value, MEMORY_ROOT_FINGERPRINT_PREFIX, 64)
+    valid_compact_sha256_prefixed(value, MEMORY_ROOT_FINGERPRINT_PREFIX)
 }
 
 pub(crate) fn valid_memory_principal_digest(value: &str) -> bool {
@@ -358,7 +361,11 @@ fn validate_scope_attribution(
 }
 
 fn validate_memory_id(value: &str) -> Result<(), MemoryStoreError> {
-    if valid_lower_hex_prefixed(value, MEMORY_ID_PREFIX, 32) {
+    if value
+        .strip_prefix(MEMORY_ID_PREFIX)
+        .and_then(webcodex_core::compact::decode::<12>)
+        .is_some()
+    {
         Ok(())
     } else {
         Err(MemoryStoreError::DatabaseUnavailable)
@@ -374,7 +381,7 @@ fn validate_memory_definition_hash(value: &str) -> Result<(), MemoryStoreError> 
 }
 
 pub fn validate_memory_revision(value: &str) -> Result<(), MemoryStoreError> {
-    if valid_lower_hex_prefixed(value, MEMORY_REVISION_PREFIX, 64) {
+    if valid_compact_sha256_prefixed(value, MEMORY_REVISION_PREFIX) {
         Ok(())
     } else {
         Err(MemoryStoreError::InvalidRevision)
@@ -434,7 +441,10 @@ pub fn memory_state_revision(
     hash_field(&mut hasher, memory_id.as_bytes());
     hash_field(&mut hasher, &generation.to_be_bytes());
     hash_field(&mut hasher, definition_hash.as_bytes());
-    format!("{MEMORY_REVISION_PREFIX}{:x}", hasher.finalize())
+    format!(
+        "{MEMORY_REVISION_PREFIX}{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 fn validate_timestamp_pair(
@@ -476,7 +486,7 @@ fn parse_scope_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectMemorySco
     // Reject malformed or hostile persisted metadata before materializing its
     // TEXT values. Scope inventory is bounded by Memory cardinality, and each
     // descriptor must also remain bounded independently.
-    if row.get::<_, i64>(7)? != ("wc_memscope_".len() + 64) as i64 {
+    if row.get::<_, i64>(7)? != ("wc_memscope_".len() + COMPACT_SHA256_SUFFIX_LEN) as i64 {
         return Err(corrupt_row(
             0,
             rusqlite::types::Type::Text,
@@ -513,7 +523,9 @@ fn parse_scope_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectMemorySco
         }
     }
     let root_length = row.get::<_, i64>(11)?;
-    if root_length != 0 && root_length != (MEMORY_ROOT_FINGERPRINT_PREFIX.len() + 64) as i64 {
+    if root_length != 0
+        && root_length != (MEMORY_ROOT_FINGERPRINT_PREFIX.len() + COMPACT_SHA256_SUFFIX_LEN) as i64
+    {
         return Err(corrupt_row(
             4,
             rusqlite::types::Type::Text,
@@ -632,15 +644,14 @@ pub fn memory_catalog_revision(records: &[ProjectMemoryRecord]) -> String {
         hash_field(&mut hasher, key.as_bytes());
         hash_field(&mut hasher, revision.as_bytes());
     }
-    format!("{MEMORY_CATALOG_REVISION_PREFIX}{:x}", hasher.finalize())
+    format!(
+        "{MEMORY_CATALOG_REVISION_PREFIX}{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 pub fn valid_memory_catalog_revision(value: &str) -> bool {
-    value.len() == MEMORY_CATALOG_REVISION_PREFIX.len() + 64
-        && value.starts_with(MEMORY_CATALOG_REVISION_PREFIX)
-        && value[MEMORY_CATALOG_REVISION_PREFIX.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    valid_compact_sha256_prefixed(value, MEMORY_CATALOG_REVISION_PREFIX)
 }
 
 fn corrupt_row(
@@ -663,10 +674,10 @@ fn parse_row(
     // large TEXT values into Rust Strings. This is a local Memory-store bound,
     // not a generic DB streaming abstraction.
     let exact_lengths = [
-        (17, MEMORY_ID_PREFIX.len() + 32),
-        (18, "wc_memscope_".len() + 64),
+        (17, MEMORY_ID_PREFIX.len() + 16),
+        (18, "wc_memscope_".len() + COMPACT_SHA256_SUFFIX_LEN),
         (24, MEMORY_DEFINITION_HASH_PREFIX.len() + 64),
-        (25, MEMORY_REVISION_PREFIX.len() + 64),
+        (25, MEMORY_REVISION_PREFIX.len() + COMPACT_SHA256_SUFFIX_LEN),
     ];
     for (column, expected) in exact_lengths {
         if row.get::<_, i64>(column)? != expected as i64 {
@@ -928,7 +939,7 @@ impl Database {
         memory_scope_id: &str,
     ) -> Result<Vec<ProjectMemoryRecord>, MemoryStoreError> {
         validate_scope(memory_scope_id)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Memory);
         list_project_memories_with_conn(&conn, memory_scope_id)
     }
 
@@ -939,7 +950,7 @@ impl Database {
     ) -> Result<Option<ProjectMemoryRecord>, MemoryStoreError> {
         validate_scope(memory_scope_id)?;
         validate_memory_key(memory_key)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Memory);
         let record = conn
             .query_row(
                 &format!("{SELECT_RECORD} WHERE memory_scope_id = ?1 AND memory_key = ?2"),
@@ -985,7 +996,7 @@ impl Database {
             &input.tags,
         );
         let now = chrono::Utc::now().timestamp_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Memory);
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| MemoryStoreError::DatabaseUnavailable)?;
@@ -1131,7 +1142,12 @@ impl Database {
             now,
             project_count == 0,
         )?;
-        let memory_id = format!("{MEMORY_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let memory_id = super::communication::allocate_identity(
+            &tx,
+            MEMORY_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM project_memories WHERE memory_id = ?1)",
+        )
+        .map_err(|_| MemoryStoreError::DatabaseUnavailable)?;
         let generation = 1u64;
         let requested_revision = memory_state_revision(
             memory_scope_id,
@@ -1194,7 +1210,7 @@ impl Database {
         validate_memory_key(memory_key)?;
         validate_memory_revision(expected_revision)?;
         let now = chrono::Utc::now().timestamp_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Memory);
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| MemoryStoreError::DatabaseUnavailable)?;
@@ -1279,7 +1295,7 @@ impl Database {
         let scope_attribution = MemoryScopeAttribution {
             project_runtime_id: "agent:test:memory".to_string(),
             runner_client_id: "test-runner".to_string(),
-            root_fingerprint: format!("wc_memroot_{}", "0".repeat(64)),
+            root_fingerprint: format!("wc_memroot_{}", webcodex_core::compact::encode([0_u8; 32])),
         };
         let principal = MemoryPrincipalAttribution {
             kind: "dev".to_string(),
@@ -1298,7 +1314,7 @@ impl Database {
         let scope_attribution = MemoryScopeAttribution {
             project_runtime_id: "agent:test:memory".to_string(),
             runner_client_id: "test-runner".to_string(),
-            root_fingerprint: format!("wc_memroot_{}", "0".repeat(64)),
+            root_fingerprint: format!("wc_memroot_{}", webcodex_core::compact::encode([0_u8; 32])),
         };
         self.delete_project_memory_attributed(
             memory_scope_id,
@@ -1321,7 +1337,7 @@ impl Database {
         // signed integer representation; callers still observe the effective
         // offset normalized against total below.
         let offset = offset.min(MAX_MEMORIES_GLOBAL);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Memory);
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM project_memory_scopes", [], |row| {
                 row.get(0)
@@ -1373,7 +1389,7 @@ impl Database {
         memory_scope_id: &str,
     ) -> Result<Option<ProjectMemoryScopeSnapshot>, MemoryStoreError> {
         validate_scope(memory_scope_id)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Memory);
         let Some(scope) = get_scope_record(&conn, memory_scope_id)? else {
             let count: i64 = conn
                 .query_row(
@@ -1403,7 +1419,7 @@ impl Database {
         if !valid_memory_catalog_revision(expected_catalog_revision) {
             return Err(MemoryStoreError::InvalidRevision);
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Memory);
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| MemoryStoreError::DatabaseUnavailable)?;

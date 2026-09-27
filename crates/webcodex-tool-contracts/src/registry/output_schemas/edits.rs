@@ -207,72 +207,130 @@ fn apply_patch_file_summary_schema() -> Value {
     })
 }
 
-fn edit_conflict_recovery_schema() -> Value {
+fn apply_text_edit_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "index": {"type":"integer","minimum":0,"maximum":19},
+            "kind": {"type":"string","enum":["replace_exact","insert_before","insert_after","delete_exact"]},
+            "old_start_line": {"type":"integer","minimum":1},
+            "old_end_line": {"type":"integer","minimum":1},
+            "new_line_count": {"type":"integer","minimum":0},
+            "would_change": {"type":"boolean"},
+            "match_count": {"type":"integer","minimum":1},
+            "expected_match_count": {"type":"integer","minimum":1,"maximum":1024},
+            "match_ranges": {"type":"array","maxItems":webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT,"items":edit_success_match_range_schema()},
+            "match_ranges_truncated": {"type":"boolean"},
+            "warning": {
+                "type": "string",
+                "enum": [webcodex_core::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING],
+                "description": "Optional non-blocking duplicate-anchor advisory. The Server preserves only this canonical fixed text when it maps to the original insert edit."
+            }
+        }
+    })
+}
+
+fn apply_text_edits_file_summary_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_FILE_CHANGES,
+        "description": "Server-validated per-file apply_text_edits success summaries. Final snapshots use read_revision; Runner SHA-256 values are internal and are not model-facing.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "index": {"type": "integer", "minimum": 0},
+                "kind": {"type": "string", "enum": ["create", "edit", "delete", "rename"]},
+                "path": {"type": "string", "minLength": 1},
+                "to_path": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                "changed": {"type": "boolean"},
+                "would_change": {"type": "boolean"},
+                "read_revision": {
+                    "description": "Fresh model-facing snapshot revision for the final file after confirmed non-dry-run success; null for delete and dry-run results.",
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 9007199254740991_u64},
+                        {"type": "null"}
+                    ]
+                },
+                "edits": {
+                    "type": "array",
+                    "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_EDITS,
+                    "items": apply_text_edit_summary_schema(),
+                    "description": "Bounded source-free per-edit summaries. The optional duplicate-anchor warning is Server-sanitized to one fixed non-blocking advisory; existing structural metadata remains additive."
+                }
+            },
+            "required": [
+                "index", "kind", "path", "to_path", "changed", "would_change",
+                "read_revision", "edits"
+            ]
+        }
+    })
+}
+
+fn edit_success_match_range_schema() -> Value {
+    let mut schema = edit_candidate_range_schema();
+    schema["required"] = json!(["occurrence", "start_line", "end_line"]);
+    schema
+}
+
+fn edit_candidate_range_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "schema_version": {"type": "integer", "const": 1},
-            "conflict_kind": {"type": "string", "enum": [
-                "multiple_matches", "match_not_found", "occurrence_out_of_range",
-                "occurrence_outside_line_scope", "overlapping_edits", "sha256_mismatch"
-            ]},
-            "recovery_action": {"type": "string", "enum": [
-                "select_occurrence_or_refine_match", "reread_or_refine_match",
-                "choose_valid_occurrence_or_refine_match", "narrow_line_scope_or_select_occurrence",
-                "adjust_line_scope_or_refine_match", "align_occurrence_with_line_scope",
-                "refine_edit_batch", "reread_file"
-            ]},
-            "occurrence_selector_supported": {"type": "boolean"},
-            "direct_retry_safe": {
-                "type": "boolean",
-                "description": "True only when a corrected request may be retried against the same observed expected_sha256 without rereading. It never authorizes automatic replay of the rejected payload."
+            "occurrence": {"type": "integer", "minimum": 1},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1}
+        },
+        "required": ["start_line", "end_line"]
+    })
+}
+
+fn conflicting_edit_ranges_schema() -> Value {
+    let mut schema = array_schema(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "edit_index": {"type": "integer", "minimum": 0},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1}
             },
-            "reread_required": {
-                "type": "boolean",
-                "description": "True when the caller must reread the affected file before another write attempt."
-            },
-            "expected_sha256": {
-                "type": "string",
-                "pattern": "^[a-f0-9]{64}$",
-                "description": "Caller-provided expected sha256 on a sha256 mismatch; hash only, never file content."
-            },
-            "current_sha256": {
-                "type": "string",
-                "pattern": "^[a-f0-9]{64}$",
-                "description": "Current observed file sha256 on a sha256 mismatch; hash only, never file content."
-            },
-            "match_count": {"type": "integer", "minimum": 0},
-            "requested_occurrence": {"type": "integer", "minimum": 1},
-            "line_scope": {
+            "required": ["edit_index", "start_line", "end_line"]
+        }),
+        "At most the resolved source-line ranges for conflicting edits; derived from the authoritative transactional edit plan and contains no source or replacement text.",
+    );
+    schema["maxItems"] = json!(2);
+    schema
+}
+
+fn read_files_recovery_call_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "tool": {"type": "string", "const": "read_files"},
+            "arguments": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1}
+                    "project": {"type": "string", "minLength": 1},
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {"path": {"type": "string", "minLength": 1}},
+                            "required": ["path"]
+                        }
+                    }
                 },
-                "required": ["start_line", "end_line"]
-            },
-            "line_scope_match_count": {"type": "integer", "minimum": 0},
-            "candidate_ranges": {
-                "type": "array", "maxItems": 8,
-                "items": {
-                    "type": "object", "additionalProperties": false,
-                    "properties": {
-                        "occurrence": {"type": "integer", "minimum": 1},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "end_line": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["occurrence", "start_line", "end_line"]
-                }
-            },
-            "candidates_truncated": {"type": "boolean"},
-            "conflicting_edit_indices": {
-                "type": "array", "maxItems": 2,
-                "items": {"type": "integer", "minimum": 0, "maximum": 19}
+                "required": ["project", "items"]
             }
         },
-        "required": ["schema_version", "conflict_kind", "recovery_action", "occurrence_selector_supported"]
+        "required": ["tool", "arguments"]
     })
 }
 
@@ -305,7 +363,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "overwritten",
-                schema_type("boolean", "True when the request successfully targeted an existing file with its exact sha256 guard."),
+                schema_type("boolean", "True when the request successfully targeted an existing file with expected_read_revision resolved to the Runner's exact SHA guard."),
             ),
             (
                 "bytes_written",
@@ -313,7 +371,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "sha256",
-                nullable_schema("string", "sha256 of the final file, current file on sha guard mismatch, or null when unavailable."),
+                nullable_schema("string", "Informational sha256 of the final file when available; stale guarded-write conflicts are projected through read revisions instead of exposing Runner SHA recovery truth."),
             ),
             (
                 "changed",
@@ -336,16 +394,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "not_started or outcome_unknown for delivery-boundary failures."),
             ),
             (
-                "recovery_action",
-                nullable_schema("string", "Bounded next action; outcome_unknown requires workspace inspection before another write."),
-            ),
-            (
-                "retry_guidance",
-                schema_type("string", "Bounded correction guidance for a deterministic preflight rejection."),
-            ),
-            (
-                "error",
-                schema_type("string", "Agent-side whole-file write rejection message, when unsuccessful."),
+                "recovery",
+                read_files_recovery_call_schema(),
             ),
         ])),
         "apply_patch" => Some(wrapped_output_schema(vec![
@@ -379,7 +429,19 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "applied_count",
-                schema_type("integer", "Number of file changes applied in the batch."),
+                schema_type("integer", "Number of confirmed applied file changes; zero for dry_run."),
+            ),
+            ("planned_count", schema_type("integer", "Number of fully planned file changes, including dry_run.")),
+            ("change_summary", json!({"type":"object","additionalProperties":false,"properties":{
+                "requested_changes":{"type":"integer","minimum":1,"maximum":16},
+                "changed_files":{"type":"integer","minimum":0,"maximum":16},
+                "logical_edits":{"type":"integer","minimum":0},
+                "resolved_matches":{"type":"integer","minimum":0},
+                "warnings":{"type":"integer","minimum":0}
+            },"required":["requested_changes","changed_files","logical_edits","resolved_matches","warnings"]})),
+            (
+                "ignored_noop_count",
+                schema_type("integer", "Number of provable empty insert operations ignored without invalidating the transactional batch."),
             ),
             (
                 "changed",
@@ -389,13 +451,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "would_change",
                 schema_type("boolean", "Whether the batch plan changes the worktree."),
             ),
-            (
-                "files",
-                schema_type(
-                    "array",
-                    "Per-file summaries with kind, paths, changed state, and old/new sha256 values.",
-                ),
-            ),
+            ("files", apply_text_edits_file_summary_schema()),
             (
                 "changed_paths",
                 schema_type("array", "Paths touched by the edit batch."),
@@ -417,16 +473,22 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "not_started or outcome_unknown for delivery-boundary failures."),
             ),
             (
-                "recovery_action",
-                nullable_schema("string", "Bounded next action; outcome_unknown requires workspace inspection before another write."),
-            ),
-            (
                 "rollback_complete",
                 nullable_schema("boolean", "Whether a failed transactional apply fully restored every prior change; false makes the final workspace state uncertain."),
             ),
             (
                 "change_index",
                 nullable_schema("integer", "Zero-based failed file-change index when known; null or absent for batch-global failures."),
+            ),
+            (
+                "path_conflict_change_indices",
+                json!({
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "integer", "minimum": 0, "maximum": 15},
+                    "description": "Server-preflight indices [first occupant, conflicting change] for a repeated source/destination path. May be equal for a self-conflict. Identifies the conflict, not permission to merge sequential edits."
+                }),
             ),
             (
                 "edit_index",
@@ -441,12 +503,33 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Project-relative failed path when known."),
             ),
             (
-                "retry_guidance",
-                schema_type("string", "Bounded recovery guidance for a deterministic no-mutation rejection."),
+                "match_count",
+                schema_type("integer", "Exact-match count reported for a deterministic text conflict when useful."),
+            ),
+            ("expected_match_count", schema_type("integer", "Caller-required exact count for match_count_mismatch.")),
+            ("actual_match_count", schema_type("integer", "Observed exact count in the requested scope for match_count_mismatch.")),
+            ("line_scope", json!({"anyOf":[{"type":"object","properties":{"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}},{"type":"null"}]})),
+            ("direct_retry_safe", schema_type("boolean", "Whether the failed exact edit can be retried without a new read.")),
+            ("reread_required", schema_type("boolean", "Whether a fresh read is required before correction.")),
+            (
+                "candidate_ranges",
+                json!({"type":"array","maxItems":webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_CONFLICT_CANDIDATES,"items":edit_candidate_range_schema(),"description":"Bounded candidate source ranges. occurrence is included only when the current read revision makes positional retry safe."}),
             ),
             (
-                "conflict_recovery",
-                edit_conflict_recovery_schema(),
+                "candidates_truncated",
+                schema_type("boolean", "True when additional exact-match candidates exist beyond candidate_ranges."),
+            ),
+            (
+                "conflicting_edit_indices",
+                array_schema(schema_type("integer", "Zero-based edit index participating in an overlap conflict."), "The edit indices whose planned ranges overlap."),
+            ),
+            (
+                "conflicting_edit_ranges",
+                conflicting_edit_ranges_schema(),
+            ),
+            (
+                "recovery",
+                read_files_recovery_call_schema(),
             ),
         ])),
         _ => None,

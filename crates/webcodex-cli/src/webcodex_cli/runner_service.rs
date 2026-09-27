@@ -426,6 +426,7 @@ struct RunnerConfigMetadata {
     allowed_roots: Vec<PathBuf>,
     server_url: String,
     token: String,
+    deprecated_config_inputs: Vec<String>,
 }
 
 fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, String> {
@@ -433,12 +434,13 @@ fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, Stri
         .map_err(|e| format!("failed to read Runner config {}: {}", path.display(), e))?;
     let cfg: RunnerStatusConfig = toml::from_str(&content)
         .map_err(|e| format!("failed to parse Runner config {}: {}", path.display(), e))?;
+    let legacy_projects_dir_used = cfg.legacy_projects_dir.is_some();
     let project_registry_dir = match (cfg.project_registry_dir, cfg.legacy_projects_dir) {
         (Some(_), Some(_)) => {
             return Err(
                 "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
                     .to_string(),
-            )
+            );
         }
         (Some(path), None) | (None, Some(path)) => path,
         (None, None) => {
@@ -446,6 +448,15 @@ fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, Stri
             webcodex_runner_config::paths::select_project_registry_dir(&base)?
         }
     };
+    let mut deprecated_config_inputs = Vec::new();
+    if path.file_name().and_then(|name| name.to_str())
+        == Some(webcodex_runner_config::paths::LEGACY_AGENT_CONFIG_FILE)
+    {
+        deprecated_config_inputs.push("agent.toml".to_string());
+    }
+    if legacy_projects_dir_used {
+        deprecated_config_inputs.push("projects_dir".to_string());
+    }
     Ok(RunnerConfigMetadata {
         path: path.to_path_buf(),
         client_id: cfg.client_id,
@@ -455,6 +466,7 @@ fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, Stri
         project_registry_dir,
         allowed_roots: cfg.policy.allowed_roots,
         server_url: cfg.server_url,
+        deprecated_config_inputs,
         token: cfg.token,
     })
 }
@@ -740,6 +752,8 @@ pub(crate) async fn run_runner_status(opts: RunnerStatusOptions) -> Result<Strin
                     "paths": metadata.allowed_roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
                 },
                 "server_url": metadata.server_url,
+                "deprecated_inputs": metadata.deprecated_config_inputs,
+                "legacy_compatibility_removal": if metadata.deprecated_config_inputs.is_empty() { Value::Null } else { json!(webcodex_runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION) },
             },
             "runtime": runtime_http.as_ref().map(|http| json!({
                 "checked": true,
@@ -806,6 +820,16 @@ pub(crate) async fn run_runner_status(opts: RunnerStatusOptions) -> Result<Strin
         "  config:               {}\n",
         metadata.path.display()
     ));
+    if !metadata.deprecated_config_inputs.is_empty() {
+        out.push_str(&format!(
+            "  config compatibility: legacy 0.4.x ({})\n",
+            metadata.deprecated_config_inputs.join(", ")
+        ));
+        out.push_str(&format!(
+            "  migration:            use runner.toml/project_registry_dir before WebCodex {}\n",
+            webcodex_runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+        ));
+    }
     out.push_str(&format!(
         "  client_id:            {}\n",
         if metadata.client_id.trim().is_empty() {
@@ -1004,9 +1028,9 @@ mod tests {
     }
 
     #[test]
-    fn runner_status_metadata_accepts_legacy_registry_alias_and_rejects_both_fields() {
+    fn runner_status_metadata_surfaces_legacy_compatibility_and_rejects_ambiguity() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("agent.toml");
+        let config = tmp.path().join("runner.toml");
         let legacy = tmp.path().join("projects.d");
         std::fs::write(
             &config,
@@ -1018,6 +1042,16 @@ mod tests {
         .unwrap();
         let metadata = read_runner_config_metadata(&config).unwrap();
         assert_eq!(metadata.project_registry_dir, legacy);
+        assert_eq!(metadata.deprecated_config_inputs, ["projects_dir"]);
+
+        let legacy_config = tmp.path().join("agent.toml");
+        std::fs::write(
+            &legacy_config,
+            "server_url = \"https://example.test\"\ntoken = \"t\"\nclient_id = \"demo\"\n",
+        )
+        .unwrap();
+        let metadata = read_runner_config_metadata(&legacy_config).unwrap();
+        assert_eq!(metadata.deprecated_config_inputs, ["agent.toml"]);
 
         let current = tmp.path().join("project-registry");
         std::fs::write(

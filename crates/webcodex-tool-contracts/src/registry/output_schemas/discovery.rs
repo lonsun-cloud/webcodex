@@ -7,15 +7,27 @@ use super::common::{
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "current_window_activity" => Some(wrapped_output_schema(vec![
+            ("status", json!({"type":"string","enum":["available","unavailable"]})),
+            ("reason_code", schema_type("string", "Bounded reason when current Window, authenticated principal, runtime:read, or activity storage is unavailable.")),
+            ("events", json!({"type":"array","maxItems":50,"description":"Newest first, sanitized current-Window events after principal and current Project visibility filtering. No arguments, outputs, raw payloads, native paths, credentials, or principal identifiers.","items":{"type":"object","additionalProperties":false,"properties":{
+                "request_observed_at_ms":{"type":"integer"},
+                "response_handed_at_ms":{"type":"integer","description":"WebCodex response constructed and handed to HTTP framework / handler returned. No client, Host, ChatGPT, or model-continuation receipt is implied."},
+                "started_at_ms":{"type":"integer"},"ended_at_ms":{"type":"integer"},"duration_ms":{"type":"integer"},
+                "service_ms":{"type":"integer"},
+                "next_call_gap_ms":{"type":["integer","null"],"description":"Observed only from a later canonical meaningful call in this principal and Window; null means no serial gap was observed, never elapsed time."},
+                "cycle_ms":{"type":"integer"},"window_transition_kind":{"type":"string"},"response_streaming":{"type":"boolean"},
+                "method":{"type":"string"},"tool_name":{"type":"string"},"activity_presentation":{"type":"string"},"activity_kind":{"type":"string"},
+                "project":{"type":"string"},"status":{"type":"string"},"http_status":{"type":"integer"},"meaningful":{"type":"boolean"},
+                "server_trace_id":{"type":"string"},"workflow_sessions":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"workflow_session_id":{"type":"string"},"project":{"type":"string"},"relation":{"type":"string"}},"required":["workflow_session_id","relation"]}},
+                "code_mode_composition":open_object_schema("Validated bounded nested WebCodex Code Mode composition when available.")
+            },"required":["started_at_ms","ended_at_ms","duration_ms","method","status","meaningful","workflow_sessions"]}})),
+            ("summary", current_window_activity_summary_schema()),
+            ("active_requests", json!({"type":"array","maxItems":8,"items":{"type":"object","additionalProperties":false,"properties":{"server_trace_id":{"type":"string"},"tool_name":{"type":["string","null"]},"started_at_ms":{"type":"integer"}},"required":["server_trace_id","tool_name","started_at_ms"]}})),
+            ("truncated", schema_type("boolean", "Visible events from the bounded recent scan were omitted by the presentation or serialized byte bound; this is not a lifetime-history completeness claim.")),
+        ])),
         "runtime_status" => Some(wrapped_output_schema(vec![
             ("service", schema_type("string", "Runtime service name.")),
-            (
-                "runtime_exposure",
-                schema_type(
-                    "string",
-                    "Configured runtime exposure: local_coding, adaptive_runtime, full_operator_runtime, or project_connector.",
-                ),
-            ),
             (
                 "mcp_compact_schemas",
                 schema_type(
@@ -34,8 +46,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "type": "object",
                             "additionalProperties": false,
                             "properties": {
-                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server; false under the project-bound ProjectConnector exposure."},
-                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server; false under the project-bound ProjectConnector exposure."},
+                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server."},
+                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server."},
                                 "oauth2_enabled": {"type": "boolean", "description": "Whether OAuth2 support was enabled in the running Server configuration."},
                                 "oauth2_shared_key_bridge_enabled": {"type": "boolean", "description": "Whether the OAuth2 shared-key bridge is enabled in the running OAuth2 configuration; false whenever OAuth2 itself is disabled. This public OAuth flow is distinct from direct Bearer shared-key authentication."}
                             },
@@ -118,7 +130,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "list_projects" => Some(wrapped_output_schema(vec![
             (
                 "projects",
-                array_schema(open_object_schema("Project summary including capabilities.git_available, supports_cleanup_verification, and recommended_for_smoke."), "Runtime projects."),
+                array_schema(open_object_schema("Project summary including canonical id, Server-issued project_ref when a stable Project root identity is available, and capabilities.git_available/supports_cleanup_verification/recommended_for_smoke."), "Runtime projects."),
             ),
             ("count", schema_type("integer", "Project count.")),
             (
@@ -218,7 +230,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("string", "Recommended next discovery action."),
             ),
         ])),
-        "tool_manifest" => Some(wrapped_output_schema(vec![
+        "tool_manifest" => {
+            let fields = vec![
             (
                 "name",
                 schema_type(
@@ -235,23 +248,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "route",
-                json!({
-                    "type": "object",
-                    "description": "Current ModelSurface invocation route only. This never grants scope, project authority, feature availability, or permission.",
-                    "additionalProperties": false,
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["direct", "gateway", "unavailable"]
-                        },
-                        "via": {
-                            "type": "string",
-                            "const": "call_runtime_tool",
-                            "description": "Gateway entry point, present only when mode=gateway."
-                        }
-                    },
-                    "required": ["mode"]
-                }),
+                tool_manifest_invocation_route_schema(),
+            ),
+            (
+                "routing_note",
+                schema_type(
+                    "string",
+                    "Model-facing routing guidance. tool_manifest discovery never dynamically registers a new Host tool.",
+                ),
             ),
             (
                 "input_schema",
@@ -298,6 +302,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 open_object_schema("Canonical ToolSpec annotations in exact lookup."),
             ),
             (
+                "execution",
+                execution_selection_schema(),
+            ),
+            (
+                "host_orchestration",
+                host_orchestration_schema(),
+            ),
+            (
                 "schema_version",
                 schema_type("integer", "Manifest schema version."),
             ),
@@ -334,7 +346,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "anyOf": [
                         {
                             "type": "object",
-                            "description": "Exact one-tool contract containing name, description, canonical effect/risk/approval/idempotency semantics, input_schema, annotations, and current MCP model-surface invocation routing. output_schema is intentionally omitted.",
+                            "description": "Exact one-tool contract containing name, description, canonical effect/risk/approval/idempotency semantics, optional execution selection semantics, input_schema, annotations, and current MCP model-surface invocation routing. output_schema is intentionally omitted.",
                             "additionalProperties": false,
                             "properties": {
                                 "name": {"type": "string"},
@@ -359,12 +371,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                                     "enum": ["pure_read", "desired_state", "keyed", "fenced_replay", "non_idempotent"],
                                     "description": "Canonical retry/idempotency contract."
                                 },
+                                "execution": execution_selection_schema(),
                                 "input_schema": {"type": "object", "additionalProperties": true},
                                 "annotations": {"type": "object", "additionalProperties": true},
                                 "availability": {
                                     "type": "string",
                                     "enum": ["direct", "gateway", "unavailable"],
-                                    "description": "Invocation route on the current MCP ModelSurface only; authorization, feature gates, and project authority are checked separately."
+                                    "description": "Invocation route on canonical Adaptive Runtime only; authorization, feature gates, and project authority are checked separately."
                                 },
                                 "gateway_tool": {
                                     "anyOf": [
@@ -444,7 +457,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "tools",
                 array_schema(
                     open_object_schema(
-                        "Default filtered model projection: name, bounded canonical-derived description, route, requires_project, effect, and risk only when non-observe. Compatibility/full canonical results may retain richer metadata."
+                        "Default filtered model projection: name, bounded canonical-derived description, route, requires_project, effect, optional execution selection metadata, and risk only when non-observe. Compatibility/full canonical results may retain richer metadata."
                     ),
                     "Filtered selection entries without input/output schemas; unfiltered sparse discovery uses the categories inventory instead of duplicating all tool names here.",
                 ),
@@ -458,13 +471,197 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "recommended_flows",
                 array_schema(
-                    open_object_schema("Recommended tool flow with name, purpose, and tools."),
+                    open_object_schema("Recommended tool flow with name, purpose, and tools; filtered partial projections also identify partial=true and omitted_tools for canonical members not selected into that projection."),
                     "Short list of recommended tool flows for common tasks.",
                 ),
             ),
-        ])),
+        ];
+            #[cfg(feature = "experimental-code-mode")]
+            let fields = {
+                let mut fields = fields;
+                fields.push((
+                    "code_mode_callable_contract",
+                    open_object_schema(
+                        "Bounded presentation-only callable contract attached only to exact Code Mode entry-tool discovery. It is derived from canonical ToolSpecs plus the existing Code Mode admission policy and grants no authority.",
+                    ),
+                ));
+                fields
+            };
+            Some(wrapped_output_schema(fields))
+        }
         _ => None,
     }
+}
+
+fn current_window_activity_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Descriptive factual metrics over the bounded visible event scan. Gap fields are WebCodex-observed serial request timing only; they do not identify Host cells, model turns, thinking time, frontend delay, network delay, or user delay.",
+        "additionalProperties": false,
+        "properties": {
+            "events_scanned": {"type":"integer"},
+            "meaningful_call_count": {"type":"integer"},
+            "observe_jobs_count": {"type":"integer"},
+            "observe_jobs_ratio_denominator": {"type":"integer"},
+            "observe_jobs_ratio": {"type":["number","null"]},
+            "handler_returned_count": {"type":"integer"},
+            "missing_handoff_count": {"type":"integer"},
+            "overlapping_call_count": {"type":"integer","description":"Count of persisted window_transition_kind=overlap facts; never inferred from a short gap."},
+            "serial_call_count": {"type":"integer"},
+            "observed_next_call_gap_count": {"type":"integer"},
+            "gaps_lt_1s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 1 second."},
+            "gaps_lt_2s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 2 seconds; includes gaps_lt_1s."},
+            "gaps_lt_5s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 5 seconds; includes the lower less-than thresholds."},
+            "gaps_ge_5s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 5 seconds."},
+            "gaps_ge_10s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 10 seconds; a subset of gaps_ge_5s."},
+            "gaps_ge_30s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 30 seconds."},
+            "gaps_ge_120s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 120 seconds."},
+            "total_service_ms": {"type":"integer"},
+            "total_positive_observed_next_call_gap_ms": {"type":"integer"},
+            "max_service_ms": {"type":["integer","null"]},
+            "max_observed_next_call_gap_ms": {"type":["integer","null"]},
+            "returned_nested_code_mode_child_count": {"type":"integer"}
+        },
+        "required": [
+            "events_scanned",
+            "meaningful_call_count",
+            "observe_jobs_count",
+            "observe_jobs_ratio_denominator",
+            "observe_jobs_ratio",
+            "handler_returned_count",
+            "missing_handoff_count",
+            "overlapping_call_count",
+            "serial_call_count",
+            "observed_next_call_gap_count",
+            "gaps_lt_1s",
+            "gaps_lt_2s",
+            "gaps_lt_5s",
+            "gaps_ge_5s",
+            "gaps_ge_10s",
+            "gaps_ge_30s",
+            "gaps_ge_120s",
+            "total_service_ms",
+            "total_positive_observed_next_call_gap_ms",
+            "max_service_ms",
+            "max_observed_next_call_gap_ms",
+            "returned_nested_code_mode_child_count"
+        ]
+    })
+}
+
+fn tool_manifest_invocation_route_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Parser-ready Adaptive Runtime invocation routing. Discovery never registers a Host tool and never grants authority.",
+        "additionalProperties": false,
+        "properties": {
+            "primary": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["direct", "gateway", "unavailable"]
+                    },
+                    "tool": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"}
+                        ]
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Canonical runtime target when primary execution uses the gateway or the tool is unavailable."
+                    }
+                },
+                "required": ["mode", "tool"]
+            },
+            "fallback": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "mode": {"type": "string", "const": "gateway"},
+                            "tool": {"type": "string", "const": "call_runtime_tool"},
+                            "target": {"type": "string"},
+                            "when": {
+                                "type": "string",
+                                "const": "direct_callable_unavailable"
+                            },
+                            "blocked_when_mcp_apps_enabled": {"type": "boolean"}
+                        },
+                        "required": [
+                            "mode",
+                            "tool",
+                            "target",
+                            "when",
+                            "blocked_when_mcp_apps_enabled"
+                        ]
+                    },
+                    {"type": "null"}
+                ],
+                "description": "Gateway fallback for an ordinary direct tool when the Host direct callable is absent; null when no fallback applies."
+            },
+            "tool_manifest_registers_host_tool": {
+                "type": "boolean",
+                "const": false
+            },
+            "discovery_effect": {
+                "type": "string",
+                "const": "none"
+            }
+        },
+        "required": [
+            "primary",
+            "fallback",
+            "tool_manifest_registers_host_tool",
+            "discovery_effect"
+        ]
+    })
+}
+
+fn host_orchestration_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Static guidance-only Host-native orchestration hints derived from ToolDefinition. They grant no authority and do not change ToolCompositionPolicy, effects, permissions, retry, idempotency, or runtime scheduling.",
+        "additionalProperties": false,
+        "properties": {
+            "guidance_only": {"type": "boolean", "const": true},
+            "concurrency": {
+                "type": "string",
+                "enum": ["unspecified", "independent_parallel_read", "sequential"]
+            },
+            "native_batch_field": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 64},
+                    {"type": "null"}
+                ]
+            },
+            "compound_preferred": {"type": "boolean"}
+        },
+        "required": [
+            "guidance_only",
+            "concurrency",
+            "native_batch_field",
+            "compound_preferred"
+        ]
+    })
+}
+
+fn execution_selection_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Optional canonical ordinary-execution selection semantics. This is model guidance only and does not grant authority or change runtime lifecycle behavior.",
+        "additionalProperties": false,
+        "properties": {
+            "form": {"type": "string", "enum": ["native_argv", "typed_script", "shell_command", "structured_validation", "persistent_shell_command"]},
+            "lifetime": {"type": "string", "enum": ["runner", "supervisor", "session_shell"]},
+            "start": {"type": "string", "enum": ["sync_first", "async_immediate", "existing_session"]},
+            "continuation": {"type": "string", "enum": ["observe_jobs", "session_shell", "none"]}
+        },
+        "required": ["form", "lifetime", "start", "continuation"]
+    })
 }
 
 fn nullable_string_array_schema(description: &str) -> Value {

@@ -1,212 +1,411 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-struct Fixture(std::path::PathBuf);
+struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "webcodex-tunnel-settings-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(path.join("secrets")).unwrap();
-        Self(path)
+        let root =
+            std::env::temp_dir().join(format!("webcodex-tunnel-profiles-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        Self(root)
     }
-    fn path(&self) -> std::path::PathBuf {
-        self.0.join("secrets").join("tunnel-config.json")
+    fn path(&self) -> PathBuf {
+        self.0.join("secrets/tunnel-config.json")
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn save(id: &str, key: Option<&str>) -> TunnelConfigRequest {
-    TunnelConfigRequest::Save {
-        tunnel_id: id.into(),
+fn create(name: &str, tunnel_id: &str, key: &str) -> TunnelProfileRequest {
+    TunnelProfileRequest {
+        id: None,
+        name: name.into(),
+        tunnel_id: tunnel_id.into(),
+        api_key: Some(key.into()),
+        autostart: true,
+        expected_revision: None,
+    }
+}
+fn edit(
+    id: TunnelProfileId,
+    name: &str,
+    tunnel_id: &str,
+    key: Option<&str>,
+) -> TunnelProfileRequest {
+    TunnelProfileRequest {
+        id: Some(id),
+        name: name.into(),
+        tunnel_id: tunnel_id.into(),
         api_key: key.map(str::to_owned),
+        autostart: true,
+        expected_revision: None,
+    }
+}
+fn command_key(store: &TunnelConfig, id: TunnelProfileId) -> String {
+    let mut command = Command::new("unused");
+    command.env("CONTROL_PLANE_API_KEY", "unrelated-environment-fixture");
+    store.apply_profile_to_command(id, &mut command).unwrap();
+    command
+        .get_envs()
+        .find(|(k, _)| *k == "CONTROL_PLANE_API_KEY")
+        .unwrap()
+        .1
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn singleton_migrates_atomically_to_default_and_preserves_autostart_intent() {
+    for autostart in [false, true] {
+        let fixture = Fixture::new();
+        let legacy = br#"{"tunnel_id":"tunnel_existing","api_key":"legacy-fixture-secret"}"#;
+        fs::write(fixture.path(), legacy).unwrap();
+        let config = TunnelConfig::load(&fixture.path(), autostart);
+        assert!(!config.invalid);
+        let profiles = config.profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, TunnelProfileId::DEFAULT);
+        assert_eq!(profiles[0].name, "ChatGPT");
+        assert_eq!(profiles[0].autostart, autostart);
+        assert_eq!(profiles[0].enabled, autostart);
+        assert_eq!(
+            command_key(&config, TunnelProfileId::DEFAULT),
+            "legacy-fixture-secret"
+        );
+        let disk: StoredProfiles =
+            serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk.schema_version, SCHEMA_VERSION);
+        let after = fs::read(fixture.path()).unwrap();
+        let reloaded = TunnelConfig::load(&fixture.path(), !autostart);
+        assert_eq!(reloaded.profiles(), profiles, "migration runs only once");
+        assert_eq!(fs::read(fixture.path()).unwrap(), after);
+        assert_eq!(
+            fs::read_dir(fixture.0.join("secrets")).unwrap().count(),
+            1,
+            "no retired-secret backup"
+        );
     }
 }
 
 #[test]
-fn saved_pair_roundtrips_overrides_environment_and_never_projects_key() {
+fn interrupted_migration_keeps_the_original_valid_file() {
+    let fixture = Fixture::new();
+    let legacy = br#"{"tunnel_id":"tunnel_original","api_key":"original-fixture-secret"}"#;
+    fs::write(fixture.path(), legacy).unwrap();
+    let failed = TunnelConfig::load_with_writer(&fixture.path(), true, |path, bytes, _| {
+        crate::state::write_atomic_file_with_hook(path, bytes, |_| {
+            Err(io::ErrorKind::Interrupted.into())
+        })
+        .map_err(|_| invalid())
+    });
+    assert!(failed.invalid);
+    assert!(failed.profiles().is_empty());
+    assert_eq!(fs::read(fixture.path()).unwrap(), legacy);
+    assert_eq!(fs::read_dir(fixture.0.join("secrets")).unwrap().count(), 1);
+    let recovered = TunnelConfig::load(&fixture.path(), true);
+    assert_eq!(
+        command_key(&recovered, TunnelProfileId::DEFAULT),
+        "original-fixture-secret"
+    );
+}
+
+#[test]
+fn explicit_null_migrates_to_only_the_legacy_environment_profile() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path(), b"null").unwrap();
+    let config = TunnelConfig::load(&fixture.path(), false);
+    assert!(!config.invalid);
+    assert_eq!(config.stored.profiles.len(), 1);
+    assert_eq!(config.stored.profiles[0].id, TunnelProfileId::DEFAULT);
+    assert!(config.stored.profiles[0].credentials.is_none());
+    assert!(!config.stored.profiles[0].autostart);
+}
+
+#[test]
+fn multiple_profiles_persist_without_projecting_secrets_and_update_only_the_selected_pair() {
+    let fixture = Fixture::new();
+    let mut config = TunnelConfig::default();
+    let a = config
+        .update_profile(
+            &fixture.path(),
+            create("Personal", "tunnel_a", "secret-a-fixture"),
+        )
+        .unwrap();
+    let b = config
+        .update_profile(
+            &fixture.path(),
+            create("Work", "tunnel_b", "secret-b-fixture"),
+        )
+        .unwrap();
+    let c = config
+        .update_profile(
+            &fixture.path(),
+            create("Account 3", "tunnel_c", "secret-c-fixture"),
+        )
+        .unwrap();
+    assert_ne!(a, b);
+    assert_ne!(b, c);
+    let mut reloaded = TunnelConfig::load(&fixture.path(), false);
+    assert_eq!(reloaded.profiles().len(), 3);
+    let serialized = serde_json::to_string(&reloaded.profiles()).unwrap();
+    for secret in ["secret-a-fixture", "secret-b-fixture", "secret-c-fixture"] {
+        assert!(!serialized.contains(secret));
+    }
+    reloaded
+        .update_profile(
+            &fixture.path(),
+            edit(a, "ChatGPT Personal", "tunnel_a_new", None),
+        )
+        .unwrap();
+    assert_eq!(command_key(&reloaded, a), "secret-a-fixture");
+    assert_eq!(command_key(&reloaded, b), "secret-b-fixture");
+    reloaded
+        .update_profile(
+            &fixture.path(),
+            edit(
+                a,
+                "ChatGPT Personal",
+                "tunnel_a_new",
+                Some("replacement-fixture"),
+            ),
+        )
+        .unwrap();
+    assert_eq!(command_key(&reloaded, a), "replacement-fixture");
+    assert_eq!(command_key(&reloaded, b), "secret-b-fixture");
+    assert!(!fs::read_to_string(fixture.path())
+        .unwrap()
+        .contains("secret-a-fixture"));
+    reloaded.remove(&fixture.path(), a).unwrap();
+    assert_eq!(reloaded.profiles().len(), 2);
+    assert_eq!(command_key(&reloaded, b), "secret-b-fixture");
+    assert!(!fs::read_to_string(fixture.path())
+        .unwrap()
+        .contains("replacement-fixture"));
+}
+
+#[test]
+fn deleting_default_cannot_resurrect_environment_fallback_after_restart() {
     let fixture = Fixture::new();
     let mut config = TunnelConfig::default();
     config
         .update(
             &fixture.path(),
-            save("tunnel_saved", Some("test-only-api-key")),
+            TunnelConfigRequest::Save {
+                tunnel_id: "tunnel_default".into(),
+                api_key: Some("fixture-secret".into()),
+            },
         )
         .unwrap();
-    let mut config = TunnelConfig::load(&fixture.path());
-    assert_eq!(config.snapshot().source, TunnelConfigSource::File);
-    assert_eq!(
-        config.snapshot().effective_tunnel_id.as_deref(),
-        Some("tunnel_saved")
-    );
-    let projected = serde_json::to_string(&config.snapshot()).unwrap();
-    assert!(!projected.contains("test-only-api-key"));
-    let mut command = Command::new("unused");
-    command
-        .env("CONTROL_PLANE_TUNNEL_ID", "tunnel_environment")
-        .env("CONTROL_PLANE_API_KEY", "environment-key");
-    config.apply_to_command(&mut command).unwrap();
-    let env: std::collections::HashMap<_, _> = command.get_envs().collect();
-    assert_eq!(
-        env[std::ffi::OsStr::new("CONTROL_PLANE_TUNNEL_ID")].unwrap(),
-        "tunnel_saved"
-    );
-    assert_eq!(
-        env[std::ffi::OsStr::new("CONTROL_PLANE_API_KEY")].unwrap(),
-        "test-only-api-key"
-    );
     config
-        .update(&fixture.path(), save("tunnel_changed", None))
+        .remove(&fixture.path(), TunnelProfileId::DEFAULT)
         .unwrap();
-    assert_eq!(
-        TunnelConfig::load(&fixture.path()).saved.unwrap().api_key,
-        "test-only-api-key"
-    );
-    config
-        .update(&fixture.path(), TunnelConfigRequest::UseEnvironment)
-        .unwrap();
-    assert_eq!(
-        TunnelConfig::load(&fixture.path()).snapshot().source,
-        TunnelConfigSource::Environment
-    );
-    assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), "null");
-    assert_eq!(
-        std::fs::read_dir(fixture.0.join("secrets"))
-            .unwrap()
-            .count(),
-        1,
-        "no secret backup"
-    );
-}
-
-#[test]
-fn invalid_or_unreadable_saved_config_fails_closed_and_can_be_repaired() {
-    let fixture = Fixture::new();
-    std::fs::write(fixture.path(), b"not-json-with-test-secret").unwrap();
-    let mut config = TunnelConfig::load(&fixture.path());
-    assert_eq!(config.snapshot().source, TunnelConfigSource::Invalid);
-    assert!(!config.snapshot().is_configured());
-    let error = config
+    let reloaded = TunnelConfig::load(&fixture.path(), true);
+    assert!(reloaded.stored.profiles.is_empty());
+    assert!(!reloaded.snapshot().is_configured());
+    assert!(reloaded
         .apply_to_command(&mut Command::new("unused"))
-        .unwrap_err();
-    assert!(!error.to_string().contains("test-secret"));
-    config
-        .update(&fixture.path(), save("tunnel_fixed", Some("test-key")))
-        .unwrap();
-    assert!(TunnelConfig::load(&fixture.path())
-        .snapshot()
-        .is_configured());
-    std::fs::write(fixture.path(), vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
-    assert_eq!(
-        TunnelConfig::load(&fixture.path()).snapshot().source,
-        TunnelConfigSource::Invalid
-    );
+        .is_err());
 }
 
 #[test]
-fn validation_and_failed_writes_keep_previous_saved_pair() {
+fn explicit_first_run_connect_remembers_default_autostart() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.path(),
+        br#"{"tunnel_id":"tunnel_existing","api_key":"legacy-fixture-secret"}"#,
+    )
+    .unwrap();
+    let mut config = TunnelConfig::load(&fixture.path(), false);
+    assert!(!config.profiles()[0].autostart);
+    config.enable_default_onboarding(&fixture.path()).unwrap();
+    let restored = TunnelConfig::load(&fixture.path(), false);
+    assert!(restored.profiles()[0].enabled);
+    assert!(restored.profiles()[0].autostart);
+}
+
+#[test]
+fn stopped_and_non_autostart_profiles_keep_their_desired_state() {
     let fixture = Fixture::new();
     let mut config = TunnelConfig::default();
-    assert!(config
-        .update(&fixture.path(), save("tunnel_one", None))
-        .is_err());
-    config
-        .update(&fixture.path(), save("tunnel_one", Some("old-test-key")))
+    let a = config
+        .update_profile(&fixture.path(), create("Personal", "tunnel_a", "fixture-a"))
         .unwrap();
-    for (id, key) in [("invalid/id", "key"), ("tunnel_one", "invalid\nkey")] {
+    let mut request = create("Work", "tunnel_b", "fixture-b");
+    request.autostart = false;
+    let b = config.update_profile(&fixture.path(), request).unwrap();
+    config.set_enabled(&fixture.path(), a, false).unwrap();
+    let reloaded = TunnelConfig::load(&fixture.path(), true);
+    assert!(
+        !reloaded
+            .profiles()
+            .iter()
+            .find(|p| p.id == a)
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        !reloaded
+            .profiles()
+            .iter()
+            .find(|p| p.id == b)
+            .unwrap()
+            .autostart
+    );
+}
+
+#[test]
+fn duplicate_ids_and_tunnel_ids_are_rejected_without_retiring_a_valid_pair() {
+    let fixture = Fixture::new();
+    let mut config = TunnelConfig::default();
+    let a = config
+        .update_profile(&fixture.path(), create("Personal", "tunnel_a", "fixture-a"))
+        .unwrap();
+    let original = fs::read(fixture.path()).unwrap();
+    assert!(config
+        .update_profile(&fixture.path(), create("Work", "tunnel_a", "fixture-b"))
+        .is_err());
+    assert_eq!(fs::read(fixture.path()).unwrap(), original);
+    let mut request = edit(a, "Changed", "tunnel_a", None);
+    request.expected_revision = Some(999);
+    assert_eq!(
+        config
+            .update_profile(&fixture.path(), request)
+            .unwrap_err()
+            .code,
+        "tunnel_profile_changed"
+    );
+    let mut bad = config.stored.clone();
+    bad.profiles.push(bad.profiles[0].clone());
+    fs::write(fixture.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(TunnelConfig::load(&fixture.path(), true).invalid);
+}
+
+#[test]
+fn malformed_or_unreadable_saved_config_fails_closed_without_secret_errors() {
+    let fixture = Fixture::new();
+    for data in [
+        b"not-json-with-fixture-secret".to_vec(),
+        vec![b' '; MAX_CONFIG_BYTES as usize + 1],
+    ] {
+        fs::write(fixture.path(), &data).unwrap();
+        let mut config = TunnelConfig::load(&fixture.path(), true);
+        assert!(config.invalid);
+        assert_eq!(config.snapshot().source, TunnelConfigSource::Invalid);
         let error = config
-            .update(&fixture.path(), save(id, Some(key)))
+            .update_profile(
+                &fixture.path(),
+                create("New", "tunnel_new", "new-fixture-secret"),
+            )
             .unwrap_err();
-        assert_eq!(error.code, "tunnel_config_invalid");
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains("fixture-secret"));
+        assert_eq!(fs::read(fixture.path()).unwrap(), data);
     }
-    let escaped_key = "\\".repeat(8192);
-    assert!(config
-        .update(&fixture.path(), save("tunnel_one", Some(&escaped_key)))
-        .is_err());
+}
+
+#[test]
+fn invalid_input_and_failed_writes_leave_both_memory_and_disk_unchanged() {
+    let fixture = Fixture::new();
+    let mut config = TunnelConfig::default();
+    let a = config
+        .update_profile(
+            &fixture.path(),
+            create("Personal", "tunnel_a", "old-fixture"),
+        )
+        .unwrap();
+    let before = fs::read(fixture.path()).unwrap();
+    for request in [
+        edit(a, "", "tunnel_a", None),
+        edit(a, "Name", "invalid/id", None),
+        edit(a, "Name", "tunnel_a", Some("invalid\nsecret")),
+    ] {
+        assert!(config.update_profile(&fixture.path(), request).is_err());
+    }
     let blocked = fixture.0.join("directory");
-    std::fs::create_dir(&blocked).unwrap();
+    fs::create_dir(&blocked).unwrap();
     assert!(config
-        .update(&blocked, save("tunnel_two", Some("new-test-key")))
+        .update_profile(
+            &blocked,
+            edit(a, "Changed", "tunnel_changed", Some("new-fixture"))
+        )
+        .is_err());
+    assert_eq!(command_key(&config, a), "old-fixture");
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+}
+
+#[test]
+fn stale_desktop_writer_cannot_overwrite_newer_profiles() {
+    let fixture = Fixture::new();
+    let mut first = TunnelConfig::default();
+    let a = first
+        .update_profile(&fixture.path(), create("A", "tunnel_a", "fixture-a"))
+        .unwrap();
+    let mut stale = TunnelConfig::load(&fixture.path(), true);
+    first
+        .update_profile(&fixture.path(), create("B", "tunnel_b", "fixture-b"))
+        .unwrap();
+    assert!(stale
+        .update_profile(
+            &fixture.path(),
+            edit(a, "Stale", "tunnel_a", Some("stale-fixture"))
+        )
         .is_err());
     assert_eq!(
-        config.snapshot().saved_tunnel_id.as_deref(),
-        Some("tunnel_one")
+        TunnelConfig::load(&fixture.path(), true).profiles().len(),
+        2
     );
-    assert_eq!(
-        TunnelConfig::load(&fixture.path()).saved.unwrap().api_key,
-        "old-test-key"
-    );
+    assert_eq!(command_key(&first, a), "fixture-a");
 }
 
 #[cfg(unix)]
 #[test]
-fn credential_file_is_private_and_symlinks_are_not_loaded() {
+fn private_mode_and_symlink_rejection_survive_migration() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let fixture = Fixture::new();
-    let mut config = TunnelConfig::default();
-    config
-        .update(&fixture.path(), save("tunnel_one", Some("test-key")))
-        .unwrap();
+    fs::write(
+        fixture.path(),
+        br#"{"tunnel_id":"tunnel_a","api_key":"fixture-secret"}"#,
+    )
+    .unwrap();
+    assert!(!TunnelConfig::load(&fixture.path(), true).invalid);
     assert_eq!(
-        std::fs::metadata(fixture.path())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let link = fixture.0.join("link.json");
     symlink(fixture.path(), &link).unwrap();
-    assert_eq!(
-        TunnelConfig::load(&link).snapshot().source,
-        TunnelConfigSource::Invalid
-    );
+    assert!(TunnelConfig::load(&link, true).invalid);
 }
 
 #[tokio::test]
-async fn saved_settings_survive_restart_and_published_state_never_uses_environment_over_them() {
+async fn desktop_restart_and_activity_never_project_stored_keys() {
     let fixture = Fixture::new();
     let app = crate::state::AppState::new(fixture.0.clone(), fixture.0.join("resources")).unwrap();
-    let snapshot = app
-        .update_tunnel_config(save("tunnel_persisted", Some("test-only-secret")))
-        .await
-        .unwrap();
-    assert_eq!(
-        snapshot.openai_tunnel_config.source,
-        TunnelConfigSource::File
-    );
+    app.update_tunnel_config(TunnelConfigRequest::Save {
+        tunnel_id: "tunnel_persisted".into(),
+        api_key: Some("private-fixture-key".into()),
+    })
+    .await
+    .unwrap();
     assert!(app.get_state().openai_tunnel_configured);
+    assert!(!serde_json::to_string(&app.get_state())
+        .unwrap()
+        .contains("private-fixture-key"));
+    assert!(!serde_json::to_string(&app.activity())
+        .unwrap()
+        .contains("private-fixture-key"));
+    let restarted =
+        crate::state::AppState::new(fixture.0.clone(), fixture.0.join("resources")).unwrap();
     assert_eq!(
-        app.get_state()
+        restarted
+            .get_state()
             .openai_tunnel_config
             .saved_tunnel_id
             .as_deref(),
         Some("tunnel_persisted")
-    );
-    let serialized = serde_json::to_string(&app.get_state()).unwrap();
-    assert!(!serialized.contains("test-only-secret"));
-    assert!(!serde_json::to_string(&app.activity())
-        .unwrap()
-        .contains("test-only-secret"));
-    let restarted =
-        crate::state::AppState::new(fixture.0.clone(), fixture.0.join("resources")).unwrap();
-    assert_eq!(
-        restarted.get_state().openai_tunnel_config.source,
-        TunnelConfigSource::File
-    );
-    assert!(restarted.get_state().openai_tunnel_configured);
-    restarted
-        .update_tunnel_config(TunnelConfigRequest::UseEnvironment)
-        .await
-        .unwrap();
-    assert_eq!(
-        restarted.get_state().openai_tunnel_config.source,
-        TunnelConfigSource::Environment
     );
 }

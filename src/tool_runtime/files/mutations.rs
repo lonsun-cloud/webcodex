@@ -6,6 +6,17 @@ pub(crate) const MAX_WRITE_CONTENT_BYTES: usize = 256 * 1024; // 256 KiB
 /// agent enforces a per-file cap instead), so it stays local.
 pub(crate) const MAX_APPLY_FILE_CHANGES_BYTES: usize = 1024 * 1024;
 
+fn compact_model_edit_surface(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_text_edits" | "write_project_file")
+}
+
+fn read_files_recovery(project: &str, path: &str) -> Value {
+    json!({
+        "tool": "read_files",
+        "arguments": {"project": project, "items": [{"path": path}]}
+    })
+}
+
 fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
     format!(
         "Rejected before write: {}.\nNo files were modified.\nRetry guidance: read the file again to refresh line numbers/context, then retry with updated guards.",
@@ -14,21 +25,24 @@ fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
 }
 
 fn structured_edit_not_started_result(tool_name: &str, reason: impl AsRef<str>) -> ToolResult {
+    let mut output = json!({
+        "execution_state": "not_started",
+        "state_changed": false,
+        "error_kind": "not_started",
+        "failure_kind": "not_started",
+        "tool_failure": true,
+    });
+    if !compact_model_edit_surface(tool_name) {
+        output["recovery_action"] = json!("retry_same_after_runner_recovery");
+    }
     ToolResult::err_with_output(
         format!(
-            "{tool_name} was not dispatched: {}. No files were modified by this request. Restore Runner availability, then retry with the same guards.",
+            "{tool_name} was not dispatched: {}. No files were modified by this request.",
             reason.as_ref()
         ),
-        json!({
-            "execution_state": "not_started",
-            "state_changed": false,
-            "error_kind": "not_started",
-            "failure_kind": "not_started",
-            "tool_failure": true,
-            "recovery_action": "retry_same_after_runner_recovery",
-        }),
+        output,
     )
-    .with_recovery(crate::tool_runtime::RecoveryKind::RetrySame, None)
+    .with_recovery(crate::tool_runtime::RecoveryKind::RetrySame)
 }
 
 fn structured_edit_outcome_unknown_result(
@@ -62,10 +76,12 @@ fn structured_edit_outcome_unknown_result(
     fields.insert("error_kind".to_string(), json!("outcome_unknown"));
     fields.insert("failure_kind".to_string(), json!("outcome_unknown"));
     fields.insert("tool_failure".to_string(), json!(true));
-    fields.insert(
-        "recovery_action".to_string(),
-        json!("inspect_workspace_before_retry"),
-    );
+    if !compact_model_edit_surface(tool_name) {
+        fields.insert(
+            "recovery_action".to_string(),
+            json!("inspect_workspace_before_retry"),
+        );
+    }
     ToolResult::err_with_output(
         format!(
             "{tool_name} outcome is unknown: {}. The Runner may already have changed files. Inspect current workspace state before issuing another write.",
@@ -73,7 +89,7 @@ fn structured_edit_outcome_unknown_result(
         ),
         output,
     )
-    .with_recovery(crate::tool_runtime::RecoveryKind::Reobserve, None)
+    .with_recovery(crate::tool_runtime::RecoveryKind::Reobserve)
 }
 
 fn structured_edit_delivery_failure(
@@ -166,7 +182,77 @@ fn write_project_file_preflight_rejection(
             "retry_guidance": retry_guidance,
         }),
     )
-    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput, None)
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
+fn read_revision_rejection(
+    project: &str,
+    path: &str,
+    error: ReadRevisionLookupError,
+) -> ToolResult {
+    let (error_kind, detail) = match error {
+        ReadRevisionLookupError::Unknown => (
+            "unknown_read_revision",
+            "the read revision is unknown, expired, evicted, or belongs to a prior Server runtime",
+        ),
+        ReadRevisionLookupError::ProjectMismatch => (
+            "read_revision_project_mismatch",
+            "the read revision belongs to a different Project",
+        ),
+        ReadRevisionLookupError::PathMismatch => (
+            "read_revision_path_mismatch",
+            "the read revision belongs to a different project-relative path",
+        ),
+        ReadRevisionLookupError::OwnerMismatch => (
+            "read_revision_owner_mismatch",
+            "the read revision belongs to a different Runner process or Project placement",
+        ),
+    };
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": error_kind,
+            "path": path,
+            "recovery": read_files_recovery(project, path),
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
+fn read_revision_target(
+    resolved: &ResolvedProject,
+    path: &str,
+    runner_instance_id: &str,
+) -> ReadRevisionTarget {
+    ReadRevisionTarget {
+        project_id: resolved.resolved_id.clone(),
+        path: path.to_string(),
+        client_id: resolved.config.client_id.clone(),
+        runner_instance_id: runner_instance_id.to_string(),
+        project_root: resolved.config.path.clone(),
+        root_fingerprint: resolved.root_fingerprint.clone(),
+    }
+}
+
+fn apply_text_edit_local_guard_capability_rejection(reason: impl AsRef<str>) -> ToolResult {
+    let reason = reason.as_ref();
+    ToolResult::err_with_output(
+        format!(
+            "Rejected before write: {reason}. No files were modified. Retry guidance: this Runner generation requires a read revision for local guarded edits; reread the current file and retry with expected_read_revision."
+        ),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": "agent_capability_unavailable",
+            "failure_kind": "capability_unavailable",
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
 }
 
 fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> ToolResult {
@@ -177,10 +263,10 @@ fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> T
         ),
         json!({
             "state_changed": false,
+            "execution_state": "not_started",
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
-            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
-            "retry_guidance": "reconnect the Runner or refine the edit to a unique exact match without occurrence"
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE
         }),
     )
 }
@@ -193,10 +279,10 @@ fn apply_text_edit_line_scope_capability_rejection(reason: impl AsRef<str>) -> T
         ),
         json!({
             "state_changed": false,
+            "execution_state": "not_started",
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
-            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
-            "retry_guidance": "reconnect a Runner with apply_text_edit_line_scope support; never silently downgrade a scoped edit to an unscoped edit"
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE
         }),
     )
 }
@@ -221,7 +307,7 @@ fn apply_patch_capability_rejection(
             "retry_guidance": format!("reconnect or upgrade the Runner so it explicitly advertises {capability}")
         }),
     )
-    .with_recovery(crate::tool_runtime::RecoveryKind::RetrySame, None)
+    .with_recovery(crate::tool_runtime::RecoveryKind::RetrySame)
 }
 
 /// Maximum decoded size for whole-payload/model-facing artifact operations.
@@ -293,6 +379,16 @@ fn validate_apply_text_edit(
             edit.kind.as_str()
         ));
     }
+    if let Some(expected) = edit.expected_match_count {
+        if expected == 0
+            || expected > crate::apply_edits_shared::MAX_APPLY_TEXT_EXPECTED_MATCH_COUNT
+        {
+            return Err(format!("change {change_index} edit {edit_index} ({}): expected_match_count must be within 1..={}", edit.kind.as_str(), crate::apply_edits_shared::MAX_APPLY_TEXT_EXPECTED_MATCH_COUNT));
+        }
+        if edit.kind != ApplyTextEditKind::ReplaceExact || edit.occurrence.is_some() {
+            return Err(format!("change {change_index} edit {edit_index} ({}): expected_match_count is only allowed for replace_exact without occurrence", edit.kind.as_str()));
+        }
+    }
     if let Some(line_scope) = edit.line_scope {
         if let Err(reason) = line_scope.validate() {
             return Err(format!(
@@ -348,14 +444,9 @@ fn validate_apply_text_edit(
                     edit.kind.as_str()
                 ));
             }
-            if edit
-                .new_text
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .is_none()
-            {
+            if edit.new_text.is_none() {
                 return Err(format!(
-                    "change {change_index} edit {edit_index} ({}): new_text must be non-empty",
+                    "change {change_index} edit {edit_index} ({}): new_text is required",
                     edit.kind.as_str()
                 ));
             }
@@ -374,6 +465,7 @@ fn validate_apply_text_edit(
 struct ApplyTextEditsPreflightValidationError {
     message: String,
     edit_index: Option<usize>,
+    reread_required: bool,
 }
 
 impl From<String> for ApplyTextEditsPreflightValidationError {
@@ -381,6 +473,7 @@ impl From<String> for ApplyTextEditsPreflightValidationError {
         Self {
             message,
             edit_index: None,
+            reread_required: false,
         }
     }
 }
@@ -389,19 +482,34 @@ fn validate_apply_file_change(
     index: usize,
     change: &ApplyFileChangeInput,
 ) -> Result<(), ApplyTextEditsPreflightValidationError> {
-    let expected_hash = || -> Result<(), ApplyTextEditsPreflightValidationError> {
-        match change.expected_sha256.as_deref() {
-            Some(hash) if is_hex_sha256(hash) => Ok(()),
-            _ => Err(format!(
-                "change {index} ({}): expected_sha256 is required and must be 64 lowercase hexadecimal characters",
+    let valid_revision = |required: bool,
+                          required_edit_index: Option<usize>|
+     -> Result<(), ApplyTextEditsPreflightValidationError> {
+        match change.expected_read_revision {
+            Some(revision) if (1..=MAX_JSON_SAFE_INTEGER).contains(&revision) => Ok(()),
+            Some(_) => Err(format!(
+                "change {index} ({}): expected_read_revision must be a positive JSON-safe integer",
                 change.kind.as_str()
             )
             .into()),
+            None if required => Err(ApplyTextEditsPreflightValidationError {
+                message: format!(
+                    "change {index} ({}): expected_read_revision is required",
+                    change.kind.as_str()
+                ),
+                edit_index: required_edit_index,
+                reread_required: true,
+            }),
+            None => Ok(()),
         }
     };
     match change.kind {
         ApplyFileChangeKind::Edit => {
-            expected_hash()?;
+            let positional_edit_index = change.edits.iter().position(|edit| {
+                edit.occurrence.is_some()
+                    || edit.line_scope.is_some()
+                    || edit.expected_match_count.is_some()
+            });
             if change.to_path.is_some() || change.content.is_some() {
                 return Err(
                     format!("change {index} (edit): to_path and content are not allowed").into(),
@@ -418,17 +526,19 @@ fn validate_apply_file_change(
                     return Err(ApplyTextEditsPreflightValidationError {
                         message,
                         edit_index: Some(edit_index),
+                        reread_required: false,
                     });
                 }
             }
+            valid_revision(positional_edit_index.is_some(), positional_edit_index)?;
         }
         ApplyFileChangeKind::Create => {
             if change.to_path.is_some()
-                || change.expected_sha256.is_some()
+                || change.expected_read_revision.is_some()
                 || !change.edits.is_empty()
             {
                 return Err(format!(
-                    "change {index} (create): to_path, expected_sha256, and edits are not allowed"
+                    "change {index} (create): to_path, expected_read_revision, and edits are not allowed"
                 )
                 .into());
             }
@@ -443,7 +553,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Delete => {
-            expected_hash()?;
+            valid_revision(true, None)?;
             if change.to_path.is_some() || change.content.is_some() || !change.edits.is_empty() {
                 return Err(format!(
                     "change {index} (delete): to_path, content, and edits are not allowed"
@@ -452,7 +562,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Rename => {
-            expected_hash()?;
+            valid_revision(true, None)?;
             let to_path = change
                 .to_path
                 .as_deref()
@@ -525,8 +635,20 @@ fn transactional_edit_agent_stdout_result(
     let applied_count = obj.get("applied_count").and_then(Value::as_u64);
     let changed = obj.get("changed").and_then(Value::as_bool);
     let would_change = obj.get("would_change").and_then(Value::as_bool);
+    let expected_applied = if tool_name == "apply_text_edits"
+        && expected_dry_run
+        && obj.get("planned_count").is_some()
+    {
+        0
+    } else {
+        expected_change_count as u64
+    };
     let valid = dry_run == Some(expected_dry_run)
-        && applied_count == Some(expected_change_count as u64)
+        && applied_count == Some(expected_applied)
+        && (tool_name != "apply_text_edits"
+            || obj.get("planned_count").is_none()
+            || obj.get("planned_count").and_then(Value::as_u64)
+                == Some(expected_change_count as u64))
         && changed.is_some()
         && would_change.is_some()
         && !(expected_dry_run && changed == Some(true))
@@ -541,6 +663,254 @@ fn transactional_edit_agent_stdout_result(
     obj["state_changed"] = json!(changed.expect("validated changed field"));
     obj["execution_state"] = json!("completed");
     ToolResult::ok(obj)
+}
+
+fn apply_text_edits_sha256(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(crate::apply_edits_shared::is_lowercase_hex_sha256)
+}
+
+fn sanitize_apply_text_edit_advisories(output: &mut Value, changes: &[ApplyFileChangeInput]) {
+    let Some(files) = output.get_mut("files").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (file, change) in files.iter_mut().zip(changes) {
+        let Some(summaries) = file.get_mut("edits").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for summary in summaries {
+            let Some(summary) = summary.as_object_mut() else {
+                continue;
+            };
+            let requested_edit = summary
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .and_then(|index| change.edits.get(index));
+            let preserve_warning = requested_edit.is_some_and(|edit| {
+                change.kind == ApplyFileChangeKind::Edit
+                    && matches!(
+                        edit.kind,
+                        ApplyTextEditKind::InsertBefore | ApplyTextEditKind::InsertAfter
+                    )
+                    && summary.get("kind").and_then(Value::as_str) == Some(edit.kind.as_str())
+                    && summary.get("warning").and_then(Value::as_str)
+                        == Some(crate::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING)
+            });
+            if !preserve_warning {
+                summary.remove("warning");
+            }
+        }
+    }
+}
+
+fn validate_apply_text_edits_success_metadata(
+    output: &Value,
+    changes: &[ApplyFileChangeInput],
+    expected_dry_run: bool,
+) -> bool {
+    let Some(files) = output.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    if files.len() != changes.len() {
+        return false;
+    }
+
+    let mut any_changed = false;
+    let mut any_would_change = false;
+    let mut total_ranges = 0usize;
+    let mut observed_edits = 0usize;
+    let mut resolved_matches = 0usize;
+    let mut warnings = 0usize;
+    let bulk_requested = changes
+        .iter()
+        .flat_map(|change| &change.edits)
+        .any(|edit| edit.expected_match_count.is_some());
+    for (expected_index, (file, change)) in files.iter().zip(changes).enumerate() {
+        if file.get("index").and_then(Value::as_u64) != Some(expected_index as u64)
+            || file.get("kind").and_then(Value::as_str) != Some(change.kind.as_str())
+            || file.get("path").and_then(Value::as_str) != Some(change.path.as_str())
+        {
+            return false;
+        }
+        let to_path_matches = match change.to_path.as_deref() {
+            Some(expected) => file.get("to_path").and_then(Value::as_str) == Some(expected),
+            None => matches!(file.get("to_path"), Some(Value::Null)),
+        };
+        if !to_path_matches {
+            return false;
+        }
+        let Some(edits) = file.get("edits").and_then(Value::as_array) else {
+            return false;
+        };
+        observed_edits += edits.len();
+        let mut seen_bulk = std::collections::HashSet::new();
+        for summary in edits {
+            let Some(fields) = summary.as_object() else {
+                return false;
+            };
+            if fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "index"
+                        | "kind"
+                        | "old_start_line"
+                        | "old_end_line"
+                        | "new_line_count"
+                        | "would_change"
+                        | "warning"
+                        | "match_count"
+                        | "expected_match_count"
+                        | "match_ranges"
+                        | "match_ranges_truncated"
+                )
+            }) {
+                return false;
+            }
+            let Some(index) = summary
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                return false;
+            };
+            let Some(requested) = change.edits.get(index) else {
+                return false;
+            };
+            if requested.expected_match_count.is_some()
+                && summary.get("kind").and_then(Value::as_str) != Some(requested.kind.as_str())
+            {
+                return false;
+            }
+            if let Some(expected) = requested.expected_match_count {
+                if !seen_bulk.insert(index) {
+                    return false;
+                }
+                if summary.get("expected_match_count").and_then(Value::as_u64)
+                    != Some(expected as u64)
+                    || summary.get("match_count").and_then(Value::as_u64) != Some(expected as u64)
+                    || summary
+                        .get("would_change")
+                        .and_then(Value::as_bool)
+                        .is_none()
+                {
+                    return false;
+                }
+                let Some(ranges) = summary.get("match_ranges").and_then(Value::as_array) else {
+                    return false;
+                };
+                let expected_ranges = expected
+                    .min(crate::apply_edits_shared::MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT)
+                    .min(
+                        crate::apply_edits_shared::MAX_APPLY_TEXT_MATCH_RANGES_TOTAL
+                            .saturating_sub(total_ranges),
+                    );
+                if ranges.len() != expected_ranges {
+                    return false;
+                }
+                total_ranges += ranges.len();
+                if total_ranges > crate::apply_edits_shared::MAX_APPLY_TEXT_MATCH_RANGES_TOTAL {
+                    return false;
+                }
+                if summary
+                    .get("match_ranges_truncated")
+                    .and_then(Value::as_bool)
+                    != Some(ranges.len() < expected)
+                {
+                    return false;
+                }
+                if ranges.iter().any(|range| {
+                    range.get("start_line").and_then(Value::as_u64).is_none()
+                        || range.get("end_line").and_then(Value::as_u64).is_none()
+                        || range.get("occurrence").and_then(Value::as_u64).is_none()
+                        || range.as_object().is_none_or(|object| object.len() != 3)
+                }) {
+                    return false;
+                }
+                if ranges.iter().any(|range| {
+                    let start = range["start_line"].as_u64().unwrap_or(0);
+                    let end = range["end_line"].as_u64().unwrap_or(0);
+                    start == 0 || end < start || range["occurrence"].as_u64() == Some(0)
+                }) || ranges.windows(2).any(|pair| {
+                    pair[0]["occurrence"].as_u64() >= pair[1]["occurrence"].as_u64()
+                        || pair[0]["start_line"].as_u64() > pair[1]["start_line"].as_u64()
+                }) {
+                    return false;
+                }
+                resolved_matches += expected;
+            } else {
+                resolved_matches += 1;
+            }
+            warnings += usize::from(summary.get("warning").is_some());
+        }
+        if change
+            .edits
+            .iter()
+            .enumerate()
+            .any(|(index, edit)| edit.expected_match_count.is_some() && !seen_bulk.contains(&index))
+        {
+            return false;
+        }
+
+        let old_sha256 = file.get("old_sha256");
+        let new_sha256 = file.get("new_sha256");
+        let sha_shape_valid = match change.kind {
+            ApplyFileChangeKind::Create => {
+                matches!(old_sha256, Some(Value::Null)) && apply_text_edits_sha256(new_sha256)
+            }
+            ApplyFileChangeKind::Edit | ApplyFileChangeKind::Rename => {
+                apply_text_edits_sha256(old_sha256) && apply_text_edits_sha256(new_sha256)
+            }
+            ApplyFileChangeKind::Delete => {
+                apply_text_edits_sha256(old_sha256) && matches!(new_sha256, Some(Value::Null))
+            }
+        };
+        if !sha_shape_valid {
+            return false;
+        }
+
+        let Some(changed) = file.get("changed").and_then(Value::as_bool) else {
+            return false;
+        };
+        let Some(would_change) = file.get("would_change").and_then(Value::as_bool) else {
+            return false;
+        };
+        if change.kind != ApplyFileChangeKind::Edit && !would_change {
+            return false;
+        }
+        if changed != (!expected_dry_run && would_change) {
+            return false;
+        }
+        any_changed |= changed;
+        any_would_change |= would_change;
+    }
+
+    let summary = output.get("change_summary");
+    let requested_logical_edits: usize = changes.iter().map(|change| change.edits.len()).sum();
+    let ignored_noop_count = output
+        .get("ignored_noop_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let summary_valid = summary.is_some_and(|summary| {
+        summary.get("requested_changes").and_then(Value::as_u64) == Some(changes.len() as u64)
+            && summary.get("changed_files").and_then(Value::as_u64)
+                == Some(
+                    files
+                        .iter()
+                        .filter(|file| file.get("changed").and_then(Value::as_bool) == Some(true))
+                        .count() as u64,
+                )
+            && summary.get("logical_edits").and_then(Value::as_u64)
+                == Some(requested_logical_edits as u64)
+            && observed_edits + ignored_noop_count == requested_logical_edits
+            && summary.get("resolved_matches").and_then(Value::as_u64)
+                == Some(resolved_matches as u64)
+            && summary.get("warnings").and_then(Value::as_u64) == Some(warnings as u64)
+    });
+    output.get("changed").and_then(Value::as_bool) == Some(any_changed)
+        && output.get("would_change").and_then(Value::as_bool) == Some(any_would_change)
+        && (summary_valid || (!bulk_requested && summary.is_none()))
 }
 
 fn apply_patch_sha256(value: &Value) -> bool {
@@ -1518,16 +1888,267 @@ fn apply_patch_agent_stdout_result(
     )
 }
 
+fn sanitize_apply_text_edits_model_recovery(
+    mut result: ToolResult,
+    project: &str,
+    changes: &[ApplyFileChangeInput],
+) -> ToolResult {
+    if result.success {
+        return result;
+    }
+    let change_index = result
+        .output
+        .get("change_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let change = change_index.and_then(|index| changes.get(index));
+    let error_kind = result
+        .output
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let raw_conflict = result
+        .output
+        .as_object_mut()
+        .and_then(|output| output.remove("conflict_recovery"));
+    if let Some(output) = result.output.as_object_mut() {
+        for key in [
+            "retry_guidance",
+            "recovery_action",
+            "expected_read_revision",
+            "reread_required",
+            "suggested_call",
+            "error",
+        ] {
+            output.remove(key);
+        }
+    }
+
+    if error_kind == "sha256_conflict" {
+        result.output["error_kind"] = json!("stale_file_revision");
+        if let Some(change) = change {
+            result.output["path"] = json!(change.path);
+            result.output["recovery"] = read_files_recovery(project, &change.path);
+        }
+        result.error = Some(
+            "Rejected transactional file batch: the source changed before mutation. No files were modified."
+                .to_string(),
+        );
+        return result;
+    }
+
+    if error_kind != "edit_conflict" {
+        return result;
+    }
+    let Some(raw_conflict) = raw_conflict.as_ref().and_then(Value::as_object) else {
+        return result;
+    };
+    let Some(conflict_kind) = raw_conflict.get("conflict_kind").and_then(Value::as_str) else {
+        return result;
+    };
+    let conflict_kind = match conflict_kind {
+        "multiple_matches"
+        | "match_count_mismatch"
+        | "match_not_found"
+        | "occurrence_out_of_range"
+        | "occurrence_outside_line_scope"
+        | "overlapping_edits" => conflict_kind,
+        _ => return result,
+    };
+    result.output["error_kind"] = json!(conflict_kind);
+    if let Some(match_count) = raw_conflict.get("match_count").and_then(Value::as_u64) {
+        result.output["match_count"] = json!(match_count);
+    }
+    if conflict_kind == "match_count_mismatch" {
+        let requested = change.and_then(|change| {
+            result
+                .output
+                .get("edit_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| change.edits.get(index as usize))
+        });
+        if let Some(expected) = requested.and_then(|edit| edit.expected_match_count) {
+            result.output["expected_match_count"] = json!(expected);
+            if let Some(scope) = requested.and_then(|edit| edit.line_scope) {
+                result.output["line_scope"] = json!(scope);
+            }
+            result.output["direct_retry_safe"] = json!(false);
+            result.output["reread_required"] = json!(true);
+            if let Some(actual) = raw_conflict
+                .get("actual_match_count")
+                .and_then(Value::as_u64)
+            {
+                result.output["actual_match_count"] = json!(actual);
+            }
+        }
+    }
+    if let Some(truncated) = raw_conflict
+        .get("candidates_truncated")
+        .and_then(Value::as_bool)
+    {
+        result.output["candidates_truncated"] = json!(if conflict_kind == "match_count_mismatch" {
+            raw_conflict
+                .get("actual_match_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| {
+                    count > crate::apply_edits_shared::MAX_APPLY_TEXT_CONFLICT_CANDIDATES as u64
+                })
+        } else {
+            truncated
+        });
+    }
+    if let Some(indices) = raw_conflict
+        .get("conflicting_edit_indices")
+        .and_then(Value::as_array)
+    {
+        result.output["conflicting_edit_indices"] = json!(indices);
+    }
+
+    if conflict_kind == "overlapping_edits" {
+        if let Some(ranges) = raw_conflict
+            .get("conflicting_edit_ranges")
+            .and_then(Value::as_array)
+        {
+            let ranges = ranges
+                .iter()
+                .take(2)
+                .filter_map(|range| {
+                    let edit_index = range.get("edit_index")?.as_u64()?;
+                    let start_line = range.get("start_line")?.as_u64()?;
+                    let end_line = range.get("end_line")?.as_u64()?;
+                    if start_line == 0 || end_line < start_line {
+                        return None;
+                    }
+                    Some(json!({
+                        "edit_index": edit_index,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            if !ranges.is_empty() {
+                result.output["conflicting_edit_ranges"] = json!(ranges);
+            }
+        }
+    }
+
+    let guarded = change.is_some_and(|change| change.expected_read_revision.is_some());
+    if let Some(candidates) = raw_conflict
+        .get("candidate_ranges")
+        .and_then(Value::as_array)
+    {
+        let candidates = candidates
+            .iter()
+            .take(crate::apply_edits_shared::MAX_APPLY_TEXT_CONFLICT_CANDIDATES)
+            .filter_map(|candidate| {
+                let start_line = candidate.get("start_line")?.as_u64()?;
+                let end_line = candidate.get("end_line")?.as_u64()?;
+                if guarded {
+                    Some(json!({
+                        "occurrence": candidate.get("occurrence")?.as_u64()?,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    }))
+                } else {
+                    Some(json!({"start_line": start_line, "end_line": end_line}))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() || conflict_kind == "match_count_mismatch" {
+            result.output["candidate_ranges"] = json!(candidates);
+        }
+    }
+
+    if (!guarded && conflict_kind != "overlapping_edits") || conflict_kind == "match_count_mismatch"
+    {
+        if let Some(change) = change {
+            result.output["recovery"] = read_files_recovery(project, &change.path);
+        }
+    }
+    result.error = Some(
+        match conflict_kind {
+            "multiple_matches" => "Rejected transactional file batch: the exact target matched multiple locations. No files were modified.",
+            "match_count_mismatch" => "Rejected transactional file batch: exact match count differed from expected_match_count. No files were modified.",
+            "match_not_found" => "Rejected transactional file batch: the exact target was not found. No files were modified.",
+            "occurrence_out_of_range" => "Rejected transactional file batch: the requested occurrence is outside the exact-match set. No files were modified.",
+            "occurrence_outside_line_scope" => "Rejected transactional file batch: the requested occurrence is outside line_scope. No files were modified.",
+            "overlapping_edits" => "Rejected transactional file batch: planned exact edit ranges overlap. No files were modified.",
+            _ => unreachable!(),
+        }
+        .to_string(),
+    );
+    result
+}
+
+fn sanitize_write_project_file_model_recovery(
+    mut result: ToolResult,
+    project: &str,
+    path: &str,
+) -> ToolResult {
+    if result.success {
+        return result;
+    }
+    let sha_mismatch = result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("expected_sha256 mismatch"));
+    if let Some(output) = result.output.as_object_mut() {
+        for key in [
+            "retry_guidance",
+            "recovery_action",
+            "expected_read_revision",
+            "reread_required",
+            "suggested_call",
+            "error",
+        ] {
+            output.remove(key);
+        }
+    }
+    if !sha_mismatch {
+        return result;
+    }
+    result
+        .output
+        .as_object_mut()
+        .map(|output| output.remove("sha256"));
+    result.output["error_kind"] = json!("stale_file_revision");
+    result.output["path"] = json!(path);
+    result.output["recovery"] = read_files_recovery(project, path);
+    result.error = Some(format!(
+        "Rejected whole-file replacement: the source for '{path}' changed before mutation. No file was overwritten."
+    ));
+    result
+}
+
 fn apply_text_edits_agent_stdout_result(
     stdout: &str,
     expected_change_count: usize,
     expected_dry_run: bool,
+    project: &str,
+    changes: &[ApplyFileChangeInput],
 ) -> ToolResult {
-    transactional_edit_agent_stdout_result(
+    let mut result = sanitize_apply_text_edits_model_recovery(
+        transactional_edit_agent_stdout_result(
+            "apply_text_edits",
+            stdout,
+            expected_change_count,
+            expected_dry_run,
+        ),
+        project,
+        changes,
+    );
+    if !result.success {
+        return result;
+    }
+    sanitize_apply_text_edit_advisories(&mut result.output, changes);
+    if validate_apply_text_edits_success_metadata(&result.output, changes, expected_dry_run) {
+        return result;
+    }
+    structured_edit_outcome_unknown_result(
         "apply_text_edits",
-        stdout,
-        expected_change_count,
-        expected_dry_run,
+        "the Runner success payload contained invalid or contradictory file-result metadata",
+        json!({}),
     )
 }
 
@@ -1585,6 +2206,94 @@ fn write_project_file_agent_stdout_result(stdout: &str) -> ToolResult {
     ToolResult::ok(obj)
 }
 
+fn compact_write_project_file_preflight_rejection(
+    detail: impl Into<String>,
+    error_kind: &'static str,
+) -> ToolResult {
+    let detail = detail.into();
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": error_kind,
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
+fn compact_apply_text_edits_preflight_rejection(
+    message: impl Into<String>,
+    error_kind: &'static str,
+    change_index: Option<usize>,
+    edit_index: Option<usize>,
+    kind: Option<&str>,
+    path: Option<&str>,
+) -> ToolResult {
+    let detail = message.into();
+    let mut output = json!({
+        "state_changed": false,
+        "execution_state": "not_started",
+        "error_kind": error_kind,
+    });
+    if let Some(change_index) = change_index {
+        output["change_index"] = json!(change_index);
+    }
+    if let Some(edit_index) = edit_index {
+        output["edit_index"] = json!(edit_index);
+    }
+    if let Some(kind) = kind {
+        output["kind"] = json!(kind);
+    }
+    if let Some(path) = path {
+        output["path"] = json!(path);
+    }
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        output,
+    )
+}
+
+fn apply_text_edits_path_overlap(
+    first_change_index: usize,
+    change_index: usize,
+    kind: &str,
+    path: &str,
+) -> ToolResult {
+    let mut result = compact_apply_text_edits_preflight_rejection(
+        format!(
+            "change {change_index} reuses path '{path}' first occupied by change {first_change_index}; each source/destination path may appear only once"
+        ),
+        "path_overlap",
+        Some(change_index),
+        None,
+        Some(kind),
+        Some(path),
+    );
+    // Proven by Server preflight, not Runner-supplied recovery. This identifies
+    // the conflict; it does not imply sequential changes can be coalesced safely.
+    result.output["path_conflict_change_indices"] = json!([first_change_index, change_index]);
+    result
+}
+
+fn compact_apply_text_edits_path_policy_rejection(
+    change_index: usize,
+    kind: &str,
+    path: &str,
+    message: String,
+) -> ToolResult {
+    let mut result = super::permissions::edit_path_policy_rejected_result(path, message);
+    if let Some(output) = result.output.as_object_mut() {
+        output.remove("path");
+        output.remove("error");
+    }
+    result.output["execution_state"] = json!("not_started");
+    result.output["change_index"] = json!(change_index);
+    result.output["kind"] = json!(kind);
+    result
+}
+
 fn apply_text_edits_preflight_rejection(
     message: impl Into<String>,
     error_kind: &'static str,
@@ -1597,6 +2306,7 @@ fn apply_text_edits_preflight_rejection(
     let detail = message.into();
     let mut output = json!({
         "state_changed": false,
+        "execution_state": "not_started",
         "error_kind": error_kind,
         "retry_guidance": retry_guidance,
     });
@@ -1634,6 +2344,7 @@ fn apply_text_edits_path_policy_rejection(
         output.remove("path");
         output.remove("error");
     }
+    result.output["execution_state"] = json!("not_started");
     result.output["change_index"] = json!(change_index);
     result.output["kind"] = json!(kind);
     result.output["retry_guidance"] =
@@ -1665,6 +2376,13 @@ pub(crate) fn apply_text_edits_to_string(
         ));
     }
     let old_sha256 = sha256_hex_bytes(original.as_bytes());
+    if edits.iter().any(|edit| edit.expected_match_count.is_some())
+        && expected_file_sha256.is_none()
+    {
+        return Err(recoverable_write_rejection(
+            "bulk exact replacement requires an expected_file_sha256 guard",
+        ));
+    }
     if let Some(expected) = expected_file_sha256 {
         if old_sha256 != expected {
             return Err(recoverable_write_rejection("expected_file_sha256 mismatch"));
@@ -1681,8 +2399,30 @@ pub(crate) fn apply_text_edits_to_string(
     // Resolve each edit to a (start, end, replacement, index) op against the
     // original content. start/end are byte offsets; inserts are zero-width.
     let mut ops: Vec<(usize, usize, String, usize)> = Vec::with_capacity(edits.len());
+    let ignored_noop_count = edits
+        .iter()
+        .filter(|edit| {
+            matches!(
+                edit.kind,
+                ApplyTextEditKind::InsertBefore | ApplyTextEditKind::InsertAfter
+            ) && edit.new_text.as_deref() == Some("")
+        })
+        .count();
     for (index, edit) in edits.iter().enumerate() {
         let kind = edit.kind;
+        if let Some(expected) = edit.expected_match_count {
+            if kind != ApplyTextEditKind::ReplaceExact
+                || edit.occurrence.is_some()
+                || expected == 0
+                || expected > crate::apply_edits_shared::MAX_APPLY_TEXT_EXPECTED_MATCH_COUNT
+            {
+                return Err(edit_field_error(
+                    index,
+                    kind,
+                    "invalid expected_match_count combination or bound",
+                ));
+            }
+        }
         if edit.occurrence == Some(0) {
             return Err(edit_field_error(
                 index,
@@ -1724,8 +2464,10 @@ pub(crate) fn apply_text_edits_to_string(
                 let new = edit
                     .new_text
                     .as_deref()
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| edit_field_error(index, kind, "new_text must be non-empty"))?;
+                    .ok_or_else(|| edit_field_error(index, kind, "new_text is required"))?;
+                if new.is_empty() {
+                    continue;
+                }
                 (anchor, new.to_string())
             }
         };
@@ -1749,6 +2491,24 @@ pub(crate) fn apply_text_edits_to_string(
             .map_err(|error| edit_field_error(index, kind, error))?
             .into_owned();
         let needle = needle.as_ref();
+        if let Some(expected) = edit.expected_match_count {
+            let matches = crate::apply_edits_shared::resolve_apply_text_bulk_matches(
+                original,
+                needle,
+                edit.line_scope.as_ref(),
+            );
+            if matches.match_count != expected {
+                return Err(edit_match_error(
+                    index,
+                    kind,
+                    "expected_match_count mismatch",
+                ));
+            }
+            for (start, end) in matches.ranges {
+                ops.push((start, end, replacement.clone(), index));
+            }
+            continue;
+        }
         let (start, end) = crate::apply_edits_shared::resolve_apply_text_match(
             original,
             needle,
@@ -1850,6 +2610,7 @@ pub(crate) fn apply_text_edits_to_string(
         "path": path,
         "dry_run": dry_run,
         "applied_count": edits.len(),
+        "ignored_noop_count": ignored_noop_count,
         "old_sha256": old_sha256,
         "new_sha256": new_sha256,
         "changed": changed,
@@ -2094,60 +2855,82 @@ impl ToolRuntime {
         path: String,
         content: String,
         overwrite: Option<bool>,
-        expected_sha256: Option<String>,
+        expected_read_revision: Option<u64>,
     ) -> ToolResult {
-        // ---- Input validation (before project resolution) ----
         if let Err(e) = validate_edit_file_path(&path) {
             return super::permissions::edit_path_policy_rejected_result(&path, e);
         }
         if content.contains('\0') {
-            return write_project_file_preflight_rejection(
+            return compact_write_project_file_preflight_rejection(
                 "content cannot contain NUL bytes",
                 "invalid_content",
-                "remove the NUL byte and retry",
             );
         }
         if content.len() > MAX_WRITE_CONTENT_BYTES {
-            return write_project_file_preflight_rejection(
+            return compact_write_project_file_preflight_rejection(
                 format!("content exceeds {MAX_WRITE_CONTENT_BYTES} bytes"),
                 "content_too_large",
-                "use apply_text_edits for a smaller local change or reduce the full rewrite",
             );
         }
         let overwrite = overwrite.unwrap_or(false);
-        if let Some(hash) = expected_sha256.as_deref() {
-            if !is_hex_sha256(hash) {
-                return write_project_file_preflight_rejection(
-                    "expected_sha256 must be a lowercase 64-character hex digest",
-                    "invalid_expected_sha256",
-                    "reread the file and provide its exact current sha256",
-                );
-            }
+        if expected_read_revision
+            .is_some_and(|revision| !(1..=MAX_JSON_SAFE_INTEGER).contains(&revision))
+        {
+            return compact_write_project_file_preflight_rejection(
+                "expected_read_revision must be a positive JSON-safe integer",
+                "invalid_expected_read_revision",
+            );
         }
-        match (overwrite, expected_sha256.is_some()) {
+        match (overwrite, expected_read_revision.is_some()) {
             (true, false) => {
-                return write_project_file_preflight_rejection(
-                    "overwrite=true requires expected_sha256",
-                    "missing_expected_sha256",
-                    "reread the existing file and retry with its exact current sha256",
+                return compact_write_project_file_preflight_rejection(
+                    "overwrite=true requires expected_read_revision",
+                    "missing_expected_read_revision",
                 )
             }
             (false, true) => {
-                return write_project_file_preflight_rejection(
-                    "expected_sha256 is allowed only when overwrite=true",
-                    "unexpected_expected_sha256",
-                    "omit expected_sha256 for a new-file create, or set overwrite=true for an existing-file rewrite",
+                return compact_write_project_file_preflight_rejection(
+                    "expected_read_revision is allowed only when overwrite=true",
+                    "unexpected_expected_read_revision",
                 )
             }
             _ => {}
         }
 
-        // ---- Project resolution (Runner-registered only) ----
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
+            Err(error) => return ToolResult::err(error),
         };
-        let client_id = proj.client_id.clone();
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return structured_edit_not_started_result(
+                "write_project_file",
+                "the resolved Runner became unavailable before mutation admission",
+            );
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return structured_edit_not_started_result(
+                "write_project_file",
+                "the resolved Project identity could not be bound to a Runner-local project id",
+            );
+        };
+        let expected_sha256 = match expected_read_revision {
+            Some(revision) => {
+                let target = read_revision_target(&resolved, &path, &runner.runner_instance_id);
+                match self.read_revisions.resolve(revision, &target) {
+                    Ok(sha256) => Some(sha256),
+                    Err(error) => {
+                        return read_revision_rejection(&resolved.resolved_id, &path, error)
+                    }
+                }
+            }
+            None => None,
+        };
 
         let payload = json!({
             "path": path.clone(),
@@ -2156,31 +2939,48 @@ impl ToolRuntime {
             "expected_sha256": expected_sha256,
         });
         let wait_timeout = 60_u64;
+        let request = ShellFileOpRequest {
+            op: "write_project_file".to_string(),
+            client_id: resolved.config.client_id.clone(),
+            path: path.clone(),
+            cwd: Some(resolved.config.path.clone()),
+            content: Some(payload.to_string()),
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            wait_timeout_secs: wait_timeout,
+        };
         let (request_id, rx) = match self
             .runner_registry
-            .enqueue_file_op(
-                ShellFileOpRequest {
-                    op: "write_project_file".to_string(),
-                    client_id,
-                    path: path.clone(),
-                    cwd: Some(proj.path.clone()),
-                    content: Some(payload.to_string()),
-                    max_bytes: None,
-                    old_text: None,
-                    pattern: None,
-                    expected_sha256: None,
-                    expected_prefix: None,
-                    start_line: None,
-                    end_line: None,
-                    line: None,
-                    create_dirs: false,
-                    wait_timeout_secs: wait_timeout,
-                },
+            .enqueue_project_file_mutation(
+                request,
+                runner_project_id,
+                &resolved.config.path,
+                &runner.runner_instance_id,
                 "tool_runtime".to_string(),
             )
             .await
         {
             Ok(request) => request,
+            Err(error) if error.starts_with("stale_runner:") => {
+                if expected_read_revision.is_some() {
+                    return read_revision_rejection(
+                        &resolved.resolved_id,
+                        &path,
+                        ReadRevisionLookupError::OwnerMismatch,
+                    );
+                }
+                return structured_edit_not_started_result(
+                    "write_project_file",
+                    "the exact Runner changed before the new-file create could be dispatched; retry after resolving the current Project owner",
+                );
+            }
             Err(_) => {
                 return structured_edit_not_started_result(
                     "write_project_file",
@@ -2200,7 +3000,11 @@ impl ToolRuntime {
             Ok(response) => response,
             Err(result) => return result,
         };
-        write_project_file_agent_stdout_result(&response.stdout.unwrap_or_default())
+        sanitize_write_project_file_model_recovery(
+            write_project_file_agent_stdout_result(&response.stdout.unwrap_or_default()),
+            &resolved.resolved_id,
+            &path,
+        )
     }
 
     pub(crate) async fn apply_patch(
@@ -2395,18 +3199,17 @@ impl ToolRuntime {
         dry_run: Option<bool>,
     ) -> ToolResult {
         if changes.is_empty() {
-            return apply_text_edits_preflight_rejection(
+            return compact_apply_text_edits_preflight_rejection(
                 "changes must contain at least one file change",
                 "empty_batch",
                 None,
                 None,
                 None,
                 None,
-                "add at least one valid file change and retry",
             );
         }
         if changes.len() > MAX_APPLY_FILE_CHANGES {
-            return apply_text_edits_preflight_rejection(
+            return compact_apply_text_edits_preflight_rejection(
                 format!(
                     "too many file changes; maximum is {}",
                     MAX_APPLY_FILE_CHANGES
@@ -2416,53 +3219,41 @@ impl ToolRuntime {
                 None,
                 None,
                 None,
-                "reduce the batch to the supported file-change limit and retry",
             );
         }
-        let mut touched_paths = HashSet::new();
+        let mut touched_paths = std::collections::HashMap::new();
         for (change_index, change) in changes.iter().enumerate() {
             if let Err(error) = validate_edit_file_path(&change.path) {
-                return apply_text_edits_path_policy_rejection(
+                return compact_apply_text_edits_path_policy_rejection(
                     change_index,
                     change.kind.as_str(),
                     &change.path,
                     error,
                 );
             }
-            if !touched_paths.insert(change.path.as_str()) {
-                return apply_text_edits_preflight_rejection(
-                    format!(
-                        "change {change_index} reuses path '{}'; each source/destination path may appear only once",
-                        change.path
-                    ),
-                    "path_overlap",
-                    Some(change_index),
-                    None,
-                    Some(change.kind.as_str()),
-                    Some(&change.path),
-                    "correct the duplicate source/destination path and retry the whole batch",
+            if let Some(first_index) = touched_paths.insert(change.path.as_str(), change_index) {
+                return apply_text_edits_path_overlap(
+                    first_index,
+                    change_index,
+                    change.kind.as_str(),
+                    &change.path,
                 );
             }
             if let Some(to_path) = change.to_path.as_deref() {
                 if let Err(error) = validate_edit_file_path(to_path) {
-                    return apply_text_edits_path_policy_rejection(
+                    return compact_apply_text_edits_path_policy_rejection(
                         change_index,
                         change.kind.as_str(),
                         to_path,
                         error,
                     );
                 }
-                if !touched_paths.insert(to_path) {
-                    return apply_text_edits_preflight_rejection(
-                        format!(
-                            "change {change_index} reuses destination path '{to_path}'; each source/destination path may appear only once"
-                        ),
-                        "path_overlap",
-                        Some(change_index),
-                        None,
-                        Some(change.kind.as_str()),
-                        Some(to_path),
-                        "correct the duplicate source/destination path and retry the whole batch",
+                if let Some(first_index) = touched_paths.insert(to_path, change_index) {
+                    return apply_text_edits_path_overlap(
+                        first_index,
+                        change_index,
+                        change.kind.as_str(),
+                        to_path,
                     );
                 }
             }
@@ -2472,9 +3263,11 @@ impl ToolRuntime {
                     .and_then(|edit_index| change.edits.get(edit_index))
                     .map(|edit| edit.kind.as_str())
                     .unwrap_or_else(|| change.kind.as_str());
-                return apply_text_edits_preflight_rejection(
+                let mut result = compact_apply_text_edits_preflight_rejection(
                     validation_error.message,
-                    if validation_error.edit_index.is_some() {
+                    if validation_error.reread_required {
+                        "missing_read_revision"
+                    } else if validation_error.edit_index.is_some() {
                         "invalid_edit"
                     } else {
                         "invalid_change"
@@ -2483,30 +3276,79 @@ impl ToolRuntime {
                     validation_error.edit_index,
                     Some(failed_kind),
                     Some(&change.path),
-                    "correct the rejected change or edit and retry the whole batch",
                 );
+                if validation_error.reread_required {
+                    result.output["recovery"] = read_files_recovery(&project, &change.path);
+                }
+                return result;
             }
         }
-        let requires_occurrence_capability = changes
-            .iter()
-            .flat_map(|change| change.edits.iter())
-            .any(|edit| edit.occurrence.is_some());
-        let requires_line_scope_capability = changes
-            .iter()
-            .flat_map(|change| change.edits.iter())
-            .any(|edit| edit.line_scope.is_some());
+
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
+            Err(error) => return ToolResult::err(error),
+        };
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return structured_edit_not_started_result(
+                "apply_text_edits",
+                "the resolved Runner became unavailable before mutation admission",
+            );
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return structured_edit_not_started_result(
+                "apply_text_edits",
+                "the resolved Project identity could not be bound to a Runner-local project id",
+            );
+        };
+
+        // Resolve every strong model-facing guard before request construction.
+        // Any invalid/stale/mismatched revision rejects the entire batch without
+        // dispatch, preserving transactionality across mixed guarded/unguarded changes.
+        let mut wire_changes = Vec::with_capacity(changes.len());
+        for (change_index, change) in changes.iter().enumerate() {
+            let expected_sha256 = match change.expected_read_revision {
+                Some(revision) => {
+                    let target =
+                        read_revision_target(&resolved, &change.path, &runner.runner_instance_id);
+                    match self.read_revisions.resolve(revision, &target) {
+                        Ok(sha256) => Some(sha256),
+                        Err(error) => {
+                            let mut result =
+                                read_revision_rejection(&resolved.resolved_id, &change.path, error);
+                            result.output["change_index"] = json!(change_index);
+                            return result;
+                        }
+                    }
+                }
+                None => None,
+            };
+            wire_changes.push(crate::apply_edits_shared::ApplyFileChangeInput {
+                kind: change.kind,
+                path: change.path.clone(),
+                to_path: change.to_path.clone(),
+                content: change.content.clone(),
+                edits: change.edits.clone(),
+                expected_sha256,
+            });
+        }
 
         let expected_change_count = changes.len();
         let expected_dry_run = dry_run.unwrap_or(false);
         let payload = json!({
-            "changes": changes,
+            "changes": wire_changes,
             "dry_run": expected_dry_run,
             "recovery_metadata_version": 1,
         });
         let serialized = match serde_json::to_string(&payload) {
             Ok(serialized) if serialized.len() <= MAX_APPLY_FILE_CHANGES_BYTES => serialized,
             Ok(_) => {
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     format!(
                         "serialized file changes exceed {} bytes",
                         MAX_APPLY_FILE_CHANGES_BYTES
@@ -2516,27 +3358,19 @@ impl ToolRuntime {
                     None,
                     None,
                     None,
-                    "reduce the batch payload size and retry",
                 )
             }
             Err(error) => {
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     format!("failed to serialize file changes payload: {error}"),
                     "serialization_failed",
                     None,
                     None,
                     None,
                     None,
-                    "correct the request payload and retry",
                 )
             }
         };
-
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        let client_id = proj.client_id.clone();
 
         let wait_timeout = 60_u64;
         let routing_path = changes
@@ -2545,9 +3379,9 @@ impl ToolRuntime {
             .expect("non-empty changes validated above");
         let request = ShellFileOpRequest {
             op: "apply_text_edits".to_string(),
-            client_id,
+            client_id: resolved.config.client_id.clone(),
             path: routing_path,
-            cwd: Some(proj.path.clone()),
+            cwd: Some(resolved.config.path.clone()),
             content: Some(serialized),
             max_bytes: None,
             old_text: None,
@@ -2560,40 +3394,78 @@ impl ToolRuntime {
             create_dirs: false,
             wait_timeout_secs: wait_timeout,
         };
-        let enqueue_result = if requires_line_scope_capability {
-            self.runner_registry
-                .enqueue_apply_text_edits_with_line_scope(
-                    request,
-                    "tool_runtime".to_string(),
-                    requires_occurrence_capability,
-                )
-                .await
-        } else if requires_occurrence_capability {
-            self.runner_registry
-                .enqueue_apply_text_edits_with_occurrence(request, "tool_runtime".to_string())
-                .await
-        } else {
-            self.runner_registry
-                .enqueue_file_op(request, "tool_runtime".to_string())
-                .await
-        };
+        let enqueue_result = self
+            .runner_registry
+            .enqueue_project_file_mutation(
+                request,
+                runner_project_id,
+                &resolved.config.path,
+                &runner.runner_instance_id,
+                "tool_runtime".to_string(),
+            )
+            .await;
         let (request_id, rx) = match enqueue_result {
-            Ok(r) => r,
-            Err(e)
-                if e.starts_with("capability_unavailable:")
-                    && e.contains(
+            Ok(request) => request,
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
+                        crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT,
+                    ) =>
+            {
+                let mut result = ToolResult::err_with_output(
+                    format!("Rejected before write: {error}. No files were modified."),
+                    json!({"changed":false,"state_changed":false,"execution_state":"not_started","error_kind":"agent_capability_unavailable","failure_kind":"capability_unavailable","capability":crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT}),
+                );
+                if let Some((change_index, edit_index, path)) = changes.iter().enumerate().find_map(|(change_index, change)| {
+                    change.edits.iter().position(|edit| edit.expected_match_count.is_some())
+                        .map(|edit_index| (change_index, edit_index, change.path.as_str()))
+                }) {
+                    result.output["change_index"] = json!(change_index);
+                    result.output["edit_index"] = json!(edit_index);
+                    result.output["path"] = json!(path);
+                }
+                return result;
+            }
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
+                        crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA,
+                    ) =>
+            {
+                return apply_text_edit_local_guard_capability_rejection(error)
+            }
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
                         crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
                     ) =>
             {
-                return apply_text_edit_line_scope_capability_rejection(e)
+                return apply_text_edit_line_scope_capability_rejection(error)
             }
-            Err(e)
-                if e.starts_with("capability_unavailable:")
-                    && e.contains(
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
                         crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
                     ) =>
             {
-                return apply_text_edit_occurrence_capability_rejection(e)
+                return apply_text_edit_occurrence_capability_rejection(error)
+            }
+            Err(error) if error.starts_with("stale_runner:") => {
+                if let Some((change_index, path)) = changes.iter().enumerate().find_map(|(index, change)| {
+                    change.expected_read_revision.map(|_| (index, change.path.as_str()))
+                }) {
+                    let mut result = read_revision_rejection(
+                        &resolved.resolved_id,
+                        path,
+                        ReadRevisionLookupError::OwnerMismatch,
+                    );
+                    result.output["change_index"] = json!(change_index);
+                    return result;
+                }
+                return structured_edit_not_started_result(
+                    "apply_text_edits",
+                    "the exact Runner changed before the local edit could be dispatched; reread before retrying",
+                );
             }
             Err(_) => {
                 return structured_edit_not_started_result(
@@ -2614,11 +3486,50 @@ impl ToolRuntime {
             Ok(response) => response,
             Err(result) => return result,
         };
-        apply_text_edits_agent_stdout_result(
+        let mut result = apply_text_edits_agent_stdout_result(
             &response.stdout.unwrap_or_default(),
             expected_change_count,
             expected_dry_run,
-        )
+            &resolved.resolved_id,
+            &changes,
+        );
+        if !result.success {
+            return result;
+        }
+
+        let files = result
+            .output
+            .get_mut("files")
+            .and_then(Value::as_array_mut)
+            .expect("validated apply_text_edits success files");
+        for (file, change) in files.iter_mut().zip(&changes) {
+            let new_sha256 = file
+                .get("new_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let read_revision = if expected_dry_run || change.kind == ApplyFileChangeKind::Delete {
+                None
+            } else {
+                let final_path = match change.kind {
+                    ApplyFileChangeKind::Rename => change
+                        .to_path
+                        .as_deref()
+                        .expect("validated rename destination"),
+                    _ => change.path.as_str(),
+                };
+                let target =
+                    read_revision_target(&resolved, final_path, &runner.runner_instance_id);
+                Some(self.read_revisions.observe(
+                    target,
+                    new_sha256.expect("validated final apply_text_edits sha256"),
+                ))
+            };
+            let file = file
+                .as_object_mut()
+                .expect("validated apply_text_edits file result object");
+            file.insert("read_revision".to_string(), json!(read_revision));
+        }
+        result
     }
 }
 
@@ -3692,8 +4603,232 @@ mod tests {
     }
 
     #[test]
+    fn apply_text_edits_success_sanitizes_duplicate_anchor_advisory_text() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "file.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: vec![ApplyTextEditInput {
+                kind: ApplyTextEditKind::InsertBefore,
+                old_text: None,
+                new_text: Some("anchor".to_string()),
+                anchor_text: Some("anchor".to_string()),
+                occurrence: None,
+                expected_match_count: None,
+                line_scope: None,
+            }],
+            expected_read_revision: None,
+        };
+        let payload = |warning: &str, kind: &str| {
+            json!({
+                "dry_run": true,
+                "applied_count": 1,
+                "changed": false,
+                "would_change": true,
+                "files": [{
+                    "index": 0,
+                    "kind": "edit",
+                    "path": "file.txt",
+                    "to_path": null,
+                    "old_sha256": "a".repeat(64),
+                    "new_sha256": "b".repeat(64),
+                    "changed": false,
+                    "would_change": true,
+                    "edits": [{
+                        "index": 0,
+                        "kind": kind,
+                        "old_start_line": 1,
+                        "old_end_line": 1,
+                        "new_line_count": 1,
+                        "warning": warning,
+                    }]
+                }],
+                "changed_paths": []
+            })
+        };
+        let canonical = crate::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING;
+        let result = apply_text_edits_agent_stdout_result(
+            &payload(canonical, "insert_before").to_string(),
+            1,
+            true,
+            "agent:test:demo",
+            std::slice::from_ref(&change),
+        );
+        assert!(result.success);
+        assert_eq!(result.output["files"][0]["edits"][0]["warning"], canonical);
+
+        for payload in [
+            payload("PRIVATE_RUNNER_TEXT", "insert_before"),
+            payload(canonical, "replace_exact"),
+        ] {
+            let result = apply_text_edits_agent_stdout_result(
+                &payload.to_string(),
+                1,
+                true,
+                "agent:test:demo",
+                std::slice::from_ref(&change),
+            );
+            assert!(result.success);
+            assert!(result.output["files"][0]["edits"][0]
+                .get("warning")
+                .is_none());
+            assert!(!result.output.to_string().contains("PRIVATE_RUNNER_TEXT"));
+        }
+    }
+
+    #[test]
+    fn apply_text_edits_success_metadata_rejects_invalid_file_authority() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "file.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: Vec::new(),
+            expected_read_revision: None,
+        };
+        let valid_payload = || {
+            json!({
+                "dry_run": false,
+                "applied_count": 1,
+                "changed": true,
+                "would_change": true,
+                "files": [{
+                    "index": 0,
+                    "kind": "edit",
+                    "path": "file.txt",
+                    "to_path": null,
+                    "old_sha256": "a".repeat(64),
+                    "new_sha256": "b".repeat(64),
+                    "changed": true,
+                    "would_change": true,
+                    "edits": []
+                }],
+                "changed_paths": ["file.txt"]
+            })
+        };
+
+        let mut invalid = Vec::new();
+        let mut wrong_index = valid_payload();
+        wrong_index["files"][0]["index"] = json!(1);
+        invalid.push(wrong_index);
+        let mut wrong_path = valid_payload();
+        wrong_path["files"][0]["path"] = json!("retargeted.txt");
+        invalid.push(wrong_path);
+        let mut wrong_to_path = valid_payload();
+        wrong_to_path["files"][0]["to_path"] = json!("retargeted.txt");
+        invalid.push(wrong_to_path);
+        let mut wrong_kind = valid_payload();
+        wrong_kind["files"][0]["kind"] = json!("rename");
+        invalid.push(wrong_kind);
+        let mut missing_files = valid_payload();
+        missing_files.as_object_mut().unwrap().remove("files");
+        invalid.push(missing_files);
+        let mut duplicate_file = valid_payload();
+        let duplicate = duplicate_file["files"][0].clone();
+        duplicate_file["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        invalid.push(duplicate_file);
+        let mut malformed_new_sha = valid_payload();
+        malformed_new_sha["files"][0]["new_sha256"] = json!("ABC");
+        invalid.push(malformed_new_sha);
+        let mut contradictory_changed = valid_payload();
+        contradictory_changed["files"][0]["changed"] = json!(false);
+        invalid.push(contradictory_changed);
+        let mut contradictory_would_change = valid_payload();
+        contradictory_would_change["files"][0]["would_change"] = json!(false);
+        invalid.push(contradictory_would_change);
+
+        for payload in invalid {
+            let result = apply_text_edits_agent_stdout_result(
+                &payload.to_string(),
+                1,
+                false,
+                "agent:test:demo",
+                std::slice::from_ref(&change),
+            );
+            assert!(!result.success);
+            assert_eq!(result.output["execution_state"], "outcome_unknown");
+            assert!(result.output["state_changed"].is_null());
+            assert!(result.output.get("files").is_none());
+            assert!(result.output.get("read_revision").is_none());
+            assert!(result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid or contradictory file-result metadata"));
+        }
+
+        let create = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Create,
+            path: "created.txt".to_string(),
+            to_path: None,
+            content: Some("created".to_string()),
+            edits: Vec::new(),
+            expected_read_revision: None,
+        };
+        let create_with_old_sha = json!({
+            "dry_run": false, "applied_count": 1, "changed": true, "would_change": true,
+            "files": [{"index":0,"kind":"create","path":"created.txt","to_path":null,"old_sha256":"a".repeat(64),"new_sha256":"b".repeat(64),"changed":true,"would_change":true,"edits":[]}],
+            "changed_paths": ["created.txt"]
+        });
+        let create_noop = json!({
+            "dry_run": false, "applied_count": 1, "changed": false, "would_change": false,
+            "files": [{"index":0,"kind":"create","path":"created.txt","to_path":null,"old_sha256":null,"new_sha256":"b".repeat(64),"changed":false,"would_change":false,"edits":[]}],
+            "changed_paths": []
+        });
+        let create_noop_result = apply_text_edits_agent_stdout_result(
+            &create_noop.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            std::slice::from_ref(&create),
+        );
+        assert!(!create_noop_result.success);
+        assert_eq!(
+            create_noop_result.output["execution_state"],
+            "outcome_unknown"
+        );
+
+        let create_result = apply_text_edits_agent_stdout_result(
+            &create_with_old_sha.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            &[create],
+        );
+        assert!(!create_result.success);
+        assert_eq!(create_result.output["execution_state"], "outcome_unknown");
+
+        let delete = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Delete,
+            path: "deleted.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: Vec::new(),
+            expected_read_revision: Some(1),
+        };
+        let delete_with_new_sha = json!({
+            "dry_run": false, "applied_count": 1, "changed": true, "would_change": true,
+            "files": [{"index":0,"kind":"delete","path":"deleted.txt","to_path":null,"old_sha256":"a".repeat(64),"new_sha256":"b".repeat(64),"changed":true,"would_change":true,"edits":[]}],
+            "changed_paths": ["deleted.txt"]
+        });
+        let delete_result = apply_text_edits_agent_stdout_result(
+            &delete_with_new_sha.to_string(),
+            1,
+            false,
+            "agent:test:demo",
+            &[delete],
+        );
+        assert!(!delete_result.success);
+        assert_eq!(delete_result.output["execution_state"], "outcome_unknown");
+    }
+
+    #[test]
     fn apply_text_edits_path_policy_recovery_omits_untrusted_path_metadata() {
-        let result = apply_text_edits_path_policy_rejection(
+        let result = compact_apply_text_edits_path_policy_rejection(
             2,
             "edit",
             "/private/secret.txt",
@@ -3718,6 +4853,8 @@ mod tests {
             r#"{"changed":true,"state_changed":false,"rollback_complete":false,"retry_guidance":"retry directly","conflict_recovery":{"schema_version":1,"conflict_kind":"multiple_matches","occurrence_selector_supported":true,"direct_retry_safe":true,"reread_required":false,"recovery_action":"select_occurrence_or_refine_match"},"error":"rollback failed"}"#,
             1,
             false,
+            "agent:test:demo",
+            &[],
         );
 
         assert!(!result.success);
@@ -3754,5 +4891,109 @@ mod tests {
         assert_eq!(rolled_back.output["changed"], false);
         assert_eq!(rolled_back.output["state_changed"], false);
         assert_eq!(rolled_back.output["execution_state"], "completed");
+    }
+
+    #[test]
+    fn bulk_success_metadata_rejects_unbounded_or_unexpected_ranges() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "bulk.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: vec![ApplyTextEditInput {
+                kind: ApplyTextEditKind::ReplaceExact,
+                old_text: Some("OLD".to_string()),
+                new_text: Some("NEW".to_string()),
+                anchor_text: None,
+                occurrence: None,
+                expected_match_count: Some(2),
+                line_scope: None,
+            }],
+            expected_read_revision: Some(1),
+        };
+        let mut payload = json!({
+            "dry_run":true,"applied_count":0,"planned_count":1,"changed":false,"would_change":true,
+            "files":[{"index":0,"kind":"edit","path":"bulk.txt","to_path":null,
+                "old_sha256":"a".repeat(64),"new_sha256":"b".repeat(64),"changed":false,"would_change":true,
+                "edits":[{"index":0,"kind":"replace_exact","old_start_line":1,"old_end_line":1,
+                    "new_line_count":1,"would_change":true,"match_count":2,"expected_match_count":2,
+                    "match_ranges":[{"occurrence":1,"start_line":1,"end_line":1},{"occurrence":2,"start_line":2,"end_line":2}],
+                    "match_ranges_truncated":false}]}],
+            "changed_paths":["bulk.txt"],
+            "change_summary":{"requested_changes":1,"changed_files":0,"logical_edits":1,"resolved_matches":2,"warnings":0}
+        });
+        let evaluate = |value: &Value| {
+            apply_text_edits_agent_stdout_result(
+                &value.to_string(),
+                1,
+                true,
+                "project",
+                &[change.clone()],
+            )
+        };
+        assert!(evaluate(&payload).success);
+        payload["files"][0]["edits"][0]["match_ranges"][0]["old_text"] = json!("SECRET");
+        let rejected = evaluate(&payload);
+        assert!(!rejected.success);
+        assert_eq!(rejected.output["execution_state"], "outcome_unknown");
+        assert!(!serde_json::to_string(&rejected).unwrap().contains("SECRET"));
+        payload["files"][0]["edits"] = json!([]);
+        payload["change_summary"]["logical_edits"] = json!(0);
+        payload["change_summary"]["resolved_matches"] = json!(0);
+        assert!(!evaluate(&payload).success);
+    }
+
+    #[test]
+    fn bulk_count_mismatch_projects_bounded_request_bound_evidence() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "bulk.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: vec![ApplyTextEditInput {
+                kind: ApplyTextEditKind::ReplaceExact,
+                old_text: Some("PRIVATE_OLD".to_string()),
+                new_text: Some("PRIVATE_NEW".to_string()),
+                anchor_text: None,
+                occurrence: None,
+                expected_match_count: Some(2),
+                line_scope: Some(crate::apply_edits_shared::ApplyTextLineScope {
+                    start_line: 3,
+                    end_line: 4,
+                }),
+            }],
+            expected_read_revision: Some(1),
+        };
+        let failure = json!({
+            "changed":false,"state_changed":false,"execution_state":"not_started",
+            "error_kind":"edit_conflict","change_index":0,"edit_index":0,
+            "kind":"replace_exact","path":"bulk.txt","error":"No files were modified",
+            "conflict_recovery":{"conflict_kind":"match_count_mismatch",
+                "expected_match_count":99,"actual_match_count":0,
+                "line_scope":{"start_line":1,"end_line":99},
+                "candidate_ranges":[],"candidates_truncated":false}
+        });
+        let result = apply_text_edits_agent_stdout_result(
+            &failure.to_string(),
+            1,
+            false,
+            "project",
+            &[change],
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "match_count_mismatch");
+        assert_eq!(result.output["expected_match_count"], 2);
+        assert_eq!(result.output["actual_match_count"], 0);
+        assert_eq!(
+            result.output["line_scope"],
+            json!({"start_line":3,"end_line":4})
+        );
+        assert_eq!(result.output["candidate_ranges"], json!([]));
+        assert_eq!(result.output["direct_retry_safe"], false);
+        assert_eq!(result.output["reread_required"], true);
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("PRIVATE_OLD"));
     }
 }

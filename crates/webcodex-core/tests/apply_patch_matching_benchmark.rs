@@ -565,11 +565,10 @@ fn deterministic_current_main_strict_vs_unique_corpus() {
     let mut partial_writes = 0usize;
 
     for case in &corpus {
-        // Baseline is the exact+unique behavior of current-main
-        // `strict_matching=true`, which is the deployed model/reviewer policy
-        // this P0 is replacing as the normal path. This intentionally does not
-        // pretend current-main's schema-default permissive false path was the
-        // observed dogfood strategy.
+        // Baseline is the exact+unique behavior used before enum-based matching
+        // became the normal model/reviewer path. This intentionally does not
+        // treat the older permissive positioning default as the observed dogfood
+        // strategy.
         let baseline = evaluate(case, ApplyPatchMatchingMode::ExactUnique);
         let unique = evaluate(case, ApplyPatchMatchingMode::Unique);
         assert_eq!(

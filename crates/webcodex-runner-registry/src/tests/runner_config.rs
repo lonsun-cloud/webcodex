@@ -32,6 +32,36 @@ fn alice() -> RunnerAccess {
 }
 
 #[tokio::test]
+async fn runner_semantic_observation_order_stays_bound_to_its_record() {
+    let registry = RunnerRegistry::default();
+    let auth = alice();
+    registry
+        .register(registration("instance-a", true))
+        .await
+        .unwrap();
+    let first = registry
+        .get_runner_semantic_view_checked_for_auth("runner-config-control", Some(&auth))
+        .await
+        .unwrap();
+    let first_returned = std::time::Instant::now();
+    registry
+        .register(registration("instance-b", true))
+        .await
+        .unwrap();
+    let replacement = registry
+        .get_runner_semantic_view_checked_for_auth("runner-config-control", Some(&auth))
+        .await
+        .unwrap();
+    // Delayed consumption of the first view must not give the retired identity
+    // a new timestamp after the replacement was already verified.
+    assert_eq!(first.view.runner_instance_id, "instance-a");
+    assert_eq!(replacement.view.runner_instance_id, "instance-b");
+    assert!(first.observed_at <= first_returned);
+    assert!(replacement.observed_at >= first_returned);
+    assert!(first.observed_at <= replacement.observed_at);
+}
+
+#[tokio::test]
 async fn runner_config_enqueue_requires_capability_exact_instance_and_closed_payload() {
     let registry = RunnerRegistry::default();
     registry

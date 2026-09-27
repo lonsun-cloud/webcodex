@@ -83,7 +83,7 @@ fn main() {
             std::fs::write(marker, b"parent_eof").expect("write parent EOF marker");
         }
         other => {
-            eprintln!("process_tree_helper: unknown mode: {other}");
+            eprintln!("process-tree-helper: unknown mode: {other}");
             std::process::exit(2);
         }
     }

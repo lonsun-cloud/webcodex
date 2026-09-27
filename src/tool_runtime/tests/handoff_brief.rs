@@ -17,6 +17,7 @@ use crate::tool_runtime::validation_events::{
 use crate::tool_runtime::{registered_tool_specs, SessionMode, ToolCall, ToolRuntime};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const PROJECT: &str = "test-project";
 
@@ -156,8 +157,11 @@ fn brief_for(
         validation_requested,
         validation: Some(validation),
         jobs,
+        external_observations: None,
         guidance_available,
         existing_suggested_actions: None,
+        session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     })
 }
 fn assert_all_objects_strict(schema: &Value, path: &str) {
@@ -200,6 +204,19 @@ fn handoff_brief_schema_is_shared_strict_and_absent_from_startup() {
     handoff_shape.as_object_mut().unwrap().remove("description");
     assert_eq!(finish_shape, handoff_shape);
     assert_all_objects_strict(finish_schema, "handoff_brief");
+    let external_schema = &finish_schema["properties"]["external_observations"];
+    assert_eq!(
+        external_schema["properties"]["provenance"]["const"],
+        "external_report"
+    );
+    assert_eq!(
+        external_schema["properties"]["coverage"]["properties"]["complete"]["const"],
+        false
+    );
+    assert_eq!(
+        external_schema["properties"]["observations"]["anyOf"][0]["maxItems"],
+        5
+    );
     let truncated_description = finish_schema["properties"]["task"]["properties"]
         ["root_instruction"]["properties"]["truncated"]["description"]
         .as_str()
@@ -211,17 +228,6 @@ fn handoff_brief_schema_is_shared_strict_and_absent_from_startup() {
         .to_string()
         .find("\"handoff_brief\"")
         .is_none());
-    let openapi = crate::openapi::build_openapi_spec();
-    assert_eq!(
-        &openapi["components"]["schemas"]["HandoffBrief"], handoff_schema,
-        "REST/OpenAPI and GPT Actions must reuse the MCP/runtime handoff schema"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["ToolResult"]["properties"]["output"]["oneOf"][0]
-            ["properties"]["handoff_brief"]["$ref"],
-        "#/components/schemas/HandoffBrief"
-    );
-
     let store = store_with_limit(200);
     let session_id = start_session(&store, "schema");
     let workspace = clean_workspace();
@@ -299,6 +305,60 @@ async fn internal_handoff_projection_does_not_append_events_or_enqueue_agent_req
 }
 
 #[tokio::test]
+async fn hidden_handoff_state_is_non_recording_exact_recovery_read() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let auth = bootstrap_auth_context();
+    let client_id = "handoff-state-hidden-read";
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", root.path(), &auth)
+            .await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("hidden handoff read".to_string()),
+    );
+    add_instruction_for_project(
+        &runtime.sessions,
+        &session.session_id,
+        &project,
+        "preserve exact recovery state",
+    );
+    let before = runtime
+        .sessions
+        .summary(&session.session_id, Some(200))
+        .unwrap();
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionHandoffState {
+                project: project.clone(),
+                session_id: session.session_id.clone(),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["project"], project);
+    assert_eq!(result.output["session_id"], session.session_id);
+    assert!(result.output["handoff_brief"].is_object());
+    assert_eq!(
+        result.output["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session.session_id, Some(200))
+        .unwrap();
+    assert_eq!(before.events_total, after.events_total);
+    assert_eq!(before.updated_at, after.updated_at);
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn public_handoff_dispatch_records_only_standard_telemetry_and_preserves_guidance() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
@@ -369,7 +429,7 @@ async fn public_handoff_dispatch_records_only_standard_telemetry_and_preserves_g
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(false),
-                summary_only: true,
+                diagnostic: true,
                 limit: Some(20),
             },
             Some(&auth),
@@ -437,15 +497,35 @@ async fn public_handoff_dispatch_records_only_standard_telemetry_and_preserves_g
 
 #[tokio::test]
 async fn finish_and_handoff_surfaces_return_the_same_brief_for_the_same_snapshot() {
+    for include_handoff in [false, true] {
+        assert_finish_and_handoff_shared_external_brief(include_handoff).await;
+    }
+}
+
+async fn assert_finish_and_handoff_shared_external_brief(include_handoff: bool) {
     let root = tempfile::tempdir().unwrap();
+    let db_root = tempfile::tempdir().unwrap();
+    let db = Arc::new(crate::db::Database::open(&db_root.path().join("db")).unwrap());
     init_git_repo(root.path());
     commit_file(root.path(), "README.md", "hello\n", "initial");
-    let runtime = ToolRuntime::new_for_tests();
+    let runtime = ToolRuntime::new_for_tests().with_communication_database(db.clone());
     let client_id = "handoff-brief-shared";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("shared builder".to_string()));
+    db.record_external_observation(
+        &session.session_id,
+        &project,
+        webcodex_store::ExternalObservation {
+            adapter_id: "a".repeat(64),
+            event_id: "b".repeat(64),
+            tool: "Bash".to_string(),
+            exit_code: None,
+            recorded_at: 1,
+        },
+    )
+    .unwrap();
     let auth = bootstrap_auth_context();
 
     let finish_task = tokio::spawn({
@@ -463,7 +543,7 @@ async fn finish_and_handoff_surfaces_return_the_same_brief_for_the_same_snapshot
                         include_diff: Some(false),
                         include_workspace: Some(false),
                         include_hygiene: Some(false),
-                        include_handoff: Some(false),
+                        include_handoff: Some(include_handoff),
                         include_validation_summary: Some(false),
                     },
                     Some(&auth),
@@ -503,4 +583,14 @@ async fn finish_and_handoff_surfaces_return_the_same_brief_for_the_same_snapshot
         finish.output["handoff_brief"],
         handoff.output["handoff_brief"]
     );
+    assert_eq!(
+        finish.output["handoff_brief"]["external_observations"]["observations"][0]["event_id"],
+        "b".repeat(64),
+    );
+    if include_handoff {
+        assert_eq!(
+            finish.output["handoff"]["handoff_brief"]["external_observations"],
+            finish.output["handoff_brief"]["external_observations"],
+        );
+    }
 }
